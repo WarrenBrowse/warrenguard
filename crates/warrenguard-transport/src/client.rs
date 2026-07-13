@@ -56,9 +56,9 @@ pub struct ClientTunnel {
     /// of the fixed-period beacon (a passive traffic-analysis tell). The
     /// config and the pump MUST flip together: enabling this without the
     /// matching pump leaves the connection with no liveness mechanism
-    /// beyond the idle timeout. Default `false` (opt-in via
-    /// [`Self::with_idle_cover`], gated on `WARREN_IDLE_COVER` at the
-    /// consumer). Mutually exclusive with DAITA (DAITA provides its own
+    /// beyond the idle timeout. Default `false` at the struct level: the
+    /// consumer wires [`Self::with_idle_cover`] from the `WARREN_IDLE_COVER`
+    /// knob (default on). Mutually exclusive with DAITA (DAITA provides its own
     /// cover), so the consumer sets this only when DAITA is not requested.
     idle_cover: bool,
     /// When `true` (Stealth profile), the client transport config pads every
@@ -1437,13 +1437,15 @@ mod tests {
 
     #[test]
     fn cover_defenses_default_off_on_a_fresh_client() {
-        // Opt-in only: a fresh client must request neither defense, so a
-        // build that never calls the switch is unchanged.
+        // The struct stays neutral: a fresh client requests neither defense,
+        // so a build that never calls the switches is unchanged. The consumer
+        // resolves the WARREN_DAITA / WARREN_IDLE_COVER knobs (idle cover is
+        // on by default THERE) and flips the switches accordingly.
         let c = ClientTunnel::new();
         assert!(
             !c.daita_support() && !c.idle_cover(),
-            "a fresh ClientTunnel must default to no cover defense (opt-in via WARREN_DAITA / \
-             WARREN_IDLE_COVER at the consumer)"
+            "a fresh ClientTunnel must default to no cover defense (the knobs are wired by the \
+             consumer, not the struct)"
         );
     }
 

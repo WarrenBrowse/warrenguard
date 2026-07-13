@@ -128,8 +128,8 @@ pub const REGISTRY: &[KnobMeta] = &[
     KnobMeta {
         name: "WARREN_IDLE_COVER",
         kind: "bool",
-        default: "off",
-        clamp: "\"1\"/\"true\" enables, else off",
+        default: "on",
+        clamp: "\"0\"/\"false\"/\"no\"/\"off\" disables, else on",
         effect: "emit jittered, size-varied idle cover datagrams to mask the keep-alive beacon",
         home: "warrenguard-pump/src/idle_cover.rs",
     },
@@ -215,6 +215,24 @@ pub fn parse_bool_flag(raw: Option<&str>, default: bool) -> bool {
 #[must_use]
 pub fn parse_enabled_unless(raw: Option<&str>, off_value: &str) -> bool {
     raw != Some(off_value)
+}
+
+/// Parses a default-on boolean knob: an explicit `"0"`, `"false"`, `"no"`
+/// or `"off"` (case-insensitive) disables it; any other value, or absence,
+/// keeps it on. On is the safe fallback (the mirror of [`parse_bool_flag`]):
+/// this shape guards default-on privacy defenses, where a typo'd override
+/// must not silently switch the defense off.
+#[must_use]
+pub fn parse_bool_default_on(raw: Option<&str>) -> bool {
+    match raw {
+        Some(v) => {
+            !(v == "0"
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("no")
+                || v.eq_ignore_ascii_case("off"))
+        }
+        None => true,
+    }
 }
 
 /// Parses a `u64` knob. Unparsable values warn and fall back to
@@ -398,8 +416,9 @@ pub fn uplink_deadpath_enabled() -> bool {
     })
 }
 
-/// `WARREN_IDLE_COVER`: enable idle cover traffic. Off
-/// by default; `"1"`/`"true"` enables. When on, the client pump emits a
+/// `WARREN_IDLE_COVER`: idle cover traffic. ON by default;
+/// `"0"`/`"false"`/`"no"`/`"off"` disables (any other value keeps it on, so a
+/// typo cannot silently strip the defense). When on, the client pump emits a
 /// jittered, size-varied dummy datagram during idle and the fixed
 /// client keep-alive PING is disabled (the dummy refreshes the NAT
 /// mapping and the 25s idle timeout still detects a dead exit), removing
@@ -411,8 +430,7 @@ pub fn uplink_deadpath_enabled() -> bool {
 #[must_use]
 pub fn idle_cover_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE
-        .get_or_init(|| parse_bool_flag(std::env::var("WARREN_IDLE_COVER").ok().as_deref(), false))
+    *CACHE.get_or_init(|| parse_bool_default_on(std::env::var("WARREN_IDLE_COVER").ok().as_deref()))
 }
 
 /// `WARREN_DAITA`: request the DAITA traffic-analysis defense. Off by
@@ -778,6 +796,31 @@ mod tests {
     fn bool_flag_uses_default_when_absent() {
         assert!(!parse_bool_flag(None, false));
         assert!(parse_bool_flag(None, true));
+    }
+
+    #[test]
+    fn default_on_bool_stays_on_unless_explicitly_disabled() {
+        assert!(
+            parse_bool_default_on(None),
+            "absent must resolve to on: the whole point of a default-on knob"
+        );
+        for off in ["0", "false", "FALSE", "no", "No", "off", "OFF"] {
+            assert!(
+                !parse_bool_default_on(Some(off)),
+                "an explicit {off:?} must force the knob off"
+            );
+        }
+        for on in ["1", "true", "TRUE"] {
+            assert!(
+                parse_bool_default_on(Some(on)),
+                "an explicit {on:?} must keep the knob on"
+            );
+        }
+        assert!(
+            parse_bool_default_on(Some("ture")),
+            "an unrecognized value must fall back to on: a typo must never \
+             silently switch a privacy defense off"
+        );
     }
 
     #[test]

@@ -57,7 +57,7 @@ knob in `REGISTRY` must appear in the table below, or the test fails.
 | `WARREN_DEAD_PATH_SECS` | u64 (seconds) | 15 | 0 disables the watch; unparsable -> default | RX-silence window before the client redials | warrenguard-transport/src/supervisor.rs |
 | `WARREN_APP_DOWNLINK_DEAD_SECS` | u64 (seconds) | 15 | 0 disables the watch; unparsable -> default | one-way-traffic window (app datagrams up, none back) before the client redials | warrenguard-transport/src/supervisor.rs |
 | `WARREN_UPLINK_DEADPATH` | bool | off | "1"/"true" enables, else off | enable the uplink-only dead-path watch | warrenguard-transport/src/supervisor.rs |
-| `WARREN_IDLE_COVER` | bool | off | "1"/"true" enables, else off | emit jittered, size-varied idle cover datagrams to mask the keep-alive beacon | warrenguard-pump/src/idle_cover.rs |
+| `WARREN_IDLE_COVER` | bool | on | "0"/"false"/"no"/"off" disables, else on | emit jittered, size-varied idle cover datagrams to mask the keep-alive beacon | warrenguard-pump/src/idle_cover.rs |
 | `WARREN_DAITA` | bool | off | "1"/"true" enables, else off | request the DAITA traffic-analysis defense (Maybenot padding/dummies); mutually exclusive with idle cover (DAITA supersedes it) | warrenguard-daita + warrenguard-pump (pump_*_with_daita) |
 | `WARREN_CLIENT_DATAPATH_SOCKETS` | usize | auto (one endpoint per connection) | unset/0 -> one per conn; else N; clamped to [1, num_conns] | client datapath UDP sockets/endpoints a multi-conn session spreads its connections across; auto = one source port per connection (distinct ports let the exit reuseport hash flows across cores and are required for the client multi-queue TUN downlink win, bench); 1 keeps a single NAT mapping | warrenguard-transport/src/client.rs (connect_multi) |
 
