@@ -1,0 +1,55 @@
+# WarrenGuard engine crate: keep the datapath's own tunnel socket OUT of the
+# tunnel it installs, per OS, at the SOCKET level (SO_MARK / IP_BOUND_IF /
+# IP_UNICAST_IF) instead of a destination route to the exit. This is the desktop
+# generalisation of the Android `VpnService.protect` hook and the Port Fail /
+# TunnelCrack ServerIP fix: only the marked/bound socket escapes.
+[package]
+name = "warrenguard-socket-bypass"
+description = "Per-OS tunnel-socket bypass (SO_MARK / IP_BOUND_IF / IP_UNICAST_IF): keep the VPN app's own socket on the physical link so no app flow leaks by targeting the exit IP (WarrenGuard engine)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The pure `SocketBypass` policy type (which mark / which interface index).
+warrenguard-tun-core = { path = "../warrenguard-tun-core" }
+
+# Raw setsockopt on Unix (SO_MARK on Linux, IP_BOUND_IF/IPV6_BOUND_IF on macOS).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Raw setsockopt on Windows (IP_UNICAST_IF / IPV6_UNICAST_IF).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Networking_WinSock",
+    "Win32_Foundation",
+] }
+
+# Test-only: resolving the loopback interface index (GetBestInterface /
+# GetBestInterfaceEx) to exercise the real IP_UNICAST_IF / IPV6_UNICAST_IF
+# syscalls end-to-end, mirroring the macOS IP_BOUND_IF tests. Cargo unifies
+# this with the dependency above for test builds, so production builds never
+# link the extra IpHelper surface.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Networking_WinSock",
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+] }
+
+[lints.rust]
+# Binding the socket to the physical interface needs the raw `setsockopt` FFI
+# (there is no safe cross-OS wrapper for IP_BOUND_IF / IP_UNICAST_IF). The
+# workspace forbids unsafe; this crate downgrades to `deny` and admits it only in
+# the documented per-OS blocks below, mirroring `warrenguard-winroute`.
+unsafe_code = "deny"
+missing_docs = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "deny", priority = -1 }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

@@ -1,0 +1,41 @@
+//! WarrenGuard client transport: the initiator-side tunnel datapath built on the
+//! shared engine primitives. Holds the QUIC client ([`ClientTunnel`] /
+//! [`ClientSession`]), the multi-connection bonded session ([`MultiSession`]),
+//! and the per-platform TUN device backends (real utun/`/dev/net/tun`, Android
+//! `VpnService` fd, iOS `NEPacketTunnelFlow`).
+
+#[cfg(target_os = "android")]
+mod android_tun;
+pub mod bench;
+pub mod bundle;
+mod client;
+pub mod ip_assign;
+// `ios_tun` is portable (pure tokio + mpsc) so it compiles on every target for
+// host-side unit tests; public exposure is gated to iOS below.
+mod ios_tun;
+pub mod multi_hop_pump;
+mod multi_session;
+pub mod multihop;
+#[cfg(target_os = "android")]
+pub mod socket_protect;
+// `real_tun` drives `tun-rs::AsyncDevice`, which has no Android nor iOS backend.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+mod real_tun;
+// The system-VPN pump driver installs OS routes (via `warrenguard-route-split`),
+// so it is gated behind `system-vpn` to keep the userland SDK closure free of the
+// privileged killswitch-os/pfctl deps (SDK purity invariant).
+#[cfg(feature = "system-vpn")]
+pub mod supervised_pump;
+pub mod supervisor;
+#[cfg(test)]
+mod test_support;
+
+#[cfg(target_os = "android")]
+pub use android_tun::AndroidTun;
+pub use client::{ClientSession, ClientTunnel};
+#[cfg(target_os = "ios")]
+pub use ios_tun::IosTun;
+pub use ip_assign::{IpAssignChannel, IpAssignSpec};
+pub use multi_session::MultiSession;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub use real_tun::RealTun;

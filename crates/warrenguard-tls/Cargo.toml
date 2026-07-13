@@ -1,0 +1,48 @@
+# WarrenGuard engine crate: a generic VPN-over-QUIC building block with no
+# Warren-specific logic, reusable by any deployer.
+[package]
+name = "warrenguard-tls"
+description = "TLS 1.3 + Raw Public Key Ed25519 configuration for the tunnel (WarrenGuard engine)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+# Post-quantum handshake: swaps the crypto provider to aws-lc-rs and offers the
+# hybrid group X25519MLKEM768 (see `pq_crypto_provider`). Off by default because
+# aws-lc-rs pulls a C toolchain build dep and the hybrid ClientHello changes the
+# JA4 fingerprint; enabling it is a gated rollout step, not the default channel.
+default = []
+pq = ["rustls/aws_lc_rs"]
+
+[dependencies]
+warrenguard-wire = { path = "../warrenguard-wire" }
+ed25519-dalek = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+webpki-root-certs = { workspace = true }
+quinn = { workspace = true }
+data-encoding = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+warrenguard-config = { path = "../warrenguard-config" }
+tokio = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+# Mints cover-domain leaf + CA fixtures in-memory for the v6 X.509 cert-loader
+# and handshake tests, so no PEM blobs need to be checked in.
+rcgen = { workspace = true }
+# Used by the `signing_key_is_zeroize_on_drop_at_compile_time` test
+# (resolver.rs) to pin the `SigningKey: ZeroizeOnDrop` invariant.
+zeroize = { workspace = true }
+# Pins the engine client's JA4 QUIC fingerprint by capturing a real Initial
+# over loopback and decrypting it (tests/ja4_fingerprint.rs).
+warrenguard-ja4 = { path = "../warrenguard-ja4" }
+
+[lints]
+workspace = true

@@ -1,0 +1,3 @@
+[submodule "vectors"]
+	path = vectors
+	url = https://github.com/WarrenBrowse/warren-vectors.git

@@ -1,0 +1,30 @@
+# WarrenGuard engine crate: compute the JA4 QUIC-client fingerprint (FoxIO
+# JA4+) from a captured QUIC Initial packet. Measurement/audit tooling for the
+# obfuscation roadmap, not part of the datapath: it decrypts
+# the Initial (RFC 9001, keys derived from the DCID like any on-path observer),
+# reassembles the TLS ClientHello, and derives the JA4 string so the engine's
+# fingerprint can be pinned as a regression guard and diffed against a browser.
+[package]
+name = "warrenguard-ja4"
+description = "JA4 QUIC-client fingerprint (FoxIO) from a QUIC Initial packet (WarrenGuard engine)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+aes = { workspace = true }
+aes-gcm = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true

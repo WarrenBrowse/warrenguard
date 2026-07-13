@@ -1,0 +1,22 @@
+# WarrenGuard engine crate: TCP fallback carrier for the QUIC data plane.
+# Wraps QUIC/UDP datagrams inside a single TLS-over-TCP stream to the exit's
+# cover domain on :443 so the tunnel still connects where UDP is blocked. This
+# crate owns the byte-carrier framing (the wire contract); the QUIC engine, HPKE
+# and obfuscation configs are untouched (it plugs in at the quinn AsyncUdpSocket
+# seam only).
+[package]
+name = "warrenguard-tcp-carrier"
+description = "TLS-over-TCP fallback carrier for QUIC datagrams (WarrenGuard engine)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

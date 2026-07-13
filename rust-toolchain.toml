@@ -1,0 +1,8 @@
+[toolchain]
+# Rust 2024 edition (>= 1.85). Pinned to 1.89 for reproducible POC
+# builds across Linux and macOS; bump only after a deliberate review of
+# transitive deps (quinn-fork, tokio, rustls, ed25519-dalek).
+channel = "1.89.0"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
+profile = "minimal"

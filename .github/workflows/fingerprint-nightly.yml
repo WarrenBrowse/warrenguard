@@ -1,0 +1,92 @@
+name: fingerprint nightly
+
+# Validates the seven wire-fingerprint invariants (I1-I7) every night so a
+# regression on any
+# branch that touches the handshake / TLS / SNI / transport-config / exit-bind
+# paths surfaces within 24h, plus on PRs touching the load-bearing crates. The
+# suite is hermetic (loopback Quinn handshake + source/config anchors); the
+# wire-level checks that need a real network (path-MTU fragmentation, GFW-class
+# SNI probing, spin-bit observation on 1-RTT short headers) are covered by
+# real-network benches, not this workflow. These binaries also run in the main
+# workspace test on every push; the nightly is the scheduled explicit guard.
+#
+# Runs on the WarrenBrowse self-hosted runner (see ci.yml); do not switch to a
+# GitHub-hosted runner.
+
+on:
+  schedule:
+    # 03:17 UTC every night, off-peak.
+    - cron: "17 3 * * *"
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - "crates/warrenguard-tls/**"
+      - "crates/warrenguard-transport-core/**"
+      - "crates/warrenguard-relay/**"
+      - "crates/warrenguard-config/**"
+      - "crates/warrenguard-ja4/**"
+      - "Cargo.lock"
+      - "scripts/check-quinn-advisories.sh"
+      - "scripts/quinn-advisories-ignore.txt"
+      - ".github/workflows/fingerprint-nightly.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  fingerprint-invariants:
+    name: wire-fingerprint invariants I1-I7
+    runs-on: [self-hosted, Linux, X64, macstudio-rosetta]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: Swatinem/rust-cache@v2
+
+      - name: "I1, I2, I6, I7 - live ALPN + SNI handshake"
+        run: cargo test -p warrenguard-tls --test fingerprint_invariants -- --nocapture
+
+      - name: "I3 - Initial-flight crypto fragmentation + obfuscation knobs"
+        run: cargo test -p warrenguard-transport-core --test obfuscation_invariants -- --nocapture
+
+      - name: "I4 - spin bit disabled + quinn-fork patch present"
+        run: cargo test -p warrenguard-transport-core --test transport_config -- --nocapture
+
+      - name: "I5 - default exit bind on 0.0.0.0:443/udp"
+        run: cargo test -p warrenguard-relay --test config_loading -- --nocapture
+
+      - name: "JA4 - engine QUIC client fingerprint (RFC 9001 decrypt + pin)"
+        # warrenguard-ja4 unit tests validate the QUIC Initial decryption against
+        # RFC 9000/9001 vectors and the JA4 computation; the tls integration test
+        # captures a real engine Initial, decrypts it, and pins the JA4 so any
+        # ClientHello drift (and its parity gap vs a browser) surfaces.
+        run: |
+          cargo test -p warrenguard-ja4 -- --nocapture
+          cargo test -p warrenguard-tls --test ja4_fingerprint -- --nocapture
+
+  quinn-advisory-watch:
+    name: warren-quinn fork advisory watch
+    runs-on: [self-hosted, Linux, X64, macstudio-rosetta]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure a TOML parser for python < 3.11
+        # The runner is Debian bullseye (python 3.9, no tomllib); install the
+        # pure-python tomli backport. No-op when tomllib or tomli is already
+        # present. The container image ships python3 WITHOUT pip ("No module
+        # named pip"), so bootstrap pip through apt first (the runner has
+        # NOPASSWD sudo scoped to apt) instead of assuming it exists.
+        run: |
+          python3 -c "import tomllib" 2>/dev/null && exit 0
+          python3 -c "import tomli" 2>/dev/null && exit 0
+          if ! python3 -m pip --version >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq python3-pip
+          fi
+          python3 -m pip install --user --quiet tomli
+      - name: Check the quinn fork base versions against the RustSec advisory DB
+        # cargo-audit/deny cannot match the renamed fork crates; this maps them
+        # back to upstream quinn/quinn-proto/quinn-udp and evaluates every
+        # advisory against the fork's base versions.
+        run: ./scripts/check-quinn-advisories.sh

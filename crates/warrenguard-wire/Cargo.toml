@@ -1,0 +1,27 @@
+# WarrenGuard engine crate: a generic VPN-over-QUIC building block with no
+# Warren-specific logic, reusable by any deployer.
+[package]
+name = "warrenguard-wire"
+description = "Application wire frames for the tunnel handshake (Setup/SetupAck), exit address/id and pubkey codecs (WarrenGuard engine)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+postcard = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
+subtle = "2"
+
+[dev-dependencies]
+postcard = { workspace = true }
+serde_json = { workspace = true }
+proptest = "1"
+
+[lints]
+workspace = true

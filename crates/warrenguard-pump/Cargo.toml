@@ -1,0 +1,37 @@
+# WarrenGuard engine crate: the bidirectional TUN <-> QUIC datagram pump, shared
+# by the client transport and the server. Sits above transport-core + daita
+# (which is why it is its own crate rather than living in transport-core). The
+# multi-conn pumps are generic over the `MultiConnSession` trait so the pump
+# stays client-agnostic.
+[package]
+name = "warrenguard-pump"
+description = "Bidirectional TUN <-> QUIC datagram pump with DAITA + rate-limit integration (WarrenGuard engine)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+warrenguard-transport-core = { path = "../warrenguard-transport-core" }
+warrenguard-daita = { path = "../warrenguard-daita" }
+warrenguard-wire = { path = "../warrenguard-wire" }
+warrenguard-ratelimit = { path = "../warrenguard-ratelimit" }
+warrenguard-config = { path = "../warrenguard-config" }
+quinn = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros", "net", "time"] }
+# Loopback client<->exit QUIC for the idle-cover integration test.
+warrenguard-tls = { path = "../warrenguard-tls" }
+ed25519-dalek = { workspace = true }
+
+[lints]
+workspace = true

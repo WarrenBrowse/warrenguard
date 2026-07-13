@@ -1,0 +1,19 @@
+# cargo-audit configuration for the WarrenGuard engine.
+#
+# The CI runs BOTH `cargo audit` and `cargo deny check`, which each read the
+# RustSec advisory DB but from their OWN ignore list. This file MUST stay in
+# sync with the `[advisories] ignore` list in `deny.toml` (the rationale for
+# each entry lives there); an advisory accepted in one tool but not the other
+# is what breaks CI. When you add or drop an advisory in `deny.toml`, mirror it
+# here. cargo-audit only errors on vulnerability/unsound advisories (the
+# unmaintained ones surface as warnings), but the full list is mirrored so the
+# two tools never diverge.
+[advisories]
+ignore = [
+    "RUSTSEC-2024-0436",
+    "RUSTSEC-2023-0089",
+    "RUSTSEC-2025-0141",
+    "RUSTSEC-2025-0134",
+    "RUSTSEC-2026-0190",
+    "RUSTSEC-2023-0071",
+]

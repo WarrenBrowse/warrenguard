@@ -1,0 +1,42 @@
+[package]
+name = "warrenguard-winroute"
+description = "Warren Windows split-default routing via the Win32 IP Helper API. The routing-plan layer is pure and cross-platform; the privileged route operations (CreateIpForwardEntry2 / DeleteIpForwardEntry2 / GetIpForwardTable2) are isolated unsafe FFI compiled only on Windows."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "warrenguard_winroute"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+# Windows-only: the IP Helper routing API. The non-Windows build is the pure
+# routing-plan layer and pulls nothing.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+] }
+
+[lints.rust]
+# Routing exception: the IP Helper route calls are unsafe FFI. The workspace
+# forbids unsafe everywhere; this crate downgrades it to `deny` and admits unsafe
+# ONLY on Windows via the documented crate-level `cfg_attr` allow in lib.rs. The
+# non-Windows build (pure routing-plan layer) contains zero unsafe.
+unsafe_code = "deny"
+missing_docs = "warn"
+unreachable_pub = "warn"
+unused_imports = "warn"
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }

@@ -1,0 +1,7 @@
+# Accepted RUSTSEC advisories against the warren-quinn fork base versions.
+#
+# One `RUSTSEC-YYYY-NNNN` id per line. A comment with the rationale is
+# MANDATORY: why the advisory does not apply to Warren's use, or the accepted
+# risk and its expiry. check-quinn-advisories.sh skips the ids listed here.
+#
+# (none yet)

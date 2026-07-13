@@ -1,0 +1,28 @@
+# WarrenGuard engine crate: generic Privacy Pass anonymous credentials, no
+# Warren-specific policy (epochs, quotas and subscription checks live in the
+# deployer's own issuer / verifier services).
+[package]
+name = "warrenguard-token"
+description = "Privacy Pass publicly-verifiable tokens (RFC 9578 type 0x0002 / RFC 9474 RSABSSA-SHA384-PSS-Deterministic): challenge, token, issuer and client primitives for anonymous session credentials (WarrenGuard engine)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+blind-rsa-signatures = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+subtle = "2"
+zeroize = { workspace = true }
+
+[dev-dependencies]
+hex = { workspace = true }
+rand = { workspace = true }
+
+[lints]
+workspace = true

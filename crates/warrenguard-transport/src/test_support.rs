@@ -1,0 +1,349 @@
+//! Shared loopback QUIC helpers for this crate's unit tests.
+//!
+//! Building a protocol-correct fake exit (relay descriptor PKI, TLS RPK
+//! dial, HPKE setup-over-stream) is overkill for exercising the pump /
+//! bundle / supervisor plumbing: those only need a live
+//! [`crate::multihop::MultiHopClient`] wired directly onto an established
+//! QUIC connection (skipping [`crate::multihop::MultiHopClient::connect`]'s
+//! relay-descriptor verification and dial) plus a matching exit-side
+//! [`ExitSession`] so a downlink test can seal frames the client can
+//! actually open. `cfg(test)`-only; `pub(crate)` so every test module in
+//! this crate can share one implementation instead of four near-duplicates.
+//! (Module itself is gated `#[cfg(test)]` at the `mod test_support;`
+//! declaration in `lib.rs`.)
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use ed25519_dalek::{Signer, SigningKey};
+use quinn::{Connection, Endpoint};
+use warrenguard_multihop::{
+    ExitId, ExitSession, RelayDescriptorSigned, WarrenControlMessage, decode_frame, encode_control,
+    encode_frame, relay_descriptor_signing_payload, test_support::derive_exit_keypair,
+};
+use warrenguard_wire::WarrenPubkey;
+
+use crate::multihop::{MultiHopClient, client_encapsulated_key_for_test};
+
+/// A loopback multi-hop pair: a real client-side [`MultiHopClient`] plus
+/// the raw server-side [`Connection`] and matching [`ExitSession`] needed
+/// to drive the exit side of the HPKE session in a test (seal downlink
+/// frames, read raw uplink datagrams, or just close the connection to
+/// exercise the reader's error path). Endpoints are kept alive on the
+/// struct: dropping them tears down the underlying UDP sockets.
+pub(crate) struct LoopbackMultiHop {
+    pub(crate) client: Arc<MultiHopClient>,
+    pub(crate) exit_conn: Connection,
+    pub(crate) exit_session: ExitSession,
+    exit_id: ExitId,
+    exit_priv: warrenguard_multihop::WarrenKemPrivateKey,
+    _client_ep: Endpoint,
+    _server_ep: Endpoint,
+}
+
+impl LoopbackMultiHop {
+    /// Rebuilds [`Self::exit_session`] from the client's CURRENT
+    /// `encapsulated_key`. A real exit re-derives its receiver context on
+    /// seeing a fresh epoch's first frame; call this right after
+    /// [`crate::multihop::MultiHopClient::rekey`] so a subsequent
+    /// `exit_session.seal_response(..)` produces a downlink frame the
+    /// client's NEW epoch can decrypt (exercising the rekey round-trip
+    /// rather than only the client-local counter rotation).
+    pub(crate) fn rebuild_exit_session_for_current_epoch(&mut self) {
+        let encapsulated_key = client_encapsulated_key_for_test(&self.client);
+        self.exit_session = ExitSession::new(&self.exit_priv, &encapsulated_key, self.exit_id)
+            .expect("exit-side session rebuild after rekey");
+    }
+}
+
+/// Spins up a bare RPK loopback QUIC connection (no relay-auth proof, no
+/// setup-stream exchange) and wraps the client side as a
+/// [`MultiHopClient`] via [`MultiHopClient::from_established_connection`].
+/// The returned [`ExitSession`] is built from the client's own
+/// `encapsulated_key`, so `exit_session.seal_response(..)` produces frames
+/// `client.recv()` can decrypt, exactly mirroring a real exit's reverse
+/// direction without paying for the setup-stream round-trip.
+pub(crate) async fn spawn_loopback_multihop(exit_id: ExitId) -> LoopbackMultiHop {
+    let tls_key = SigningKey::from_bytes(&[0x77; 32]);
+    let server_cfg = warrenguard_tls::make_server_config(
+        &tls_key,
+        warrenguard_tls::default_crypto_provider(),
+        &[warrenguard_config::ALPN_H3],
+    )
+    .expect("server cfg");
+    let server_ep = Endpoint::server(
+        server_cfg,
+        "127.0.0.1:0".parse().expect("static addr parses"),
+    )
+    .expect("server bind");
+    let addr = server_ep.local_addr().expect("local addr");
+
+    let server_for_accept = server_ep.clone();
+    let accept = tokio::spawn(async move {
+        let incoming = server_for_accept.accept().await.expect("incoming");
+        incoming.await.expect("server handshake")
+    });
+
+    let client_cfg = warrenguard_tls::make_client_config(
+        warrenguard_tls::default_crypto_provider(),
+        &[warrenguard_config::ALPN_H3],
+    )
+    .expect("client cfg");
+    let mut client_ep =
+        Endpoint::client("127.0.0.1:0".parse().expect("static addr parses")).expect("client bind");
+    client_ep.set_default_client_config(client_cfg);
+    let sni =
+        warrenguard_tls::name::encode(WarrenPubkey::from_bytes(tls_key.verifying_key().to_bytes()));
+    let client_conn = client_ep
+        .connect(addr, &sni)
+        .expect("connect builds")
+        .await
+        .expect("client handshake");
+
+    let exit_conn = accept.await.expect("server accept task");
+
+    let (exit_priv, exit_pub) = derive_exit_keypair(&[0x99; 32]);
+    let exit_pub_bytes = warrenguard_multihop::test_support::pubkey_to_bytes(&exit_pub);
+
+    let client = Arc::new(
+        MultiHopClient::from_established_connection(
+            client_ep.clone(),
+            client_conn,
+            exit_id,
+            &exit_pub_bytes,
+            None,
+        )
+        .expect("client-side HPKE session setup"),
+    );
+
+    let encapsulated_key = client_encapsulated_key_for_test(&client);
+    let exit_session =
+        ExitSession::new(&exit_priv, &encapsulated_key, exit_id).expect("exit-side session setup");
+
+    LoopbackMultiHop {
+        client,
+        exit_conn,
+        exit_session,
+        exit_id,
+        exit_priv,
+        _client_ep: client_ep,
+        _server_ep: server_ep,
+    }
+}
+
+/// A loopback fake relay+exit that speaks the real wire protocol
+/// [`crate::multihop::MultiHopClient::connect`] expects: a properly-signed
+/// [`RelayDescriptorSigned`] pinned by TLS RPK, and the HPKE
+/// setup-over-stream round-trip. One process plays both the relay (the TLS
+/// identity the client dials) and the exit (the HPKE session the setup
+/// frame is addressed to): the supervisor's dial path cannot tell the
+/// difference from a real two-hop deployment, since the multi-hop wire
+/// protocol is end-to-end between client and exit regardless of what sits
+/// in between.
+///
+/// Drives [`crate::supervisor::MultiHopSupervisor::run`] end-to-end without
+/// a live network, so the supervisor's cold-dial, reconnect, and
+/// setup-rejection paths get real coverage instead of only the pure
+/// `dummy_config`-gated unit tests.
+pub(crate) struct FakeMultihopExit {
+    pub(crate) relay: Arc<RelayDescriptorSigned>,
+    pub(crate) exit_id: ExitId,
+    pub(crate) exit_x25519_pubkey: [u8; 32],
+    /// Number of connections accepted so far (post TLS handshake), so a
+    /// test can assert a redial actually reached the exit again.
+    pub(crate) accepted: Arc<AtomicUsize>,
+    /// When set, every subsequent setup reply is a sealed `Rejected`
+    /// detail instead of an `IpAssign`.
+    pub(crate) reject: Arc<AtomicBool>,
+    _server_ep: Endpoint,
+}
+
+const FAKE_EXIT_IKM: [u8; 32] = [0x99; 32];
+
+/// Handles exactly one accepted connection's setup-stream round-trip, then
+/// idles reading (and discarding) datagrams until the connection dies so the
+/// supervisor's serve loop has a live peer to race against.
+async fn serve_one_fake_exit_connection(
+    conn: Connection,
+    exit_id: ExitId,
+    reject: Arc<AtomicBool>,
+) {
+    let Ok((mut send, mut recv)) = conn.accept_bi().await else {
+        return;
+    };
+    let Ok(bytes) = recv.read_to_end(64 * 1024).await else {
+        return;
+    };
+    let Ok(frame) = decode_frame(&bytes) else {
+        return;
+    };
+    // Deterministic re-derivation instead of threading a `Clone` private
+    // key through the task: cheap, and keeps the exit identity anchored to
+    // one constant so every connection (including a redial) opens against
+    // the same recipient key the client's `exit_x25519_pubkey` pins.
+    let (exit_priv, _exit_pub) = derive_exit_keypair(&FAKE_EXIT_IKM);
+    let Ok(exit_session) = ExitSession::new(&exit_priv, &frame.encapsulated_key, exit_id) else {
+        return;
+    };
+    if exit_session.open(&frame).is_err() {
+        return;
+    }
+    let reply_msg = if reject.load(Ordering::Relaxed) {
+        WarrenControlMessage::Rejected
+    } else {
+        WarrenControlMessage::IpAssign {
+            ipv4: [10, 77, 0, 2],
+            prefix_len: 24,
+            gateway_ipv4: [10, 77, 0, 1],
+            ipv6: None,
+            prefix_len_v6: 0,
+            gateway_ipv6: None,
+        }
+    };
+    let Ok(plaintext) = encode_control(&reply_msg) else {
+        return;
+    };
+    let Ok(reply_frame) = exit_session.seal_response(&plaintext, 0, 0) else {
+        return;
+    };
+    let Ok(wire) = encode_frame(&reply_frame) else {
+        return;
+    };
+    if send.write_all(&wire).await.is_err() {
+        return;
+    }
+    let _ = send.finish();
+
+    loop {
+        if conn.read_datagram().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Spawns the fake relay+exit and returns the descriptor + control handles
+/// a [`crate::supervisor::SupervisorConfig`] plugs straight into.
+/// `operational_key` must be the signing counterpart of the
+/// `operational_pubkey` the supervisor is configured with, or the relay
+/// descriptor fails PKI verification before any dial happens.
+pub(crate) fn spawn_fake_multihop_exit(
+    operational_key: &SigningKey,
+    exit_id: ExitId,
+) -> FakeMultihopExit {
+    let relay_tls_key = SigningKey::from_bytes(&[0x66; 32]);
+    let relay_id = [0xAA; 16];
+    let relay_pubkey = relay_tls_key.verifying_key().to_bytes();
+    let signature = operational_key
+        .sign(&relay_descriptor_signing_payload(&relay_id, &relay_pubkey))
+        .to_bytes();
+
+    let server_cfg = warrenguard_tls::make_server_config(
+        &relay_tls_key,
+        warrenguard_tls::default_crypto_provider(),
+        &[warrenguard_config::ALPN_H3],
+    )
+    .expect("server cfg");
+    let server_ep = Endpoint::server(
+        server_cfg,
+        "127.0.0.1:0".parse().expect("static addr parses"),
+    )
+    .expect("server bind");
+    let addr = server_ep.local_addr().expect("local addr");
+
+    let relay = Arc::new(RelayDescriptorSigned {
+        relay_id,
+        relay_ed25519_pubkey: relay_pubkey,
+        endpoint: addr,
+        cover_domain: None,
+        signature,
+    });
+
+    let (_exit_priv, exit_pub) = derive_exit_keypair(&FAKE_EXIT_IKM);
+    let exit_x25519_pubkey = warrenguard_multihop::test_support::pubkey_to_bytes(&exit_pub);
+
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let reject = Arc::new(AtomicBool::new(false));
+
+    let accept_loop_ep = server_ep.clone();
+    let accept_loop_accepted = accepted.clone();
+    let accept_loop_reject = reject.clone();
+    tokio::spawn(async move {
+        loop {
+            let Some(incoming) = accept_loop_ep.accept().await else {
+                return;
+            };
+            let Ok(conn) = incoming.await else {
+                continue;
+            };
+            accept_loop_accepted.fetch_add(1, Ordering::Relaxed);
+            serve_one_fake_exit_connection(conn, exit_id, accept_loop_reject.clone()).await;
+        }
+    });
+
+    FakeMultihopExit {
+        relay,
+        exit_id,
+        exit_x25519_pubkey,
+        accepted,
+        reject,
+        _server_ep: server_ep,
+    }
+}
+
+/// A bare RPK loopback QUIC connection pair with NO multi-hop / HPKE
+/// semantics on top: just two established [`Connection`]s, for tests of
+/// generic QUIC-adjacent plumbing (e.g. [`crate::multi_session`]) that need
+/// a live connection only to exercise a real send/close path, not the
+/// multi-hop wire protocol.
+pub(crate) struct LoopbackConnPair {
+    pub(crate) client_conn: Connection,
+    pub(crate) server_conn: Connection,
+    pub(crate) client_ep: Endpoint,
+    _server_ep: Endpoint,
+}
+
+pub(crate) async fn spawn_loopback_conn_pair() -> LoopbackConnPair {
+    let tls_key = SigningKey::from_bytes(&[0x88; 32]);
+    let server_cfg = warrenguard_tls::make_server_config(
+        &tls_key,
+        warrenguard_tls::default_crypto_provider(),
+        &[warrenguard_config::ALPN_H3],
+    )
+    .expect("server cfg");
+    let server_ep = Endpoint::server(
+        server_cfg,
+        "127.0.0.1:0".parse().expect("static addr parses"),
+    )
+    .expect("server bind");
+    let addr = server_ep.local_addr().expect("local addr");
+
+    let server_for_accept = server_ep.clone();
+    let accept = tokio::spawn(async move {
+        let incoming = server_for_accept.accept().await.expect("incoming");
+        incoming.await.expect("server handshake")
+    });
+
+    let client_cfg = warrenguard_tls::make_client_config(
+        warrenguard_tls::default_crypto_provider(),
+        &[warrenguard_config::ALPN_H3],
+    )
+    .expect("client cfg");
+    let mut client_ep =
+        Endpoint::client("127.0.0.1:0".parse().expect("static addr parses")).expect("client bind");
+    client_ep.set_default_client_config(client_cfg);
+    let sni =
+        warrenguard_tls::name::encode(WarrenPubkey::from_bytes(tls_key.verifying_key().to_bytes()));
+    let client_conn = client_ep
+        .connect(addr, &sni)
+        .expect("connect builds")
+        .await
+        .expect("client handshake");
+    let server_conn = accept.await.expect("server accept task");
+
+    LoopbackConnPair {
+        client_conn,
+        server_conn,
+        client_ep,
+        _server_ep: server_ep,
+    }
+}

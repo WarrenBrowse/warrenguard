@@ -1,0 +1,156 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+# WarrenGuard engine: a generic VPN-over-QUIC building block, carved out to
+# stand on its own. Versioned independently from any consumer; `0.1.x` is the
+# first standalone line.
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/WarrenBrowse/warrenguard"
+authors = ["WarrenBrowse <hello@warrenbrowse.com>"]
+rust-version = "1.89"
+# Flipped to `true` (per-crate or here) on the crates.io go-live. Until then
+# the engine is consumed via path/git deps, so publishing stays gated to avoid
+# an accidental `cargo publish`. The rest of the metadata (license, repository,
+# per-crate `description`) is already crates.io-ready.
+publish = false
+
+[workspace.dependencies]
+# QUIC backend: the warren-quinn fork (renamed crates, lib names unchanged so
+# `use quinn` stays). Carries the GSO transmit constants, the
+# Initial-fragmentation knobs (`initial_datagram_min_size` /
+# `initial_crypto_first_fragment_size`), socket buffer sizing, and the Apple
+# fast datapath. Inherited transitively, no `[patch.crates-io]` needed.
+quinn = { git = "ssh://git@github.com/WarrenBrowse/warren-quinn.git", tag = "v0.11.16-fork.8", package = "warren-quinn" }
+quinn-udp = { git = "ssh://git@github.com/WarrenBrowse/warren-quinn.git", tag = "v0.11.16-fork.8", package = "warren-quinn-udp" }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "logging"] }
+# Async TLS 1.3 for the TCP-over-TLS fallback carrier (client dials the cover
+# domain on :443/tcp, exit terminates it). Wraps the rustls configs built in
+# warrenguard-tls; ring-only (no aws-lc C toolchain), no tls12 (the carrier is
+# TLS 1.3 only, matching the QUIC path).
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
+# PEM cert/key loading for the v6 X.509 exit (ACME fullchain.pem + privkey.pem)
+# and self-hosted CA roots; keeps the rustls-pemfile glue in warrenguard-tls.
+rustls-pemfile = "2"
+# Bundled Mozilla CA root program (full DER certs) for the v6 client to validate
+# a public-ACME exit certificate the way a browser does.
+webpki-root-certs = "1"
+data-encoding = "2"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+
+# Cross-OS TUN. `async_tokio` exposes the `dev.recv().await` API.
+tun-rs = { version = "2.8", features = ["async_tokio"] }
+
+# Crypto / identity
+ed25519-dalek = { version = "2", features = ["zeroize", "rand_core"] }
+hkdf = "0.12"
+sha2 = "0.10"
+# Privacy Pass anonymous session credentials (RFC 9578 token type 0x0002,
+# RFC 9474 RSABSSA-SHA384-PSS-Deterministic). Audited blind-RSA core (Frank
+# Denis); warrenguard-token layers the Privacy Pass framing on top. Pins
+# rand/rand_core 0.10, matching the workspace.
+blind-rsa-signatures = "0.17"
+# AES for QUIC Initial packet protection (RFC 9001): AES-128-GCM payload +
+# AES-128 (single-block ECB) header-protection mask. Used by warrenguard-ja4.
+aes = "0.8"
+aes-gcm = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+rand = "0.10"
+
+# Encoding (Setup / SetupAck frames, config)
+postcard = { version = "1", features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# HTTP (the eDNS proxy admission surface)
+axum = "0.8"
+governor = "0.10"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Utility
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive", "env"] }
+hex = "0.4"
+bytes = "1"
+parking_lot = "0.12"
+
+# Identity (BIP39 is a default-on feature of warrenguard-identity; a deployer
+# can drop it for raw-seed keys).
+bip39 = { version = "2", features = ["rand", "zeroize"] }
+
+# Global allocator on the release binaries.
+mimalloc = { version = "0.1", default-features = false }
+
+# DAITA (Defense Against AI-guided Traffic Analysis): the upstream
+# traffic-analysis-defense framework (Karlstad U / Mullvad), tied here to the
+# Quinn datagram pump.
+maybenot = "2.2.2"
+maybenot-machines = "1.0.1"
+
+# Test utilities (dev-dependencies only).
+tempfile = "3"
+# Self-signed cert/CA generation for v6 X.509 tests (ring backend only, no
+# aws-lc C toolchain). Used to mint cover-domain leaf + CA fixtures in-test.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+
+# ---------------------------------------------------------------------------
+# Workspace-level lints. Security-critical engine (VPN data-plane): strict by
+# default. `warrenguard-tun-core` / `-tun-device` opt out and declare their own
+# (the privileged TUN FFI needs `unsafe_code = "deny"` rather than "forbid").
+# ---------------------------------------------------------------------------
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+unused_imports = "warn"
+
+[workspace.lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+must_use_candidate = "warn"
+needless_pass_by_value = "warn"
+explicit_iter_loop = "warn"
+
+# ---------------------------------------------------------------------------
+# Profiles
+# ---------------------------------------------------------------------------
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+debug = false
+
+[profile.dev]
+opt-level = 0
+debug = true
+incremental = true
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.bench]
+inherits = "release"
+debug = true
+strip = false
+
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = false
+

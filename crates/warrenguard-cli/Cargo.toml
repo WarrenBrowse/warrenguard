@@ -1,0 +1,36 @@
+# WarrenGuard engine crate: a reference CLI that drives the engine as a generic
+# VPN-over-QUIC tool ("like WireGuard"), with no Warren backend in the path. It
+# is the human-facing companion to the generic-deployer e2e test.
+[package]
+name = "warrenguard-cli"
+description = "Reference CLI for the WarrenGuard engine: keygen, a generic AllowAll server, and a raw-key client (WarrenGuard engine)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "warrenguard"
+path = "src/main.rs"
+
+[dependencies]
+warrenguard-server = { path = "../warrenguard-server" }
+warrenguard-transport = { path = "../warrenguard-transport" }
+warrenguard-tls = { path = "../warrenguard-tls" }
+warrenguard-identity = { path = "../warrenguard-identity", default-features = false }
+warrenguard-wire = { path = "../warrenguard-wire" }
+warrenguard-config = { path = "../warrenguard-config" }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+data-encoding = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+tracing-subscriber = { workspace = true }
+zeroize = { workspace = true }
+
+[lints]
+workspace = true

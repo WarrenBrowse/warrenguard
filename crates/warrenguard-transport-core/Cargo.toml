@@ -1,0 +1,30 @@
+# WarrenGuard engine crate: the shared data-plane primitives consumed by both
+# the client transport and the server. No Warren-specific logic.
+[package]
+name = "warrenguard-transport-core"
+description = "Shared tunnel data-plane primitives: error, close codes, packet device, buffer pool, QUIC transport config (fork knobs), metrics, path probe, flow hash (WarrenGuard engine)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+warrenguard-config = { path = "../warrenguard-config" }
+warrenguard-wire = { path = "../warrenguard-wire" }
+# For `From<DaitaError> for TunnelError`: the transport error already carries
+# DAITA-flavoured variants, so it owns the boundary conversion a consumer needs
+# when a DAITA spec fails outside the pump. daita is a lower engine leaf (it
+# does not depend on transport-core), so this is a cycle-free engine-engine dep.
+warrenguard-daita = { path = "../warrenguard-daita" }
+quinn = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

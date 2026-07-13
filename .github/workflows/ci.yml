@@ -1,0 +1,125 @@
+name: CI
+
+# Runs exclusively on the WarrenBrowse org self-hosted runners (Default runner
+# group). Label sets are matched against the live runners:
+#   [self-hosted, Linux, X64, macstudio-rosetta] -> macstudio-linux-rosetta (the provisioned Rust runner)
+#   [self-hosted, macOS, ARM64]  -> axiomStudio
+# Do not switch any job to a GitHub-hosted runner.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
+  # Rosetta-stable linker for the x86-linux jobs: rustc's default `cc` (gnu
+  # ld/collect2) SIGSEGVs under Rosetta on heavy links; clang+lld is stable and
+  # memory-light. Target-scoped, so the macos matrix job is unaffected. The
+  # `clang-lld` wrapper is baked into the runner image.
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang-lld
+
+concurrency:
+  # A single self-hosted Linux runner serves these jobs; cancel superseded runs
+  # on the same ref so a burst of pushes cannot pile up a long serial backlog.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: cargo fmt
+    runs-on: [self-hosted, Linux, X64, macstudio-rosetta]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: cargo clippy (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            runner: [self-hosted, Linux, X64, macstudio-rosetta]
+          - name: macos
+            runner: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        # Persistent self-hosted runners already keep target/ across jobs;
+        # rust-cache's target prune drops .d dep-info and corrupts the restore
+        # (nextest "could not parse/generate dep info ... No such file"). Cache
+        # only the registry, let the runner's persistent target serve incremental.
+        with:
+          cache-targets: "false"
+      # --all-features lints the cfg-gated per-OS datapath (the Apple fast path,
+      # the pfctl killswitch, the experimental TUN) on each native runner.
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    name: cargo test
+    runs-on: [self-hosted, Linux, X64, macstudio-rosetta]
+    steps:
+      # The shared golden vectors are a private submodule (warren-vectors); the
+      # conformance tests read them at runtime, so this job needs them checked
+      # out. VECTORS_TOKEN is the org-level PAT with read access to the repos.
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.VECTORS_TOKEN }}
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: Swatinem/rust-cache@v2
+        # Persistent self-hosted runners already keep target/ across jobs;
+        # rust-cache's target prune drops .d dep-info and corrupts the restore
+        # (nextest "could not parse/generate dep info ... No such file"). Cache
+        # only the registry, let the runner's persistent target serve incremental.
+        with:
+          cache-targets: "false"
+      - name: install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      # nextest retries the in-process quinn loopback tunnel tests, which can hit
+      # a quinn Drop/UDP-bind race on a loaded runner.
+      - run: cargo nextest run --locked --workspace --all-targets --retries 2
+      # The X-Wing / PQ-HPKE tests are gated behind the `pq-hpke` feature, which
+      # the workspace run above does not enable, so the golden KATs would never
+      # execute in CI (clippy only lints them). Run them explicitly.
+      - run: cargo nextest run --locked -p warrenguard-multihop --features pq-hpke --retries 2
+
+  audit:
+    name: cargo audit
+    runs-on: [self-hosted, Linux, X64, macstudio-rosetta]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      # Supply-chain gate for a security-critical, public-bound data-plane. The
+      # vendored quinn fork carries a pinned transport-parameters DoS fix, so
+      # advisory drift on the QUIC stack must surface here.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit
+
+  deny:
+    name: cargo deny
+    runs-on: [self-hosted, Linux, X64, macstudio-rosetta]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      # Complements cargo-audit: bans, license allowlist and source pinning on
+      # top of the advisory feed (config in deny.toml).
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny check

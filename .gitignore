@@ -1,0 +1,12 @@
+/target
+# The quinn fork is reassembled from upstream + the Warren patch by
+# bench/scripts/setup-quinn-fork.sh; never committed. Anchored and
+# type-agnostic (`/vendor`, not `vendor/`) so a stray `vendor` SYMLINK
+# (e.g. a worktree pointing at the main checkout's fork) is also ignored
+# and cannot be staged by `git add -A`.
+/vendor
+**/*.rs.bk
+.DS_Store
+# ACME / lego working dir: contains private keys (cert + ACME account) and
+# issued certificates. Never commit secret material. Anchored to the repo root.
+/.lego

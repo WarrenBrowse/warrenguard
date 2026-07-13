@@ -1,0 +1,65 @@
+# WarrenGuard engine crate: the exit-side tunnel datapath (QUIC server,
+# handshake, downlink dispatcher, allowlist). No Warren-specific policy; the
+# subscription/account enforcement plugs in via the Authorizer/DeviceCapEnforcer
+# traits implemented in the private backend.
+[package]
+name = "warrenguard-server"
+description = "Exit-side tunnel datapath: QUIC server, handshake, per-client downlink dispatcher, allowlist (WarrenGuard engine)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+warrenguard-transport-core = { path = "../warrenguard-transport-core" }
+warrenguard-pump = { path = "../warrenguard-pump" }
+# In-band drain advisory: the exit encodes the frozen 0xC0 control frame
+# (`WarrenControlMessage::ExitDraining`) on the single-hop downlink with the
+# same wire format the multi-hop control channel uses, so one client decoder
+# covers both hop paths.
+warrenguard-multihop = { path = "../warrenguard-multihop" }
+warrenguard-daita = { path = "../warrenguard-daita" }
+warrenguard-wire = { path = "../warrenguard-wire" }
+warrenguard-tls = { path = "../warrenguard-tls" }
+warrenguard-ratelimit = { path = "../warrenguard-ratelimit" }
+warrenguard-config = { path = "../warrenguard-config" }
+quinn = { workspace = true }
+rustls = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+ed25519-dalek = { workspace = true }
+parking_lot = { workspace = true }
+# SO_REUSEPORT multi-endpoint datapath: bind N UDP sockets on one port so the
+# kernel 4-tuple-hashes inbound QUIC flows across N endpoint drivers. `all`
+# gates the reuse-port setter. Already in the tree via quinn-udp.
+socket2 = { version = "0.6", features = ["all"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+rand_v9 = { package = "rand", version = "0.9" }
+# v7 session-token admission derives the multi-conn attach capability and the
+# session-map key value from the token serial (see exit/session_token.rs).
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }
+tempfile = { workspace = true }
+# The generic-deployer e2e (tests/generic_deployer_e2e.rs) drives a real client
+# against this server using engine crates ONLY, proving the WarrenGuard engine
+# is a self-contained VPN-over-QUIC building block (no Warren backend in the path).
+warrenguard-transport = { path = "../warrenguard-transport" }
+warrenguard-identity = { path = "../warrenguard-identity" }
+# Mints a test CA + cover-domain leaf in-memory for the v6 X.509 e2e tests
+# (generic-WebPKI-client reachability and the MITM-with-valid-cert rejection),
+# so no cert fixtures need to be checked in.
+rcgen = { workspace = true }
+
+[lints]
+workspace = true

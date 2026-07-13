@@ -1,0 +1,23 @@
+# WarrenGuard engine crate: the browser-facing edge ingress. Parses real
+# HTTP/3 (RFC 9114) + QPACK (RFC 9204) far enough to recognise a browser
+# WebTransport extended-CONNECT (RFC 9220) and extract the Privacy Pass token
+# it presents, so an exit node can accept a zero-install browser session as a
+# multi-hop entry. Pure parsing + classification; no async/quinn here (that
+# plumbing lives in the node that consumes this crate).
+[package]
+name = "warrenguard-edge"
+description = "Browser WebTransport edge-ingress classifier (HTTP/3 + QPACK + Privacy Pass) for the WarrenGuard multi-hop entry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+warrenguard-token = { path = "../warrenguard-token" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+hex = { workspace = true }

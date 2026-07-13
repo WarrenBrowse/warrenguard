@@ -1,0 +1,43 @@
+[package]
+name = "warrenguard-edns-proxy"
+description = "Warren Encrypted DNS proxy server: XOR-deobfuscating TCP forwarder, wire-compatible with the Mullvad encrypted-dns-proxy client format"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "warrenguard_edns_proxy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "warrenguard-edns-proxy"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum = { workspace = true }
+
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+hex = { workspace = true }
+governor = { workspace = true }
+
+# Global allocator, matching the relay/exit binaries: the proxy sits on the
+# API access-method hot path and forwards every byte of the client's TLS
+# session. Gated non-Windows (mingw cross-compile of the C sources fails;
+# no Windows host targets this binary in production).
+mimalloc = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

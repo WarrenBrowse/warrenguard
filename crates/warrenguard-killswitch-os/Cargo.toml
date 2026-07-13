@@ -1,0 +1,25 @@
+# WarrenGuard engine crate (kernelland): generic OS killswitch (nft/pf/WFP).
+[package]
+name = "warrenguard-killswitch-os"
+description = "OS killswitch for the WarrenGuard tunnel: blocks out-of-tunnel leaks while a client is up (Linux nftables; macOS pf; Windows WFP planned). Generic, no Warren-specific logic."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+pfctl = "0.7"
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

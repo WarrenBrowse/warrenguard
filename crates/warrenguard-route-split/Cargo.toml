@@ -1,0 +1,39 @@
+# WarrenGuard engine crate: privileged system-VPN routing (default-route
+# split, DNS push, IPv6 killswitch, policy routing). Same tier as
+# `warrenguard-tun-device`.
+[package]
+name = "warrenguard-route-split"
+description = "Privileged system-VPN routing for the guard-based routing model: default-route split, DNS push, IPv6 killswitch, policy routing (WarrenGuard engine)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+warrenguard-killswitch-os = { path = "../warrenguard-killswitch-os" }
+# The shared tunnel-socket firewall mark (`WARREN_TUNNEL_FWMARK`): the split
+# routes send the marked carrier socket out `main` instead of pinning the exit
+# IP by a /32 host route (Port Fail / TunnelCrack ServerIP fix). Zero-dep crate.
+warrenguard-tun-core = { path = "../warrenguard-tun-core" }
+warrenguard-wire = { path = "../warrenguard-wire" }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+# Windows split-default routing via the Win32 IP Helper API. Pure routing-plan
+# layer on non-Windows; the privileged route ops are isolated unsafe FFI there.
+warrenguard-winroute = { path = "../warrenguard-winroute" }
+
+# macOS: name -> kernel interface index for the physical-NIC socket bypass
+# (`discover_physical_ifindex` / `IP_BOUND_IF`). `nix::net::if_::if_nametoindex`
+# is a safe wrapper over the libc call, so the workspace-wide `forbid(unsafe_code)`
+# stays intact here (unlike `warrenguard-winroute`, which had to downgrade it).
+[target.'cfg(target_os = "macos")'.dependencies]
+nix = { version = "0.31", features = ["net"] }
+
+[lints]
+workspace = true

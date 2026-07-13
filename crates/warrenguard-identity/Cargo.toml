@@ -1,0 +1,41 @@
+# WarrenGuard engine crate: identity key derivation (BIP39 seed -> HKDF-SHA256 ->
+# Ed25519 node key). No SS58 (that wb… brand codec lives in the private
+# `warren-ss58`) and no X-Warren request signing (that lives in `warren-identity`).
+[package]
+name = "warrenguard-identity"
+description = "Identity key derivation: BIP39 seed -> HKDF-SHA256 -> Ed25519 node key (WarrenGuard engine)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+# BIP39 mnemonic <-> seed (+ the on-disk mnemonic file helper) is ON by default
+# so Warren's backend (which derives its node identity from a 12-word phrase) is
+# unaffected. A generic deployer that supplies a raw 32-byte seed (KMS/HSM/random)
+# can turn it off with `default-features = false` and keep only the pure
+# `derive_node_key` primitive, with no BIP39 dependency.
+default = ["bip39"]
+bip39 = ["dep:bip39"]
+
+[dependencies]
+warrenguard-config = { path = "../warrenguard-config" }
+ed25519-dalek = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+bip39 = { workspace = true, optional = true }
+zeroize = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

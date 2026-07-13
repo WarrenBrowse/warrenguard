@@ -1,0 +1,20 @@
+# WarrenGuard engine crate: generic VPN-over-QUIC constants (ALPN, HKDF
+# contexts, MTU/pool sizing, NAT-PMP and QUIC tuning) plus the env-knob registry.
+# No Warren-product specifics (those live in the private `warren-config`).
+[package]
+name = "warrenguard-config"
+description = "Generic VPN-over-QUIC constants and env-knob registry (WarrenGuard engine)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,38 @@
+[package]
+name = "warrenguard-tun-device"
+description = "Warren privileged TUN backend (EXPERIMENTAL / NOT YET REAL-EXIT VALIDATED): OS-agnostic TUN packet framing and routing/killswitch plan computation, plus a feature-gated per-OS device open. The default build is dependency-free and unsafe-free; only the `experimental-tun` feature compiles the privileged device code."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The safe, always-on seam (framing, plan, gateway, device traits + adapter).
+warrenguard-tun-core = { path = "../warrenguard-tun-core" }
+# Only the privileged device open (TUNSETIFF ioctl on Linux, utun control socket
+# on macOS) needs raw OS calls; it is gated behind `experimental-tun` so the
+# default build pulls no third-party dependency and stays `unsafe`-free.
+libc = { version = "0.2", optional = true }
+
+[features]
+# Compiles the privileged per-OS TUN device open (requires root / CAP_NET_ADMIN
+# at runtime). OFF by default: the framing and plan logic compile and test
+# without it. NOT YET validated against a real exit (see the crate docs).
+experimental-tun = ["dep:libc", "warrenguard-tun-core/experimental-tun"]
+
+[lints.rust]
+# TUN exception: opening the kernel TUN device needs `unsafe` (the ioctl /
+# control-socket FFI). The workspace forbids unsafe everywhere; this crate
+# downgrades it to `deny` and admits unsafe ONLY under the `experimental-tun`
+# feature via a documented crate-level `cfg_attr` allow. The default
+# (feature-off) build contains zero unsafe.
+unsafe_code = "deny"
+missing_docs = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "deny", priority = -1 }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

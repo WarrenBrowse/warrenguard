@@ -1,0 +1,79 @@
+# cargo-deny configuration for the WarrenGuard engine.
+# See https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+no-default-features = false
+exclude-dev = false
+
+[advisories]
+yanked = "warn"
+# RUSTSEC ignores below are limited to unmaintained transitives whose code is
+# not reachable at runtime in the engine configuration.
+ignore = [
+    # paste: unmaintained, transitive via the netlink chain. No drop-in
+    # replacement exists. Attack surface is compile-time generated code only.
+    "RUSTSEC-2024-0436",
+    # atomic-polyfill: unmaintained, transitive via portable-atomic-util. No
+    # user-facing surface, just an atomic trampoline.
+    "RUSTSEC-2023-0089",
+    # bincode 1.3.3: unmaintained after the upstream team ceased development.
+    # Reached transitively as maybenot-machines -> bincode, used only to decode
+    # machine spec blobs at parse time. The engine never feeds
+    # attacker-controlled bytes to bincode at runtime: machine specs come from
+    # the compile-time DAITA pool. Removing this ignore requires maybenot to
+    # migrate off bincode upstream.
+    "RUSTSEC-2025-0141",
+    # rustls-pemfile: unmaintained (folded into rustls itself). It only parses
+    # local PEM cert/key material at config/startup time, never
+    # attacker-controlled bytes at runtime, so there is no reachable surface.
+    "RUSTSEC-2025-0134",
+    # anyhow: unsoundness in `Error::downcast_mut()`. The engine never calls
+    # `downcast_mut` (verified: zero uses); anyhow is used only for error
+    # context/propagation in binaries, so the unsound path is unreachable.
+    "RUSTSEC-2026-0190",
+    # rsa 0.10-rc (Marvin timing sidechannel): exploitable only against
+    # variable-time RSA PRIVATE-KEY PKCS#1 v1.5 DECRYPTION of attacker-controlled
+    # ciphertext (a padding oracle). warrenguard-token pulls rsa via
+    # blind-rsa-signatures solely for RFC 9474 RSA blind signatures, which
+    # blind-sign and public-key-verify, never PKCS#1 v1.5 decryption, so the
+    # vulnerable path is not reachable. No fixed rsa release exists (upstream
+    # API rewrite pending). Kept in sync with .cargo/audit.toml.
+    "RUSTSEC-2023-0071",
+]
+
+[bans]
+multiple-versions = "warn"
+# `allow-wildcard-paths = true` only allows wildcards on `path = "..."` deps
+# (= internal workspace crates, never published).
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+deny = []
+
+[licenses]
+# Explicit allow-list. Anything not listed is flagged by cargo-deny.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "Zlib",
+    "MPL-2.0",
+    "AGPL-3.0-or-later", # The engine's own license (first-party crates).
+    "Unlicense",
+    "CDLA-Permissive-2.0", # webpki-root-certs (Mozilla trust store).
+]
+confidence-threshold = 0.93
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# The warren-quinn fork is the only sanctioned git dependency (see CLAUDE.md
+# section 3: the QUIC stack is pinned by tag on this fork).
+allow-git = ["ssh://git@github.com/WarrenBrowse/warren-quinn.git"]

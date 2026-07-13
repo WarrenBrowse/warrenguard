@@ -1,0 +1,24 @@
+# WarrenGuard engine crate: the DAITA traffic-analysis defense (maybenot),
+# shared by the client and the server. No Warren-specific logic.
+[package]
+name = "warrenguard-daita"
+description = "DAITA traffic-analysis defense (maybenot framework + server-side machine pool) (WarrenGuard engine)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+warrenguard-wire = { path = "../warrenguard-wire" }
+thiserror = { workspace = true }
+maybenot = { workspace = true }
+maybenot-machines = { workspace = true }
+# `rand` 0.9 line: the maybenot 2.x API consumes rand_core 0.9 traits, while the
+# workspace `rand` is on a newer line. Aliased as `rand_v9` for that surface.
+rand_v9 = { package = "rand", version = "0.9" }
+
+[lints]
+workspace = true

@@ -1,0 +1,40 @@
+# WarrenGuard engine crate: TCP-over-TLS fallback datapath for QUIC.
+# The async I/O built on top of the `warrenguard-tcp-carrier` framing codec:
+# the client-side quinn `AsyncUdpSocket` shim that tunnels QUIC datagrams inside
+# one TLS 1.3 stream to the exit's cover domain on :443/tcp, the exit-side
+# terminator that de-encapsulates and shuttles to the local QUIC dispatcher with
+# per-connection 5-tuple isolation, and the auto-activation policy (opt-in,
+# off by default) that retries over TCP after a UDP-handshake timeout. It plugs
+# in at the quinn abstract-socket seam only; the QUIC engine, HPKE and
+# obfuscation configs are untouched.
+[package]
+name = "warrenguard-tcp-fallback"
+description = "TCP-over-TLS fallback datapath (client shim + exit terminator + auto-activation) for the WarrenGuard QUIC engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+warrenguard-tcp-carrier = { path = "../warrenguard-tcp-carrier" }
+warrenguard-tls = { path = "../warrenguard-tls" }
+
+quinn = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+warrenguard-config = { path = "../warrenguard-config" }
+ed25519-dalek = { workspace = true }
+rcgen = { workspace = true }
+
+[lints]
+workspace = true

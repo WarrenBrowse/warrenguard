@@ -1,0 +1,43 @@
+# WarrenGuard engine crate: the async HTTP/3 WebTransport edge server. Runs a
+# dedicated quinn (warren-quinn fork) endpoint that completes a browser
+# WebTransport-over-HTTP/3 handshake (server SETTINGS with static-only QPACK,
+# extended-CONNECT 200 accept) using the pure `warrenguard-edge` classifier, so
+# a zero-install browser can open a Warren multi-hop entry. Separate from the
+# production exit endpoint on purpose: the exit's transport profile forbids
+# peer-initiated uni streams (max_concurrent_uni_streams = 0), which a browser
+# HTTP/3 client requires, so the edge needs its own browser-compatible endpoint.
+[package]
+name = "warrenguard-edge-server"
+description = "Async HTTP/3 WebTransport edge server for the WarrenGuard multi-hop entry (browser zero-install)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+warrenguard-edge = { path = "../warrenguard-edge" }
+warrenguard-multihop = { path = "../warrenguard-multihop" }
+# Per-source-IP connection rate limiting on the edge ingress: a generic
+# token-bucket limiter any other QUIC ingress point in a deployment can reuse.
+warrenguard-ratelimit = { path = "../warrenguard-ratelimit" }
+warrenguard-server = { path = "../warrenguard-server" }
+warrenguard-token = { path = "../warrenguard-token" }
+warrenguard-wire = { path = "../warrenguard-wire" }
+bytes = { workspace = true }
+quinn = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+warrenguard-tls = { path = "../warrenguard-tls" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "signal"] }
+rcgen = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+tracing-subscriber = { workspace = true }
