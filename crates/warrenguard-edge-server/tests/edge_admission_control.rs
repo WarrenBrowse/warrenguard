@@ -27,6 +27,10 @@ use warrenguard_wire::SessionToken;
 /// constant ever changes.
 const PER_IP_SESSION_BURST: usize = 32;
 
+/// Mirrors the crate-private `PER_IP_SESSION_REFILL` (one token per this
+/// interval). Pinned for the same reason as the burst constant above.
+const PER_IP_SESSION_REFILL_MS: u128 = 100;
+
 /// A `SessionTokenAdmitter` that always rejects. The admission-control layer
 /// under test runs entirely before this is ever consulted, so its answer is
 /// irrelevant here; it exists only to satisfy `run_edge_listener`'s bound.
@@ -106,6 +110,9 @@ async fn run_edge_listener_refuses_once_the_per_ip_burst_is_exhausted() {
     let addr = server.local_addr().expect("bound addr");
     let shutdown = CancellationToken::new();
     let listener_shutdown = shutdown.clone();
+    // The token bucket starts refilling when the listener builds it, so the
+    // admission upper bound asserted at the end is measured from here.
+    let started = std::time::Instant::now();
     let listener = tokio::spawn(run_edge_listener(
         server,
         Arc::new(RejectAllGate),
@@ -132,25 +139,52 @@ async fn run_edge_listener_refuses_once_the_per_ip_burst_is_exhausted() {
         held.push(conn);
     }
 
-    // One more, immediately (well within the refill interval): the per-IP
-    // token bucket must be empty and refuse it (a QUIC-level
-    // CONNECTION_REFUSED close), proving `run_edge_listener` now enforces the
-    // same admission control as `run_edge_entry_listener`.
-    let over_burst = tokio::time::timeout(
-        Duration::from_secs(5),
-        client
-            .connect(addr, "cover.example.com")
-            .expect("connect builds"),
-    )
-    .await
-    .expect("the refusal must arrive promptly, not hang");
+    // The bucket refills one token per 100 ms of wall clock, so on a slow
+    // runner one or more tokens may legitimately have refilled while the
+    // burst above was being spent: a single extra admission is not a limiter
+    // failure. Keep dialing back-to-back; each admission consumes a token
+    // faster than the bucket refills (unless a loopback handshake costs more
+    // than the whole refill interval), so a refusal (a QUIC-level
+    // CONNECTION_REFUSED close) must arrive within a bounded number of
+    // attempts. A missing limiter admits every one of them and fails loudly.
+    let mut refused = false;
+    for _ in 0..64 {
+        let attempt = tokio::time::timeout(
+            Duration::from_secs(5),
+            client
+                .connect(addr, "cover.example.com")
+                .expect("connect builds"),
+        )
+        .await
+        .expect("each verdict must arrive promptly, not hang");
+        match attempt {
+            Ok(conn) => held.push(conn),
+            Err(_) => {
+                refused = true;
+                break;
+            }
+        }
+    }
     assert!(
-        over_burst.is_err(),
-        "a connection past the per-IP burst (with no time to refill) must be refused, not admitted"
+        refused,
+        "the per-IP limiter must refuse once the burst and any refilled tokens are spent, \
+         proving run_edge_listener enforces the same admission control as run_edge_entry_listener"
     );
 
-    // Keep the held connections alive until here so the burst was genuinely
-    // still exhausted when the over-burst attempt was made.
+    // The admitted total must respect the bucket contract: the initial burst
+    // plus at most what the elapsed wall clock can have refilled (plus one
+    // for interval rounding).
+    let max_admitted = PER_IP_SESSION_BURST
+        + (started.elapsed().as_millis() / PER_IP_SESSION_REFILL_MS) as usize
+        + 1;
+    assert!(
+        held.len() <= max_admitted,
+        "admitted {} connections, above the bucket contract bound of {max_admitted}",
+        held.len()
+    );
+
+    // Keep the held connections alive until here so the bucket was genuinely
+    // exhausted when the refusal was observed.
     drop(held);
     shutdown.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(5), listener).await;

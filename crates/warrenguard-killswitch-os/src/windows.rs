@@ -1096,9 +1096,15 @@ DefaultOutboundAction : Block
 
         #[test]
         fn run_sync_bounded_returns_none_for_a_missing_program() {
+            // Absolute path into a directory that cannot exist: a bare
+            // program name goes through the Windows executable-search rules
+            // (test-exe dir, CWD, PATH, App Execution Aliases), which are
+            // environment-dependent and resolved to something on hosted CI
+            // runners, flaking this test. Spawn failure itself is what the
+            // killswitch relies on mapping to None.
             assert!(
                 run_sync_bounded(
-                    "warren-definitely-not-a-real-binary",
+                    "C:\\warren-test-missing-dir\\definitely-not-a-real-binary.exe",
                     &[],
                     Duration::from_secs(1)
                 )
