@@ -210,6 +210,13 @@ impl DaitaPool {
         self.pick(&mut rand_v9::rngs::StdRng::from_os_rng())
     }
 
+    /// [`Self::pick_with_name`] seeded from the OS RNG. The exit samples the
+    /// pool once per accepted connection and has no RNG of its own to thread.
+    #[must_use]
+    pub fn pick_with_name_os(&self) -> Option<(&'static str, DaitaConfig)> {
+        self.pick_with_name(&mut rand_v9::rngs::StdRng::from_os_rng())
+    }
+
     /// [`Self::pick_named`] seeded from the OS RNG.
     #[must_use]
     pub fn pick_named_os(&self, name: &str) -> Option<DaitaConfig> {
