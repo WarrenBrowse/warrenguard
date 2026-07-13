@@ -43,6 +43,10 @@ pub struct ForwardSummary {
     /// Datagrams dropped on the exit to client direction for the same
     /// reason.
     pub dropped_exit_to_client_too_large: u64,
+    /// Wall-clock lifetime of the forward session, in whole seconds.
+    /// Lets a log reader tell a long-lived bonded-secondary connection
+    /// (one-sided by flow-ownership design) from a short-lived blackhole.
+    pub duration_secs: u64,
 }
 
 /// Pumps DATA datagrams bidirectionally between `client_conn` and
@@ -67,6 +71,7 @@ pub async fn forward_session(
     client_conn: Connection,
     exit_conn: Arc<Connection>,
 ) -> Result<ForwardSummary, ForwardError> {
+    let started = std::time::Instant::now();
     let mut summary = ForwardSummary::default();
 
     // Spawn two unidirectional pumps. JoinSet lets us cancel the
@@ -111,6 +116,7 @@ pub async fn forward_session(
         set.abort_all();
     }
 
+    summary.duration_secs = started.elapsed().as_secs();
     Ok(summary)
 }
 

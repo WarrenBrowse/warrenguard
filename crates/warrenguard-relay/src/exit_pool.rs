@@ -305,4 +305,43 @@ impl ExitConnPool {
     pub fn cached_entry_count(&self) -> usize {
         self.state.lock().len()
     }
+
+    /// Point-in-time QUIC path stats of every live pooled exit leg,
+    /// deliberately unlabeled: no exit_id, endpoint, or any other
+    /// identifier leaves this snapshot, so an aggregate metrics
+    /// exposition cannot link a leg to a destination. Closed
+    /// connections are skipped. Synchronous map walk over a handful of
+    /// entries; zero cost on the forwarding hot path.
+    #[must_use]
+    pub fn leg_stats(&self) -> Vec<ExitLegStats> {
+        let map = self.state.lock();
+        map.values()
+            .filter(|conn| conn.close_reason().is_none())
+            .map(|conn| {
+                let stats = conn.stats();
+                ExitLegStats {
+                    rtt_ms: u64::try_from(stats.path.rtt.as_millis()).unwrap_or(u64::MAX),
+                    cwnd_bytes: stats.path.cwnd,
+                    lost_packets: stats.path.lost_packets,
+                    congestion_events: stats.path.congestion_events,
+                }
+            })
+            .collect()
+    }
+}
+
+/// Anonymous QUIC path health of one pooled relay->exit connection
+/// (see [`ExitConnPool::leg_stats`]). Counters are per-connection
+/// lifetime and reset when the pool re-dials, so expose them as gauges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExitLegStats {
+    /// Smoothed path round-trip time, milliseconds.
+    pub rtt_ms: u64,
+    /// Current congestion window, bytes. A collapsed cwnd on a live
+    /// leg is the congestion tell even when loss counters look flat.
+    pub cwnd_bytes: u64,
+    /// Packets deemed lost on this connection so far.
+    pub lost_packets: u64,
+    /// Congestion (loss/ECN) events on this connection so far.
+    pub congestion_events: u64,
 }

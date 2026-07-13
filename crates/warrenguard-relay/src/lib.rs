@@ -27,7 +27,7 @@ pub mod server;
 pub mod session;
 
 pub use config::{ConfigError, ExitDescriptorSigned, RelayConfig};
-pub use exit_pool::{ExitConnPool, ExitPoolError};
+pub use exit_pool::{ExitConnPool, ExitLegStats, ExitPoolError};
 pub use forward::{ForwardError, ForwardSummary, forward_session};
 pub use metrics::{RelayMetrics, RelayMetricsSnapshot, record_forward_summary};
 pub use pki::{PkiError, exit_descriptor_signing_payload, verify_exit_descriptor};

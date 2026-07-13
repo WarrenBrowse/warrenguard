@@ -44,6 +44,14 @@ pub struct RelayMetrics {
     pub datagrams_dropped_too_large_c2e: AtomicU64,
     /// Same as above on the `exit -> client` direction.
     pub datagrams_dropped_too_large_e2c: AtomicU64,
+    /// Number of forward sessions that closed (any outcome).
+    pub forward_sessions_closed: AtomicU64,
+    /// Number of closed forward sessions where exactly one direction
+    /// carried datagrams. Bonded-secondary connections close one-sided
+    /// by design (flow ownership pins downlink to the uplink conn), so
+    /// treat a RATE spike of this counter as the anomaly signal (redial
+    /// storm, blackholed leg), not any single increment.
+    pub forward_sessions_one_sided: AtomicU64,
 }
 
 impl RelayMetrics {
@@ -126,6 +134,8 @@ impl RelayMetrics {
             datagrams_dropped_too_large_e2c: self
                 .datagrams_dropped_too_large_e2c
                 .load(Ordering::Relaxed),
+            forward_sessions_closed: self.forward_sessions_closed.load(Ordering::Relaxed),
+            forward_sessions_one_sided: self.forward_sessions_one_sided.load(Ordering::Relaxed),
         }
     }
 }
@@ -151,6 +161,10 @@ pub struct RelayMetricsSnapshot {
     pub datagrams_dropped_too_large_c2e: u64,
     /// See [`RelayMetrics::datagrams_dropped_too_large_e2c`].
     pub datagrams_dropped_too_large_e2c: u64,
+    /// See [`RelayMetrics::forward_sessions_closed`].
+    pub forward_sessions_closed: u64,
+    /// See [`RelayMetrics::forward_sessions_one_sided`].
+    pub forward_sessions_one_sided: u64,
 }
 
 /// Folds a [`crate::forward::ForwardSummary`] into the metrics block.
@@ -161,6 +175,14 @@ pub fn record_forward_summary(metrics: &RelayMetrics, summary: &crate::forward::
     metrics.add_e2c(summary.exit_to_client);
     metrics.add_dropped_c2e(summary.dropped_client_to_exit_too_large);
     metrics.add_dropped_e2c(summary.dropped_exit_to_client_too_large);
+    metrics
+        .forward_sessions_closed
+        .fetch_add(1, Ordering::Relaxed);
+    if (summary.client_to_exit == 0) != (summary.exit_to_client == 0) {
+        metrics
+            .forward_sessions_one_sided
+            .fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -178,6 +200,7 @@ mod tests {
                 exit_to_client: 5,
                 dropped_client_to_exit_too_large: 1,
                 dropped_exit_to_client_too_large: 2,
+                duration_secs: 60,
             },
         );
         record_forward_summary(
@@ -187,6 +210,7 @@ mod tests {
                 exit_to_client: 11,
                 dropped_client_to_exit_too_large: 0,
                 dropped_exit_to_client_too_large: 4,
+                duration_secs: 1,
             },
         );
         let snap = m.snapshot();
@@ -194,6 +218,41 @@ mod tests {
         assert_eq!(snap.datagrams_exit_to_client, 16);
         assert_eq!(snap.datagrams_dropped_too_large_c2e, 1);
         assert_eq!(snap.datagrams_dropped_too_large_e2c, 6);
+        assert_eq!(snap.forward_sessions_closed, 2);
+        assert_eq!(snap.forward_sessions_one_sided, 0);
+    }
+
+    #[test]
+    fn one_sided_forward_sessions_are_counted_but_idle_and_healthy_are_not() {
+        let m = RelayMetrics::new();
+        record_forward_summary(
+            &m,
+            &ForwardSummary {
+                client_to_exit: 90,
+                exit_to_client: 0,
+                ..Default::default()
+            },
+        );
+        record_forward_summary(
+            &m,
+            &ForwardSummary {
+                client_to_exit: 0,
+                exit_to_client: 12,
+                ..Default::default()
+            },
+        );
+        record_forward_summary(&m, &ForwardSummary::default());
+        record_forward_summary(
+            &m,
+            &ForwardSummary {
+                client_to_exit: 4,
+                exit_to_client: 4,
+                ..Default::default()
+            },
+        );
+        let snap = m.snapshot();
+        assert_eq!(snap.forward_sessions_closed, 4);
+        assert_eq!(snap.forward_sessions_one_sided, 2);
     }
 
     #[test]
