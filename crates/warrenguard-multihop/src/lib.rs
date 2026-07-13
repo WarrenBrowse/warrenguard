@@ -62,7 +62,7 @@ pub use close_codes::{
     RejectionReason, WARREN_MH_DRAINING, WARREN_MH_FORCED_RECONNECT, WARREN_MH_REJECTED,
 };
 pub use control::{
-    CONTROL_FIRST_BYTE, CONTROL_VERSION_V2, ControlError, PopSignature, WarrenControlMessage,
+    CONTROL_FIRST_BYTE, CONTROL_VERSION_V3, ControlError, PopSignature, WarrenControlMessage,
     encode_control, try_decode_control,
 };
 pub use errors::MultihopError;

@@ -17,21 +17,18 @@
 //!
 //! ```text
 //! +--------+--------+--------+----...---+
-//! | 0xC0   | 0x02   | payload (postcard-encoded `WarrenControlMessage`)
+//! | 0xC0   | 0x03   | payload (postcard-encoded `WarrenControlMessage`)
 //! +--------+--------+--------+----...---+
 //!   marker  version
 //! ```
 //!
-//! Frozen for `/v2`. Any incompatible change must bump the version byte
-//! (see [`CONTROL_VERSION_V2`]) and live in a separate module per the
-//! Warren versioning doctrine. The `0x01` version byte is retired: the
-//! `/v1` payload schema (single-field `IpRequest`) was mutated in place
-//! by the V2/V3 capability-negotiation collapse, so `0x01` is ambiguous
-//! and a receiver MUST reject it (`UnsupportedVersion`) instead of
-//! guessing which schema the sender meant. Client and exits are always
-//! redeployed together (pre-production doctrine), so there is no
-//! dual-stack decode path: a version mismatch means a stale binary and
-//! must fail loudly.
+//! Frozen for `/v3`. Any incompatible change must bump the version byte
+//! (see [`CONTROL_VERSION_V3`]) and live in a separate module per the
+//! Warren versioning doctrine. The earlier version bytes are retired and a
+//! receiver MUST reject them (`UnsupportedVersion`) rather than guess which
+//! schema the sender meant. Clients and exits are always redeployed together
+//! (pre-production doctrine), so there is no dual-stack decode path: a version
+//! mismatch means a stale binary and must fail loudly.
 
 use serde::{Deserialize, Serialize};
 use warrenguard_wire::SessionToken;
@@ -44,14 +41,16 @@ use warrenguard_wire::SessionToken;
 /// plaintext at the rx-side pump.
 pub const CONTROL_FIRST_BYTE: u8 = 0xC0;
 
-/// Control protocol version byte. `0x02` for the current layout
-/// (proof-of-possession slot on `IpRequest` + sealed `Rejected` reply).
-/// A breaking change must bump this value. Forward-compatible additions
-/// go inside the postcard payload via serde's optional fields.
+/// Control protocol version byte. `0x03` for the current layout
+/// (proof-of-possession slot on `IpRequest`, sealed `Rejected` reply, and the
+/// DAITA capability echo: `wants_daita` on the requests, `daita_spec` on
+/// `IpAssign`). A breaking change must bump this value.
 ///
-/// `0x01` is retired and never decoded: its payload schema was mutated
-/// in place pre-production, so it no longer identifies one layout.
-pub const CONTROL_VERSION_V2: u8 = 0x02;
+/// `0x01` and `0x02` are retired and never decoded: a peer speaking either one
+/// cannot express whether the traffic-analysis defense is running, and a
+/// silently-undefended session is exactly the failure this version exists to
+/// make impossible.
+pub const CONTROL_VERSION_V3: u8 = 0x03;
 
 /// Errors emitted by [`try_decode_control`] and [`encode_control`].
 ///
@@ -72,7 +71,7 @@ pub enum ControlError {
     },
 
     /// The version byte did not match the build's expected value
-    /// ([`CONTROL_VERSION_V2`]). Receivers MUST drop the frame and
+    /// ([`CONTROL_VERSION_V3`]). Receivers MUST drop the frame and
     /// MAY log a warning so the operator can detect a peer running
     /// an incompatible Warren build.
     #[error("unsupported control version: got 0x{got:02x}, expected 0x{expected:02x}")]
@@ -146,11 +145,11 @@ impl<'de> Deserialize<'de> for PopSignature {
 /// Warren multi-hop control messages exchanged between client and exit
 /// over the same HPKE-sealed datagram channel that carries IP packets.
 ///
-/// Single `/v2` format (pre-production: client + exit are always rebuilt
+/// Single `/v3` format (pre-production: client + exit are always rebuilt
 /// and redeployed together, so the message carries every field directly
 /// instead of accumulating append-only variants). A future genuine wire
-/// break bumps [`CONTROL_VERSION_V2`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// break bumps [`CONTROL_VERSION_V3`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum WarrenControlMessage {
     /// Client -> exit. Asks the exit to allocate a tunnel IP.
     IpRequest {
@@ -181,6 +180,14 @@ pub enum WarrenControlMessage {
         /// the per-session `encapsulated_key`; intra-session replay is
         /// covered by the session-scoped anti-replay window.
         pop_sig: Option<PopSignature>,
+        /// `true` ⇒ the client wants the traffic-analysis defense (DAITA) on
+        /// this session. The exit answers with [`Self::IpAssign::daita_spec`]:
+        /// `Some(spec)` when it granted the defense (and the client MUST drive
+        /// that machine on its uplink), `None` when it could not. Same
+        /// capability-echo contract as `wants_ipv6`: a client that asked and
+        /// got `None` knows the defense is NOT running and surfaces that,
+        /// rather than padding nothing while believing it is protected.
+        wants_daita: bool,
     },
 
     /// Exit -> client. Authoritative IP allocation, sent over the reliable
@@ -188,7 +195,8 @@ pub enum WarrenControlMessage {
     /// dual-stack v6 - so its presence is the capability echo: a client
     /// that asked for v6 (`wants_ipv6`) but got `ipv6: None` knows the exit
     /// could not serve it and surfaces that instead of silently going
-    /// v4-only.
+    /// v4-only. `daita_spec` carries the same contract for the
+    /// traffic-analysis defense.
     IpAssign {
         /// Allocated host IPv4 address.
         ipv4: [u8; 4],
@@ -203,6 +211,13 @@ pub enum WarrenControlMessage {
         prefix_len_v6: u8,
         /// IPv6 subnet gateway (`fdcc:f:1::1`), or `None` when no v6.
         gateway_ipv6: Option<[u8; 16]>,
+        /// The maybenot machine the exit sampled for THIS session, or `None`
+        /// when it did not grant the defense (client did not ask, or the exit
+        /// runs no pool). `Some` is the exit's commitment that it is driving
+        /// the defense on its downlink; the client drives the same spec on its
+        /// uplink. Its absence is the honest "DAITA is not running here"
+        /// signal, which the client must surface rather than pad nothing.
+        daita_spec: Option<warrenguard_wire::DaitaConfig>,
     },
 
     /// Exit -> client. The pool is exhausted. The client SHOULD terminate
@@ -258,6 +273,9 @@ pub enum WarrenControlMessage {
         /// sticky allocation + session registry by that anonymous serial
         /// (pubkey-shaped) instead of a wallet pubkey.
         session_tokens: Vec<SessionToken>,
+        /// `true` ⇒ the client wants the traffic-analysis defense (same
+        /// capability-echo contract as [`Self::IpRequest::wants_daita`]).
+        wants_daita: bool,
     },
 }
 
@@ -274,7 +292,7 @@ pub fn encode_control(msg: &WarrenControlMessage) -> Result<Vec<u8>, ControlErro
     let payload = postcard::to_stdvec(msg).map_err(ControlError::Decode)?;
     let mut out = Vec::with_capacity(2 + payload.len());
     out.push(CONTROL_FIRST_BYTE);
-    out.push(CONTROL_VERSION_V2);
+    out.push(CONTROL_VERSION_V3);
     out.extend_from_slice(&payload);
     Ok(out)
 }
@@ -307,10 +325,10 @@ pub fn try_decode_control(plaintext: &[u8]) -> Result<Option<WarrenControlMessag
         });
     }
     let version = plaintext[1];
-    if version != CONTROL_VERSION_V2 {
+    if version != CONTROL_VERSION_V3 {
         return Err(ControlError::UnsupportedVersion {
             got: version,
-            expected: CONTROL_VERSION_V2,
+            expected: CONTROL_VERSION_V3,
         });
     }
     // `take_from_bytes` + explicit rest check rejects trailing bytes after
@@ -338,9 +356,10 @@ mod tests {
             ipv6: None,
             prefix_len_v6: 0,
             gateway_ipv6: None,
+            daita_spec: None,
         };
         let encoded = encode_control(&msg).expect("encode");
-        assert_eq!(hex::encode(&encoded), "c002010a420003180a420001000000");
+        assert_eq!(hex::encode(&encoded), "c003010a420003180a42000100000000");
         // And it round-trips back to the same message.
         assert_eq!(try_decode_control(&encoded).expect("decode"), Some(msg));
     }
@@ -352,10 +371,11 @@ mod tests {
             client_pubkey: None,
             wants_ipv6: false,
             pop_sig: None,
+            wants_daita: false,
         };
         let encoded = encode_control(&msg).expect("encode");
         assert_eq!(encoded[0], CONTROL_FIRST_BYTE);
-        assert_eq!(encoded[1], CONTROL_VERSION_V2);
+        assert_eq!(encoded[1], CONTROL_VERSION_V3);
         let decoded = try_decode_control(&encoded)
             .expect("decode result")
             .expect("control message present");
@@ -370,6 +390,7 @@ mod tests {
                 client_pubkey: Some([0x42; 32]),
                 wants_ipv6,
                 pop_sig: Some(PopSignature([0xA5; 64])),
+                wants_daita: false,
             };
             let decoded = try_decode_control(&encode_control(&msg).unwrap())
                 .unwrap()
@@ -391,6 +412,7 @@ mod tests {
                     SessionToken([0xAB; warrenguard_wire::SESSION_TOKEN_LEN]),
                     SessionToken([0xCD; warrenguard_wire::SESSION_TOKEN_LEN]),
                 ],
+                wants_daita: false,
             };
             let decoded = try_decode_control(&encode_control(&msg).unwrap())
                 .unwrap()
@@ -412,17 +434,19 @@ mod tests {
             prefer_ipv4: None,
             wants_ipv6: false,
             session_tokens: vec![SessionToken(vec![0xCD; len].try_into().unwrap())],
+            wants_daita: false,
         };
         let bytes = encode_control(&msg).unwrap();
         let mut expected = vec![
             CONTROL_FIRST_BYTE, // 0xC0 marker
-            CONTROL_VERSION_V2, // 0x02 version (unchanged: append-only variant)
+            CONTROL_VERSION_V3, // 0x03 version
             0x05,               // enum discriminant: 6th variant (IpRequestV7)
             0x00,               // prefer_ipv4: Option None
             0x00,               // wants_ipv6: false
             0x01,               // session_tokens: Vec length = 1
         ];
         expected.extend_from_slice(&vec![0xCD; len]); // token[0] raw bytes
+        expected.push(0x00); // wants_daita: false
         assert_eq!(bytes, expected, "v7 IpRequest control layout is frozen");
 
         // The pre-existing v6 IpRequest MUST still encode at discriminant 0
@@ -432,6 +456,7 @@ mod tests {
             client_pubkey: None,
             wants_ipv6: false,
             pop_sig: None,
+            wants_daita: false,
         };
         let v6_bytes = encode_control(&v6).unwrap();
         assert_eq!(
@@ -450,6 +475,7 @@ mod tests {
             ipv6: None,
             prefix_len_v6: 0,
             gateway_ipv6: None,
+            daita_spec: None,
         };
         let decoded = try_decode_control(&encode_control(&v4_only).unwrap())
             .unwrap()
@@ -468,6 +494,7 @@ mod tests {
             gateway_ipv6: Some([
                 0xfd, 0xcc, 0, 0x0f, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
             ]),
+            daita_spec: None,
         };
         let decoded = try_decode_control(&encode_control(&dual).unwrap())
             .unwrap()
@@ -502,18 +529,20 @@ mod tests {
             client_pubkey: None,
             wants_ipv6: false,
             pop_sig: None,
+            wants_daita: false,
         };
         let encoded = encode_control(&msg).unwrap();
         assert_eq!(
             encoded,
             vec![
                 0xC0, // CONTROL_FIRST_BYTE
-                0x02, // CONTROL_VERSION_V2
+                0x03, // CONTROL_VERSION_V3
                 0x00, // variant tag 0 (IpRequest)
                 0x00, // prefer_ipv4 = None
                 0x00, // client_pubkey = None
                 0x00, // wants_ipv6 = false
                 0x00, // pop_sig = None
+                0x00, // wants_daita = false
             ],
             "minimal IpRequest wire layout drifted - bump the version byte + freeze a new vector"
         );
@@ -526,11 +555,12 @@ mod tests {
             client_pubkey: Some([0x42; 32]),
             wants_ipv6: true,
             pop_sig: Some(PopSignature([0xA5; 64])),
+            wants_daita: true,
         };
         let encoded = encode_control(&msg).unwrap();
         let mut expected = vec![
             0xC0, // CONTROL_FIRST_BYTE
-            0x02, // CONTROL_VERSION_V2
+            0x03, // CONTROL_VERSION_V3
             0x00, // variant tag 0 (IpRequest)
             0x01, // prefer_ipv4 = Some
             10, 66, 0, 42,   // prefer_ipv4 bytes
@@ -540,6 +570,7 @@ mod tests {
         expected.push(0x01); // wants_ipv6 = true
         expected.push(0x01); // pop_sig = Some
         expected.extend_from_slice(&[0xA5; 64]); // raw signature, no length prefix
+        expected.push(0x01); // wants_daita = true
         assert_eq!(
             encoded, expected,
             "full IpRequest wire layout drifted - bump the version byte + freeze a new vector"
@@ -555,13 +586,14 @@ mod tests {
             ipv6: None,
             prefix_len_v6: 0,
             gateway_ipv6: None,
+            daita_spec: None,
         };
         let encoded = encode_control(&msg).unwrap();
         assert_eq!(
             encoded,
             vec![
                 0xC0, // CONTROL_FIRST_BYTE
-                0x02, // CONTROL_VERSION_V2
+                0x03, // CONTROL_VERSION_V3
                 0x01, // variant tag 1 (IpAssign)
                 10, 66, 0, 7,  // ipv4
                 24, // prefix_len
@@ -569,6 +601,7 @@ mod tests {
                 0x00, // ipv6 = None
                 0x00, // prefix_len_v6
                 0x00, // gateway_ipv6 = None
+                0x00, // daita_spec = None (the exit did not grant the defense)
             ],
             "IpAssign wire layout drifted - bump the version byte + freeze a new vector"
         );
@@ -579,7 +612,7 @@ mod tests {
         let encoded = encode_control(&WarrenControlMessage::IpExhausted).unwrap();
         assert_eq!(
             encoded,
-            vec![0xC0, 0x02, 0x02],
+            vec![0xC0, 0x03, 0x02],
             "IpExhausted wire layout drifted - bump the version byte + freeze a new vector"
         );
     }
@@ -589,7 +622,7 @@ mod tests {
         let encoded = encode_control(&WarrenControlMessage::Rejected).unwrap();
         assert_eq!(
             encoded,
-            vec![0xC0, 0x02, 0x03],
+            vec![0xC0, 0x03, 0x03],
             "Rejected wire layout drifted - bump the version byte + freeze a new vector"
         );
     }
@@ -607,7 +640,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             encoded,
-            vec![0xC0, 0x02, 0x04, 0xF8, 0xE2, 0xCF, 0xAA, 0x06, 0x00],
+            vec![0xC0, 0x03, 0x04, 0xF8, 0xE2, 0xCF, 0xAA, 0x06, 0x00],
             "ExitDraining wire layout drifted - bump the version byte + freeze a new vector"
         );
     }
@@ -648,7 +681,7 @@ mod tests {
     fn unknown_variant_tag_is_a_decode_error_not_a_panic() {
         // A control-marked plaintext whose variant tag is out of range must
         // fail the decode cleanly (never panic, never misread).
-        let bogus = [CONTROL_FIRST_BYTE, CONTROL_VERSION_V2, 0x7F, 0x00];
+        let bogus = [CONTROL_FIRST_BYTE, CONTROL_VERSION_V3, 0x7F, 0x00];
         assert!(matches!(
             try_decode_control(&bogus),
             Err(ControlError::Decode(_))
@@ -672,18 +705,24 @@ mod tests {
     }
 
     #[test]
-    fn retired_v1_version_byte_is_rejected_loudly() {
-        // A stale pre-bump binary still emits 0x01. The receiver must
-        // surface UnsupportedVersion (loggable) instead of decoding the
-        // ambiguous old schema silently.
-        let stale = [CONTROL_FIRST_BYTE, 0x01, 0x02];
-        assert!(matches!(
-            try_decode_control(&stale),
-            Err(ControlError::UnsupportedVersion {
-                got: 0x01,
-                expected: 0x02
-            })
-        ));
+    fn retired_version_bytes_are_rejected_loudly() {
+        // A stale binary still emits an older version byte. It cannot express
+        // whether the traffic-analysis defense is running, so the receiver must
+        // surface UnsupportedVersion (loggable) rather than decode an ambiguous
+        // schema and leave a session silently undefended.
+        for retired in [0x01u8, 0x02] {
+            let stale = [CONTROL_FIRST_BYTE, retired, 0x02];
+            assert!(
+                matches!(
+                    try_decode_control(&stale),
+                    Err(ControlError::UnsupportedVersion {
+                        got,
+                        expected: CONTROL_VERSION_V3
+                    }) if got == retired
+                ),
+                "control version 0x{retired:02x} must be refused, not decoded"
+            );
+        }
     }
 
     #[test]
@@ -696,7 +735,7 @@ mod tests {
             try_decode_control(&[CONTROL_FIRST_BYTE, 0x99, 0x00]),
             Err(ControlError::UnsupportedVersion {
                 got: 0x99,
-                expected: 0x02
+                expected: CONTROL_VERSION_V3
             })
         ));
     }

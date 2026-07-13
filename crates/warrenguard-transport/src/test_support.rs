@@ -309,6 +309,7 @@ async fn serve_one_fake_exit_connection(
             ipv6: None,
             prefix_len_v6: 0,
             gateway_ipv6: None,
+            daita_spec: None,
         }
     };
     let Ok(plaintext) = encode_control(&reply_msg) else {

@@ -1648,8 +1648,9 @@ impl MultiHopClient {
         &self,
         identity: Option<&SigningKey>,
         wants_ipv6: bool,
+        wants_daita: bool,
     ) -> Result<Vec<u8>, MultiHopError> {
-        self.setup_over_stream_with_tokens(identity, wants_ipv6, None)
+        self.setup_over_stream_with_tokens(identity, wants_ipv6, wants_daita, None)
             .await
     }
 
@@ -1672,6 +1673,7 @@ impl MultiHopClient {
         &self,
         identity: Option<&SigningKey>,
         wants_ipv6: bool,
+        wants_daita: bool,
         session_tokens: Option<&[SessionToken]>,
     ) -> Result<Vec<u8>, MultiHopError> {
         // v7 anonymous admission: the token is the authorization, so the
@@ -1683,6 +1685,7 @@ impl MultiHopClient {
                 prefer_ipv4: None,
                 wants_ipv6,
                 session_tokens: tokens.to_vec(),
+                wants_daita,
             },
             _ => {
                 // Single `IpRequest`: carries the sticky/allowlist pubkey, the
@@ -1723,6 +1726,7 @@ impl MultiHopClient {
                     client_pubkey,
                     wants_ipv6,
                     pop_sig,
+                    wants_daita,
                 }
             }
         };
@@ -1809,6 +1813,20 @@ impl MultiHopClient {
     #[must_use]
     pub fn assignment(&self) -> Option<IpAssignment> {
         self.assignment.lock().clone()
+    }
+
+    /// The maybenot machine the exit granted for THIS session, or `None` when
+    /// it did not grant the defense.
+    ///
+    /// `None` after a setup in which the client asked for DAITA is the exit
+    /// saying the defense is NOT running. The caller must surface that, never
+    /// run the plain pump while reporting the tunnel as defended.
+    #[must_use]
+    pub fn daita_spec(&self) -> Option<warrenguard_wire::DaitaConfig> {
+        self.assignment
+            .lock()
+            .as_ref()
+            .and_then(|a| a.daita_spec.clone())
     }
 
     /// The assigned tunnel IPv4, if [`Self::assignment`] is populated.

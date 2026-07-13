@@ -145,6 +145,11 @@ pub struct SupervisorConfig {
     /// TunnelCrack ServerIP. `None` for the userland proxy (no OS tunnel to
     /// bypass) and mobile (handled by `VpnService.protect`).
     pub socket_bypass: Option<SocketBypass>,
+    /// `true` ⇒ ask every circuit for the traffic-analysis defense (DAITA).
+    /// The exit answers per session; a granted machine reaches the caller via
+    /// [`MultiHopClient::daita_spec`], and its absence means the defense is NOT
+    /// running, which the caller must surface rather than pump undefended.
+    pub enable_daita: bool,
     /// Exponential backoff schedule for retries. `Backoff::HANDSHAKE`
     /// (base 500 ms, max 15 s) is the default and matches the
     /// cold-start retry profile of [`MultiHopClient::connect_with_retry`].
@@ -952,6 +957,7 @@ impl MultiHopSupervisor {
             .setup_over_stream_with_tokens(
                 Some(&self.config.client_signing),
                 self.config.wants_ipv6,
+                self.config.enable_daita,
                 session_tokens,
             )
             .await;
@@ -1337,6 +1343,7 @@ impl MultiHopSupervisor {
                 .setup_over_stream_with_tokens(
                     Some(&config.client_signing),
                     config.wants_ipv6,
+                    config.enable_daita,
                     session_tokens,
                 )
                 .await;
@@ -1680,6 +1687,7 @@ mod tests {
             enable_gso: false,
             use_warren_obfuscation: false,
             socket_bypass: None,
+            enable_daita: false,
             backoff: Backoff::HANDSHAKE,
             on_reconnect: None,
             ip_assign_channel: None,
@@ -2112,6 +2120,7 @@ mod run_tests {
             enable_gso: false,
             use_warren_obfuscation: false,
             socket_bypass: None,
+            enable_daita: false,
             backoff: Backoff::HANDSHAKE,
             on_reconnect: None,
             ip_assign_channel: None,

@@ -26,7 +26,8 @@ use crate::wire_format::WarrenMultihopFrame;
 /// `IpAssign` reply. `ipv6` is `Some` iff the exit actually granted dual-stack
 /// v6 (the capability echo): a client that asked for v6 but got `None` knows the
 /// exit could not serve it and surfaces that instead of going v4-only silently.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `daita_spec` carries the same contract for the traffic-analysis defense.
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct IpAssignment {
     /// Allocated host IPv4 address.
@@ -41,6 +42,11 @@ pub struct IpAssignment {
     pub prefix_len_v6: u8,
     /// IPv6 subnet gateway, or `None` when no v6.
     pub gateway_ipv6: Option<[u8; 16]>,
+    /// The maybenot machine the exit sampled for this session, or `None` when it
+    /// did not grant the defense. The client MUST drive `Some(spec)` on its
+    /// uplink; `None` means the defense is NOT running and the client has to say
+    /// so rather than believe it is protected.
+    pub daita_spec: Option<warrenguard_wire::DaitaConfig>,
 }
 
 impl IpAssignment {
@@ -57,6 +63,7 @@ impl IpAssignment {
             ipv6: None,
             prefix_len_v6: 0,
             gateway_ipv6: None,
+            daita_spec: None,
         }
     }
 }
@@ -111,6 +118,7 @@ impl ClientSession {
         signing_key: Option<&SigningKey>,
         prefer_ipv4: Option<[u8; 4]>,
         wants_ipv6: bool,
+        wants_daita: bool,
     ) -> WarrenControlMessage {
         let exit_id = self.exit_id();
         let encapsulated_key = self.encapsulated_key();
@@ -126,6 +134,7 @@ impl ClientSession {
             client_pubkey,
             wants_ipv6,
             pop_sig,
+            wants_daita,
         }
     }
 
@@ -144,10 +153,11 @@ impl ClientSession {
         signing_key: Option<&SigningKey>,
         prefer_ipv4: Option<[u8; 4]>,
         wants_ipv6: bool,
+        wants_daita: bool,
         epoch: u32,
         seq: u64,
     ) -> Result<WarrenMultihopFrame, SetupError> {
-        let msg = self.build_ip_request(signing_key, prefer_ipv4, wants_ipv6);
+        let msg = self.build_ip_request(signing_key, prefer_ipv4, wants_ipv6, wants_daita);
         let plaintext = encode_control(&msg)?;
         Ok(self.seal(&plaintext, epoch, seq)?)
     }
@@ -162,11 +172,13 @@ impl ClientSession {
         session_tokens: Vec<warrenguard_wire::SessionToken>,
         prefer_ipv4: Option<[u8; 4]>,
         wants_ipv6: bool,
+        wants_daita: bool,
     ) -> WarrenControlMessage {
         WarrenControlMessage::IpRequestV7 {
             prefer_ipv4,
             wants_ipv6,
             session_tokens,
+            wants_daita,
         }
     }
 
@@ -182,10 +194,11 @@ impl ClientSession {
         session_tokens: Vec<warrenguard_wire::SessionToken>,
         prefer_ipv4: Option<[u8; 4]>,
         wants_ipv6: bool,
+        wants_daita: bool,
         epoch: u32,
         seq: u64,
     ) -> Result<WarrenMultihopFrame, SetupError> {
-        let msg = self.build_ip_request_v7(session_tokens, prefer_ipv4, wants_ipv6);
+        let msg = self.build_ip_request_v7(session_tokens, prefer_ipv4, wants_ipv6, wants_daita);
         let plaintext = encode_control(&msg)?;
         Ok(self.seal(&plaintext, epoch, seq)?)
     }
@@ -212,6 +225,7 @@ impl ClientSession {
                 ipv6,
                 prefix_len_v6,
                 gateway_ipv6,
+                daita_spec,
             }) => Ok(IpAssignment {
                 ipv4,
                 prefix_len,
@@ -219,6 +233,7 @@ impl ClientSession {
                 ipv6,
                 prefix_len_v6,
                 gateway_ipv6,
+                daita_spec,
             }),
             Some(WarrenControlMessage::Rejected) => Err(SetupError::Rejected),
             Some(WarrenControlMessage::IpExhausted) => Err(SetupError::IpExhausted),
@@ -264,7 +279,7 @@ mod tests {
         let (client, exit, account) = pair();
 
         let request = client
-            .seal_setup_request(Some(&account), None, true, 0, 0)
+            .seal_setup_request(Some(&account), None, true, false, 0, 0)
             .expect("seal setup request");
         assert_eq!(request.seq, 0, "setup frame is the first forward frame");
         assert_eq!(request.epoch, 0);
@@ -277,6 +292,7 @@ mod tests {
             pop_sig,
             wants_ipv6,
             prefer_ipv4,
+            wants_daita: false,
         } = try_decode_control(&plaintext).unwrap().unwrap()
         else {
             panic!("expected an IpRequest");
@@ -307,6 +323,7 @@ mod tests {
             gateway_ipv6: Some([
                 0xfd, 0xcc, 0, 0x0f, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
             ]),
+            daita_spec: None,
         };
         let reply = exit
             .seal_response(&encode_control(&assign).unwrap(), 0, 0)
@@ -323,7 +340,7 @@ mod tests {
     fn permissive_request_without_identity_omits_pubkey_and_pop() {
         let (client, exit, _account) = pair();
         let request = client
-            .seal_setup_request(None, Some([10, 66, 0, 5]), false, 0, 0)
+            .seal_setup_request(None, Some([10, 66, 0, 5]), false, false, 0, 0)
             .unwrap();
         let plaintext = exit.open(&request).unwrap();
         let WarrenControlMessage::IpRequest {
@@ -331,6 +348,7 @@ mod tests {
             pop_sig,
             prefer_ipv4,
             wants_ipv6,
+            wants_daita: false,
         } = try_decode_control(&plaintext).unwrap().unwrap()
         else {
             panic!("expected an IpRequest");
@@ -345,7 +363,7 @@ mod tests {
     fn rejected_reply_maps_to_rejected_error() {
         let (client, exit, account) = pair();
         let request = client
-            .seal_setup_request(Some(&account), None, false, 0, 0)
+            .seal_setup_request(Some(&account), None, false, false, 0, 0)
             .unwrap();
         let _ = exit.open(&request).unwrap();
         let reply = exit
@@ -365,7 +383,7 @@ mod tests {
     fn ip_exhausted_reply_maps_to_ip_exhausted_error() {
         let (client, exit, account) = pair();
         let request = client
-            .seal_setup_request(Some(&account), None, false, 0, 0)
+            .seal_setup_request(Some(&account), None, false, false, 0, 0)
             .unwrap();
         let _ = exit.open(&request).unwrap();
         let reply = exit
@@ -385,7 +403,7 @@ mod tests {
     fn an_ip_request_on_the_reply_path_is_unexpected() {
         let (client, exit, account) = pair();
         let request = client
-            .seal_setup_request(Some(&account), None, false, 0, 0)
+            .seal_setup_request(Some(&account), None, false, false, 0, 0)
             .unwrap();
         let _ = exit.open(&request).unwrap();
         // The exit must never send an IpRequest back; the client rejects it.
@@ -394,6 +412,7 @@ mod tests {
             client_pubkey: None,
             wants_ipv6: false,
             pop_sig: None,
+            wants_daita: false,
         };
         let reply = exit
             .seal_response(&encode_control(&bogus).unwrap(), 0, 0)

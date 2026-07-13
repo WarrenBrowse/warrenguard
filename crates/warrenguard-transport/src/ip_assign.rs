@@ -104,6 +104,10 @@ impl IpAssignSpec {
                 ipv6,
                 prefix_len_v6,
                 gateway_ipv6,
+                // The negotiated defense is session state, not an addressing
+                // fact: it lives on the client, which must stay Copy + Eq to
+                // compare assignments across reconnects.
+                daita_spec: _,
             } => Some(Self {
                 assigned: Ipv4Addr::from(*ipv4),
                 prefix_len: *prefix_len,

@@ -143,6 +143,18 @@ struct ControlVec {
     gateway_ipv4: Option<[u8; 4]>,
     deadline_unix_secs: Option<u64>,
     reason_code: Option<u8>,
+    #[serde(default)]
+    wants_daita: bool,
+    daita_spec: Option<DaitaSpecVec>,
+}
+
+/// The granted maybenot machine, mirrored from the vector so the replay drives
+/// the real `DaitaConfig` rather than a hand-rolled stand-in.
+#[derive(serde::Deserialize)]
+struct DaitaSpecVec {
+    machine_specs: Vec<String>,
+    max_padding_frac: f64,
+    max_blocking_frac: f64,
 }
 
 fn message_for(v: &ControlVec) -> WarrenControlMessage {
@@ -155,14 +167,23 @@ fn message_for(v: &ControlVec) -> WarrenControlMessage {
                 .pop_sig_hex
                 .as_ref()
                 .map(|h| PopSignature(hex::decode(h).expect("hex").try_into().expect("64 bytes"))),
+            wants_daita: v.wants_daita,
         },
-        "ip_assign" => WarrenControlMessage::IpAssign {
+        "ip_assign" | "ip_assign_with_daita" => WarrenControlMessage::IpAssign {
             ipv4: v.ipv4.expect("ipv4"),
             prefix_len: v.prefix_len.expect("prefix_len"),
             gateway_ipv4: v.gateway_ipv4.expect("gateway_ipv4"),
             ipv6: None,
             prefix_len_v6: 0,
             gateway_ipv6: None,
+            daita_spec: v
+                .daita_spec
+                .as_ref()
+                .map(|d| warrenguard_wire::DaitaConfig {
+                    machine_specs: d.machine_specs.clone(),
+                    max_padding_frac: d.max_padding_frac,
+                    max_blocking_frac: d.max_blocking_frac,
+                }),
         },
         "ip_exhausted" => WarrenControlMessage::IpExhausted,
         "rejected" => WarrenControlMessage::Rejected,
@@ -179,7 +200,7 @@ fn control_vectors_match() {
     let f: ControlFile = serde_json::from_str(&read("vectors/control.json")).expect("parse");
     assert!(
         f.vectors.len() >= 5,
-        "expected the full /v2 control message set"
+        "expected the full /v3 control message set"
     );
     for v in &f.vectors {
         let msg = message_for(v);

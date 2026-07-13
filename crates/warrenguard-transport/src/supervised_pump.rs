@@ -824,6 +824,7 @@ mod tests {
             ipv6: None,
             prefix_len_v6: 0,
             gateway_ipv6: None,
+            daita_spec: None,
         };
         let spec = IpAssignSpec::from_control(&msg).expect("IpAssign must yield Some");
         assert_eq!(spec.assigned, Ipv4Addr::new(10, 66, 0, 42));
@@ -844,6 +845,7 @@ mod tests {
             ipv6: Some(Ipv6Addr::new(0xfdcc, 0x000f, 0x0001, 0, 0, 0, 0, 2).octets()),
             prefix_len_v6: 64,
             gateway_ipv6: Some(Ipv6Addr::new(0xfdcc, 0x000f, 0x0001, 0, 0, 0, 0, 1).octets()),
+            daita_spec: None,
         };
         let spec = IpAssignSpec::from_control(&msg).expect("IpAssign must yield Some");
         assert_eq!(
@@ -865,6 +867,7 @@ mod tests {
             client_pubkey: None,
             wants_ipv6: false,
             pop_sig: None,
+            wants_daita: false,
         };
         assert!(IpAssignSpec::from_control(&req).is_none());
         let ex = WarrenControlMessage::IpExhausted;
@@ -894,6 +897,7 @@ mod tests {
             ipv6: None,
             prefix_len_v6: 0,
             gateway_ipv6: None,
+            daita_spec: None,
         };
         assert!(ExitDrainAdvisory::from_control(&assign).is_none());
         assert!(ExitDrainAdvisory::from_control(&WarrenControlMessage::Rejected).is_none());
@@ -1537,6 +1541,7 @@ mod live_pump_tests {
             ipv6: None,
             prefix_len_v6: 0,
             gateway_ipv6: None,
+            daita_spec: None,
         })
         .expect("encode_control");
         exit_send_datagram(&pair, 0, control).await;

@@ -227,6 +227,7 @@ mod tests {
             ipv6: None,
             prefix_len_v6: 0,
             gateway_ipv6: None,
+            daita_spec: None,
         };
         assert_eq!(
             RejectionReason::from_sealed_detail(&assign),
