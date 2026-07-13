@@ -66,6 +66,10 @@ quinn-udp = { workspace = true, features = ["fast-apple-datapath"] }
 # loop installs OS routes via `warrenguard-route-split`). Off by default to keep
 # the userland closure clean (SDK purity invariant). Enabled by system-VPN consumers.
 system-vpn = ["dep:warrenguard-route-split"]
+# Post-quantum (`/v2` X-Wing) multi-hop client datapath. Off by default: the
+# classical `/v1` DHKEM(X25519) session stays the production default until the
+# PQ path is real-exit validated.
+pq-hpke = ["warrenguard-multihop/pq-hpke"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

@@ -21,8 +21,12 @@ use warrenguard_multihop::{
     ExitId, ExitSession, RelayDescriptorSigned, WarrenControlMessage, decode_frame, encode_control,
     encode_frame, relay_descriptor_signing_payload, test_support::derive_exit_keypair,
 };
+#[cfg(feature = "pq-hpke")]
+use warrenguard_multihop::{PqExitSession, XWingRecipientSecretKey};
 use warrenguard_wire::WarrenPubkey;
 
+#[cfg(feature = "pq-hpke")]
+use crate::multihop::client_pq_setup_material_for_test;
 use crate::multihop::{MultiHopClient, client_encapsulated_key_for_test};
 
 /// A loopback multi-hop pair: a real client-side [`MultiHopClient`] plus
@@ -56,21 +60,31 @@ impl LoopbackMultiHop {
     }
 }
 
-/// Spins up a bare RPK loopback QUIC connection (no relay-auth proof, no
-/// setup-stream exchange) and wraps the client side as a
-/// [`MultiHopClient`] via [`MultiHopClient::from_established_connection`].
-/// The returned [`ExitSession`] is built from the client's own
-/// `encapsulated_key`, so `exit_session.seal_response(..)` produces frames
-/// `client.recv()` can decrypt, exactly mirroring a real exit's reverse
-/// direction without paying for the setup-stream round-trip.
-pub(crate) async fn spawn_loopback_multihop(exit_id: ExitId) -> LoopbackMultiHop {
-    let tls_key = SigningKey::from_bytes(&[0x77; 32]);
-    let server_cfg = warrenguard_tls::make_server_config(
+/// Bare RPK loopback QUIC bootstrap (no relay-auth proof, no setup-stream
+/// exchange, no multi-hop semantics at all): TLS server + client endpoints
+/// on a fixed RPK identity, connected. Shared by [`spawn_loopback_multihop`]
+/// and its PQ twin [`spawn_loopback_multihop_pq`], which differ only in
+/// which HPKE session they build over the resulting connection.
+/// `tls_key_seed` fixes the server's RPK identity byte so concurrently
+/// running loopback tests never collide on it. `transport_config`, when
+/// `Some`, is applied to BOTH endpoints (needed by the PQ variant: Quinn's
+/// unconfigured default initial MTU is too small for a `/v2` setup frame's
+/// 1088-byte `pq_ct`); `None` keeps Quinn's absolute defaults, matching the
+/// classical loopback's behavior before this helper was shared.
+async fn bare_rpk_loopback(
+    tls_key_seed: u8,
+    transport_config: Option<Arc<quinn::TransportConfig>>,
+) -> (Endpoint, Connection, Connection, Endpoint) {
+    let tls_key = SigningKey::from_bytes(&[tls_key_seed; 32]);
+    let mut server_cfg = warrenguard_tls::make_server_config(
         &tls_key,
         warrenguard_tls::default_crypto_provider(),
         &[warrenguard_config::ALPN_H3],
     )
     .expect("server cfg");
+    if let Some(cfg) = &transport_config {
+        server_cfg.transport_config(cfg.clone());
+    }
     let server_ep = Endpoint::server(
         server_cfg,
         "127.0.0.1:0".parse().expect("static addr parses"),
@@ -84,11 +98,14 @@ pub(crate) async fn spawn_loopback_multihop(exit_id: ExitId) -> LoopbackMultiHop
         incoming.await.expect("server handshake")
     });
 
-    let client_cfg = warrenguard_tls::make_client_config(
+    let mut client_cfg = warrenguard_tls::make_client_config(
         warrenguard_tls::default_crypto_provider(),
         &[warrenguard_config::ALPN_H3],
     )
     .expect("client cfg");
+    if let Some(cfg) = transport_config {
+        client_cfg.transport_config(cfg);
+    }
     let mut client_ep =
         Endpoint::client("127.0.0.1:0".parse().expect("static addr parses")).expect("client bind");
     client_ep.set_default_client_config(client_cfg);
@@ -101,6 +118,18 @@ pub(crate) async fn spawn_loopback_multihop(exit_id: ExitId) -> LoopbackMultiHop
         .expect("client handshake");
 
     let exit_conn = accept.await.expect("server accept task");
+    (client_ep, client_conn, exit_conn, server_ep)
+}
+
+/// Spins up a bare RPK loopback QUIC connection (no relay-auth proof, no
+/// setup-stream exchange) and wraps the client side as a
+/// [`MultiHopClient`] via [`MultiHopClient::from_established_connection`].
+/// The returned [`ExitSession`] is built from the client's own
+/// `encapsulated_key`, so `exit_session.seal_response(..)` produces frames
+/// `client.recv()` can decrypt, exactly mirroring a real exit's reverse
+/// direction without paying for the setup-stream round-trip.
+pub(crate) async fn spawn_loopback_multihop(exit_id: ExitId) -> LoopbackMultiHop {
+    let (client_ep, client_conn, exit_conn, server_ep) = bare_rpk_loopback(0x77, None).await;
 
     let (exit_priv, exit_pub) = derive_exit_keypair(&[0x99; 32]);
     let exit_pub_bytes = warrenguard_multihop::test_support::pubkey_to_bytes(&exit_pub);
@@ -126,6 +155,88 @@ pub(crate) async fn spawn_loopback_multihop(exit_id: ExitId) -> LoopbackMultiHop
         exit_session,
         exit_id,
         exit_priv,
+        _client_ep: client_ep,
+        _server_ep: server_ep,
+    }
+}
+
+/// PQ (`/v2` X-Wing) twin of [`LoopbackMultiHop`].
+#[cfg(feature = "pq-hpke")]
+pub(crate) struct LoopbackMultiHopPq {
+    pub(crate) client: Arc<MultiHopClient>,
+    pub(crate) exit_conn: Connection,
+    pub(crate) exit_session: PqExitSession,
+    exit_id: ExitId,
+    exit_secret: XWingRecipientSecretKey,
+    _client_ep: Endpoint,
+    _server_ep: Endpoint,
+}
+
+#[cfg(feature = "pq-hpke")]
+impl LoopbackMultiHopPq {
+    /// Rebuilds [`Self::exit_session`] from the client's CURRENT
+    /// `(encapsulated_key, pq_ct)`. Mirror of
+    /// [`LoopbackMultiHop::rebuild_exit_session_for_current_epoch`] for the
+    /// `/v2` session: call right after
+    /// [`crate::multihop::MultiHopClient::rekey`] so a subsequent
+    /// `exit_session.seal_response(..)` targets the NEW epoch's session
+    /// rather than the stale one.
+    pub(crate) fn rebuild_exit_session_for_current_epoch(&mut self) {
+        let (encapsulated_key, pq_ct) = client_pq_setup_material_for_test(&self.client);
+        self.exit_session =
+            PqExitSession::new(&self.exit_secret, &encapsulated_key, &pq_ct, self.exit_id)
+                .expect("pq exit-side session rebuild after rekey");
+    }
+}
+
+/// PQ (`/v2` X-Wing) twin of [`spawn_loopback_multihop`]: same bare RPK QUIC
+/// bootstrap, but the client is built via
+/// [`MultiHopClient::from_established_connection_pq`] (`require_pq = true`,
+/// so a broken test fixture fails loudly instead of silently falling back to
+/// `/v1`) and the exit side is a [`PqExitSession`] derived from a
+/// deterministic X-Wing recipient keypair.
+#[cfg(feature = "pq-hpke")]
+pub(crate) async fn spawn_loopback_multihop_pq(exit_id: ExitId) -> LoopbackMultiHopPq {
+    // Quinn's unconfigured default initial MTU cannot fit a `/v2` setup
+    // frame (1088-byte `pq_ct`); the multihop client transport config
+    // raises it to `TUNNEL_INITIAL_MTU` (1280) with no Initial-padding
+    // knobs (irrelevant to a bare loopback), reused on both endpoints since
+    // only the MTU floor matters here, not the stream/buffer tuning that
+    // differs between the real client and exit profiles.
+    let (client_ep, client_conn, exit_conn, server_ep) = bare_rpk_loopback(
+        0x78,
+        Some(warrenguard_transport_core::warren_transport_config_client_multihop_with_gso(false)),
+    )
+    .await;
+
+    let (exit_secret, exit_pub) =
+        XWingRecipientSecretKey::derive_deterministic(&[0xA1; 32], &[0xA2; 32], &[0xA3; 32]);
+    let mlkem_ek = exit_pub.mlkem768_ek_bytes();
+    let exit_x25519_pubkey = *exit_pub.x25519_pubkey();
+
+    let client = Arc::new(
+        MultiHopClient::from_established_connection_pq(
+            client_ep.clone(),
+            client_conn,
+            exit_id,
+            &exit_x25519_pubkey,
+            &mlkem_ek,
+            true,
+            None,
+        )
+        .expect("client-side PQ HPKE session setup"),
+    );
+
+    let (encapsulated_key, pq_ct) = client_pq_setup_material_for_test(&client);
+    let exit_session = PqExitSession::new(&exit_secret, &encapsulated_key, &pq_ct, exit_id)
+        .expect("exit-side PQ session setup");
+
+    LoopbackMultiHopPq {
+        client,
+        exit_conn,
+        exit_session,
+        exit_id,
+        exit_secret,
         _client_ep: client_ep,
         _server_ep: server_ep,
     }

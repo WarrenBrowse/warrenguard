@@ -27,6 +27,8 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+#[cfg(feature = "pq-hpke")]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -43,6 +45,11 @@ use warrenguard_multihop::{
     WARREN_MH_DRAINING, WarrenControlMessage, WarrenKemPublicKey, decode_frame,
     decode_relay_auth_proof, encode_control, encode_frame, parse_exit_x25519_pubkey,
     verify_relay_descriptor,
+};
+#[cfg(feature = "pq-hpke")]
+use warrenguard_multihop::{
+    MULTIHOP_FRAME_V2_MAX_OVERHEAD, PqClientSession, XWingRecipientPublicKey, decode_frame_v2,
+    encode_frame_v2,
 };
 use warrenguard_socket_bypass::SocketBypass;
 use warrenguard_tls::{
@@ -355,6 +362,102 @@ where
     Ok((plaintext, is_pending))
 }
 
+/// Maps a [`MultihopError`] from a wire-frame encode call
+/// ([`encode_frame`] / [`encode_frame_v2`]) to the transport's error type.
+/// Shared by the `/v1` and `/v2` branches of
+/// [`MultiHopClient::seal_next_forward_frame`] so the mapping stays
+/// identical regardless of frame version.
+fn map_multihop_encode_err(e: MultihopError) -> MultiHopError {
+    match e {
+        MultihopError::Decode(p) => MultiHopError::Encode(p),
+        other => MultiHopError::Session(other),
+    }
+}
+
+/// Maps a [`MultihopError`] from a wire-frame decode call
+/// ([`decode_frame`] / [`decode_frame_v2`]) to the transport's error type.
+/// Shared by the `/v1` and `/v2` branches of
+/// [`MultiHopClient::decode_and_open_reply`].
+fn map_multihop_decode_err(e: MultihopError) -> MultiHopError {
+    match e {
+        MultihopError::Decode(p) => MultiHopError::Decode(p),
+        other => MultiHopError::Session(other),
+    }
+}
+
+/// The HPKE session a [`MultiHopClient`] holds: exactly one of the classical
+/// `/v1` DHKEM(X25519) session or (`pq-hpke` only) the `/v2` X-Wing hybrid
+/// session, picked once at construction and never mixed. The `/v2` variant
+/// also carries the X-Wing recipient public key alongside the session, since
+/// [`PqClientSession::rekey`] needs to re-encapsulate against it and (unlike
+/// the classical recipient) it is not otherwise retained on
+/// [`MultiHopClient`].
+enum ClientSessionKind {
+    V1(RwLock<ClientSession>),
+    #[cfg(feature = "pq-hpke")]
+    V2 {
+        session: RwLock<PqClientSession>,
+        // Boxed: `XWingRecipientPublicKey` embeds the ~1184-byte ML-KEM-768
+        // encapsulation key inline, which would otherwise make every
+        // `ClientSessionKind` (including a `/v1` one) pay for the largest
+        // variant's stack footprint.
+        recipient: Box<XWingRecipientPublicKey>,
+    },
+}
+
+impl ClientSessionKind {
+    fn epoch(&self) -> u32 {
+        match self {
+            Self::V1(s) => s.read().epoch(),
+            #[cfg(feature = "pq-hpke")]
+            Self::V2 { session, .. } => session.read().epoch(),
+        }
+    }
+
+    fn encapsulated_key(&self) -> [u8; 32] {
+        match self {
+            Self::V1(s) => s.read().encapsulated_key(),
+            #[cfg(feature = "pq-hpke")]
+            Self::V2 { session, .. } => session.read().encapsulated_key(),
+        }
+    }
+
+    fn prune_pending_old_epoch(&self) {
+        match self {
+            Self::V1(s) => s.write().prune_pending_old_epoch(),
+            #[cfg(feature = "pq-hpke")]
+            Self::V2 { session, .. } => session.write().prune_pending_old_epoch(),
+        }
+    }
+
+    /// Worst-case per-frame wire overhead of this session's version, for
+    /// [`MultiHopClient::max_inner_payload`]. The `/v2` bound is
+    /// deliberately the SETUP-frame overhead (with `pq_ct`) even though
+    /// most `/v2` frames are smaller: an MTU budget must hold for the
+    /// largest frame this session can emit.
+    fn max_frame_overhead(&self) -> usize {
+        match self {
+            Self::V1(_) => MULTIHOP_FRAME_MAX_OVERHEAD,
+            #[cfg(feature = "pq-hpke")]
+            Self::V2 { .. } => MULTIHOP_FRAME_V2_MAX_OVERHEAD,
+        }
+    }
+
+    /// Borrow the classical `/v1` session, or `None` when this is a `/v2`
+    /// session. Used by call sites whose logic has no `/v2` counterpart yet
+    /// (e.g. the [`crate::multihop::MultiHopClient::setup_over_stream`]
+    /// `IpAssignment` capture, which depends on
+    /// [`warrenguard_multihop::IpAssignment`] being `#[non_exhaustive]` and
+    /// buildable only from inside `warrenguard-multihop`).
+    fn as_v1(&self) -> Option<&RwLock<ClientSession>> {
+        match self {
+            Self::V1(s) => Some(s),
+            #[cfg(feature = "pq-hpke")]
+            Self::V2 { .. } => None,
+        }
+    }
+}
+
 /// Multi-hop client tunnel.
 ///
 /// Owns the Quinn `Endpoint` + `Connection` to the relay and an
@@ -370,7 +473,7 @@ pub struct MultiHopClient {
     // all in-flight datagrams.
     endpoint: Endpoint,
     conn: Connection,
-    session: RwLock<ClientSession>,
+    session: ClientSessionKind,
     seq_send: AtomicU64,
     frames_in_epoch: AtomicU64,
     last_rekey: Mutex<Instant>,
@@ -393,6 +496,14 @@ pub struct MultiHopClient {
     /// [`WarrenControlMessage::IpAssign`]. `None` before setup, or if the
     /// reply was a policy refusal (`Rejected` / `IpExhausted`) instead.
     assignment: Mutex<Option<IpAssignment>>,
+    /// `/v2` only: whether the exit has proven (by a reverse frame observed
+    /// on the current epoch) that it established this epoch's PQ session.
+    /// While `false`, every outbound frame keeps carrying `pq_ct` (via
+    /// [`PqClientSession::seal_setup`]) since a rekey's `pq_ct` travels over
+    /// lossy datagrams and MUST reach the exit or it can never decapsulate
+    /// the new epoch. Reset to `false` on every rekey.
+    #[cfg(feature = "pq-hpke")]
+    pq_setup_acked: AtomicBool,
 }
 
 /// Atomic counters that aggregate per-session activity. Mutation paths
@@ -409,6 +520,12 @@ pub struct MultiHopMetrics {
     decode_errors: AtomicU64,
     unexpected_exit_id: AtomicU64,
     decode_fallback_to_old_epoch: AtomicU64,
+    /// `/v2` only: forward frames re-sent with `pq_ct` attached after the
+    /// first one for a not-yet-acked epoch. Bounded by the datagram loss
+    /// rate on the path; a runaway counter means the exit is not seeing the
+    /// rekey's `pq_ct` at all (worth investigating).
+    #[cfg(feature = "pq-hpke")]
+    pq_setup_resends: AtomicU64,
 }
 
 /// Snapshot of [`MultiHopMetrics`] for a single point in time.
@@ -438,6 +555,11 @@ pub struct MultiHopMetricsSnapshot {
     /// exit side is leaking large bursts of old-epoch reverse frames,
     /// which is worth investigating.
     pub decode_fallback_to_old_epoch: u64,
+    /// `/v2` only (always `0` on a `/v1` session): forward frames re-sent
+    /// with `pq_ct` attached while [`Self::rekey_count`]'s latest epoch was
+    /// not yet acked by the exit.
+    #[cfg(feature = "pq-hpke")]
+    pub pq_setup_resends: u64,
 }
 
 impl MultiHopMetrics {
@@ -452,6 +574,8 @@ impl MultiHopMetrics {
             decode_errors: self.decode_errors.load(Ordering::Relaxed),
             unexpected_exit_id: self.unexpected_exit_id.load(Ordering::Relaxed),
             decode_fallback_to_old_epoch: self.decode_fallback_to_old_epoch.load(Ordering::Relaxed),
+            #[cfg(feature = "pq-hpke")]
+            pq_setup_resends: self.pq_setup_resends.load(Ordering::Relaxed),
         }
     }
 }
@@ -579,16 +703,105 @@ impl MultiHopClient {
         // verbatim client bind (userland proxy, or Android which uses `protect`).
         socket_bypass: Option<SocketBypass>,
     ) -> Result<Self, MultiHopError> {
+        // Validated again (and turned into the HPKE session) inside
+        // `from_established_connection` below; parsed here too so a malformed
+        // key fails before any UDP traffic is emitted, matching the relay-PKI
+        // check inside `dial_relay`.
+        let _ = parse_exit_x25519_pubkey(exit_x25519_multihop_pubkey)?;
+        let (endpoint, conn, relay_auth_pubkey) = Self::dial_relay(
+            relay,
+            operational_pubkey,
+            bind_addr,
+            transport_config,
+            socket_bypass,
+        )
+        .await?;
+        tracing::info!("multi-hop session established");
+        Self::from_established_connection(
+            endpoint,
+            conn,
+            exit_id,
+            exit_x25519_multihop_pubkey,
+            relay_auth_pubkey,
+        )
+    }
+
+    /// PQ (`/v2` X-Wing) twin of [`Self::connect_with_transport_config`].
+    ///
+    /// `mlkem768_ek` is the exit's raw ML-KEM-768 encapsulation key material
+    /// (`warrenguard_multihop::MLKEM768_ENCAPS_KEY_LEN` bytes) read from its
+    /// PQ-signed descriptor, typically via
+    /// [`warrenguard_multihop::negotiate_pq`]. `require_pq` decides the
+    /// failure mode when `mlkem768_ek` does not parse: `true` fails closed
+    /// (anti-downgrade); `false` falls back to the classical `/v1` session
+    /// over the same `exit_x25519_multihop_pubkey`. See
+    /// [`Self::from_established_connection_pq`] for the exact rule.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::connect_with_transport_config`], plus
+    /// [`MultiHopError::Session`] wrapping the ML-KEM key-length failure
+    /// when `require_pq` is set.
+    #[cfg(feature = "pq-hpke")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn connect_with_transport_config_pq(
+        relay: &RelayDescriptorSigned,
+        exit_id: ExitId,
+        exit_x25519_multihop_pubkey: &[u8; 32],
+        mlkem768_ek: &[u8],
+        require_pq: bool,
+        operational_pubkey: &VerifyingKey,
+        _client_signing_key: &SigningKey,
+        bind_addr: SocketAddr,
+        transport_config: Arc<TransportConfig>,
+        socket_bypass: Option<SocketBypass>,
+    ) -> Result<Self, MultiHopError> {
+        let _ = parse_exit_x25519_pubkey(exit_x25519_multihop_pubkey)?;
+        let (endpoint, conn, relay_auth_pubkey) = Self::dial_relay(
+            relay,
+            operational_pubkey,
+            bind_addr,
+            transport_config,
+            socket_bypass,
+        )
+        .await?;
+        tracing::info!("multi-hop session established");
+        Self::from_established_connection_pq(
+            endpoint,
+            conn,
+            exit_id,
+            exit_x25519_multihop_pubkey,
+            mlkem768_ek,
+            require_pq,
+            relay_auth_pubkey,
+        )
+    }
+
+    /// Verify the relay descriptor and dial the relay over QUIC. Shared by
+    /// [`Self::connect_with_transport_config`] and its PQ twin
+    /// [`Self::connect_with_transport_config_pq`]: the two only differ in
+    /// which HPKE session they build over the resulting connection.
+    ///
+    /// # Errors
+    ///
+    /// [`MultiHopError::RelayPki`], [`MultiHopError::Tls`],
+    /// [`MultiHopError::Bind`], [`MultiHopError::Connect`], or
+    /// [`MultiHopError::Handshake`].
+    async fn dial_relay(
+        relay: &RelayDescriptorSigned,
+        operational_pubkey: &VerifyingKey,
+        bind_addr: SocketAddr,
+        transport_config: Arc<TransportConfig>,
+        // When `Some`, the freshly bound UDP socket is marked/bound to the
+        // physical link before its first send (Port Fail fix). `None` keeps the
+        // verbatim client bind (userland proxy, or Android which uses `protect`).
+        socket_bypass: Option<SocketBypass>,
+    ) -> Result<(Endpoint, Connection, Option<WarrenPubkey>), MultiHopError> {
         // On Android the socket is protected by `VpnService.protect` (below), not
         // a setsockopt, so any desktop bypass value is irrelevant there.
         #[cfg(target_os = "android")]
         let _ = socket_bypass;
         verify_relay_descriptor(operational_pubkey, relay)?;
-        // Validated again (and turned into the HPKE session) inside
-        // `from_established_connection` below; parsed here too so a malformed
-        // key fails before any UDP traffic is emitted, matching the relay-PKI
-        // check above.
-        let _ = parse_exit_x25519_pubkey(exit_x25519_multihop_pubkey)?;
 
         // In X.509 cover-domain mode the relay presents an ordinary
         // public-CA certificate the client validates via WebPKI (Mozilla roots),
@@ -695,14 +908,7 @@ impl MultiHopClient {
         // RPK mode pins the identity at the TLS layer and needs no in-band proof.
         let relay_auth_pubkey = relay.cover_domain.is_some().then_some(relay_pubkey);
 
-        tracing::info!("multi-hop session established");
-        Self::from_established_connection(
-            endpoint,
-            conn,
-            exit_id,
-            exit_x25519_multihop_pubkey,
-            relay_auth_pubkey,
-        )
+        Ok((endpoint, conn, relay_auth_pubkey))
     }
 
     /// Build a client session directly on top of an already-established QUIC
@@ -739,7 +945,7 @@ impl MultiHopClient {
         Ok(Self {
             endpoint,
             conn,
-            session: RwLock::new(session),
+            session: ClientSessionKind::V1(RwLock::new(session)),
             seq_send: AtomicU64::new(0),
             frames_in_epoch: AtomicU64::new(0),
             last_rekey: Mutex::new(Instant::now()),
@@ -752,6 +958,106 @@ impl MultiHopClient {
             metrics: MultiHopMetrics::default(),
             relay_auth_pubkey,
             assignment: Mutex::new(None),
+            #[cfg(feature = "pq-hpke")]
+            pq_setup_acked: AtomicBool::new(false),
+        })
+    }
+
+    /// PQ (`/v2` X-Wing) twin of [`Self::from_established_connection`].
+    ///
+    /// `mlkem768_ek` is the exit's raw ML-KEM-768 encapsulation key material;
+    /// `exit_x25519_multihop_pubkey` doubles as the X-Wing recipient's X25519
+    /// half (the same key `/v1` uses as its HPKE recipient). Building the
+    /// X-Wing recipient from `mlkem768_ek` can fail (wrong length, or an
+    /// empty slice for an exit with no PQ key at all):
+    /// - `require_pq == true` propagates that failure (anti-downgrade:
+    ///   falling back silently would let a middlebox strip PQ from a client
+    ///   that demanded it).
+    /// - `require_pq == false` falls back to the classical `/v1` session
+    ///   over `exit_x25519_multihop_pubkey`, exactly as
+    ///   [`Self::from_established_connection`] would have built it.
+    ///
+    /// # Errors
+    ///
+    /// [`MultiHopError::Session`] if `require_pq` and `mlkem768_ek` fails to
+    /// parse, or if building the selected HPKE session fails.
+    #[cfg(feature = "pq-hpke")]
+    pub fn from_established_connection_pq(
+        endpoint: Endpoint,
+        conn: Connection,
+        exit_id: ExitId,
+        exit_x25519_multihop_pubkey: &[u8; 32],
+        mlkem768_ek: &[u8],
+        require_pq: bool,
+        relay_auth_pubkey: Option<WarrenPubkey>,
+    ) -> Result<Self, MultiHopError> {
+        match XWingRecipientPublicKey::from_descriptor_bytes(
+            mlkem768_ek,
+            exit_x25519_multihop_pubkey,
+        ) {
+            Ok(recipient) => Self::from_established_connection_v2(
+                endpoint,
+                conn,
+                exit_id,
+                recipient,
+                relay_auth_pubkey,
+            ),
+            Err(e) if require_pq => Err(MultiHopError::Session(e)),
+            Err(_) => Self::from_established_connection(
+                endpoint,
+                conn,
+                exit_id,
+                exit_x25519_multihop_pubkey,
+                relay_auth_pubkey,
+            ),
+        }
+    }
+
+    /// Builds a `/v2` session over an already-negotiated
+    /// [`XWingRecipientPublicKey`]. Split out of
+    /// [`Self::from_established_connection_pq`] so the anti-downgrade
+    /// decision (propagate vs. fall back to `/v1`) stays a single small
+    /// `match`.
+    #[cfg(feature = "pq-hpke")]
+    fn from_established_connection_v2(
+        endpoint: Endpoint,
+        conn: Connection,
+        exit_id: ExitId,
+        recipient: XWingRecipientPublicKey,
+        relay_auth_pubkey: Option<WarrenPubkey>,
+    ) -> Result<Self, MultiHopError> {
+        // The X-Wing recipient's X25519 half doubles as the classical
+        // `exit_pubkey` field: it is never used for a `/v2` session's own
+        // crypto (rekey re-encapsulates against `recipient` instead), but
+        // keeping the field populated avoids making it `Option` just for
+        // this branch.
+        let exit_pubkey_bytes = *recipient.x25519_pubkey();
+        let exit_pubkey = parse_exit_x25519_pubkey(&exit_pubkey_bytes)?;
+        let pq_session = PqClientSession::new(
+            &recipient,
+            exit_id,
+            &mut rand_core::UnwrapErr(rand_core::OsRng),
+        )?;
+        Ok(Self {
+            endpoint,
+            conn,
+            session: ClientSessionKind::V2 {
+                session: RwLock::new(pq_session),
+                recipient: Box::new(recipient),
+            },
+            seq_send: AtomicU64::new(0),
+            frames_in_epoch: AtomicU64::new(0),
+            last_rekey: Mutex::new(Instant::now()),
+            rekey_policy: RekeyPolicy::default(),
+            exit_pubkey,
+            exit_id,
+            replay: Mutex::new(ReplayState::new()),
+            pending_old_epoch_at: Mutex::new(None),
+            pending_old_epoch_ttl: PENDING_OLD_EPOCH_TTL,
+            metrics: MultiHopMetrics::default(),
+            relay_auth_pubkey,
+            assignment: Mutex::new(None),
+            pq_setup_acked: AtomicBool::new(false),
         })
     }
 
@@ -1175,20 +1481,45 @@ impl MultiHopClient {
     /// Seal `payload` as the next forward-direction frame and return the
     /// encoded wire bytes. Allocates the next seq, runs the per-packet
     /// HPKE seal under the active epoch, and serialises the resulting
-    /// [`warrenguard_multihop::WarrenMultihopFrame`]. Shared by the datagram
-    /// [`Self::send`] path and the [`Self::setup_over_stream`] path so
-    /// the two transports emit byte-identical frames.
+    /// wire frame. Shared by the datagram [`Self::send`] path and the
+    /// [`Self::setup_over_stream`] path so the two transports emit
+    /// byte-identical frames.
+    ///
+    /// `/v2` only: while the current epoch's PQ setup is unacked, every
+    /// frame is sealed with [`PqClientSession::seal_setup`] (carrying
+    /// `pq_ct`) instead of [`PqClientSession::seal`], so a rekey's ML-KEM
+    /// ciphertext keeps riding outbound datagrams until the exit proves it
+    /// decapsulated it (a reverse frame observed on the new epoch).
     fn seal_next_forward_frame(&self, payload: &[u8]) -> Result<Vec<u8>, MultiHopError> {
         let seq = self.seq_send.fetch_add(1, Ordering::AcqRel);
-        let frame = {
-            let sess = self.session.read();
-            let epoch = sess.epoch();
-            sess.seal(payload, epoch, seq)?
-        };
-        encode_frame(&frame).map_err(|e| match e {
-            MultihopError::Decode(p) => MultiHopError::Encode(p),
-            other => MultiHopError::Session(other),
-        })
+        match &self.session {
+            ClientSessionKind::V1(session) => {
+                let frame = {
+                    let sess = session.read();
+                    let epoch = sess.epoch();
+                    sess.seal(payload, epoch, seq)?
+                };
+                encode_frame(&frame).map_err(map_multihop_encode_err)
+            }
+            #[cfg(feature = "pq-hpke")]
+            ClientSessionKind::V2 { session, .. } => {
+                let frame = {
+                    let sess = session.read();
+                    let epoch = sess.epoch();
+                    if self.pq_setup_acked.load(Ordering::Acquire) {
+                        sess.seal(payload, epoch, seq)?
+                    } else {
+                        if self.frames_in_epoch.load(Ordering::Acquire) > 0 {
+                            self.metrics
+                                .pq_setup_resends
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        sess.seal_setup(payload, epoch, seq)?
+                    }
+                };
+                encode_frame_v2(&frame).map_err(map_multihop_encode_err)
+            }
+        }
     }
 
     /// Decode `bytes` as a reverse-direction frame, enforce the
@@ -1198,33 +1529,73 @@ impl MultiHopClient {
     /// path so the crypto + replay accounting are identical regardless
     /// of which transport carried the frame.
     fn decode_and_open_reply(&self, bytes: &[u8]) -> Result<Vec<u8>, MultiHopError> {
-        let frame = decode_frame(bytes).map_err(|e| {
-            self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
-            match e {
-                MultihopError::Decode(p) => MultiHopError::Decode(p),
-                other => MultiHopError::Session(other),
+        match &self.session {
+            ClientSessionKind::V1(session) => {
+                let frame = decode_frame(bytes).map_err(|e| {
+                    self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
+                    map_multihop_decode_err(e)
+                })?;
+                if frame.exit_id != self.exit_id {
+                    self.metrics
+                        .unexpected_exit_id
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(MultiHopError::UnexpectedExitId);
+                }
+                // Two-phase verify-then-record anti-replay (cf.
+                // open_replay_gated): the window matching the frame's epoch
+                // (current, or the rekey-overlap pending slot) is probed
+                // before the AEAD open and committed only once the frame
+                // authenticated. A frame whose epoch matches neither slot (a
+                // deeper old epoch, or a typo by a hostile relay) is counted
+                // as a replay reject and surfaced as MultiHopError::Replay.
+                let gated = open_replay_gated(&self.replay, frame.epoch, frame.seq, move || {
+                    let sess = session.read();
+                    // Consume the decoded frame: decrypt in place in its own
+                    // buffer, no per-packet ciphertext copy on the
+                    // reverse-direction datapath.
+                    Ok(sess.open_response_owned(frame)?)
+                });
+                let (plaintext, _frame_epoch_is_pending) = self.record_reply_metrics(gated)?;
+                Ok(plaintext)
             }
-        })?;
-        if frame.exit_id != self.exit_id {
-            self.metrics
-                .unexpected_exit_id
-                .fetch_add(1, Ordering::Relaxed);
-            return Err(MultiHopError::UnexpectedExitId);
+            #[cfg(feature = "pq-hpke")]
+            ClientSessionKind::V2 { session, .. } => {
+                let frame = decode_frame_v2(bytes).map_err(|e| {
+                    self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
+                    map_multihop_decode_err(e)
+                })?;
+                if frame.exit_id != self.exit_id {
+                    self.metrics
+                        .unexpected_exit_id
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(MultiHopError::UnexpectedExitId);
+                }
+                let gated = open_replay_gated(&self.replay, frame.epoch, frame.seq, move || {
+                    let sess = session.read();
+                    Ok(sess.open_response(&frame)?)
+                });
+                let (plaintext, frame_epoch_is_pending) = self.record_reply_metrics(gated)?;
+                // The resend-until-ack signal: a reverse frame that matched
+                // the CURRENT (not the rekey-overlap pending) window proves
+                // the exit has decapsulated this epoch's pq_ct, so the
+                // forward path can stop re-carrying it.
+                if !frame_epoch_is_pending {
+                    self.pq_setup_acked.store(true, Ordering::Release);
+                }
+                Ok(plaintext)
+            }
         }
+    }
 
-        // Two-phase verify-then-record anti-replay (cf.
-        // open_replay_gated): the window matching the frame's epoch
-        // (current, or the rekey-overlap pending slot) is probed before
-        // the AEAD open and committed only once the frame
-        // authenticated. A frame whose epoch matches neither slot (a
-        // deeper old epoch, or a typo by a hostile relay) is counted as
-        // a replay reject and surfaced as MultiHopError::Replay.
-        let gated = open_replay_gated(&self.replay, frame.epoch, frame.seq, move || {
-            let sess = self.session.read();
-            // Consume the decoded frame: decrypt in place in its own buffer,
-            // no per-packet ciphertext copy on the reverse-direction datapath.
-            Ok(sess.open_response_owned(frame)?)
-        });
+    /// Shared tail of the reply-open chokepoint: given the result of
+    /// [`open_replay_gated`], update the frames/bytes/replay/fallback
+    /// counters and return the plaintext plus whether the frame matched the
+    /// rekey-overlap pending epoch. Identical accounting for `/v1` and
+    /// `/v2` replies.
+    fn record_reply_metrics(
+        &self,
+        gated: Result<(Vec<u8>, bool), MultiHopError>,
+    ) -> Result<(Vec<u8>, bool), MultiHopError> {
         let (plaintext, frame_epoch_is_pending) = match gated {
             Ok(opened) => opened,
             Err(e) => {
@@ -1243,7 +1614,7 @@ impl MultiHopClient {
         self.metrics
             .bytes_recv
             .fetch_add(plaintext.len() as u64, Ordering::Relaxed);
-        Ok(plaintext)
+        Ok((plaintext, frame_epoch_is_pending))
     }
 
     /// Perform the multi-hop SETUP round-trip over a reliable bidi QUIC
@@ -1335,7 +1706,7 @@ impl MultiHopClient {
                         // the seal below; if one ever did, the exit would
                         // reject the stale PoP and the supervisor would redial
                         // cleanly.
-                        let encapsulated_key = self.session.read().encapsulated_key();
+                        let encapsulated_key = self.session.encapsulated_key();
                         (
                             Some(key.verifying_key().to_bytes()),
                             Some(warrenguard_multihop::sign_pop(
@@ -1418,8 +1789,14 @@ impl MultiHopClient {
         // Best-effort: a `Rejected` / `IpExhausted` reply (or any other
         // non-IpAssign control message) leaves `assignment` at `None`; the
         // caller still gets the raw plaintext back to interpret itself.
-        if let Ok(frame) = decode_frame(&reply)
-            && let Ok(assignment) = self.session.read().open_setup_reply(&frame)
+        // `/v2` only: `warrenguard_multihop::IpAssignment` is `#[non_exhaustive]`
+        // and buildable only from inside `warrenguard-multihop` via the
+        // classical `ClientSession::open_setup_reply`, which has no `/v2`
+        // counterpart yet; `self.session.as_v1()` is `None` there, so
+        // `assignment` simply stays unset for a PQ session.
+        if let Some(v1) = self.session.as_v1()
+            && let Ok(frame) = decode_frame(&reply)
+            && let Ok(assignment) = v1.read().open_setup_reply(&frame)
         {
             *self.assignment.lock() = Some(assignment);
         }
@@ -1456,18 +1833,21 @@ impl MultiHopClient {
 
     /// The largest inner IP packet that fits in one sealed datagram: the path
     /// datagram size minus the worst-case frame overhead. Falls back to the
-    /// 1280-byte base MTU before the first PMTU probe.
+    /// 1280-byte base MTU before the first PMTU probe. On a `/v2` session
+    /// the overhead bound is the SETUP-frame one (`pq_ct` attached), so the
+    /// budget holds even for the largest frame this session can emit, not
+    /// just its (smaller) steady-state frames.
     #[must_use]
     pub fn max_inner_payload(&self) -> usize {
         const BASE_MTU: usize = 1280;
         let path = self.max_datagram_size().unwrap_or(BASE_MTU);
-        path.saturating_sub(MULTIHOP_FRAME_MAX_OVERHEAD)
+        path.saturating_sub(self.session.max_frame_overhead())
     }
 
     /// The current HPKE epoch (starts at `0`, `+1` per [`Self::rekey`]).
     #[must_use]
     pub fn current_epoch(&self) -> u32 {
-        self.session.read().epoch()
+        self.session.epoch()
     }
 
     /// Time since the current epoch was installed (construction or last
@@ -1485,7 +1865,7 @@ impl MultiHopClient {
     /// [`RekeyPolicy`]-shaped doctrine with a caller-chosen overlap window).
     /// Idempotent.
     pub fn prune_old_epoch(&self) {
-        self.session.write().prune_pending_old_epoch();
+        self.session.prune_pending_old_epoch();
         self.replay.lock().pending = None;
         *self.pending_old_epoch_at.lock() = None;
     }
@@ -1502,13 +1882,26 @@ impl MultiHopClient {
     /// - [`MultiHopError::Session`] if the underlying HPKE rekey fails
     ///   (KEM ECDH error or epoch overflow at `u32::MAX`).
     pub fn rekey(&self) -> Result<u32, MultiHopError> {
-        let new_epoch = {
-            let mut sess = self.session.write();
-            sess.rekey(
-                &self.exit_pubkey,
-                &mut rand_core::UnwrapErr(rand_core::OsRng),
-            )?;
-            sess.epoch()
+        let new_epoch = match &self.session {
+            ClientSessionKind::V1(session) => {
+                let mut sess = session.write();
+                sess.rekey(
+                    &self.exit_pubkey,
+                    &mut rand_core::UnwrapErr(rand_core::OsRng),
+                )?;
+                sess.epoch()
+            }
+            #[cfg(feature = "pq-hpke")]
+            ClientSessionKind::V2 { session, recipient } => {
+                let mut sess = session.write();
+                sess.rekey(recipient, &mut rand_core::UnwrapErr(rand_core::OsRng))?;
+                // A rekey's pq_ct rides lossy datagrams (unlike epoch 0's,
+                // which rides the reliable setup stream): the forward path
+                // must go back to `seal_setup` until the exit acks the new
+                // epoch (see `decode_and_open_reply`).
+                self.pq_setup_acked.store(false, Ordering::Release);
+                sess.epoch()
+            }
         };
         self.seq_send.store(0, Ordering::Release);
         self.frames_in_epoch.store(0, Ordering::Release);
@@ -1551,7 +1944,7 @@ impl MultiHopClient {
         if !should_prune {
             return;
         }
-        self.session.write().prune_pending_old_epoch();
+        self.session.prune_pending_old_epoch();
         self.replay.lock().pending = None;
         *self.pending_old_epoch_at.lock() = None;
     }
@@ -1646,7 +2039,21 @@ impl WarrenPumpHandle for MultiHopClient {
 pub(crate) fn client_encapsulated_key_for_test(
     client: &MultiHopClient,
 ) -> warrenguard_multihop::EncapsulatedKeyBytes {
-    client.session.read().encapsulated_key()
+    client.session.encapsulated_key()
+}
+
+/// Test-only accessor for a `/v2` client's PQ setup material
+/// (`encapsulated_key`, `pq_ct`), so a loopback test harness can build the
+/// matching [`warrenguard_multihop::PqExitSession`] without going through
+/// the setup-stream wire exchange. Only ever called on a client built via
+/// [`MultiHopClient::from_established_connection_pq`].
+#[cfg(all(test, feature = "pq-hpke"))]
+pub(crate) fn client_pq_setup_material_for_test(client: &MultiHopClient) -> ([u8; 32], Vec<u8>) {
+    let ClientSessionKind::V2 { session, .. } = &client.session else {
+        panic!("client_pq_setup_material_for_test called on a /v1 session");
+    };
+    let sess = session.read();
+    (sess.encapsulated_key(), sess.pq_ct().to_vec())
 }
 
 #[cfg(test)]
@@ -2233,5 +2640,218 @@ mod tests {
             .expect("must not time out")
             .expect("recv must decrypt the new-epoch reply");
         assert_eq!(recovered, b"\x45reply-epoch-1");
+    }
+
+    // ------------------------------------------------------------------
+    // `/v2` PQ (X-Wing) twins of the rekey tests above, plus the
+    // resend-until-ack state machine itself.
+    // ------------------------------------------------------------------
+
+    #[cfg(feature = "pq-hpke")]
+    mod pq_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn should_rekey_true_only_at_or_past_the_frame_count_threshold_pq() {
+            let mut pair =
+                crate::test_support::spawn_loopback_multihop_pq(ExitId::from_bytes([0x71; 16]))
+                    .await;
+            Arc::get_mut(&mut pair.client)
+                .expect("sole owner before any clone")
+                .set_rekey_policy(RekeyPolicy {
+                    max_frames: 5,
+                    max_age: Duration::from_secs(3600),
+                });
+            assert!(
+                !pair.client.should_rekey(4),
+                "below the frame threshold must not rekey"
+            );
+            assert!(
+                pair.client.should_rekey(5),
+                "at the frame threshold must rekey"
+            );
+            assert!(
+                pair.client.should_rekey(6),
+                "past the frame threshold must rekey"
+            );
+        }
+
+        #[tokio::test]
+        async fn should_rekey_true_once_the_age_threshold_elapses_pq() {
+            let mut pair =
+                crate::test_support::spawn_loopback_multihop_pq(ExitId::from_bytes([0x72; 16]))
+                    .await;
+            Arc::get_mut(&mut pair.client)
+                .expect("sole owner before any clone")
+                .set_rekey_policy(RekeyPolicy {
+                    max_frames: u64::MAX,
+                    max_age: Duration::from_millis(20),
+                });
+            assert!(
+                !pair.client.should_rekey(0),
+                "a fresh session under the age threshold must not rekey"
+            );
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            assert!(
+                pair.client.should_rekey(0),
+                "past the age threshold must rekey regardless of frame count"
+            );
+        }
+
+        #[tokio::test]
+        async fn rekey_round_trip_new_epoch_frame_decrypts_in_both_directions_pq() {
+            let mut pair =
+                crate::test_support::spawn_loopback_multihop_pq(ExitId::from_bytes([0x73; 16]))
+                    .await;
+
+            // Uplink before the rekey: epoch 0, unacked since construction
+            // -> pq_ct attached.
+            pair.client
+                .send(b"\x45pre-rekey")
+                .await
+                .expect("send epoch 0");
+            let wire0 =
+                tokio::time::timeout(Duration::from_secs(2), pair.exit_conn.read_datagram())
+                    .await
+                    .expect("must not time out")
+                    .expect("datagram");
+            let frame0 = decode_frame_v2(&wire0).expect("decode epoch-0 v2 frame");
+            assert_eq!(frame0.epoch, 0);
+            assert!(!frame0.pq_ct.is_empty(), "unacked epoch 0 must carry pq_ct");
+            assert_eq!(
+                pair.exit_session
+                    .open(&frame0)
+                    .expect("exit opens epoch-0 frame"),
+                b"\x45pre-rekey"
+            );
+
+            let new_epoch = pair.client.rekey().expect("rekey must succeed");
+            assert_eq!(new_epoch, 1, "the first rekey must move epoch 0 -> 1");
+
+            // First post-rekey frame: unacked again -> pq_ct attached.
+            pair.client
+                .send(b"\x45post-rekey")
+                .await
+                .expect("send epoch 1");
+            let wire1 =
+                tokio::time::timeout(Duration::from_secs(2), pair.exit_conn.read_datagram())
+                    .await
+                    .expect("must not time out")
+                    .expect("datagram");
+            let frame1 = decode_frame_v2(&wire1).expect("decode epoch-1 v2 frame");
+            assert_eq!(
+                frame1.epoch, 1,
+                "post-rekey frames must carry the new epoch"
+            );
+            assert_eq!(frame1.seq, 0, "the forward seq counter must reset on rekey");
+            assert!(
+                !frame1.pq_ct.is_empty(),
+                "the new epoch's first frame must still carry pq_ct (unacked)"
+            );
+
+            // Downlink round-trip: the exit re-derives its receiver context
+            // from the new epoch's (encapsulated_key, pq_ct) on seeing this
+            // first post-rekey frame; mirror that, then confirm the
+            // client's own `recv()` (gated on the SAME new epoch) opens it
+            // AND flips the resend-until-ack flag.
+            pair.rebuild_exit_session_for_current_epoch();
+            let reply = pair
+                .exit_session
+                .seal_response(b"\x45reply-epoch-1", new_epoch, 0)
+                .expect("seal_response");
+            let reply_wire = encode_frame_v2(&reply).expect("encode_frame_v2");
+            pair.exit_conn
+                .send_datagram(bytes::Bytes::from(reply_wire))
+                .expect("send_datagram");
+            let recovered = tokio::time::timeout(Duration::from_secs(2), pair.client.recv())
+                .await
+                .expect("must not time out")
+                .expect("recv must decrypt the new-epoch reply");
+            assert_eq!(recovered, b"\x45reply-epoch-1");
+
+            // Acked now: the NEXT forward frame must drop pq_ct.
+            pair.client
+                .send(b"\x45steady-state")
+                .await
+                .expect("send steady-state frame");
+            let wire2 =
+                tokio::time::timeout(Duration::from_secs(2), pair.exit_conn.read_datagram())
+                    .await
+                    .expect("must not time out")
+                    .expect("datagram");
+            let frame2 = decode_frame_v2(&wire2).expect("decode steady-state v2 frame");
+            assert_eq!(frame2.epoch, 1);
+            assert_eq!(frame2.seq, 1);
+            assert!(
+                frame2.pq_ct.is_empty(),
+                "an acked epoch's steady-state frames must not re-carry pq_ct"
+            );
+        }
+
+        #[tokio::test]
+        async fn resend_until_ack_state_machine_stops_carrying_pq_ct_after_ack() {
+            // Focused unit test for the resend-until-ack policy, decoupled
+            // from the full rekey round trip above: after `rekey()`, every
+            // `seal_next_forward_frame` output must carry `pq_ct` until a
+            // reverse frame on the new epoch is observed via
+            // `recv()`/`decode_and_open_reply`, then it must stop.
+            let mut pair =
+                crate::test_support::spawn_loopback_multihop_pq(ExitId::from_bytes([0x74; 16]))
+                    .await;
+            let new_epoch = pair.client.rekey().expect("rekey must succeed");
+
+            for seq in 0..3u64 {
+                pair.client
+                    .send(b"\x45unacked")
+                    .await
+                    .expect("send before ack");
+                let wire =
+                    tokio::time::timeout(Duration::from_secs(2), pair.exit_conn.read_datagram())
+                        .await
+                        .expect("must not time out")
+                        .expect("datagram");
+                let frame = decode_frame_v2(&wire).expect("decode v2 frame");
+                assert_eq!(frame.epoch, new_epoch);
+                assert_eq!(frame.seq, seq);
+                assert!(
+                    !frame.pq_ct.is_empty(),
+                    "frame {seq} before the ack must still carry pq_ct"
+                );
+            }
+
+            // Ack: the exit answers on the new epoch.
+            pair.rebuild_exit_session_for_current_epoch();
+            let reply = pair
+                .exit_session
+                .seal_response(b"\x45ack", new_epoch, 0)
+                .expect("seal_response");
+            let reply_wire = encode_frame_v2(&reply).expect("encode_frame_v2");
+            pair.exit_conn
+                .send_datagram(bytes::Bytes::from(reply_wire))
+                .expect("send_datagram");
+            tokio::time::timeout(Duration::from_secs(2), pair.client.recv())
+                .await
+                .expect("must not time out")
+                .expect("recv must decrypt the ack");
+
+            // Every subsequent frame must drop pq_ct.
+            for _ in 0..3 {
+                pair.client
+                    .send(b"\x45steady")
+                    .await
+                    .expect("send after ack");
+                let wire =
+                    tokio::time::timeout(Duration::from_secs(2), pair.exit_conn.read_datagram())
+                        .await
+                        .expect("must not time out")
+                        .expect("datagram");
+                let frame = decode_frame_v2(&wire).expect("decode v2 frame");
+                assert_eq!(frame.epoch, new_epoch);
+                assert!(
+                    frame.pq_ct.is_empty(),
+                    "frames after the ack must not carry pq_ct"
+                );
+            }
+        }
     }
 }
