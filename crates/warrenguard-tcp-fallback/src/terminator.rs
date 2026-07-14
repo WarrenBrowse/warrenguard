@@ -1,8 +1,8 @@
 //! Exit-side terminator: de-encapsulate a carrier stream and shuttle its QUIC
 //! datagrams to the exit's local QUIC dispatcher.
 //!
-//! Each terminated connection gets a FRESH loopback UDP socket (an ephemeral
-//! source port) connected to the dispatcher, so the dispatcher sees every
+//! Each terminated connection gets a FRESH UDP socket (an ephemeral source port,
+//! on the dispatcher's own IP) connected to the dispatcher, so the dispatcher sees every
 //! fallback client as a distinct 5-tuple, exactly as it would for a direct UDP
 //! client. The terminator is a thin byte-shuttle: it never terminates the inner
 //! QUIC TLS, so the exit's in-band auth and its QUIC-layer active-probe decoy
@@ -12,7 +12,7 @@
 
 use std::future::Future;
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -54,7 +54,7 @@ pub async fn terminate_carrier<S>(stream: S, dispatcher: SocketAddr) -> io::Resu
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let udp = Arc::new(bind_loopback_to(dispatcher).await?);
+    let udp = Arc::new(bind_shuttle_to(dispatcher).await?);
     let (read, write) = tokio::io::split(stream);
     run_shuttle(read, write, udp, Deframer::new(), None).await
 }
@@ -111,7 +111,7 @@ where
         return decoy(stream, consumed).await;
     }
 
-    let udp = Arc::new(bind_loopback_to(config.dispatcher).await?);
+    let udp = Arc::new(bind_shuttle_to(config.dispatcher).await?);
     let (read, write) = tokio::io::split(stream);
     run_shuttle(read, write, udp, deframer, Some(first_datagram)).await
 }
@@ -127,14 +127,18 @@ fn is_quic_long_header(datagram: &[u8]) -> bool {
     matches!(datagram.first(), Some(byte) if byte & 0xc0 == 0xc0)
 }
 
-/// Binds a loopback UDP socket on an ephemeral port (the per-connection 5-tuple
-/// isolation) and connects it to `dispatcher`.
-async fn bind_loopback_to(dispatcher: SocketAddr) -> io::Result<UdpSocket> {
-    let bind: SocketAddr = match dispatcher {
-        SocketAddr::V4(_) => (Ipv4Addr::LOCALHOST, 0).into(),
-        SocketAddr::V6(_) => (Ipv6Addr::LOCALHOST, 0).into(),
-    };
-    let udp = UdpSocket::bind(bind).await?;
+/// Binds a fresh UDP socket on an ephemeral port (the per-connection 5-tuple
+/// isolation) that can reach `dispatcher`, and connects it.
+///
+/// The socket binds the dispatcher's OWN IP, not a hardcoded loopback: a
+/// production exit's QUIC dispatcher binds its specific public IP (defense in
+/// depth, never `0.0.0.0`), so a loopback-bound shuttle socket could not reach
+/// it and every de-encapsulated datagram would be black-holed. Binding the
+/// dispatcher's IP keeps delivery local (via `lo` for a same-host public IP, or
+/// loopback for a loopback dispatcher) while the ephemeral source port still
+/// gives each carrier connection a distinct 5-tuple at the dispatcher.
+async fn bind_shuttle_to(dispatcher: SocketAddr) -> io::Result<UdpSocket> {
+    let udp = UdpSocket::bind(SocketAddr::new(dispatcher.ip(), 0)).await?;
     udp.connect(dispatcher).await?;
     Ok(udp)
 }
