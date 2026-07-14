@@ -731,16 +731,13 @@ impl MultiHopSupervisor {
                     }
                     () = app_downlink_dead_watch({
                         let sample = bundle.clone();
-                        move || {
-                            let mut tx = 0u64;
-                            let mut rx = 0u64;
-                            for c in sample.clients() {
-                                let s = c.quinn_stats();
-                                tx += s.frame_tx.datagram;
-                                rx += s.frame_rx.datagram;
-                            }
-                            (tx, rx)
-                        }
+                        // Real-packet counters, NOT Quinn's datagram frames:
+                        // an armed exit rains 0xFF dummies on the downlink
+                        // and a DAITA client pads its uplink, so frame
+                        // counters keep a dead tunnel looking alive (and an
+                        // idle DAITA session would look one-way and be
+                        // spuriously redialed).
+                        move || sample.real_traffic_totals()
                     }) => {
                         tracing::warn!(
                             window_secs = app_downlink_dead_secs(),

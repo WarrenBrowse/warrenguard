@@ -635,8 +635,20 @@ pub async fn run_downlink<T: PacketDevice>(
                                 continue;
                             }
                         }
+                        // An armed exit pads its downlink with 0xFF dummies for
+                        // every connection, not only DAITA-negotiated ones. On
+                        // this plain pump each dummy written to the TUN is a
+                        // kernel-rejected write ("IP version 15") that costs the
+                        // 1 ms tolerance backoff, stalling real downlink packets
+                        // behind it.
+                        if is_daita_dummy(&payload) {
+                            continue;
+                        }
                         match tun.send(&payload).await {
-                            Ok(()) => tun_io.ok(),
+                            Ok(()) => {
+                                tun_io.ok();
+                                client.note_real_downlink();
+                            }
                             Err(e) => {
                                 tun_io
                                     .tolerate(&e)
@@ -764,6 +776,7 @@ pub async fn run_downlink_with_daita<T: PacketDevice>(
                                 Ok(()) => {
                                     tun_io.ok();
                                     to_tun += 1;
+                                    client.note_real_downlink();
                                 }
                                 Err(e) => {
                                     tun_io
@@ -1437,6 +1450,67 @@ mod live_pump_tests {
         assert!(
             result.is_err(),
             "closing the watch mid-serve must surface as Err"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_downlink_drops_daita_dummies_before_tun() {
+        let pair = spawn_loopback_multihop(ExitId::from_bytes([0x22; 16])).await;
+        let bundle = MultiHopBundle::new(vec![pair.client.clone()]);
+        let (tx, rx) = tokio::sync::watch::channel(Some(bundle.clone()));
+        let tun = warrenguard_transport_core::FakeTun::new();
+
+        let task = tokio::spawn(run_downlink(rx, tun.clone(), None));
+
+        // An exit runs its DAITA machines whenever the operator arms them,
+        // so a client on the PLAIN pump still receives 0xFF dummies. They
+        // must be dropped here: written to the TUN the kernel rejects each
+        // one ("IP version 15") and the tolerance path stalls the pump
+        // 1 ms per dummy (2026-07-15 incident).
+        exit_send_datagram(&pair, 0, vec![0xFF; 64]).await;
+        tokio::time::sleep(ABSENCE_WINDOW).await;
+        assert!(
+            tun.take_outbound().is_empty(),
+            "a DAITA dummy must never be forwarded to the TUN by the plain pump"
+        );
+        assert_eq!(
+            bundle.real_traffic_totals().1,
+            0,
+            "a dummy must not count as real downlink for the liveness watches"
+        );
+
+        exit_send_datagram(&pair, 1, vec![0x45, 0, 0, 20, 3, 3, 3, 3]).await;
+        let out = wait_for_outbound(&tun).await;
+        assert_eq!(out, vec![vec![0x45, 0, 0, 20, 3, 3, 3, 3]]);
+        assert_eq!(
+            bundle.real_traffic_totals().1,
+            1,
+            "a forwarded IP packet must count as real downlink"
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+    }
+
+    #[tokio::test]
+    async fn real_uplink_accounting_counts_sends_but_never_padding() {
+        let pair = spawn_loopback_multihop(ExitId::from_bytes([0x23; 16])).await;
+        let bundle = MultiHopBundle::new(vec![pair.client.clone()]);
+
+        bundle
+            .send(&[0x45, 0, 0, 20, 1, 1, 1, 1])
+            .await
+            .expect("send");
+        assert_eq!(bundle.real_traffic_totals().0, 1);
+
+        // DAITA padding must stay invisible to the liveness accounting: an
+        // idle DAITA session pads continuously and would otherwise look
+        // like one-way app traffic, forcing spurious redials.
+        bundle.send_daita_padding().await.expect("padding");
+        assert_eq!(
+            bundle.real_traffic_totals().0,
+            1,
+            "padding must not count as real uplink"
         );
     }
 

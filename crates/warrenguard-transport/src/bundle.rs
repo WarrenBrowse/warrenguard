@@ -21,7 +21,7 @@
 //! errors, no extra copies on the uplink path.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use parking_lot::{Mutex as PlMutex, RwLock};
 
@@ -68,6 +68,11 @@ pub struct MultiHopBundle {
     /// a degraded bundle never lingers half-alive.
     closed_tx: watch::Sender<Option<quinn::ConnectionError>>,
     reader_tasks: PlMutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Real user packets pumped up/down, maintained by the supervised
+    /// pumps (padding, dummies and control frames excluded). See
+    /// [`Self::real_traffic_totals`].
+    real_tx: AtomicU64,
+    real_rx: AtomicU64,
 }
 
 impl MultiHopBundle {
@@ -111,6 +116,8 @@ impl MultiHopBundle {
             merged_tx: PlMutex::new(Some(merged_tx)),
             closed_tx,
             reader_tasks: PlMutex::new(reader_tasks),
+            real_tx: AtomicU64::new(0),
+            real_rx: AtomicU64::new(0),
         })
     }
 
@@ -237,7 +244,14 @@ impl MultiHopBundle {
     ///
     /// Propagates [`MultiHopClient::send`] errors of the picked session.
     pub async fn send(&self, payload: &[u8]) -> Result<(), MultiHopError> {
-        self.pick(payload).send(payload).await
+        let sent = self.pick(payload).send(payload).await;
+        // Padding rides `send_daita_padding`, so everything sent here is
+        // real user traffic: feed the liveness accounting directly (see
+        // `real_traffic_totals`).
+        if sent.is_ok() {
+            self.note_real_uplink();
+        }
+        sent
     }
 
     /// Sends one DAITA padding frame on the next round-robin session,
@@ -318,6 +332,33 @@ impl MultiHopBundle {
     #[must_use]
     pub fn quinn_stats(&self) -> quinn::ConnectionStats {
         self.primary().quinn_stats()
+    }
+
+    /// Records one REAL uplink packet (from the TUN, not DAITA padding or
+    /// idle cover) successfully handed to a session.
+    pub fn note_real_uplink(&self) {
+        self.real_tx.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records one REAL downlink packet (decoded IP, not a 0xFF dummy or
+    /// a control frame) successfully written to the TUN.
+    pub fn note_real_downlink(&self) {
+        self.real_rx.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Cumulative (real uplink, real downlink) packet counts recorded by
+    /// the supervised pumps. Liveness watches MUST sample this instead of
+    /// Quinn's datagram frame counters: an armed exit pads its downlink
+    /// with dummies and a DAITA client pads its uplink, so frame counters
+    /// keep advancing on a tunnel that carries no user traffic at all
+    /// (2026-07-15 incident: a dead uplink sat "Connected" behind a rain
+    /// of exit dummies).
+    #[must_use]
+    pub fn real_traffic_totals(&self) -> (u64, u64) {
+        (
+            self.real_tx.load(Ordering::Relaxed),
+            self.real_rx.load(Ordering::Relaxed),
+        )
     }
 
     /// Field-wise sum of every bonded session's metrics snapshot, so a
