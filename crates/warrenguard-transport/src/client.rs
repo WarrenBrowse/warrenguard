@@ -23,7 +23,16 @@ use warrenguard_wire::{
 };
 use zeroize::Zeroize;
 
+use tokio::net::TcpStream;
+use warrenguard_tcp_fallback::tls::connect_cover_tls;
+use warrenguard_tcp_fallback::{
+    FallbackPolicy, TcpCarrierSocket, build_carrier_client_endpoint, connect_with_fallback,
+};
+
 use crate::MultiSession;
+use crate::tcp_fallback::{
+    COVER_TCP_PORT, CoverTls, build_cover_client_config, resolve_fallback_policy,
+};
 use warrenguard_socket_bypass::SocketBypass;
 use warrenguard_transport_core::error::{Result, TunnelError};
 
@@ -114,6 +123,21 @@ pub struct ClientTunnel {
     /// [`Self::with_socket_bypass`]. Fail-closed: if the mark/bind cannot be set,
     /// the endpoint bind fails rather than letting the socket leak.
     socket_bypass: Option<SocketBypass>,
+    /// Client-side preference for the TLS-over-TCP fallback carrier. When `true`
+    /// (the default), a QUIC/UDP handshake that fails in a way consistent with
+    /// UDP being blocked is retried over the carrier
+    /// ([`warrenguard_tcp_fallback`]) to the exit's cover domain on `:443/tcp`,
+    /// so the tunnel survives a UDP-hostile network. This is only the client's
+    /// *preference*: the carrier is dialled solely when the selected exit also
+    /// advertises the capability (`WarrenExitAddr::tcp_fallback`) AND carries a
+    /// cover domain, so a non-capable exit is never pointlessly probed over TCP
+    /// (see [`Self::connect_with_tcp_fallback`]). On by default because a
+    /// censored user should not have to opt in to reach the network; override
+    /// with [`Self::with_tcp_fallback`]. Read ONLY by
+    /// [`Self::connect_with_tcp_fallback`]; the plain [`Self::connect`] /
+    /// `connect_multi` UDP paths ignore it, so the default is behaviour-neutral
+    /// for every existing caller.
+    tcp_fallback: bool,
 }
 
 /// Trust anchors a v6 X.509 client validates the exit chain against.
@@ -156,6 +180,7 @@ impl ClientTunnel {
             x509: None,
             session_tokens: None,
             socket_bypass: None,
+            tcp_fallback: true,
         }
     }
 
@@ -178,6 +203,7 @@ impl ClientTunnel {
             x509: None,
             session_tokens: None,
             socket_bypass: None,
+            tcp_fallback: true,
         }
     }
 
@@ -222,6 +248,29 @@ impl ClientTunnel {
     pub fn with_x509_webpki(mut self, server_name: String) -> Self {
         self.x509 = Some((X509Roots::Mozilla, server_name));
         self
+    }
+
+    /// Override the client-side TLS-over-TCP fallback preference (default `true`,
+    /// on). Pass `false` to force the plain UDP dial and never retry a blocked
+    /// handshake over the carrier. The exit-capability and cover-domain gates
+    /// still apply when enabled, so leaving it on is safe. See the
+    /// [`tcp_fallback`](Self::connect_with_tcp_fallback) field.
+    #[must_use]
+    pub fn with_tcp_fallback(mut self, enabled: bool) -> Self {
+        self.tcp_fallback = enabled;
+        self
+    }
+
+    /// The explicit DER trust anchors this client validates the exit chain
+    /// against, if any (X.509 `Der` mode). `None` means the Mozilla program (or
+    /// RPK). The carrier's cover-TLS trust store is built from the same anchors
+    /// so the TCP path validates the cover certificate exactly like the QUIC
+    /// dial, presenting no distinct trust profile.
+    fn x509_der_roots(&self) -> Option<Vec<Vec<u8>>> {
+        match &self.x509 {
+            Some((X509Roots::Der(ders), _)) => Some(ders.clone()),
+            _ => None,
+        }
     }
 
     /// The SNI to dial: the cover domain in X.509 mode, otherwise the
@@ -560,6 +609,135 @@ impl ClientTunnel {
             })?;
         self.from_established_connection(endpoint, conn, target.id)
             .await
+    }
+
+    /// Like [`Self::connect`], but transparently falls back to the TLS-over-TCP
+    /// carrier when the QUIC/UDP handshake fails on a UDP-hostile network AND the
+    /// selected exit advertises the capability (`target.tcp_fallback`) with a
+    /// cover domain. The client-side preference is on by default
+    /// ([`Self::with_tcp_fallback`]); the exit capability and the cover domain
+    /// are the hard gates, so a non-capable exit is dialled over UDP only and
+    /// its failure surfaces verbatim (no pointless TCP attempt). On a working UDP
+    /// network the carrier is never touched, and with the policy disabled this is
+    /// the plain UDP [`Self::connect`] datapath (same quinn handshake timeout and
+    /// typed errors).
+    ///
+    /// # Errors
+    /// See [`Self::connect`]; additionally a [`TunnelError::QuicStream`] tagged
+    /// `tcp fallback carrier` (carrying the engine's typed
+    /// [`warrenguard_tcp_fallback::FallbackError`] as its source) when the UDP
+    /// handshake failed and the armed carrier also failed to connect.
+    pub async fn connect_with_tcp_fallback(&self, target: WarrenExitAddr) -> Result<ClientSession> {
+        let remote = pick_remote_addr(&target)?;
+        let server_name = self.dial_server_name(&target);
+        let policy = resolve_fallback_policy(
+            self.tcp_fallback,
+            target.tcp_fallback,
+            target.cover_domain.as_deref(),
+        );
+        let cover = if policy.tcp_fallback_enabled {
+            // `policy.tcp_fallback_enabled` implies `cover_domain.is_some()`;
+            // `unwrap_or_default` keeps this panic-free, and an empty SNI would
+            // only fail the TLS name parse (an honest error), never abort.
+            Some(CoverTls {
+                addr: SocketAddr::new(remote.ip(), COVER_TCP_PORT),
+                domain: target.cover_domain.as_deref().unwrap_or_default(),
+                client_config: build_cover_client_config(self.x509_der_roots().as_deref())?,
+            })
+        } else {
+            None
+        };
+        let (endpoint, conn) = self
+            .dial_quic_with_fallback(remote, &server_name, &policy, cover)
+            .await?;
+        self.from_established_connection(endpoint, conn, target.id)
+            .await
+    }
+
+    /// Dials the exit over QUIC/UDP, retrying over the TLS-over-TCP carrier only
+    /// when `policy` is enabled and a `cover` target is present. With the policy
+    /// disabled this is the plain UDP dial verbatim (quinn's own handshake
+    /// timeout, typed errors, and the TCP path never even constructed).
+    async fn dial_quic_with_fallback(
+        &self,
+        remote: SocketAddr,
+        server_name: &str,
+        policy: &FallbackPolicy,
+        cover: Option<CoverTls<'_>>,
+    ) -> Result<(Endpoint, Connection)> {
+        let cover = cover.filter(|_| policy.tcp_fallback_enabled);
+        let Some(cover) = cover else {
+            let endpoint = self.bind_client_endpoint(remote)?;
+            let conn = endpoint
+                .connect(remote, server_name)
+                .map_err(|source| TunnelError::QuicConnect {
+                    target: remote.to_string(),
+                    source,
+                })?
+                .await
+                .map_err(|source| TunnelError::QuicConnection {
+                    context: "connect to exit",
+                    source,
+                })?;
+            return Ok((endpoint, conn));
+        };
+
+        // The UDP error is only surfaced by the engine when the fallback is
+        // disabled, which cannot happen on this (enabled) branch, so it is
+        // mapped to an opaque io::Error (no address, no-log) purely to satisfy
+        // the race's shared Result type.
+        let udp = async {
+            let endpoint = self
+                .bind_client_endpoint(remote)
+                .map_err(|_| std::io::Error::other("udp endpoint bind failed"))?;
+            let conn = endpoint
+                .connect(remote, server_name)
+                .map_err(|_| std::io::Error::other("udp quic connect setup failed"))?
+                .await
+                .map_err(|_| std::io::Error::other("udp quic handshake failed"))?;
+            Ok::<(Endpoint, Connection), std::io::Error>((endpoint, conn))
+        };
+        let tcp = || self.dial_tcp_carrier(remote, server_name, cover);
+
+        connect_with_fallback(policy, udp, tcp)
+            .await
+            .map_err(|source| TunnelError::QuicStream {
+                context: "tcp fallback carrier".into(),
+                source: Box::new(source),
+            })
+    }
+
+    /// Builds the TLS-over-TCP carrier to `cover.addr`, wraps it as a quinn
+    /// abstract socket, and dials the exit's QUIC endpoint over it with the SAME
+    /// inner client config and SNI as the UDP dial, so the QUIC state machine,
+    /// RPK/X.509 identity check and obfuscation are identical. Errors are opaque
+    /// io::Errors (no address, no-log); the engine's [`connect_with_fallback`]
+    /// surfaces them as
+    /// [`FallbackError::TcpFallbackFailed`](warrenguard_tcp_fallback::FallbackError::TcpFallbackFailed).
+    async fn dial_tcp_carrier(
+        &self,
+        remote: SocketAddr,
+        server_name: &str,
+        cover: CoverTls<'_>,
+    ) -> std::io::Result<(Endpoint, Connection)> {
+        let tcp = TcpStream::connect(cover.addr).await?;
+        let stream = connect_cover_tls(cover.domain, tcp, cover.client_config)
+            .await
+            .map_err(|_| std::io::Error::other("cover-domain tls handshake failed"))?;
+        // The synthetic quinn peer MUST equal the address passed to `connect`, so
+        // quinn routes the carrier's inbound datagrams to this connection's path.
+        let socket = TcpCarrierSocket::new(stream, remote);
+        let client_config = self
+            .build_client_config()
+            .map_err(|_| std::io::Error::other("inner quic client config failed"))?;
+        let endpoint = build_carrier_client_endpoint(socket, client_config)
+            .map_err(|_| std::io::Error::other("carrier quic endpoint build failed"))?;
+        let conn = endpoint
+            .connect(remote, server_name)
+            .map_err(|_| std::io::Error::other("carrier quic connect setup failed"))?
+            .await
+            .map_err(|_| std::io::Error::other("carrier quic handshake failed"))?;
+        Ok((endpoint, conn))
     }
 
     /// Completes the Setup/SetupAck handshake on an already-established QUIC
@@ -969,6 +1147,22 @@ impl ClientTunnel {
                 source,
             })?,
         };
+        let client_cfg = self.build_client_config()?;
+        endpoint.set_default_client_config(client_cfg);
+        Ok(endpoint)
+    }
+
+    /// Builds the Warren-configured quinn client config (RPK, or v6 X.509/WebPKI
+    /// per [`Self::with_x509`] / [`Self::with_x509_webpki`], plus the Warren
+    /// transport tuning). Extracted from [`Self::bind_client_endpoint`] so the
+    /// TLS-over-TCP carrier ([`Self::dial_tcp_carrier`]) can drive its quinn
+    /// endpoint with the exact same inner config as the UDP dial, keeping the
+    /// fallback session byte-for-byte the UDP session over a different socket.
+    ///
+    /// # Errors
+    /// [`TunnelError::Internal`] if the trust store is empty (fail closed) or if
+    /// rustls rejects the config.
+    fn build_client_config(&self) -> Result<quinn::ClientConfig> {
         let alpns: Vec<&[u8]> = self.alpn_protocols.iter().map(Vec::as_slice).collect();
         let mut client_cfg = if let Some((roots, _)) = &self.x509 {
             // v6 X.509 exit mode: validate the exit's real cert
@@ -1023,8 +1217,7 @@ impl ClientTunnel {
                 ),
             );
         }
-        endpoint.set_default_client_config(client_cfg);
-        Ok(endpoint)
+        Ok(client_cfg)
     }
 }
 
@@ -1639,6 +1832,237 @@ mod live_session_tests {
         assert!(
             matches!(err, TunnelError::ExitAuthFailed),
             "expected ExitAuthFailed, got {err:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod carrier_fallback_tests {
+    //! End-to-end datapath test for the client TCP-fallback orchestration: a real
+    //! cover-domain TLS-over-TCP carrier terminated by the engine `serve_carrier`,
+    //! shuttling to a loopback QUIC RPK dispatcher. Proves that a dial whose UDP
+    //! path is black-holed falls back to the carrier and connects, that a working
+    //! UDP dial never opens the carrier, and that a disabled policy never dials it.
+    //! This is the network datapath; the anti-censorship behaviour over a real
+    //! blocked-UDP link stays operator-validated (see the crate `tcp_fallback`
+    //! module and the `warrenguard-tcp-fallback` live-validation runbook).
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use ed25519_dalek::SigningKey;
+    use tokio::io::AsyncWriteExt;
+    use warrenguard_tcp_fallback::{FallbackPolicy, TerminatorConfig, serve_carrier};
+    use warrenguard_wire::WarrenPubkey;
+
+    use super::*;
+
+    /// A loopback QUIC RPK dispatcher plus a cover-domain TLS-over-TCP carrier
+    /// terminator in front of it. Returns the exit pubkey, the dispatcher's UDP
+    /// address (the direct-UDP dial target), the carrier's TCP address, the DER of
+    /// the self-signed cover cert (the client trusts it as a WebPKI root), and a
+    /// counter of TCP carrier connections accepted (to assert the carrier stays
+    /// untouched when it must).
+    struct Harness {
+        exit_pubkey: [u8; 32],
+        dispatcher_addr: std::net::SocketAddr,
+        cover_addr: std::net::SocketAddr,
+        cover_cert_der: Vec<u8>,
+        carrier_conns: Arc<AtomicUsize>,
+    }
+
+    async fn spawn_harness() -> Harness {
+        let provider = warrenguard_tls::default_crypto_provider();
+
+        // Loopback QUIC RPK dispatcher: a bare exit endpoint that accepts and
+        // holds connections (the terminator shuttles carrier datagrams here).
+        let exit_key = SigningKey::from_bytes(&[7u8; 32]);
+        let exit_pubkey = exit_key.verifying_key().to_bytes();
+        let server_cfg = warrenguard_tls::make_server_config(&exit_key, provider.clone(), &[b"h3"])
+            .expect("dispatcher server config");
+        let dispatcher = quinn::Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap())
+            .expect("dispatcher binds");
+        let dispatcher_addr = dispatcher.local_addr().expect("dispatcher addr");
+        tokio::spawn(async move {
+            while let Some(incoming) = dispatcher.accept().await {
+                tokio::spawn(async move {
+                    if let Ok(conn) = incoming.await {
+                        conn.closed().await;
+                    }
+                });
+            }
+        });
+
+        // Cover-domain TLS-over-TCP carrier terminator in front of it.
+        let ck = rcgen::generate_simple_self_signed(vec!["cover.test".to_string()])
+            .expect("self-signed cover cert");
+        let cover_cert = ck.cert.der().clone();
+        let cover_cert_der = cover_cert.to_vec();
+        let cover_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(ck.key_pair.serialize_der()),
+        );
+        let cover_server_cfg = warrenguard_tls::build_server_rustls_config_x509(
+            vec![cover_cert],
+            cover_key,
+            provider.clone(),
+            &[b"http/1.1"],
+        )
+        .expect("cover server config");
+        let acceptor =
+            warrenguard_tcp_fallback::tls::cover_tls_acceptor(Arc::new(cover_server_cfg));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("cover listener binds");
+        let cover_addr = listener.local_addr().expect("cover addr");
+        let term_cfg = TerminatorConfig {
+            dispatcher: dispatcher_addr,
+            first_frame_timeout: Duration::from_secs(5),
+        };
+        let carrier_conns = Arc::new(AtomicUsize::new(0));
+        let conns = Arc::clone(&carrier_conns);
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    break;
+                };
+                conns.fetch_add(1, Ordering::SeqCst);
+                let acceptor = acceptor.clone();
+                let term_cfg = term_cfg.clone();
+                tokio::spawn(async move {
+                    let Ok(tls_stream) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    // A non-carrier prober is served a minimal HTTP/1.1 decoy.
+                    let _ = serve_carrier(tls_stream, &term_cfg, |mut s, _prefix| async move {
+                        let _ = s
+                            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                            .await;
+                        Ok(())
+                    })
+                    .await;
+                });
+            }
+        });
+
+        Harness {
+            exit_pubkey,
+            dispatcher_addr,
+            cover_addr,
+            cover_cert_der,
+            carrier_conns,
+        }
+    }
+
+    /// A client dialling with the same RPK inner config the loopback dispatcher
+    /// serves. The exit's cover trust anchor is the self-signed test cert, wired
+    /// through the real [`build_cover_client_config`] helper.
+    fn cover_for(h: &Harness) -> CoverTls<'static> {
+        CoverTls {
+            addr: h.cover_addr,
+            domain: "cover.test",
+            client_config: build_cover_client_config(Some(std::slice::from_ref(&h.cover_cert_der)))
+                .expect("cover client config"),
+        }
+    }
+
+    fn server_name_for(h: &Harness) -> String {
+        warrenguard_tls::name::encode(WarrenPubkey::from_bytes(h.exit_pubkey))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocked_udp_with_armed_policy_falls_back_to_the_carrier() {
+        let h = spawn_harness().await;
+        let client = ClientTunnel::new();
+
+        // The UDP dial targets a loopback port with no listener, so the QUIC
+        // handshake never completes; with a short deadline the fallback fires.
+        let black_hole: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let policy = FallbackPolicy {
+            tcp_fallback_enabled: true,
+            udp_handshake_timeout: Duration::from_millis(400),
+        };
+        let server_name = server_name_for(&h);
+
+        let (_endpoint, conn) = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.dial_quic_with_fallback(black_hole, &server_name, &policy, Some(cover_for(&h))),
+        )
+        .await
+        .expect("the fallback dial completes")
+        .expect("blocked UDP must fall back to the TCP carrier and connect");
+
+        assert!(
+            conn.close_reason().is_none(),
+            "the QUIC connection established over the carrier must be live"
+        );
+        assert_eq!(
+            h.carrier_conns.load(Ordering::SeqCst),
+            1,
+            "exactly one carrier connection must have been used for the fallback"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn working_udp_never_touches_the_carrier() {
+        let h = spawn_harness().await;
+        let client = ClientTunnel::new();
+
+        // UDP works (dial the live dispatcher directly); even with the policy
+        // armed and a cover target present, the carrier must never be dialled.
+        let policy = FallbackPolicy::enabled();
+        let server_name = server_name_for(&h);
+
+        let (_endpoint, conn) = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.dial_quic_with_fallback(
+                h.dispatcher_addr,
+                &server_name,
+                &policy,
+                Some(cover_for(&h)),
+            ),
+        )
+        .await
+        .expect("the UDP dial completes")
+        .expect("a reachable exit must connect over UDP");
+
+        assert!(
+            conn.close_reason().is_none(),
+            "the UDP connection must be live"
+        );
+        assert_eq!(
+            h.carrier_conns.load(Ordering::SeqCst),
+            0,
+            "a successful UDP handshake must never open the TCP carrier"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disabled_policy_never_dials_the_carrier() {
+        let h = spawn_harness().await;
+        let client = ClientTunnel::new();
+
+        // Policy disabled (the shape a non-capable exit yields via
+        // `resolve_fallback_policy`): even with a cover target present and UDP
+        // black-holed, the plain UDP path is taken and the carrier is untouched.
+        let black_hole: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let policy = FallbackPolicy::default();
+        let server_name = server_name_for(&h);
+
+        // The plain UDP dial to a dead port runs on quinn's own (long) handshake
+        // timeout, so bound the wait: whether it errors or is still pending, the
+        // carrier must never have been opened.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.dial_quic_with_fallback(black_hole, &server_name, &policy, Some(cover_for(&h))),
+        )
+        .await;
+
+        assert_eq!(
+            h.carrier_conns.load(Ordering::SeqCst),
+            0,
+            "a disabled policy must never open the TCP carrier, even when UDP fails"
         );
     }
 }

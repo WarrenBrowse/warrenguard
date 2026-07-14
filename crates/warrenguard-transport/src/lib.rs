@@ -27,6 +27,11 @@ mod real_tun;
 #[cfg(feature = "system-vpn")]
 pub mod supervised_pump;
 pub mod supervisor;
+// Client-side TLS-over-TCP fallback orchestration (anti-censorship datapath):
+// decides when a UDP-blocked dial is retried over the carrier. The heavy dial
+// logic lives on `ClientTunnel` (needs its private config seam); this module is
+// the pure policy + cover-config helpers.
+mod tcp_fallback;
 #[cfg(test)]
 mod test_support;
 

@@ -27,6 +27,11 @@ warrenguard-daita = { path = "../warrenguard-daita" }
 # Lightweight (libc/windows-sys only), so it stays in the userland closure too;
 # the proxy datapath simply configures no bypass.
 warrenguard-socket-bypass = { path = "../warrenguard-socket-bypass" }
+# TLS-over-TCP fallback carrier (anti-censorship datapath): the client dials this
+# to the exit's cover domain on :443/tcp when the QUIC/UDP handshake fails on a
+# UDP-hostile network. Plugs in at the quinn abstract-socket seam only; the QUIC
+# engine, HPKE and obfuscation configs are untouched.
+warrenguard-tcp-fallback = { path = "../warrenguard-tcp-fallback" }
 # Privileged system-VPN routing (default-route split): the reassign loop
 # installs the Linux v6 split route via `DefaultRouteSplitV6Guard`. Optional +
 # feature-gated so the userland SDK (which consumes this crate for the session
@@ -45,6 +50,9 @@ rand = { workspace = true }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+# Names `rustls::ClientConfig` in the carrier's cover-TLS seam (the config comes
+# from `warrenguard-tls`; this dep is only to name the type at the boundary).
+rustls = { workspace = true }
 # rand_core 0.9 matches the trait bounds expected by `warrenguard-multihop`
 # (HPKE 0.13 still consumes the 0.9 trait line); the workspace
 # `rand = 0.10` is incompatible.
@@ -74,6 +82,8 @@ pq-hpke = ["warrenguard-multihop/pq-hpke"]
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 ed25519-dalek = { workspace = true }
+# Self-signed cover certificate for the carrier end-to-end test.
+rcgen = { workspace = true }
 
 [lints]
 workspace = true
