@@ -37,6 +37,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use parking_lot::{Mutex, RwLock};
 use quinn::{Connection, Endpoint, TransportConfig};
 use thiserror::Error;
+use tokio::net::TcpStream;
 use warrenguard_backoff::Backoff;
 use warrenguard_config::ALPN_H3;
 use warrenguard_multihop::{
@@ -52,10 +53,16 @@ use warrenguard_multihop::{
     encode_frame_v2,
 };
 use warrenguard_socket_bypass::SocketBypass;
+use warrenguard_tcp_fallback::tls::connect_cover_tls;
+use warrenguard_tcp_fallback::{
+    FallbackPolicy, TcpCarrierSocket, build_carrier_client_endpoint, connect_with_fallback,
+};
 use warrenguard_tls::{
     WarrenTlsError, channel_binding, default_crypto_provider, make_client_config,
     make_client_config_webpki, mozilla_root_store, verify_relay_auth,
 };
+
+use crate::tcp_fallback::{COVER_TCP_PORT, build_cover_client_config};
 use warrenguard_transport_core::{
     warren_transport_config_client_multihop_with_gso, warren_transport_config_client_with_gso,
 };
@@ -99,6 +106,14 @@ pub enum MultiHopError {
     /// pin mismatch surfaced as a TLS verifier rejection, etc.).
     #[error("QUIC handshake failed: {0}")]
     Handshake(#[source] quinn::ConnectionError),
+    /// The relay's UDP handshake failed and the armed TLS-over-TCP fallback
+    /// carrier also failed (cover-domain TLS handshake, the carrier's inner
+    /// QUIC handshake, or the cover-config build). Carries an opaque I/O error:
+    /// no address or identity material is rendered. Retriable like a plain
+    /// handshake failure, since a UDP-hostile network can be transiently
+    /// TCP-hostile and the descriptor/PKI have already verified.
+    #[error("tcp fallback carrier failed: {0}")]
+    TcpFallback(#[source] std::io::Error),
     /// HPKE setup or rekey failed.
     #[error("HPKE session error: {0}")]
     Session(#[from] MultihopError),
@@ -172,7 +187,10 @@ impl MultiHopError {
     pub fn is_retriable(&self) -> bool {
         matches!(
             self,
-            MultiHopError::Bind { .. } | MultiHopError::Connect(_) | MultiHopError::Handshake(_),
+            MultiHopError::Bind { .. }
+                | MultiHopError::Connect(_)
+                | MultiHopError::Handshake(_)
+                | MultiHopError::TcpFallback(_),
         )
     }
 
@@ -223,6 +241,48 @@ pub enum DialRefusedHop {
     Entry,
     /// The exit refused the session with its drain close code.
     Exit,
+}
+
+/// Whether the TLS-over-TCP fallback carrier is armed for `relay`: it both
+/// advertises the carrier (`tcp_fallback`) AND carries a cover domain. The
+/// cover domain is the outer TLS SNI and implies X.509 mode, so without it
+/// there is no carrier to dial. Gated purely on the descriptor (no client
+/// opt-in threaded through the connect variants), so an RPK relay (no cover
+/// domain) is never dialed over TCP even if the flag is set, and a relay that
+/// does not advertise the carrier keeps the plain UDP dial.
+#[must_use]
+fn carrier_armed(relay: &RelayDescriptorSigned) -> bool {
+    relay.tcp_fallback && relay.cover_domain.is_some()
+}
+
+/// Trust anchors for the relay's cover-domain certificate, shared by the inner
+/// QUIC WebPKI handshake (in cover mode) and the outer carrier cover-TLS.
+/// `None` (production) selects the bundled Mozilla program, i.e. the
+/// public-ACME cover cert a real relay presents. A `#[cfg(test)]` seam injects
+/// a throwaway CA so a loopback test completes a genuine cover handshake,
+/// mirroring the single-hop client's `x509_der_roots`.
+#[must_use]
+fn cover_trust_anchors() -> Option<Vec<Vec<u8>>> {
+    #[cfg(test)]
+    {
+        tests::test_cover_trust_anchors()
+    }
+    #[cfg(not(test))]
+    {
+        None
+    }
+}
+
+/// The `:443/tcp` cover endpoint the carrier dials: the relay's advertised IP
+/// on the fixed cover HTTPS port. A `#[cfg(test)]` seam redirects it to a
+/// loopback terminator, since a test cannot bind `:443`.
+#[must_use]
+fn carrier_cover_endpoint(relay_endpoint: SocketAddr) -> SocketAddr {
+    #[cfg(test)]
+    if let Some(addr) = tests::test_carrier_endpoint() {
+        return addr;
+    }
+    SocketAddr::new(relay_endpoint.ip(), COVER_TCP_PORT)
 }
 
 /// Rekey trigger thresholds. The session rotates the HPKE context as
@@ -830,11 +890,26 @@ impl MultiHopClient {
         // pinning the RFC 7250 raw public key in the SNI. With no cover_domain
         // the historical RPK path is kept verbatim.
         let mut client_cfg = if relay.cover_domain.is_some() {
-            make_client_config_webpki(mozilla_root_store(), default_crypto_provider(), &[ALPN_H3])?
+            // Production trusts the Mozilla program (the relay presents a
+            // public-ACME cover cert); a `#[cfg(test)]` seam swaps in a
+            // throwaway CA so a loopback carrier handshake can validate.
+            // Behaviour-neutral in production: the seam yields `None`, i.e. the
+            // bundled Mozilla roots, exactly as before.
+            let roots = match cover_trust_anchors() {
+                Some(ders) => warrenguard_tls::root_store_from_der(&ders).0,
+                None => mozilla_root_store(),
+            };
+            make_client_config_webpki(roots, default_crypto_provider(), &[ALPN_H3])?
         } else {
             make_client_config(default_crypto_provider(), &[ALPN_H3])?
         };
         client_cfg.transport_config(transport_config);
+        // Clone the inner QUIC config for the carrier BEFORE the UDP endpoint
+        // consumes it via `set_default_client_config`: the carrier dials the
+        // relay with the IDENTICAL config so the TCP path is byte-for-byte the
+        // UDP session (same X.509 identity check, transport params). Only when
+        // armed (`quinn::ClientConfig: Clone`).
+        let carrier_client_cfg = carrier_armed(relay).then(|| client_cfg.clone());
 
         // On Android the endpoint socket must be protected (routed onto the
         // underlying physical network) BEFORE it sends anything, or the VPN
@@ -913,10 +988,23 @@ impl MultiHopClient {
             Some(domain) => domain.clone(),
             None => warrenguard_tls::name::encode(relay_pubkey),
         };
-        let conn = endpoint
-            .connect(relay.endpoint, &server_name)?
-            .await
-            .map_err(MultiHopError::Handshake)?;
+        // When the carrier is armed, race the UDP dial against the TLS-over-TCP
+        // carrier so a UDP-hostile network still connects; otherwise keep the
+        // plain UDP dial verbatim (behaviour-neutral for every RPK / non-carrier
+        // relay). The winning path's endpoint is carried out and kept alive for
+        // the connection.
+        let (endpoint, conn) = match carrier_client_cfg {
+            Some(inner_cfg) => {
+                Self::dial_relay_with_carrier(relay, endpoint, &server_name, inner_cfg).await?
+            }
+            None => {
+                let conn = endpoint
+                    .connect(relay.endpoint, &server_name)?
+                    .await
+                    .map_err(MultiHopError::Handshake)?;
+                (endpoint, conn)
+            }
+        };
 
         // In X.509 cover-domain mode the relay proves its
         // directory-vouched Ed25519 identity in-band, but it emits that proof
@@ -929,6 +1017,83 @@ impl MultiHopClient {
         let relay_auth_pubkey = relay.cover_domain.is_some().then_some(relay_pubkey);
 
         Ok((endpoint, conn, relay_auth_pubkey))
+    }
+
+    /// Races the relay's UDP QUIC dial (on the already-bound `endpoint`)
+    /// against the TLS-over-TCP fallback carrier. The carrier is dialed ONLY
+    /// after the UDP handshake fails or times out (see
+    /// [`warrenguard_tcp_fallback::connect_with_fallback`]); on a working UDP
+    /// network it is never touched. The winner's endpoint is returned and MUST
+    /// be kept alive for the connection. The carrier dials the relay's inner
+    /// QUIC with the identical `inner_cfg` and `server_name` and a synthetic
+    /// peer equal to the UDP target, so the QUIC state machine and X.509
+    /// identity check are unchanged: the carrier only swaps the socket
+    /// underneath.
+    ///
+    /// # Errors
+    /// [`MultiHopError::TcpFallback`] when the UDP handshake failed and the
+    /// armed carrier also failed (cover-config build, cover-domain TLS
+    /// handshake, or the carrier's inner QUIC handshake). No address or
+    /// identity material is rendered.
+    async fn dial_relay_with_carrier(
+        relay: &RelayDescriptorSigned,
+        endpoint: Endpoint,
+        server_name: &str,
+        inner_cfg: quinn::ClientConfig,
+    ) -> Result<(Endpoint, Connection), MultiHopError> {
+        // The synthetic quinn peer and both dials target the relay's advertised
+        // QUIC endpoint; only the socket beneath differs between the arms.
+        let target = relay.endpoint;
+        // `carrier_armed` guaranteed a cover domain; an empty SNI would only
+        // fail the TLS name parse (an honest error), never panic.
+        let cover_domain = relay.cover_domain.as_deref().unwrap_or_default().to_owned();
+        // Production trusts the Mozilla program; a `#[cfg(test)]` seam injects a
+        // throwaway CA. A build failure disarms the carrier, surfaced only if
+        // UDP also fails (below).
+        let cover_config =
+            build_cover_client_config(cover_trust_anchors().as_deref()).map_err(|_| {
+                MultiHopError::TcpFallback(std::io::Error::other(
+                    "cover TLS client config build failed",
+                ))
+            })?;
+        let carrier_endpoint = carrier_cover_endpoint(target);
+
+        // The UDP error is only surfaced by the engine when the fallback is
+        // disabled, which cannot happen on this (armed) path, so it is mapped
+        // to an opaque io::Error (no address, no-log) purely to satisfy the
+        // race's shared Result type.
+        let udp = async {
+            let conn = endpoint
+                .connect(target, server_name)
+                .map_err(|_| std::io::Error::other("udp quic connect setup failed"))?
+                .await
+                .map_err(|_| std::io::Error::other("udp quic handshake failed"))?;
+            Ok::<(Endpoint, Connection), std::io::Error>((endpoint, conn))
+        };
+        let tcp = || async move {
+            let tcp = TcpStream::connect(carrier_endpoint).await?;
+            let stream = connect_cover_tls(&cover_domain, tcp, cover_config)
+                .await
+                .map_err(|_| std::io::Error::other("cover-domain tls handshake failed"))?;
+            // The synthetic quinn peer MUST equal the connect target so quinn
+            // routes the carrier's inbound datagrams to this connection's path.
+            // The carrier TCP socket is not yet bound to the physical link
+            // (no socket_bypass here), matching the single-hop carrier; a
+            // separate change handles the system-VPN bypass.
+            let socket = TcpCarrierSocket::new(stream, target);
+            let carrier_ep = build_carrier_client_endpoint(socket, inner_cfg)
+                .map_err(|_| std::io::Error::other("carrier quic endpoint build failed"))?;
+            let conn = carrier_ep
+                .connect(target, server_name)
+                .map_err(|_| std::io::Error::other("carrier quic connect setup failed"))?
+                .await
+                .map_err(|_| std::io::Error::other("carrier quic handshake failed"))?;
+            Ok::<(Endpoint, Connection), std::io::Error>((carrier_ep, conn))
+        };
+
+        connect_with_fallback(&FallbackPolicy::enabled(), udp, tcp)
+            .await
+            .map_err(|source| MultiHopError::TcpFallback(std::io::Error::other(source)))
     }
 
     /// Build a client session directly on top of an already-established QUIC
@@ -2239,6 +2404,30 @@ pub(crate) fn client_pq_setup_material_for_test(client: &MultiHopClient) -> ([u8
 mod tests {
     use super::*;
 
+    use std::cell::RefCell;
+
+    // Per-test carrier seams read by `super::cover_trust_anchors` /
+    // `super::carrier_cover_endpoint`. Thread-local (not a global) so the
+    // current-thread `#[tokio::test]` runtime that arms them isolates each
+    // test: production never sees them (both seams return `None` off-test).
+    thread_local! {
+        static TEST_COVER_ANCHORS: RefCell<Option<Vec<Vec<u8>>>> = const { RefCell::new(None) };
+        static TEST_CARRIER_ENDPOINT: RefCell<Option<SocketAddr>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn test_cover_trust_anchors() -> Option<Vec<Vec<u8>>> {
+        TEST_COVER_ANCHORS.with(|c| c.borrow().clone())
+    }
+
+    pub(super) fn test_carrier_endpoint() -> Option<SocketAddr> {
+        TEST_CARRIER_ENDPOINT.with(|c| *c.borrow())
+    }
+
+    fn arm_test_carrier(anchors: Vec<Vec<u8>>, endpoint: SocketAddr) {
+        TEST_COVER_ANCHORS.with(|c| *c.borrow_mut() = Some(anchors));
+        TEST_CARRIER_ENDPOINT.with(|c| *c.borrow_mut() = Some(endpoint));
+    }
+
     /// Stand-in for an AEAD authentication failure: any non-replay
     /// session error works, the gate must propagate it untouched.
     fn mock_aead_failure() -> MultiHopError {
@@ -2639,6 +2828,197 @@ mod tests {
             .is_retriable()
         );
         assert!(MultiHopError::Handshake(quinn::ConnectionError::TimedOut).is_retriable());
+        // A failed armed carrier is treated like a handshake failure: a
+        // UDP-hostile network can be transiently TCP-hostile, and the
+        // descriptor/PKI have already verified, so a redial is worthwhile.
+        assert!(MultiHopError::TcpFallback(std::io::Error::other("carrier failed")).is_retriable());
+    }
+
+    /// A minimal descriptor for the arming decision (signature/keys unused by
+    /// `carrier_armed`, which reads only `tcp_fallback` + `cover_domain`).
+    fn armed_probe_descriptor(
+        tcp_fallback: bool,
+        cover_domain: Option<&str>,
+    ) -> RelayDescriptorSigned {
+        RelayDescriptorSigned {
+            relay_id: [0u8; 16],
+            relay_ed25519_pubkey: [0u8; 32],
+            endpoint: "127.0.0.1:1".parse().expect("static addr parses"),
+            cover_domain: cover_domain.map(str::to_owned),
+            tcp_fallback,
+            signature: [0u8; 64],
+        }
+    }
+
+    #[test]
+    fn carrier_armed_requires_both_the_advert_and_a_cover_domain() {
+        assert!(
+            carrier_armed(&armed_probe_descriptor(true, Some("cover.example"))),
+            "advertised carrier + cover domain must arm the carrier"
+        );
+        assert!(
+            !carrier_armed(&armed_probe_descriptor(true, None)),
+            "an RPK relay (no cover domain) must never arm the carrier even with tcp_fallback set"
+        );
+        assert!(
+            !carrier_armed(&armed_probe_descriptor(false, Some("cover.example"))),
+            "a relay that does not advertise the carrier must stay UDP-only"
+        );
+        assert!(
+            !carrier_armed(&armed_probe_descriptor(false, None)),
+            "neither advertised nor cover-capable must stay UDP-only"
+        );
+    }
+
+    /// `(ca_der, leaf_chain_der, leaf_key_pkcs8_der)` for `cover_domain`: a
+    /// throwaway CA and a leaf it signs, so a WebPKI handshake trusting the CA
+    /// validates a server presenting the leaf. Mirrors the relay C2 X.509 test.
+    fn mint_cover_ca_and_leaf(cover_domain: &str) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        let ca_key = KeyPair::generate().expect("ca key");
+        let mut ca_params = CertificateParams::new(Vec::new()).expect("ca params");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).expect("self-signed CA");
+        let leaf_key = KeyPair::generate().expect("leaf key");
+        let leaf_params =
+            CertificateParams::new(vec![cover_domain.to_owned()]).expect("leaf params");
+        let leaf = leaf_params
+            .signed_by(&leaf_key, &ca, &ca_key)
+            .expect("CA-signed leaf");
+        (
+            ca.der().to_vec(),
+            leaf.der().to_vec(),
+            leaf_key.serialize_der(),
+        )
+    }
+
+    /// End-to-end: with the relay's UDP endpoint black-holed, `dial_relay` must
+    /// fall back to the TLS-over-TCP carrier and complete the relay QUIC
+    /// handshake through it. The inner relay QUIC server presents a cover-domain
+    /// X.509 cert on loopback UDP; a TCP terminator fronts it with the outer
+    /// cover-TLS and shuttles de-encapsulated datagrams to it; the descriptor
+    /// arms the carrier and points UDP at a bound-but-silent socket. The
+    /// `#[cfg(test)]` seams trust the throwaway CA on both TLS layers and
+    /// redirect the carrier off `:443` to the loopback terminator (production
+    /// stays on Mozilla roots + `:443`).
+    #[tokio::test]
+    async fn udp_blocked_relay_completes_the_handshake_over_the_tcp_carrier() {
+        use std::net::Ipv4Addr;
+
+        use ed25519_dalek::Signer;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        use tokio::net::{TcpListener, UdpSocket};
+        use warrenguard_multihop::relay_descriptor_signing_payload;
+        use warrenguard_multihop::test_support::{derive_exit_keypair, pubkey_to_bytes};
+        use warrenguard_tcp_fallback::terminate_carrier;
+        use warrenguard_tcp_fallback::tls::cover_tls_acceptor;
+        use warrenguard_transport_core::warren_transport_config_client_multihop_with_gso;
+
+        let cover_domain = "cover.warrenguard.test";
+        let (ca_der, leaf_der, leaf_key_der) = mint_cover_ca_and_leaf(cover_domain);
+        let transport = warren_transport_config_client_multihop_with_gso(false);
+
+        // Inner relay QUIC server (cover-domain X.509) on loopback UDP: the
+        // dispatcher the terminator shuttles to. Applying the same multihop
+        // transport config to both ends keeps the handshake loopback-safe.
+        let inner_chain = vec![CertificateDer::from(leaf_der.clone())];
+        let inner_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key_der.clone()));
+        let mut relay_server_cfg = warrenguard_tls::make_server_config_x509(
+            inner_chain,
+            inner_key,
+            default_crypto_provider(),
+            &[ALPN_H3],
+        )
+        .expect("inner relay x509 server config");
+        relay_server_cfg.transport_config(transport.clone());
+        let relay_ep = Endpoint::server(relay_server_cfg, (Ipv4Addr::LOCALHOST, 0).into())
+            .expect("inner relay quinn server binds");
+        let dispatcher = relay_ep.local_addr().expect("inner relay addr");
+        let accept_ep = relay_ep.clone();
+        let relay_accept = tokio::spawn(async move {
+            if let Some(incoming) = accept_ep.accept().await
+                && let Ok(conn) = incoming.await
+            {
+                conn.closed().await;
+            }
+        });
+
+        // Outer carrier terminator: a cover-TLS acceptor on a loopback TCP port
+        // (the carrier target), shuttling to the inner relay QUIC server.
+        let cover_chain = vec![CertificateDer::from(leaf_der)];
+        let cover_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key_der));
+        let cover_server_cfg = Arc::new(
+            warrenguard_tls::build_server_rustls_config_x509(
+                cover_chain,
+                cover_key,
+                default_crypto_provider(),
+                crate::tcp_fallback::COVER_TCP_ALPN,
+            )
+            .expect("cover-TLS server config"),
+        );
+        let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("carrier TCP listener binds");
+        let carrier_addr = tcp_listener.local_addr().expect("carrier TCP addr");
+        let term_task = tokio::spawn(async move {
+            if let Ok((tcp, _peer)) = tcp_listener.accept().await
+                && let Ok(tls) = cover_tls_acceptor(cover_server_cfg).accept(tcp).await
+            {
+                let _ = terminate_carrier(tls, dispatcher).await;
+            }
+        });
+
+        // A bound-but-silent UDP socket: the descriptor's UDP endpoint. Nothing
+        // ever answers, so the UDP handshake times out and the carrier takes
+        // over (deterministic, unlike a closed port's OS-dependent ICMP).
+        let dead_udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("silent UDP socket binds");
+        let dead_addr = dead_udp.local_addr().expect("silent UDP addr");
+
+        arm_test_carrier(vec![ca_der], carrier_addr);
+
+        let operational = SigningKey::from_bytes(&[0x42; 32]);
+        let relay_id = [0xAB; 16];
+        // Only feeds the in-band relay-auth proof, which `connect` defers to the
+        // first setup exchange (not reached here); the descriptor signature is
+        // over relay_id + relay_ed25519_pubkey.
+        let relay_pubkey = [0x11u8; 32];
+        let signature = operational
+            .sign(&relay_descriptor_signing_payload(&relay_id, &relay_pubkey))
+            .to_bytes();
+        let relay = RelayDescriptorSigned {
+            relay_id,
+            relay_ed25519_pubkey: relay_pubkey,
+            endpoint: dead_addr,
+            cover_domain: Some(cover_domain.to_owned()),
+            tcp_fallback: true,
+            signature,
+        };
+
+        let (_exit_priv, exit_pub) = derive_exit_keypair(&[0x99; 32]);
+        let exit_x25519 = pubkey_to_bytes(&exit_pub);
+        let client_signing = SigningKey::from_bytes(&[0x88; 32]);
+
+        let client = MultiHopClient::connect_with_transport_config(
+            &relay,
+            ExitId::from_bytes([0u8; 16]),
+            &exit_x25519,
+            &operational.verifying_key(),
+            &client_signing,
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            transport,
+            None,
+        )
+        .await
+        .expect("carrier must complete the relay QUIC handshake when UDP is black-holed");
+
+        // Holding the client proves a live connection came back over the
+        // carrier; drop it and the sockets/tasks after the assertion.
+        drop(client);
+        drop(dead_udp);
+        relay_accept.abort();
+        term_task.abort();
     }
 
     #[tokio::test]
