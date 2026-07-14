@@ -22,7 +22,9 @@ use warrenguard_multihop::{
     encode_frame, relay_descriptor_signing_payload, test_support::derive_exit_keypair,
 };
 #[cfg(feature = "pq-hpke")]
-use warrenguard_multihop::{PqExitSession, XWingRecipientSecretKey};
+use warrenguard_multihop::{
+    PqExitSession, XWingRecipientSecretKey, decode_frame_v2, encode_frame_v2,
+};
 use warrenguard_wire::WarrenPubkey;
 
 #[cfg(feature = "pq-hpke")]
@@ -186,6 +188,55 @@ impl LoopbackMultiHopPq {
         self.exit_session =
             PqExitSession::new(&self.exit_secret, &encapsulated_key, &pq_ct, self.exit_id)
                 .expect("pq exit-side session rebuild after rekey");
+    }
+
+    /// Spawns a task that answers exactly one `setup_over_stream` round trip
+    /// on `exit_conn`: establishes the exit-side PQ session from the request
+    /// frame's `(encapsulated_key, pq_ct)` and replies with a trivial
+    /// `IpAssign`. For a test that needs epoch 0 to go through the real
+    /// reliable-stream admission path instead of being pre-seeded via
+    /// `client_pq_setup_material_for_test`.
+    pub(crate) fn spawn_setup_stream_server(&self) -> tokio::task::JoinHandle<()> {
+        let exit_conn = self.exit_conn.clone();
+        let exit_id = self.exit_id;
+        tokio::spawn(async move {
+            let (mut send, mut recv) = exit_conn.accept_bi().await.expect("accept_bi");
+            let bytes = recv
+                .read_to_end(crate::multihop::MAX_MULTIHOP_SETUP_FRAME_BYTES)
+                .await
+                .expect("read request");
+            let frame = decode_frame_v2(&bytes).expect("decode v2 setup frame");
+            // Same fixed seed `spawn_loopback_multihop_pq` derives its exit
+            // secret from: deterministic, so re-deriving here (rather than
+            // moving or cloning `self.exit_secret`, which does not
+            // implement `Clone` by design as a zeroize-on-drop secret)
+            // yields the identical key.
+            let (exit_secret, _exit_pub) = XWingRecipientSecretKey::derive_deterministic(
+                &[0xA1; 32],
+                &[0xA2; 32],
+                &[0xA3; 32],
+            );
+            let exit_session =
+                PqExitSession::new(&exit_secret, &frame.encapsulated_key, &frame.pq_ct, exit_id)
+                    .expect("exit establishes the pq session from the setup frame");
+            let _plaintext = exit_session.open(&frame).expect("exit opens setup frame");
+            let reply_msg = WarrenControlMessage::IpAssign {
+                ipv4: [10, 88, 0, 2],
+                prefix_len: 24,
+                gateway_ipv4: [10, 88, 0, 1],
+                ipv6: None,
+                prefix_len_v6: 0,
+                gateway_ipv6: None,
+                daita_spec: None,
+            };
+            let reply_plaintext = encode_control(&reply_msg).expect("encode reply");
+            let reply_frame = exit_session
+                .seal_response(&reply_plaintext, frame.epoch, frame.seq)
+                .expect("seal reply");
+            let reply_wire = encode_frame_v2(&reply_frame).expect("encode reply frame");
+            send.write_all(&reply_wire).await.expect("write reply");
+            let _ = send.finish();
+        })
     }
 }
 

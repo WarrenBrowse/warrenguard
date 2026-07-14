@@ -96,6 +96,9 @@ jobs:
       # the workspace run above does not enable, so the golden KATs would never
       # execute in CI (clippy only lints them). Run them explicitly.
       - run: cargo nextest run --locked -p warrenguard-multihop --features pq-hpke --retries 2
+      # Same reasoning for the PQ multihop client datapath (rekey / resend-until-ack
+      # state machine, epoch bootstrap ping): otherwise only clippy ever sees it.
+      - run: cargo nextest run --locked -p warrenguard-transport --features pq-hpke --retries 2
 
   audit:
     name: cargo audit

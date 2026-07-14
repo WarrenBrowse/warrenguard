@@ -93,9 +93,15 @@ fn zero_key_array(buf: &mut [u8; PER_PACKET_KEY_LEN]) {
 }
 
 /// Retained previous-epoch X-Wing secret for the rekey overlap window (mirror
-/// of the classical `PendingOldEpoch`).
+/// of the classical `PendingOldEpoch`). Keeps `encapsulated_key` alongside
+/// `ss` so [`PqClientSession::seal_pending_old_epoch`] can stamp a DATA frame
+/// with the OLD epoch's `ct_X`: the exit's session cache is keyed by
+/// `encapsulated_key`, so a frame sealed under the new epoch's key would miss
+/// the old, already-established cache entry even if the AAD/key derivation
+/// used the right shared secret.
 struct PqPendingOldEpoch {
     ss: XWingSharedSecret,
+    encapsulated_key: [u8; 32],
     epoch: u32,
 }
 
@@ -216,11 +222,13 @@ impl PqClientSession {
         let new_pq_ct = ct.mlkem_ct().to_vec();
 
         let old_ss = std::mem::replace(&mut self.ss, ss);
+        let old_encapsulated_key =
+            std::mem::replace(&mut self.encapsulated_key, new_encapsulated_key);
         self.pending_old_epoch = Some(PqPendingOldEpoch {
             ss: old_ss,
+            encapsulated_key: old_encapsulated_key,
             epoch: self.epoch,
         });
-        self.encapsulated_key = new_encapsulated_key;
         self.pq_ct = new_pq_ct.clone();
         self.epoch = next_epoch;
         Ok((new_encapsulated_key, new_pq_ct))
@@ -281,9 +289,69 @@ impl PqClientSession {
         seq: u64,
         pq_ct: Vec<u8>,
     ) -> Result<WarrenMultihopFrameV2, MultihopError> {
+        Self::seal_with(
+            &self.ss,
+            self.encapsulated_key,
+            &self.exit_id,
+            payload,
+            epoch,
+            seq,
+            pq_ct,
+        )
+    }
+
+    /// Seal a DATA frame under the RETAINED previous epoch while a rekey's new
+    /// epoch is still unacked at the exit. The exit already established this
+    /// old epoch (it is what accepted the pre-rekey traffic), so a full-size
+    /// uplink packet keeps flowing there during the rekey overlap window
+    /// instead of being oversized with `pq_ct`: the new epoch bootstraps on
+    /// its own dedicated small setup frame instead (see
+    /// [`Self::seal_setup`]). Mirrors [`Self::seal`] (no `pq_ct`), but under
+    /// the pending epoch's shared secret and `encapsulated_key` rather than
+    /// the current one, so the frame lands in the exit's cache entry for the
+    /// OLD epoch rather than missing (or worse, colliding with) the NEW one.
+    ///
+    /// # Errors
+    ///
+    /// [`MultihopError::RekeyFailed`] if there is no pending old epoch. The
+    /// caller must check [`Self::has_pending_old_epoch`] first (under the
+    /// same session lock as the seal, so this should never fire in practice).
+    /// [`MultihopError::PqAead`] if the AEAD seal fails.
+    pub fn seal_pending_old_epoch(
+        &self,
+        payload: &[u8],
+        seq: u64,
+    ) -> Result<WarrenMultihopFrameV2, MultihopError> {
+        let pending = self
+            .pending_old_epoch
+            .as_ref()
+            .ok_or(MultihopError::RekeyFailed(
+                "no pending old epoch to seal a DATA frame under",
+            ))?;
+        Self::seal_with(
+            &pending.ss,
+            pending.encapsulated_key,
+            &self.exit_id,
+            payload,
+            pending.epoch,
+            seq,
+            Vec::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn seal_with(
+        ss: &XWingSharedSecret,
+        encapsulated_key: [u8; 32],
+        exit_id: &ExitId,
+        payload: &[u8],
+        epoch: u32,
+        seq: u64,
+        pq_ct: Vec<u8>,
+    ) -> Result<WarrenMultihopFrameV2, MultihopError> {
         let mut key = [0u8; PER_PACKET_KEY_LEN];
-        derive_per_packet_key(&self.ss, &pq_export_info(epoch, seq), &mut key);
-        let aad = pq_compose_aad(&self.exit_id, epoch, seq);
+        derive_per_packet_key(ss, &pq_export_info(epoch, seq), &mut key);
+        let aad = pq_compose_aad(exit_id, epoch, seq);
 
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
         let nonce = Nonce::from_slice(&NONCE_ZERO_12);
@@ -296,10 +364,10 @@ impl PqClientSession {
         tag_arr.copy_from_slice(tag.as_slice());
         Ok(WarrenMultihopFrameV2 {
             version: WARREN_HPKE_VERSION_V2,
-            exit_id: self.exit_id,
+            exit_id: *exit_id,
             epoch,
             seq,
-            encapsulated_key: self.encapsulated_key,
+            encapsulated_key,
             pq_ct,
             aead_tag: tag_arr,
             ciphertext: buf,
@@ -578,5 +646,48 @@ mod tests {
             client.open_response(&old_reply),
             Err(MultihopError::PqAead)
         ));
+    }
+
+    #[test]
+    fn seal_pending_old_epoch_before_any_rekey_errors() {
+        let (client, _exit) = pair();
+        assert!(matches!(
+            client.seal_pending_old_epoch(b"data", 0),
+            Err(MultihopError::RekeyFailed(_))
+        ));
+    }
+
+    #[test]
+    fn seal_pending_old_epoch_opens_at_the_still_established_old_exit_session() {
+        let (sk, pk) =
+            XWingRecipientSecretKey::derive_deterministic(&[4u8; 32], &[5u8; 32], &[6u8; 32]);
+        let exit_id = ExitId::from_bytes([0x5b; 16]);
+        let mut rng = ChaCha20Rng::seed_from_u64(11);
+        let mut client = PqClientSession::new(&pk, exit_id, &mut rng).expect("client");
+
+        // The exit-side session for the OLD (epoch 0) session, exactly as a
+        // real exit would have cached it from the initial setup frame.
+        let old_exit = PqExitSession::new(&sk, &client.encapsulated_key(), client.pq_ct(), exit_id)
+            .expect("old exit session");
+
+        client.rekey(&pk, &mut rng).expect("rekey");
+        assert_eq!(client.epoch(), 1);
+
+        // A DATA frame sealed under the pending old epoch must carry no
+        // pq_ct (never oversized) and must still open at the OLD exit
+        // session: the new epoch has not been bootstrapped at the exit yet,
+        // but the old one is still live for the doctrine overlap window.
+        let frame = client
+            .seal_pending_old_epoch(b"full-size uplink", 7)
+            .expect("seal under pending old epoch");
+        assert_eq!(frame.epoch, 0, "must stamp the OLD epoch, not the new one");
+        assert!(
+            frame.pq_ct.is_empty(),
+            "a DATA frame must never carry pq_ct, old epoch or new"
+        );
+        assert_eq!(
+            old_exit.open(&frame).expect("old exit session opens it"),
+            b"full-size uplink"
+        );
     }
 }
