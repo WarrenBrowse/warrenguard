@@ -37,7 +37,6 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use parking_lot::{Mutex, RwLock};
 use quinn::{Connection, Endpoint, TransportConfig};
 use thiserror::Error;
-use tokio::net::TcpStream;
 use warrenguard_backoff::Backoff;
 use warrenguard_config::ALPN_H3;
 use warrenguard_multihop::{
@@ -62,7 +61,7 @@ use warrenguard_tls::{
     make_client_config_webpki, mozilla_root_store, verify_relay_auth,
 };
 
-use crate::tcp_fallback::{COVER_TCP_PORT, build_cover_client_config};
+use crate::tcp_fallback::{COVER_TCP_PORT, build_cover_client_config, connect_tcp_carrier};
 use warrenguard_transport_core::{
     warren_transport_config_client_multihop_with_gso, warren_transport_config_client_with_gso,
 };
@@ -995,7 +994,14 @@ impl MultiHopClient {
         // the connection.
         let (endpoint, conn) = match carrier_client_cfg {
             Some(inner_cfg) => {
-                Self::dial_relay_with_carrier(relay, endpoint, &server_name, inner_cfg).await?
+                Self::dial_relay_with_carrier(
+                    relay,
+                    endpoint,
+                    &server_name,
+                    inner_cfg,
+                    socket_bypass,
+                )
+                .await?
             }
             None => {
                 let conn = endpoint
@@ -1040,6 +1046,10 @@ impl MultiHopClient {
         endpoint: Endpoint,
         server_name: &str,
         inner_cfg: quinn::ClientConfig,
+        // Same bypass as the UDP endpoint: when `Some`, the carrier's TCP socket
+        // is pinned to the physical link before connect (system-VPN Port Fail
+        // fix); `None` keeps the plain connect (userland proxy).
+        socket_bypass: Option<SocketBypass>,
     ) -> Result<(Endpoint, Connection), MultiHopError> {
         // The synthetic quinn peer and both dials target the relay's advertised
         // QUIC endpoint; only the socket beneath differs between the arms.
@@ -1071,15 +1081,16 @@ impl MultiHopClient {
             Ok::<(Endpoint, Connection), std::io::Error>((endpoint, conn))
         };
         let tcp = || async move {
-            let tcp = TcpStream::connect(carrier_endpoint).await?;
+            // Under a full-tunnel system VPN the carrier's TCP socket must be
+            // pinned to the physical link (like the UDP endpoint), or it loops
+            // into the TUN. With no bypass (userland proxy) this is the plain
+            // connect, verbatim.
+            let tcp = connect_tcp_carrier(carrier_endpoint, socket_bypass).await?;
             let stream = connect_cover_tls(&cover_domain, tcp, cover_config)
                 .await
                 .map_err(|_| std::io::Error::other("cover-domain tls handshake failed"))?;
             // The synthetic quinn peer MUST equal the connect target so quinn
             // routes the carrier's inbound datagrams to this connection's path.
-            // The carrier TCP socket is not yet bound to the physical link
-            // (no socket_bypass here), matching the single-hop carrier; a
-            // separate change handles the system-VPN bypass.
             let socket = TcpCarrierSocket::new(stream, target);
             let carrier_ep = build_carrier_client_endpoint(socket, inner_cfg)
                 .map_err(|_| std::io::Error::other("carrier quic endpoint build failed"))?;

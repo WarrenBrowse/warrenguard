@@ -18,6 +18,12 @@ publish.workspace = true
 # The pure `SocketBypass` policy type (which mark / which interface index).
 warrenguard-tun-core = { path = "../warrenguard-tun-core" }
 
+# `apply_pre_connect` scopes a not-yet-connected socket (the TLS-over-TCP
+# carrier): `std::net` offers no way to set a sockopt before connect, so the
+# caller builds a `socket2::Socket`, we bind it, and it is then converted to a
+# real stream and connected. Public in the API, so a normal dependency.
+socket2 = { workspace = true }
+
 # Raw setsockopt on Unix (SO_MARK on Linux, IP_BOUND_IF/IPV6_BOUND_IF on macOS).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

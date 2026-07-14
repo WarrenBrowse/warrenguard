@@ -23,7 +23,6 @@ use warrenguard_wire::{
 };
 use zeroize::Zeroize;
 
-use tokio::net::TcpStream;
 use warrenguard_tcp_fallback::tls::connect_cover_tls;
 use warrenguard_tcp_fallback::{
     FallbackPolicy, TcpCarrierSocket, build_carrier_client_endpoint, connect_with_fallback,
@@ -720,7 +719,10 @@ impl ClientTunnel {
         server_name: &str,
         cover: CoverTls<'_>,
     ) -> std::io::Result<(Endpoint, Connection)> {
-        let tcp = TcpStream::connect(cover.addr).await?;
+        // Under a full-tunnel system VPN the carrier's TCP socket must be pinned
+        // to the physical link (like the UDP endpoint), or it loops into the TUN.
+        // With no bypass (userland proxy) this is the plain connect, verbatim.
+        let tcp = crate::tcp_fallback::connect_tcp_carrier(cover.addr, self.socket_bypass).await?;
         let stream = connect_cover_tls(cover.domain, tcp, cover.client_config)
             .await
             .map_err(|_| std::io::Error::other("cover-domain tls handshake failed"))?;

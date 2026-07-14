@@ -3621,6 +3621,7 @@ name = "warrenguard-socket-bypass"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "socket2",
  "warrenguard-tun-core",
  "windows-sys 0.59.0",
 ]
@@ -3690,6 +3691,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "ed25519-dalek",
+ "libc",
  "nix 0.31.3",
  "parking_lot",
  "postcard",
@@ -3697,6 +3699,7 @@ dependencies = [
  "rand_core 0.9.5",
  "rcgen",
  "rustls",
+ "socket2",
  "thiserror",
  "tokio",
  "tracing",

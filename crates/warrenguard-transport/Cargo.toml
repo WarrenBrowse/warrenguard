@@ -32,6 +32,11 @@ warrenguard-socket-bypass = { path = "../warrenguard-socket-bypass" }
 # UDP-hostile network. Plugs in at the quinn abstract-socket seam only; the QUIC
 # engine, HPKE and obfuscation configs are untouched.
 warrenguard-tcp-fallback = { path = "../warrenguard-tcp-fallback" }
+# Raw socket construction for the TLS-over-TCP carrier's pre-connect bypass:
+# under a full-tunnel system VPN the carrier's TCP socket must be marked/bound to
+# the physical link BEFORE connect (via `warrenguard-socket-bypass`), which
+# `TcpStream::connect` gives no seam for. Already transitive via tokio/quinn.
+socket2 = { workspace = true }
 # Privileged system-VPN routing (default-route split): the reassign loop
 # installs the Linux v6 split route via `DefaultRouteSplitV6Guard`. Optional +
 # feature-gated so the userland SDK (which consumes this crate for the session
@@ -63,6 +68,11 @@ rand_core = { version = "0.9", default-features = false, features = ["os_rng"] }
 [target.'cfg(target_os = "android")'.dependencies]
 nix = { version = "0.31", features = ["fs"] }
 
+# Unix: name `EINPROGRESS` to recognise a non-blocking connect that has merely
+# not completed yet (vs a real failure) on the carrier's pre-connect bypass path.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # Enable Quinn's Apple fast UDP datapath (sendmsg_x/recvmsg_x batch syscalls) on
 # macOS only. quinn-udp resolves to the warren-quinn fork via the workspace
 # git-dep (package = "warren-quinn-udp"). NEVER enable on iOS.
@@ -84,6 +94,11 @@ tokio = { workspace = true, features = ["test-util"] }
 ed25519-dalek = { workspace = true }
 # Self-signed cover certificate for the carrier end-to-end test.
 rcgen = { workspace = true }
+
+# Resolve the loopback interface index (safe wrapper, no `unsafe`, which this
+# crate forbids) to drive the real IP_BOUND_IF carrier-bypass dial test on macOS.
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.31", features = ["net"] }
 
 [lints]
 workspace = true

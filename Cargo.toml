@@ -47,6 +47,12 @@ tokio-util = "0.7"
 # Cross-OS TUN. `async_tokio` exposes the `dev.recv().await` API.
 tun-rs = { version = "2.8", features = ["async_tokio"] }
 
+# Raw socket construction for the pre-connect bypass: the TLS-over-TCP carrier
+# must set its per-OS SO_MARK / IP_BOUND_IF / IP_UNICAST_IF BEFORE connect, which
+# `std::net::TcpStream::connect` gives no seam for. Already transitive via
+# tokio/quinn, pinned here so the socket-bypass and transport crates share it.
+socket2 = "0.6"
+
 # Crypto / identity
 ed25519-dalek = { version = "2", features = ["zeroize", "rand_core"] }
 hkdf = "0.12"
