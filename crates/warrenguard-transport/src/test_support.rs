@@ -418,6 +418,7 @@ pub(crate) fn spawn_fake_multihop_exit(
         relay_ed25519_pubkey: relay_pubkey,
         endpoint: addr,
         cover_domain: None,
+        tcp_fallback: false,
         signature,
     });
 

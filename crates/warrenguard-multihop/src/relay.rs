@@ -47,10 +47,10 @@
 //! `WARREN_PKI_OPERATIONAL_RELAY_V1 || relay_id (16 B) || relay_ed25519_pubkey (32 B)`.
 //! Total length 42 + 16 + 32 = 90 bytes. This constant tuple is frozen for
 //! all `/v1` deployments. Any breaking change must bump to `/v2`
-//! (CLAUDE.md § 3). The `cover_domain` field is additive and
-//! UNSIGNED, so it does not alter this payload: a descriptor with or without
-//! it verifies under the same `/v1` signature, and an RPK descriptor
-//! (cover_domain absent) round-trips byte-for-byte.
+//! (CLAUDE.md § 3). The `cover_domain` and `tcp_fallback` fields are additive
+//! and UNSIGNED, so they do not alter this payload: a descriptor with or
+//! without them verifies under the same `/v1` signature, and a legacy
+//! descriptor (both absent/false) round-trips byte-for-byte.
 
 use std::net::SocketAddr;
 
@@ -96,10 +96,28 @@ pub struct RelayDescriptorSigned {
     /// (RPK) descriptor round-trips byte-for-byte.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cover_domain: Option<String>,
+    /// True when this relay terminates the TLS-over-TCP fallback carrier on
+    /// `:443/tcp` (the anti-censorship datapath for a client whose outbound
+    /// UDP/QUIC is blocked). The client reads it to decide whether a UDP
+    /// handshake timeout against this relay is worth retrying over TCP; a relay
+    /// that does not advertise it is dialed over UDP only, so no pointless TCP
+    /// attempt is made. Outside the signature on purpose, exactly like
+    /// `endpoint` and `cover_domain`: flipping it cannot admit a foreign relay
+    /// (the RPK pin or the in-band relay-auth proof binds identity), so it needs
+    /// no operational re-sign and warren-api may overlay it from the node
+    /// heartbeat. `skip_serializing_if` keeps a non-carrier descriptor
+    /// byte-for-byte the legacy `/v1` shape.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tcp_fallback: bool,
     /// Ed25519 signature over the canonical payload produced by
     /// [`relay_descriptor_signing_payload`].
     #[serde(with = "hex_array_64")]
     pub signature: [u8; 64],
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Errors raised by [`verify_relay_descriptor`].
@@ -281,6 +299,7 @@ mod tests {
             relay_ed25519_pubkey: relay_pubkey,
             endpoint: "192.0.2.10:443".parse().expect("static addr parses"),
             cover_domain: None,
+            tcp_fallback: false,
             signature: sig.to_bytes(),
         };
         verify_relay_descriptor(&op.verifying_key(), &descriptor)
@@ -300,6 +319,7 @@ mod tests {
             relay_ed25519_pubkey: relay_pubkey,
             endpoint: "192.0.2.10:443".parse().expect("static addr parses"),
             cover_domain: None,
+            tcp_fallback: false,
             signature: sig.to_bytes(),
         };
         let err = verify_relay_descriptor(&other.verifying_key(), &descriptor)
@@ -326,6 +346,7 @@ mod tests {
             relay_ed25519_pubkey: relay_pubkey,
             endpoint: "192.0.2.10:443".parse().expect("static addr parses"),
             cover_domain: None,
+            tcp_fallback: false,
             signature: sig.to_bytes(),
         };
         for cover in [
@@ -353,6 +374,7 @@ mod tests {
             relay_ed25519_pubkey: [0x22; 32],
             endpoint: "192.0.2.10:443".parse().expect("static addr parses"),
             cover_domain: None,
+            tcp_fallback: false,
             signature: [0x33; 64],
         };
         let json = serde_json::to_string(&descriptor).expect("serialize");
@@ -371,12 +393,88 @@ mod tests {
             relay_ed25519_pubkey: [0x22; 32],
             endpoint: "192.0.2.10:443".parse().expect("static addr parses"),
             cover_domain: Some("nl1.edge.example.com".to_owned()),
+            tcp_fallback: false,
             signature: [0x33; 64],
         };
         let json = serde_json::to_string(&descriptor).expect("serialize");
         assert!(json.contains("nl1.edge.example.com"));
         let back: RelayDescriptorSigned = serde_json::from_str(&json).expect("round-trip");
         assert_eq!(back.cover_domain.as_deref(), Some("nl1.edge.example.com"));
+    }
+
+    // --- tcp_fallback is additive + unsigned (mirror of cover_domain) ---
+
+    #[test]
+    fn signature_verifies_regardless_of_tcp_fallback_value() {
+        // tcp_fallback is OUTSIDE the signed payload, so the SAME operational
+        // signature must verify whether the field is false or true. This pins
+        // the "unsigned advisory" contract: warren-api can overlay the carrier
+        // capability from the node heartbeat without re-signing the pool, and a
+        // hostile relay flipping the bit cannot invalidate the signature (the
+        // RPK pin / in-band relay-auth proof binds identity, not this flag).
+        let op = det_signing_key(0x33);
+        let relay_id = [0x77; 16];
+        let relay_pubkey = [0xAA; 32];
+        let sig = op.sign(&relay_descriptor_signing_payload(&relay_id, &relay_pubkey));
+        let base = RelayDescriptorSigned {
+            relay_id,
+            relay_ed25519_pubkey: relay_pubkey,
+            endpoint: "192.0.2.10:443".parse().expect("static addr parses"),
+            cover_domain: None,
+            tcp_fallback: false,
+            signature: sig.to_bytes(),
+        };
+        for tcp_fallback in [false, true] {
+            let descriptor = RelayDescriptorSigned {
+                tcp_fallback,
+                ..base.clone()
+            };
+            verify_relay_descriptor(&op.verifying_key(), &descriptor).unwrap_or_else(|_| {
+                panic!("the /v1 signature must verify for tcp_fallback = {tcp_fallback}")
+            });
+        }
+    }
+
+    #[test]
+    fn legacy_descriptor_omits_tcp_fallback_in_serialized_form() {
+        // Backward-compat: a non-carrier (tcp_fallback = false) descriptor must
+        // serialize WITHOUT a tcp_fallback key, so existing directories round-trip
+        // byte-for-byte and the server-envelope signature over them is unchanged.
+        let descriptor = RelayDescriptorSigned {
+            relay_id: [0x11; 16],
+            relay_ed25519_pubkey: [0x22; 32],
+            endpoint: "192.0.2.10:443".parse().expect("static addr parses"),
+            cover_domain: None,
+            tcp_fallback: false,
+            signature: [0x33; 64],
+        };
+        let json = serde_json::to_string(&descriptor).expect("serialize");
+        assert!(
+            !json.contains("tcp_fallback"),
+            "a non-carrier descriptor must omit tcp_fallback entirely, got: {json}"
+        );
+        let back: RelayDescriptorSigned = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(back, descriptor);
+    }
+
+    #[test]
+    fn carrier_descriptor_round_trips_tcp_fallback_true() {
+        let descriptor = RelayDescriptorSigned {
+            relay_id: [0x11; 16],
+            relay_ed25519_pubkey: [0x22; 32],
+            endpoint: "192.0.2.10:443".parse().expect("static addr parses"),
+            cover_domain: Some("nl1.edge.example.com".to_owned()),
+            tcp_fallback: true,
+            signature: [0x33; 64],
+        };
+        let json = serde_json::to_string(&descriptor).expect("serialize");
+        assert!(
+            json.contains("\"tcp_fallback\":true"),
+            "a carrier descriptor must serialize tcp_fallback=true, got: {json}"
+        );
+        let back: RelayDescriptorSigned = serde_json::from_str(&json).expect("round-trip");
+        assert!(back.tcp_fallback);
+        assert_eq!(back, descriptor);
     }
 
     // --- in-band relay-auth proof framing ---

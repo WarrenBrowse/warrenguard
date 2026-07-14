@@ -32,6 +32,7 @@ fn signed_descriptor(
         relay_ed25519_pubkey: relay_pubkey,
         endpoint: endpoint.parse().expect("static addr parses"),
         cover_domain: None,
+        tcp_fallback: false,
         signature: sig.to_bytes(),
     }
 }

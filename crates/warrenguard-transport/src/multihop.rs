@@ -2659,6 +2659,7 @@ mod tests {
             relay_ed25519_pubkey: [0u8; 32],
             endpoint: "127.0.0.1:1".parse().expect("static addr parses"),
             cover_domain: None,
+            tcp_fallback: false,
             signature: [0u8; 64],
         };
 
