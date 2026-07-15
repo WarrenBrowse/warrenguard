@@ -14,8 +14,7 @@
 //! capability in its signed descriptor (`WarrenExitAddr::tcp_fallback`), and it
 //! carries a cover domain to present as the SNI. A non-capable exit is never
 //! dialled over TCP: it would only refuse the connection, so probing it is
-//! pointless. This mirrors the SDK reference (`warren-transport::tcp_fallback`)
-//! and is the engine home both the app and the SDK inherit.
+//! pointless.
 
 use std::io;
 use std::net::SocketAddr;

@@ -21,12 +21,17 @@ and used with a fixed all-zero `ChaCha20Poly1305` nonce. The pattern is
 unreliable-transport-friendly (QUIC datagram reorder / drop tolerant)
 and mirrors how QUIC itself derives per-packet keys internally.
 
-## Frozen `/v1` contract
+## Frozen `/v1` contract, the `/v2` hybrid suite, and the control layer
 
 All `WARREN_*_V1` constants and the wire layout of `WarrenMultihopFrame`
-are immutable. Any breaking change must bump to `/v2`. The frozen test
-vectors in `tests/hpke_vectors_v1.rs` (and the binary fixture
-`tests/hpke_vector_max_ciphertext.bin`) detect any drift.
+are immutable. The frozen test vectors in `tests/hpke_vectors_v1.rs` (and
+the binary fixture `tests/hpke_vector_max_ciphertext.bin`) detect any
+drift. Breaking changes rotate the version instead of mutating `/v1`:
+the post-quantum `/v2` suite (X-Wing hybrid KEM, `wire_format_v2` /
+`pq_session`, gated behind the `pq-hpke` feature) already coexists with
+`/v1` this way, negotiated per session and pinned by its own vectors.
+The control-message codec on top has its own version line (currently
+v3, DAITA echo) pinned by `vectors/control.json`.
 
 Regenerate the vectors with:
 
