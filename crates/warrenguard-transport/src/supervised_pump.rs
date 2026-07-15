@@ -1493,6 +1493,40 @@ mod live_pump_tests {
     }
 
     #[tokio::test]
+    async fn dead_datapath_escalation_judges_real_downlink_not_quinn_frames() {
+        let pair = spawn_loopback_multihop(ExitId::from_bytes([0x24; 16])).await;
+        let bundle = MultiHopBundle::new(vec![pair.client.clone()]);
+        let (tx, rx) = tokio::sync::watch::channel(Some(bundle.clone()));
+        let tun = warrenguard_transport_core::FakeTun::new();
+        let task = tokio::spawn(run_downlink(rx, tun.clone(), None));
+
+        // The incident shape: a dead uplink under an armed exit still
+        // RECEIVES dummies, so quinn's datagram counter climbs on a session
+        // that carried zero real downlink. If the escalation judged that
+        // counter it would reset on every close and the "datapath dead"
+        // fatal could never fire.
+        exit_send_datagram(&pair, 0, vec![0xFF; 64]).await;
+        tokio::time::sleep(ABSENCE_WINDOW).await;
+        let quinn_frames: u64 = bundle
+            .clients()
+            .iter()
+            .map(|c| c.quinn_stats().frame_rx.datagram)
+            .sum();
+        assert!(
+            quinn_frames > 0,
+            "the dummy must be visible to quinn (that is the trap)"
+        );
+        assert_eq!(
+            crate::supervisor::session_escalation_downlink(&bundle),
+            0,
+            "a dummy-only session must count as a zero-downlink dead window"
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+    }
+
+    #[tokio::test]
     async fn real_uplink_accounting_counts_sends_but_never_padding() {
         let pair = spawn_loopback_multihop(ExitId::from_bytes([0x23; 16])).await;
         let bundle = MultiHopBundle::new(vec![pair.client.clone()]);

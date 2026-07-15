@@ -486,6 +486,15 @@ struct DeadPathEscalation {
     consecutive: u32,
 }
 
+/// Downlink volume a closing session is judged on by the dead-datapath
+/// escalation. Sampled from the bundle's real-traffic accounting, NEVER from
+/// quinn frame counters: an armed exit's DAITA dummies advance
+/// `frame_rx.datagram` on a fully dead tunnel, which would reset the
+/// escalation on every close and permanently suppress the fatal.
+pub(crate) fn session_escalation_downlink(bundle: &MultiHopBundle) -> u64 {
+    bundle.real_traffic_totals().1
+}
+
 impl DeadPathEscalation {
     /// Record a session close. `watchdog_forced` is true when a dead-path
     /// watch (RX silence, one-way app traffic, uplink loss) forced the
@@ -837,12 +846,8 @@ impl MultiHopSupervisor {
                 // zero application downlink AND that a watchdog had to kill is
                 // one dead window; enough of them in a row must become visible
                 // to the user instead of an endless silent redial loop.
-                let session_downlink_frames: u64 = bundle
-                    .clients()
-                    .iter()
-                    .map(|c| c.quinn_stats().frame_rx.datagram)
-                    .sum();
-                if dead_path_escalation.record_close(watchdog_forced, session_downlink_frames) {
+                let session_downlink = session_escalation_downlink(&bundle);
+                if dead_path_escalation.record_close(watchdog_forced, session_downlink) {
                     let _ = self.datapath_dead_tx.send(true);
                     tracing::error!(
                         consecutive = DATAPATH_DEAD_FATAL_REDIALS,
