@@ -27,7 +27,7 @@ use parking_lot::{Mutex as PlMutex, RwLock};
 
 use quinn::Connection;
 use tokio::sync::{mpsc, watch};
-use warrenguard_multihop::RejectionReason;
+use warrenguard_multihop::{MULTIHOP_FRAME_MAX_OVERHEAD, RejectionReason};
 
 use crate::multihop::{MultiHopClient, MultiHopError};
 
@@ -325,6 +325,24 @@ impl MultiHopBundle {
             .iter()
             .filter_map(|c| c.max_datagram_size())
             .min()
+    }
+
+    /// Most conservative inner-packet budget across the bonded sessions:
+    /// the largest inner IP packet every session can currently carry in
+    /// one datagram (path budget minus that session's frame overhead).
+    /// This is the live "effective inner MTU" of the tunnel; when it
+    /// drops below the TUN MTU the pumps clamp TCP MSS and reflect
+    /// PMTUD so the datapath keeps flowing on reduced-MTU underlays.
+    #[must_use]
+    pub fn max_inner_payload(&self) -> usize {
+        self.clients
+            .read()
+            .iter()
+            .map(|c| c.max_inner_payload())
+            .min()
+            .unwrap_or(
+                usize::from(warrenguard_config::TUNNEL_MIN_MTU) - MULTIHOP_FRAME_MAX_OVERHEAD,
+            )
     }
 
     /// Primary session's Quinn stats (bench scraping; per-session stats

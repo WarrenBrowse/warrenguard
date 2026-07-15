@@ -29,11 +29,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use parking_lot::Mutex as PlMutex;
+use warrenguard_config::{TUNNEL_GATEWAY_IP, TUNNEL_GATEWAY_IPV6};
 use warrenguard_daita::DaitaState;
 use warrenguard_multihop::WarrenControlMessage;
-use warrenguard_pump::{TunIoTolerance, is_daita_dummy};
-use warrenguard_transport_core::PacketDevice;
+use warrenguard_pump::{TunIoTolerance, is_daita_dummy, record_uplink_too_large_drop};
+use warrenguard_transport_core::{PacketDevice, build_frag_needed, clamp_syn_mss, is_tcp_syn};
 
+use crate::bundle::MultiHopBundle;
 use crate::multihop::MultiHopError;
 use crate::supervisor::ClientWatch;
 
@@ -384,6 +386,36 @@ pub async fn run_reassign_loop<T: ReassignableTun>(
     }
 }
 
+/// Rewrites the MSS option of a SYN/SYN-ACK crossing this pump down to the
+/// bundle's live inner-packet budget (no-op whenever everything already
+/// fits). The MSS a peer announces governs segments that must later fit
+/// this tunnel's datagrams, so clamping at both pump directions keeps
+/// end-to-end TCP flowing on reduced-MTU underlays (train/satellite
+/// backhauls, nested tunnels) instead of black-holing full-size segments
+/// while the tunnel looks Connected (2026-07-15 SNCF incident).
+fn clamp_syn_to_budget(client: &MultiHopBundle, pkt: &mut [u8]) {
+    if !is_tcp_syn(pkt) {
+        return;
+    }
+    let budget = u16::try_from(client.max_inner_payload()).unwrap_or(u16::MAX);
+    if let Some((old, new)) = clamp_syn_mss(pkt, budget) {
+        tracing::debug!(old, new, budget, "clamped inner TCP MSS to tunnel budget");
+    }
+}
+
+/// Reflects a dropped too-large uplink packet back into the TUN as ICMP
+/// Fragmentation-Needed / Packet-Too-Big from the tunnel gateway, so the
+/// local stack's PMTUD converges per-destination instead of black-holing
+/// non-TCP flows (inner QUIC, UDP) that the MSS clamp cannot cover.
+async fn reflect_frag_needed<T: PacketDevice>(tun: &T, client: &MultiHopBundle, dropped: &[u8]) {
+    let eff = u16::try_from(client.max_inner_payload()).unwrap_or(u16::MAX);
+    if let Some(ptb) = build_frag_needed(dropped, eff, TUNNEL_GATEWAY_IP, TUNNEL_GATEWAY_IPV6)
+        && let Err(e) = tun.send(&ptb).await
+    {
+        tracing::trace!(error = %e, "frag-needed reflection tun write failed");
+    }
+}
+
 /// Uplink pump: read IP packets from `tun` and seal them as multi-hop
 /// frames using the latest [`crate::multihop::MultiHopClient`] the
 /// supervisor publishes on `rx`. Drops packets during reconnect windows
@@ -397,7 +429,7 @@ pub async fn run_reassign_loop<T: ReassignableTun>(
 pub async fn run_uplink<T: PacketDevice>(rx: ClientWatch, tun: T) -> Result<()> {
     let mut tun_io = TunIoTolerance::new("uplink tun recv");
     loop {
-        let packet = match tun.recv().await {
+        let mut packet = match tun.recv().await {
             Ok(p) => {
                 tun_io.ok();
                 p
@@ -417,13 +449,12 @@ pub async fn run_uplink<T: PacketDevice>(rx: ClientWatch, tun: T) -> Result<()> 
             );
             continue;
         };
+        clamp_syn_to_budget(&client, &mut packet);
         match client.send(&packet).await {
             Ok(()) => {}
             Err(MultiHopError::Send(quinn::SendDatagramError::TooLarge)) => {
-                tracing::trace!(
-                    pkt = packet.len(),
-                    "dropping oversized packet (transient PMTU race)"
-                );
+                record_uplink_too_large_drop(packet.len(), client.max_datagram_size());
+                reflect_frag_needed(&tun, &client, &packet).await;
             }
             Err(MultiHopError::Send(_)) | Err(MultiHopError::Recv(_)) => {
                 tracing::debug!("uplink send on dying connection, supervisor will reconnect");
@@ -511,6 +542,8 @@ pub async fn run_uplink_with_daita<T: PacketDevice>(
                     );
                     continue;
                 };
+                let mut packet = packet;
+                clamp_syn_to_budget(&client, &mut packet);
                 match client.send(&packet).await {
                     Ok(()) => {
                         sent_real += 1;
@@ -519,10 +552,8 @@ pub async fn run_uplink_with_daita<T: PacketDevice>(
                     }
                     Err(MultiHopError::Send(quinn::SendDatagramError::TooLarge)) => {
                         too_large += 1;
-                        tracing::trace!(
-                            pkt = packet.len(),
-                            "dropping oversized packet (transient PMTU race)"
-                        );
+                        record_uplink_too_large_drop(packet.len(), client.max_datagram_size());
+                        reflect_frag_needed(&tun, &client, &packet).await;
                     }
                     Err(MultiHopError::Send(_)) | Err(MultiHopError::Recv(_)) => {
                         dying += 1;
@@ -644,6 +675,8 @@ pub async fn run_downlink<T: PacketDevice>(
                         if is_daita_dummy(&payload) {
                             continue;
                         }
+                        let mut payload = payload;
+                        clamp_syn_to_budget(&client, &mut payload);
                         match tun.send(&payload).await {
                             Ok(()) => {
                                 tun_io.ok();
@@ -772,6 +805,8 @@ pub async fn run_downlink_with_daita<T: PacketDevice>(
                             // Drop the dummy; the receiver TUN would discard it
                             // anyway as a malformed IP packet.
                         } else {
+                            let mut payload = payload;
+                            clamp_syn_to_budget(&client, &mut payload);
                             match tun.send(&payload).await {
                                 Ok(()) => {
                                     tun_io.ok();

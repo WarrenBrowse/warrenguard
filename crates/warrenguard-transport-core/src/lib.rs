@@ -9,6 +9,7 @@ pub mod client_metrics;
 pub mod constants;
 pub mod error;
 pub mod flow_hash;
+pub mod inner_mtu;
 pub mod ip_parse;
 pub mod packet_device;
 pub mod path_probe;
@@ -17,6 +18,7 @@ pub mod transport_config;
 pub use client_metrics::{ClientMetrics, ClientMetricsSnapshot, MetricsRegistry};
 pub use error::{Result, TunnelError};
 pub use flow_hash::flow_hash_5tuple;
+pub use inner_mtu::{build_frag_needed, clamp_syn_mss, effective_mss, is_tcp_syn};
 pub use ip_parse::{
     extract_dst_ipv4, extract_dst_ipv6, extract_src_ipv4, extract_src_ipv6, source_ip_matches,
 };

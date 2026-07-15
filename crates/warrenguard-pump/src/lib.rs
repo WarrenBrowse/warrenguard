@@ -241,7 +241,7 @@ fn uplink_batch_max() -> usize {
 /// before/after delta (the counter is process-global, like
 /// [`TunIoTolerance::global_error_total`], so an absolute-value assertion
 /// would be racy against other tests running in the same process).
-fn record_uplink_too_large_drop(pkt_size: usize, max_datagram: Option<usize>) -> u64 {
+pub fn record_uplink_too_large_drop(pkt_size: usize, max_datagram: Option<usize>) -> u64 {
     static DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let total = n + 1;
