@@ -342,6 +342,43 @@ fn primary_scoped_default_missing(netstat_v6: &str, pif: &str) -> bool {
     !via_pif
 }
 
+/// True iff no UNSCOPED v6 `default` route exists: every `default` line
+/// carries the RTF_IFSCOPE `I` flag, or there is no default at all. Both are
+/// teardown residue, not "link down": the kernel re-creates an RA default
+/// only when the NEXT router advertisement arrives (minutes away on many
+/// routers), and until then every unscoped v6 socket fails instantly. The
+/// caller gates on SC's `State:/Network/Global/IPv6` still naming a router,
+/// so a genuinely v6-less link never reaches this check.
+fn unscoped_default_missing_v6(netstat_v6: &str) -> bool {
+    !netstat_v6
+        .lines()
+        .filter(|l| l.starts_with("default"))
+        .any(|l| {
+            l.split_whitespace()
+                .nth(2)
+                .is_some_and(|flags| !flags.contains('I'))
+        })
+}
+
+/// Argv for `route` to add the UNSCOPED v6 default via `router`. Same gateway
+/// scoping as [`build_scoped_default_add_v6`] (a link-local gateway needs its
+/// zone), but no `-ifscope`: this is the route ordinary (unscoped) sockets
+/// resolve against.
+fn build_unscoped_default_add_v6(pif: &str, router: &str) -> Vec<String> {
+    let gateway = if router.contains('%') {
+        router.to_owned()
+    } else {
+        format!("{router}%{pif}")
+    };
+    vec![
+        "-n".into(),
+        "add".into(),
+        "-inet6".into(),
+        "default".into(),
+        gateway,
+    ]
+}
+
 /// Argv for `route` to add the primary interface's scoped v6 default via
 /// `router`. A link-local router is scoped to `pif`; `-n` avoids a name lookup
 /// (which is exactly what is broken when this runs).
@@ -401,20 +438,27 @@ fn scutil_show(key: &str) -> Option<String> {
     }
 }
 
-/// Restore the primary interface's scoped IPv6 default route if the tunnel
-/// teardown stranded it. THE production root cause on a dual-homed macOS box:
-/// the daemon's `restore_default_route` re-adds only the single best UNSCOPED
-/// default per family, never the per-interface IFSCOPE defaults. When the
-/// primary service (the DNS-scope interface, e.g. Wi-Fi) is not the best-
-/// default one, its scoped default is lost and the primary-scoped system
-/// resolver has no route: mDNSResponder stops resolving even though unscoped
-/// `ping`/`dig` still work via the surviving default.
+/// Restore the primary interface's IPv6 default routes (unscoped and scoped)
+/// if the tunnel teardown stranded them. TWO production root causes on macOS:
 ///
-/// Deterministic and ownership-safe: acts only on the bug's fingerprint (the
-/// primary interface has no v6 default while another does) and re-adds exactly
-/// the route SC's own `PrimaryInterface` + `Router` describe. Best-effort,
-/// panic- and privilege-tolerant, so it is safe on the teardown path.
-pub fn restore_primary_scoped_default_v6() {
+/// - **Unscoped default lost**: the daemon's `restore_default_route` re-adds
+///   the best unscoped default per family only from its own tracked view;
+///   when that view is empty for v6 at teardown, nothing is re-added, and
+///   unlike v4 (configd re-plumbs the DHCP default immediately) the kernel
+///   re-creates the RA default only at the NEXT router advertisement,
+///   minutes away. Until then every unscoped v6 socket fails and v6-capable
+///   apps ride their fallback timers: the user sees "no internet" right
+///   after disconnect.
+/// - **Scoped default lost** (dual-homed): the same restore never re-adds
+///   per-interface IFSCOPE defaults, stranding the primary-scoped system
+///   resolver; mDNSResponder stops resolving even though unscoped
+///   `ping`/`dig` still work via the surviving default.
+///
+/// Deterministic and ownership-safe: acts only on each bug's fingerprint and
+/// re-adds exactly the route SC's own `PrimaryInterface` + `Router` describe.
+/// Best-effort, panic- and privilege-tolerant, so it is safe on the teardown
+/// path.
+pub fn restore_primary_defaults_v6() {
     let Some(global) = scutil_show("State:/Network/Global/IPv6") else {
         return;
     };
@@ -426,29 +470,42 @@ pub fn restore_primary_scoped_default_v6() {
     else {
         return;
     };
-    if !primary_scoped_default_missing(&table, &pif) {
+    let need_unscoped = unscoped_default_missing_v6(&table);
+    let need_scoped = primary_scoped_default_missing(&table, &pif);
+    if !need_unscoped && !need_scoped {
         return;
     }
     // Leak guard (defense in depth): NEVER re-open a physical path while a
     // tunnel is still carrying traffic. All callers run this on teardown after
     // the tunnel routes are torn down, but if unscoped v6 egress still resolves
-    // through a `utun`, the tunnel is up (or teardown is unfinished): adding the
-    // primary interface's scoped default now would let the primary-scoped
-    // system DNS resolver query OUTSIDE the tunnel (a DNS leak). Restore only
-    // once egress is back on a physical NIC.
+    // through a `utun`, the tunnel is up (or teardown is unfinished): adding a
+    // physical default now would route v6 traffic (and the primary-scoped
+    // system DNS resolver) OUTSIDE the tunnel (a leak). Restore only once
+    // egress is back on a physical NIC.
     if route_iface_v6("2000::")
         .as_deref()
         .is_some_and(is_tunnel_iface)
     {
         return;
     }
-    tracing::warn!(
-        interface = %pif,
-        "Primary interface lost its scoped IPv6 default route at tunnel teardown; restoring so the scoped DNS resolver is reachable again"
-    );
-    let argv = build_scoped_default_add_v6(&pif, &router);
-    let args: Vec<&str> = argv.iter().map(String::as_str).collect();
-    let _ = run_blocking_bounded("route", &args);
+    if need_unscoped {
+        tracing::warn!(
+            interface = %pif,
+            "No unscoped IPv6 default survived tunnel teardown; restoring from SC's primary router so native IPv6 recovers before the next RA"
+        );
+        let argv = build_unscoped_default_add_v6(&pif, &router);
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let _ = run_blocking_bounded("route", &args);
+    }
+    if need_scoped {
+        tracing::warn!(
+            interface = %pif,
+            "Primary interface lost its scoped IPv6 default route at tunnel teardown; restoring so the scoped DNS resolver is reachable again"
+        );
+        let argv = build_scoped_default_add_v6(&pif, &router);
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let _ = run_blocking_bounded("route", &args);
+    }
     // Nudge the resolvers to re-evaluate reachability of the now-routable DNS
     // server (SCNetworkReachability caches the stale "unreachable" verdict).
     let _ = run_blocking_bounded("dscacheutil", &["-flushcache"]);
@@ -1313,6 +1370,61 @@ default                                 fe80::1234:56ff:fe78:9abc%en1           
 2001:db8:101e:b950::/64                 link#24                                 UC                    en1
 ";
         assert!(!primary_scoped_default_missing(table, "en1"));
+    }
+
+    #[test]
+    fn unscoped_default_missing_v6_true_when_only_ifscoped_defaults_remain() {
+        // The teardown residue this repair exists for: only IFSCOPE (`I`)
+        // defaults survive, so every unscoped v6 socket fails until the next
+        // RA re-creates the kernel default.
+        let table = "\
+default                                 fe80::1234:56ff:fe78:9abc%en0           UGdScIg               en0
+default                                 fe80::%utun3                            UGcIg                 utun3
+::1                                     ::1                                     UHL                   lo0
+";
+        assert!(unscoped_default_missing_v6(table));
+    }
+
+    #[test]
+    fn unscoped_default_missing_v6_false_when_an_unscoped_default_exists() {
+        // Healthy: an unscoped default is present (no `I` flag) → never
+        // re-add (idempotent), whatever scoped copies also exist.
+        let table = "\
+default                                 fe80::1234:56ff:fe78:9abc%en0           UGdScg                en0
+default                                 fe80::1234:56ff:fe78:9abc%en1           UGScIg                en1
+";
+        assert!(!unscoped_default_missing_v6(table));
+    }
+
+    #[test]
+    fn unscoped_default_missing_v6_true_when_no_default_at_all() {
+        // A fully-deleted default IS this bug's shape (the kernel re-adds an
+        // RA default only at the next RA): the caller's SC gate, not the
+        // table, decides whether v6 is supposed to exist.
+        let table = "\
+::1                                     ::1                                     UHL                   lo0
+2001:db8:101e:b950::/64                 link#24                                 UC                    en1
+";
+        assert!(unscoped_default_missing_v6(table));
+    }
+
+    #[test]
+    fn build_unscoped_default_add_v6_keeps_the_route_unscoped() {
+        // The gateway needs its link-local zone, but the route itself must
+        // NOT be ifscoped: it is the route ordinary sockets resolve against.
+        let cmd = build_unscoped_default_add_v6("en1", "fe80::1234:56ff:fe78:9abc");
+        assert_eq!(
+            cmd,
+            vec![
+                "-n",
+                "add",
+                "-inet6",
+                "default",
+                "fe80::1234:56ff:fe78:9abc%en1"
+            ]
+        );
+        let cmd = build_unscoped_default_add_v6("en1", "fe80::1%en1");
+        assert_eq!(cmd.last().unwrap(), "fe80::1%en1");
     }
 
     #[test]
