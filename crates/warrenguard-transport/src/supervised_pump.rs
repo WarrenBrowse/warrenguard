@@ -393,11 +393,21 @@ pub async fn run_reassign_loop<T: ReassignableTun>(
 /// end-to-end TCP flowing on reduced-MTU underlays (train/satellite
 /// backhauls, nested tunnels) instead of black-holing full-size segments
 /// while the tunnel looks Connected (2026-07-15 SNCF incident).
-fn clamp_syn_to_budget(client: &MultiHopBundle, pkt: &mut [u8]) {
+/// Asymmetry allowance for MSS options crossing the UPLINK pump: their
+/// beneficiary segments will cross the EXIT's transmit budget, which this
+/// client cannot read. The local budget is a same-path proxy; the margin
+/// absorbs the exit converging a little lower (its own DPLPMTUD, its own
+/// frame overhead). On paths that fit the default inner MTU the clamped
+/// value stays above the default MSS, so this costs nothing there.
+const PROXY_BUDGET_MARGIN: u16 = 48;
+
+fn clamp_syn_to_budget(client: &MultiHopBundle, pkt: &mut [u8], margin: u16) {
     if !is_tcp_syn(pkt) {
         return;
     }
-    let budget = u16::try_from(client.max_inner_payload()).unwrap_or(u16::MAX);
+    let budget = u16::try_from(client.max_inner_payload())
+        .unwrap_or(u16::MAX)
+        .saturating_sub(margin);
     if let Some((old, new)) = clamp_syn_mss(pkt, budget) {
         tracing::debug!(old, new, budget, "clamped inner TCP MSS to tunnel budget");
     }
@@ -449,7 +459,7 @@ pub async fn run_uplink<T: PacketDevice>(rx: ClientWatch, tun: T) -> Result<()> 
             );
             continue;
         };
-        clamp_syn_to_budget(&client, &mut packet);
+        clamp_syn_to_budget(&client, &mut packet, PROXY_BUDGET_MARGIN);
         match client.send(&packet).await {
             Ok(()) => {}
             Err(MultiHopError::Send(quinn::SendDatagramError::TooLarge)) => {
@@ -543,7 +553,7 @@ pub async fn run_uplink_with_daita<T: PacketDevice>(
                     continue;
                 };
                 let mut packet = packet;
-                clamp_syn_to_budget(&client, &mut packet);
+                clamp_syn_to_budget(&client, &mut packet, PROXY_BUDGET_MARGIN);
                 match client.send(&packet).await {
                     Ok(()) => {
                         sent_real += 1;
@@ -676,7 +686,7 @@ pub async fn run_downlink<T: PacketDevice>(
                             continue;
                         }
                         let mut payload = payload;
-                        clamp_syn_to_budget(&client, &mut payload);
+                        clamp_syn_to_budget(&client, &mut payload, 0);
                         match tun.send(&payload).await {
                             Ok(()) => {
                                 tun_io.ok();
@@ -806,7 +816,7 @@ pub async fn run_downlink_with_daita<T: PacketDevice>(
                             // anyway as a malformed IP packet.
                         } else {
                             let mut payload = payload;
-                            clamp_syn_to_budget(&client, &mut payload);
+                            clamp_syn_to_budget(&client, &mut payload, 0);
                             match tun.send(&payload).await {
                                 Ok(()) => {
                                     tun_io.ok();
