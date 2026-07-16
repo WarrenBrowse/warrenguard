@@ -38,6 +38,11 @@ use warrenguard_wire::SessionToken;
 
 use crate::bundle::{MAX_BONDED_CONNECTIONS, MultiHopBundle};
 use crate::ip_assign::{IpAssignChannel, IpAssignSpec};
+use warrenguard_transport_core::{
+    warren_transport_config_client_multihop_with_idle_cover,
+    warren_transport_config_client_with_idle_cover,
+};
+
 use crate::multihop::{self, MultiHopClient, MultiHopError};
 
 /// Observer invoked whenever the supervisor successfully publishes a
@@ -150,6 +155,18 @@ pub struct SupervisorConfig {
     /// [`MultiHopClient::daita_spec`], and its absence means the defense is NOT
     /// running, which the caller must surface rather than pump undefended.
     pub enable_daita: bool,
+    /// `true` => dial with the fixed keep-alive PING disabled and let the
+    /// caller drive idle cover
+    /// ([`crate::supervised_pump::run_idle_cover`]) for liveness + NAT refresh
+    /// instead (ADR-0006). The two MUST be set together: this only changes the
+    /// dial's transport config; the caller still spawns the cover emitter, so
+    /// keep-alive-off without a cover pump leaves the session with only the
+    /// 25s idle timeout. Resolve it from
+    /// [`warrenguard_config::knobs::cover_defenses`] so the DAITA/idle-cover
+    /// mutual exclusion holds (DAITA already emits its own cover, so idle cover
+    /// is off whenever `enable_daita` is on). `false` keeps the fixed keep-alive
+    /// beacon, byte-identical to the pre-ADR-0006 dial.
+    pub idle_cover: bool,
     /// Exponential backoff schedule for retries. `Backoff::HANDSHAKE`
     /// (base 500 ms, max 15 s) is the default and matches the
     /// cold-start retry profile of [`MultiHopClient::connect_with_retry`].
@@ -891,35 +908,38 @@ impl MultiHopSupervisor {
         }
     }
 
+    /// The Quinn transport config for a (re)dial, resolved from the same
+    /// obfuscation and idle-cover switches for the primary and every bonded
+    /// secondary. `idle_cover` disables the fixed keep-alive PING on the
+    /// obfuscation or multihop profile; when it is `false` this is
+    /// byte-identical to the pre-ADR-0006 dial (`_with_gso`), because
+    /// `_with_idle_cover(gso, false)` is defined as the `_with_gso` config.
+    fn dial_transport_config(config: &SupervisorConfig) -> Arc<quinn::TransportConfig> {
+        if config.use_warren_obfuscation {
+            warren_transport_config_client_with_idle_cover(config.enable_gso, config.idle_cover)
+        } else {
+            warren_transport_config_client_multihop_with_idle_cover(
+                config.enable_gso,
+                config.idle_cover,
+            )
+        }
+    }
+
     async fn connect_once(&self) -> Result<MultiHopClient, MultiHopError> {
         // Read the LIVE target (not config): a `migrate_to` retargets this
         // so the next dial lands on a different exit (cross-exit migration).
         let target = self.current_target();
-        if self.config.use_warren_obfuscation {
-            MultiHopClient::connect_with_warren_obfuscation(
-                &target.relay,
-                target.exit_id,
-                &target.exit_x25519_multihop_pubkey,
-                &self.config.operational_pubkey,
-                &self.config.client_signing,
-                self.config.bind_addr,
-                self.config.enable_gso,
-                self.config.socket_bypass,
-            )
-            .await
-        } else {
-            MultiHopClient::connect(
-                &target.relay,
-                target.exit_id,
-                &target.exit_x25519_multihop_pubkey,
-                &self.config.operational_pubkey,
-                &self.config.client_signing,
-                self.config.bind_addr,
-                self.config.enable_gso,
-                self.config.socket_bypass,
-            )
-            .await
-        }
+        MultiHopClient::connect_with_transport_config(
+            &target.relay,
+            target.exit_id,
+            &target.exit_x25519_multihop_pubkey,
+            &self.config.operational_pubkey,
+            &self.config.client_signing,
+            self.config.bind_addr,
+            Self::dial_transport_config(&self.config),
+            self.config.socket_bypass,
+        )
+        .await
     }
 
     /// Run the primary's reliable setup-stream round-trip and detect a
@@ -1302,31 +1322,17 @@ impl MultiHopSupervisor {
     ) -> Option<Arc<MultiHopClient>> {
         let bind_addr = secondary_bind_addr(config.bind_addr);
         for attempt in 0..2u8 {
-            let result = if config.use_warren_obfuscation {
-                MultiHopClient::connect_with_warren_obfuscation(
-                    &target.relay,
-                    target.exit_id,
-                    &target.exit_x25519_multihop_pubkey,
-                    &config.operational_pubkey,
-                    &config.client_signing,
-                    bind_addr,
-                    config.enable_gso,
-                    config.socket_bypass,
-                )
-                .await
-            } else {
-                MultiHopClient::connect(
-                    &target.relay,
-                    target.exit_id,
-                    &target.exit_x25519_multihop_pubkey,
-                    &config.operational_pubkey,
-                    &config.client_signing,
-                    bind_addr,
-                    config.enable_gso,
-                    config.socket_bypass,
-                )
-                .await
-            };
+            let result = MultiHopClient::connect_with_transport_config(
+                &target.relay,
+                target.exit_id,
+                &target.exit_x25519_multihop_pubkey,
+                &config.operational_pubkey,
+                &config.client_signing,
+                bind_addr,
+                Self::dial_transport_config(config),
+                config.socket_bypass,
+            )
+            .await;
             let client = match result {
                 Ok(c) => Arc::new(c),
                 Err(e) => {
@@ -1691,6 +1697,7 @@ mod tests {
             use_warren_obfuscation: false,
             socket_bypass: None,
             enable_daita: false,
+            idle_cover: false,
             backoff: Backoff::HANDSHAKE,
             on_reconnect: None,
             ip_assign_channel: None,
@@ -2125,6 +2132,7 @@ mod run_tests {
             use_warren_obfuscation: false,
             socket_bypass: None,
             enable_daita: false,
+            idle_cover: false,
             backoff: Backoff::HANDSHAKE,
             on_reconnect: None,
             ip_assign_channel: None,

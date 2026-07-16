@@ -269,6 +269,24 @@ impl MultiHopBundle {
         client.send_daita_padding().await
     }
 
+    /// Sends one idle-cover dummy of `padding_len` padding bytes on the next
+    /// round-robin session, spreading cover across every bonded connection
+    /// exactly like [`Self::send_daita_padding`]. Unlike DAITA padding (which
+    /// auto-sizes to the path MTU) the caller picks the length, so the
+    /// jittered, size-varied idle-cover scheduler drives the on-wire size.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`MultiHopClient::send_cover_traffic`] errors.
+    pub fn send_cover_traffic(&self, padding_len: usize) -> Result<(), MultiHopError> {
+        let client = {
+            let clients = self.clients.read();
+            let idx = self.rr.fetch_add(1, Ordering::Relaxed) % clients.len();
+            clients[idx].clone()
+        };
+        client.send_cover_traffic(padding_len)
+    }
+
     /// Receives the next decoded inner packet from any bonded session.
     ///
     /// # Errors

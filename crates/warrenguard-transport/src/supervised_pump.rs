@@ -869,6 +869,124 @@ pub async fn run_downlink_with_daita<T: PacketDevice>(
     }
 }
 
+/// Idle-cover emitter for the multi-hop supervised datapath.
+///
+/// The mono-conn pump ([`warrenguard_pump::pump_bidirectional_with_idle_cover`])
+/// runs cover inline in its single select loop, but the multi-hop pump is
+/// split into independent uplink/downlink tasks over a session that the
+/// supervisor swaps on reconnect. This task is the cover home for that shape:
+/// it follows the live [`crate::bundle::MultiHopBundle`] on the watch channel
+/// and drives the SAME [`warrenguard_pump::idle_cover::IdleCover`] scheduler,
+/// so the jittered interval + varied size are byte-identical to the mono-conn
+/// footprint. It sends each dummy through [`MultiHopBundle::send_cover_traffic`]
+/// (sealed by HPKE, dropped at the exit by `is_daita_dummy`), and the exit's
+/// own downlink dummies are already filtered by [`run_downlink`].
+///
+/// Caller contract (mirrors the mono-conn pump): the multi-hop client
+/// transport config MUST disable the keep-alive PING
+/// (`warren_transport_config_client_multihop_with_idle_cover(.., true)` /
+/// the obfuscation profile's idle-cover variant), or the fixed 5s beacon this
+/// replaces still fires alongside cover.
+///
+/// # Errors
+///
+/// Returns `Ok(())` when the supervisor's watch channel closes (shutdown). A
+/// transient cover-send failure (dying connection, PMTU race) is logged at
+/// trace and tolerated; the supervisor redials.
+pub async fn run_idle_cover(rx: ClientWatch) -> Result<()> {
+    run_idle_cover_interval(
+        rx,
+        warrenguard_pump::idle_cover::IDLE_COVER_MIN_INTERVAL,
+        warrenguard_pump::idle_cover::IDLE_COVER_MAX_INTERVAL,
+    )
+    .await
+}
+
+/// Test/tuning seam behind [`run_idle_cover`]: identical wiring with an
+/// explicit jittered interval range instead of the fixed production 10-20s
+/// bounds, so an integration test can drive the real reconnect-following loop
+/// with a short interval instead of waiting ~35s.
+///
+/// # Errors
+///
+/// Same as [`run_idle_cover`].
+pub async fn run_idle_cover_interval(
+    mut rx: ClientWatch,
+    min_interval: Duration,
+    max_interval: Duration,
+) -> Result<()> {
+    use warrenguard_pump::idle_cover::IdleCover;
+
+    // Created lazily on the first live bundle (it needs the path budget to seed
+    // the size cap) and then kept across reconnects so the jitter/size cadence
+    // stays continuous through a make-before-break swap; a `None` on the watch
+    // (mid-reconnect gap) drops it so the next bundle re-seeds to its own MTU.
+    let mut cover: Option<IdleCover> = None;
+    // Last real-traffic totals seen: cover stays silent while user traffic
+    // flows, mirroring the mono-conn pump's `note_activity` but sampled at each
+    // jittered deadline (the split tasks own the packet loops, this task only
+    // watches the bundle's cumulative real-traffic counters).
+    let mut last_totals: Option<(u64, u64)> = None;
+    loop {
+        let Some(bundle) = rx.borrow().clone() else {
+            cover = None;
+            last_totals = None;
+            if rx.changed().await.is_err() {
+                return Ok(());
+            }
+            continue;
+        };
+        if cover.is_none() {
+            cover = Some(IdleCover::with_interval(
+                // Per-bundle local seed (never on the wire) so two concurrent
+                // tunnels do not share a cover schedule.
+                Arc::as_ptr(&bundle) as usize as u64,
+                Instant::now(),
+                Some(bundle.max_inner_payload()),
+                min_interval,
+                max_interval,
+            ));
+            // Baseline the silencing counter so the first idle deadline emits
+            // (rather than being mistaken for activity against a `None`).
+            last_totals = Some(bundle.real_traffic_totals());
+        }
+        let sched = cover.as_mut().expect("scheduler seeded above");
+        let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(sched.deadline()));
+        tokio::pin!(sleep);
+        tokio::select! {
+            () = &mut sleep => {
+                let now = Instant::now();
+                let totals = bundle.real_traffic_totals();
+                if last_totals != Some(totals) {
+                    // Real traffic advanced during this interval: silence cover
+                    // and re-arm, exactly like note_activity on the mono pump.
+                    last_totals = Some(totals);
+                    cover
+                        .as_mut()
+                        .expect("scheduler seeded above")
+                        .note_activity(now);
+                    continue;
+                }
+                let size = cover.as_mut().expect("scheduler seeded above").fire_size(now);
+                // A dummy is one discriminator byte plus padding; clamp to the
+                // live path budget so a PMTU shrink since seeding does not make
+                // every dummy a TooLarge drop.
+                let padding_len = size
+                    .saturating_sub(1)
+                    .min(bundle.max_inner_payload().saturating_sub(1));
+                if let Err(e) = bundle.send_cover_traffic(padding_len) {
+                    tracing::trace!(error = %e, "idle cover send transient error");
+                }
+            }
+            res = rx.changed() => {
+                if res.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1433,6 +1551,103 @@ mod live_pump_tests {
             "forwarding must resume once live again"
         );
 
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+    }
+
+    // ------------------------------------------------------------------
+    // run_idle_cover: multi-hop cover emitter (ADR-0006)
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn run_idle_cover_emits_hpke_sealed_dummies_the_exit_drops() {
+        let pair = spawn_loopback_multihop(ExitId::from_bytes([0x31; 16])).await;
+        let bundle = MultiHopBundle::new(vec![pair.client.clone()]);
+        let (tx, rx) = tokio::sync::watch::channel(Some(bundle));
+
+        // Short interval so cover fires inside the test window (the production
+        // path is 10-20s); the seam drives the exact same reconnect-following
+        // loop, just re-timed.
+        let task = tokio::spawn(run_idle_cover_interval(
+            rx,
+            Duration::from_millis(20),
+            Duration::from_millis(40),
+        ));
+
+        // While nothing else flows, the emitter must send a cover dummy. The
+        // exit reads it as an ordinary forward frame; opened, it is a 0xFF
+        // dummy a real exit drops (`is_daita_dummy`), NOT a real IP packet, and
+        // NOT a fixed-size 5s beacon. Sealed by HPKE, so the relay only sees
+        // ciphertext.
+        let wire = tokio::time::timeout(RECV_TIMEOUT, pair.exit_conn.read_datagram())
+            .await
+            .expect("idle cover must emit a dummy within a few short intervals")
+            .expect("datagram");
+        let frame = warrenguard_multihop::decode_frame(&wire).expect("decode_frame");
+        let plaintext = pair
+            .exit_session
+            .open(&frame)
+            .expect("exit opens the sealed cover frame");
+        assert!(
+            warrenguard_pump::is_daita_dummy(&plaintext),
+            "idle cover must seal a 0xFF-marked dummy the exit drops, not a real packet"
+        );
+
+        // Closing the watch (supervisor shutdown) must return the task cleanly.
+        drop(tx);
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("cover task must return promptly when the watch closes")
+            .expect("cover task must not panic");
+        assert!(
+            result.is_ok(),
+            "a closed watch is a clean shutdown, not an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_idle_cover_stays_silent_while_real_traffic_flows() {
+        let pair = spawn_loopback_multihop(ExitId::from_bytes([0x32; 16])).await;
+        let bundle = MultiHopBundle::new(vec![pair.client.clone()]);
+        // Simulate a steadily-used tunnel: the pumps advance the real-traffic
+        // counters the emitter samples. It must then skip cover, exactly like
+        // `note_activity` silences the mono-conn pump under load.
+        let (tx, rx) = tokio::sync::watch::channel(Some(bundle.clone()));
+        let task = tokio::spawn(run_idle_cover_interval(
+            rx,
+            Duration::from_millis(20),
+            Duration::from_millis(40),
+        ));
+
+        // Advance the real-uplink counter every 8ms (well under the 20ms min
+        // interval) for the whole check window, so every jittered deadline sees
+        // fresh activity. The bumper runs CONCURRENTLY with the exit read: cover
+        // must stay silent throughout, not merely resume once traffic stops.
+        let bumper_bundle = bundle.clone();
+        let stop_bumping = Arc::new(tokio::sync::Notify::new());
+        let stop2 = stop_bumping.clone();
+        let bumper = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = stop2.notified() => break,
+                    () = tokio::time::sleep(Duration::from_millis(8)) => {
+                        bumper_bundle.note_real_uplink();
+                    }
+                }
+            }
+        });
+
+        // No cover frame must reach the exit over a window spanning several max
+        // intervals while traffic flows.
+        let got =
+            tokio::time::timeout(Duration::from_millis(200), pair.exit_conn.read_datagram()).await;
+        assert!(
+            got.is_err(),
+            "cover must stay silent while the tunnel carries real traffic"
+        );
+
+        stop_bumping.notify_one();
+        let _ = bumper.await;
         drop(tx);
         let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
     }

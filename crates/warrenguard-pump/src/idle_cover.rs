@@ -165,6 +165,22 @@ impl IdleCover {
         self.next
     }
 
+    /// Pick the varied datagram size for one cover emission (idle elapsed)
+    /// and re-arm the next deadline relative to `now`. The size is in
+    /// `[IDLE_COVER_MIN_SIZE, max]`.
+    ///
+    /// This is the emission primitive both cover consumers share: the
+    /// mono-conn pump wraps it in [`Self::fire`] to build the raw datagram,
+    /// while [`IdleCoverDriver`] (the session-agnostic driver behind the
+    /// multi-hop / SDK datapaths) turns it into a padding length. Keeping
+    /// the size distribution in one method is what makes the idle footprint
+    /// byte-identical across every datapath rather than re-derived per home.
+    pub fn fire_size(&mut self, now: Instant) -> usize {
+        let size = self.min_size + (self.next_u64() as usize % (self.span_size + 1));
+        self.arm(now);
+        size
+    }
+
     /// Produce one cover datagram (idle elapsed) and re-arm the next
     /// deadline relative to `now`. The datagram has a varied size in
     /// `[IDLE_COVER_MIN_SIZE, max]` and first byte
@@ -172,11 +188,128 @@ impl IdleCover {
     /// [`crate::is_daita_dummy`].
     #[must_use]
     pub fn fire(&mut self, now: Instant) -> Vec<u8> {
-        let size = self.min_size + (self.next_u64() as usize % (self.span_size + 1));
-        self.arm(now);
         // Constant 0xFF fill: the marker is the first byte; the rest is
         // non-secret padding (QUIC encrypts the whole datagram).
-        vec![DAITA_DUMMY_FIRST_BYTE; size]
+        vec![DAITA_DUMMY_FIRST_BYTE; self.fire_size(now)]
+    }
+}
+
+/// A live tunnel session cover traffic can be driven over. The engine's
+/// mono-conn pump emits cover inline; the split-task datapaths (the
+/// multi-hop supervised pump, and the SDK's userland proxy sessions) drive
+/// it through this seam instead, so the jitter/size scheduler
+/// ([`IdleCover`]) has a single home rather than a re-implementation per
+/// consumer.
+pub trait CoverSink: Send + Sync + 'static {
+    /// Sends one cover (dummy) datagram carrying `padding_len` padding bytes
+    /// after the discriminator. Returns `false` if the tunnel is gone (the
+    /// driver then stops). A `bool` keeps the trait free of each session's
+    /// distinct error type.
+    fn send_cover(&self, padding_len: usize) -> bool;
+    /// The largest inner payload a cover datagram can carry on the current
+    /// path. Seeds the scheduler's size cap so a dummy never exceeds the MTU.
+    fn max_inner_payload(&self) -> usize;
+    /// A stable, connection-local id used only to seed the jitter PRNG (never
+    /// on the wire), so two concurrent tunnels do not share a cover schedule.
+    fn cover_seed(&self) -> u64;
+}
+
+/// Drives idle cover traffic for a [`CoverSink`] session. Construct with
+/// [`new`](Self::new), spawn [`run`](Self::run), and report real traffic
+/// through a [`handle`](Self::handle) so cover stays silent under load.
+///
+/// This is the session-scoped driver: it owns one session for that session's
+/// lifetime (the SDK re-creates it per dial). The multi-hop supervised pump,
+/// whose session is swapped on reconnect behind a watch channel, drives the
+/// same [`IdleCover`] scheduler directly instead of holding a fixed session.
+pub struct IdleCoverDriver<S: CoverSink> {
+    session: std::sync::Arc<S>,
+    cover: std::sync::Mutex<IdleCover>,
+    wake: tokio::sync::Notify,
+    covers_sent: std::sync::atomic::AtomicU64,
+}
+
+impl<S: CoverSink> IdleCoverDriver<S> {
+    /// Builds a driver for `session`, arming the first cover deadline now.
+    #[must_use]
+    pub fn new(session: std::sync::Arc<S>) -> std::sync::Arc<Self> {
+        let cover = IdleCover::new(
+            session.cover_seed(),
+            Instant::now(),
+            Some(session.max_inner_payload()),
+        );
+        std::sync::Arc::new(Self {
+            session,
+            cover: std::sync::Mutex::new(cover),
+            wake: tokio::sync::Notify::new(),
+            covers_sent: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// A cheap, cloneable handle the datapath uses to report real traffic.
+    #[must_use]
+    pub fn handle(self: &std::sync::Arc<Self>) -> IdleCoverDriverHandle<S> {
+        IdleCoverDriverHandle(std::sync::Arc::clone(self))
+    }
+
+    /// Number of cover datagrams emitted so far (observability / tests).
+    #[must_use]
+    pub fn covers_sent(&self) -> u64 {
+        self.covers_sent.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Runs the cover loop until `stop` is notified or the tunnel closes (a
+    /// cover send then errors). The loop never holds the lock across an
+    /// `.await`, and the cover send is synchronous, so it cannot stall the
+    /// runtime.
+    pub async fn run(self: std::sync::Arc<Self>, stop: std::sync::Arc<tokio::sync::Notify>) {
+        loop {
+            // Arm the wake waiter BEFORE reading the deadline so an activity
+            // report that lands between the two cannot be missed for a cycle.
+            let wake = self.wake.notified();
+            tokio::pin!(wake);
+            wake.as_mut().enable();
+
+            let deadline = self.lock().deadline();
+            let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+            tokio::pin!(sleep);
+            tokio::select! {
+                () = &mut sleep => {}
+                () = &mut wake => continue,
+                () = stop.notified() => return,
+            }
+
+            // A cover dummy is one discriminator byte plus `padding_len`
+            // padding bytes, so the on-wire plaintext size equals the
+            // scheduler's chosen datagram size.
+            let padding_len = self.lock().fire_size(Instant::now()).saturating_sub(1);
+            if !self.session.send_cover(padding_len) {
+                // The tunnel is gone; stop (the session is finished).
+                return;
+            }
+            self.covers_sent
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, IdleCover> {
+        self.cover.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// A cloneable handle the datapath uses to report real traffic, silencing
+/// cover for the next interval. Optional: if the datapath never reports, the
+/// driver still emits on every jittered interval (correct, just not
+/// load-optimized).
+#[derive(Clone)]
+pub struct IdleCoverDriverHandle<S: CoverSink>(std::sync::Arc<IdleCoverDriver<S>>);
+
+impl<S: CoverSink> IdleCoverDriverHandle<S> {
+    /// Reports real application traffic (uplink or downlink) at this instant,
+    /// pushing the next cover emission out by a fresh jittered interval.
+    pub fn note_activity(&self) {
+        self.0.lock().note_activity(Instant::now());
+        self.0.wake.notify_one();
     }
 }
 
@@ -311,5 +444,102 @@ mod tests {
             "when the path MTU is below the min cover size, clamp to the min, do not panic"
         );
         assert!(is_daita_dummy(&dummy));
+    }
+
+    #[test]
+    fn fire_datagram_length_equals_fire_size_for_the_same_rng_stream() {
+        // `fire` must be exactly `fire_size` wrapped in a 0xFF fill: same seed,
+        // same `now` must produce a datagram whose length equals the size the
+        // size-only primitive returns, proving the two did not diverge (the
+        // reason a single scheduler can back both the raw-datagram pump and the
+        // padding-length driver).
+        let now = Instant::now();
+        let mut a = IdleCover::new(77, now, Some(1280));
+        let mut b = IdleCover::new(77, now, Some(1280));
+        for _ in 0..64 {
+            let size = a.fire_size(now);
+            let dummy = b.fire(now);
+            assert_eq!(
+                dummy.len(),
+                size,
+                "fire() length must equal fire_size() on an identical RNG stream"
+            );
+        }
+    }
+
+    /// A fake [`CoverSink`] recording the padding lengths it was asked to send.
+    struct RecordingSink {
+        sent: std::sync::Mutex<Vec<usize>>,
+        alive: std::sync::atomic::AtomicBool,
+    }
+    impl CoverSink for RecordingSink {
+        fn send_cover(&self, padding_len: usize) -> bool {
+            if !self.alive.load(std::sync::atomic::Ordering::Relaxed) {
+                return false;
+            }
+            self.sent.lock().unwrap().push(padding_len);
+            true
+        }
+        fn max_inner_payload(&self) -> usize {
+            1280
+        }
+        fn cover_seed(&self) -> u64 {
+            0xABCD
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn driver_emits_padded_dummies_on_the_jittered_schedule() {
+        let sink = std::sync::Arc::new(RecordingSink {
+            sent: std::sync::Mutex::new(Vec::new()),
+            alive: std::sync::atomic::AtomicBool::new(true),
+        });
+        let driver = IdleCoverDriver::new(std::sync::Arc::clone(&sink));
+        let stop = std::sync::Arc::new(tokio::sync::Notify::new());
+        let run = tokio::spawn(driver.clone().run(stop.clone()));
+
+        // With time paused, advance past several max intervals so the loop must
+        // fire multiple covers; every emitted padding must be within the
+        // scheduler's size bounds (minus the one discriminator byte).
+        tokio::time::advance(IDLE_COVER_MAX_INTERVAL * 5).await;
+        tokio::task::yield_now().await;
+        stop.notify_one();
+        let _ = run.await;
+
+        let sent = sink.sent.lock().unwrap().clone();
+        assert!(
+            !sent.is_empty(),
+            "driver must emit at least one cover over five idle intervals"
+        );
+        assert_eq!(
+            sent.len() as u64,
+            driver.covers_sent(),
+            "covers_sent counter must match the sends the sink observed"
+        );
+        for pad in sent {
+            assert!(
+                (IDLE_COVER_MIN_SIZE - 1..=IDLE_COVER_MAX_SIZE_CAP - 1).contains(&pad),
+                "padding {pad} out of [min-1, cap-1] (one discriminator byte precedes it)"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn driver_stops_when_the_sink_reports_the_tunnel_gone() {
+        let sink = std::sync::Arc::new(RecordingSink {
+            sent: std::sync::Mutex::new(Vec::new()),
+            alive: std::sync::atomic::AtomicBool::new(false),
+        });
+        let driver = IdleCoverDriver::new(std::sync::Arc::clone(&sink));
+        let stop = std::sync::Arc::new(tokio::sync::Notify::new());
+        let run = tokio::spawn(driver.clone().run(stop));
+        tokio::time::advance(IDLE_COVER_MAX_INTERVAL * 2).await;
+        // The first send returns false (tunnel gone), so run must return on its
+        // own without the stop signal ever firing.
+        tokio::time::timeout(Duration::from_secs(1), run)
+            .await
+            .expect("run must return once the sink reports the tunnel gone")
+            .expect("run task must not panic");
+        assert_eq!(driver.covers_sent(), 0, "a failed send emits no cover");
     }
 }
