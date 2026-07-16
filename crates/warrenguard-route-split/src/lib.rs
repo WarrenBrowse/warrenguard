@@ -20,8 +20,18 @@ pub mod bypass_cidr;
 /// the default route is split into the TUN, the tunnel's own QUIC socket escapes
 /// via a socket mark/bind, not a `<server_ip>/32` host route (Port Fail /
 /// TunnelCrack ServerIP fix); this picks the [`SocketBypass`](warrenguard_tun_core::SocketBypass)
-/// the transport applies to that socket.
+/// the transport applies to that socket. The bind is PREFERRED not mandatory:
+/// [`carrier_egress_guard`] is the paired policy that keeps it only while egress
+/// is proven and reverts to the `<carrier_ip>/32` route escape otherwise.
 pub mod socket_bypass;
+
+/// Bootstrap egress guard: the single home of the post-incident carrier policy
+/// (2026-07-13 blackhole fix) that verifies the [`socket_bypass`] bind actually
+/// egresses and self-heals to the `<carrier_ip>/32` route escape when it does
+/// not. Pure decision logic over an [`carrier_egress_guard::EgressGuardIo`] seam
+/// each datapath consumer implements, so both the app and the SDK drive one
+/// proven policy instead of re-deriving it.
+pub mod carrier_egress_guard;
 
 /// Policy routing helpers (shell-out to `ip` + `nft`).
 /// Compiles everywhere for unit-testability; only `PolicyRoutingGuard::install`
