@@ -9,6 +9,11 @@ mod android_tun;
 pub mod bench;
 pub mod bundle;
 mod client;
+// Reusable in-tunnel egress-liveness probe (the single liveness home): a
+// transport-agnostic scheduler plus a TUN-routed datapath probe, so every
+// client detects "QUIC alive but exit forwards nothing" with the same debounce
+// and escalation semantics instead of reimplementing them.
+pub mod egress_probe;
 pub mod ip_assign;
 // `ios_tun` is portable (pure tokio + mpsc) so it compiles on every target for
 // host-side unit tests; public exposure is gated to iOS below.
