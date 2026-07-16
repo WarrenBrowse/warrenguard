@@ -22,53 +22,16 @@ use std::sync::Arc;
 
 use tokio::net::TcpStream;
 use warrenguard_socket_bypass::SocketBypass;
-use warrenguard_tcp_fallback::FallbackPolicy;
 use warrenguard_transport_core::error::{Result, TunnelError};
 
-/// The exit's public TCP port for the fallback carrier. The cover-domain TLS
-/// handshake mimics ordinary HTTPS, which always lives on `:443`.
-pub(crate) const COVER_TCP_PORT: u16 = 443;
-
-/// ALPN offered on the cover-domain TLS handshake of the fallback carrier. Over
-/// TCP a real cover host negotiates HTTP (`h2` then `http/1.1`), never `h3`,
-/// which is QUIC-only: offering `h3` on a TCP `:443` handshake would be an
-/// anomalous, fingerprintable tell that no ordinary browser produces. The
-/// carrier payload after the handshake is framed QUIC datagrams regardless of
-/// the negotiated protocol, so this list is purely the on-wire fingerprint,
-/// matched here to what a browser offers a plain HTTPS server.
-pub(crate) const COVER_TCP_ALPN: &[&[u8]] = &[b"h2", b"http/1.1"];
-
-/// The cover-domain TLS target of the fallback carrier for one dial: the exit's
-/// `:443/tcp` address, the cover-domain SNI to present, and the WebPKI client
-/// config that validates the cover certificate.
-pub(crate) struct CoverTls<'a> {
-    /// The exit's `:443/tcp` endpoint the carrier connects to.
-    pub addr: SocketAddr,
-    /// The cover-domain hostname: the TLS SNI and the name validated against the
-    /// presented certificate. Sourced from the exit's signed descriptor.
-    pub domain: &'a str,
-    /// WebPKI client config (roots + [`COVER_TCP_ALPN`]) for the cover handshake.
-    pub client_config: Arc<rustls::ClientConfig>,
-}
-
-/// Resolves the fallback policy for one dial. Enabled ONLY when all three hold:
-/// the client prefers the fallback (`opt_in`, on by default), the selected exit
-/// advertises the carrier (`exit_tcp_fallback`, from its signed descriptor), and
-/// it carries a cover domain to present as the TLS SNI. Any missing precondition
-/// yields the default OFF policy, so a UDP failure is surfaced and no `:443/tcp`
-/// connection is attempted.
-#[must_use]
-pub(crate) fn resolve_fallback_policy(
-    opt_in: bool,
-    exit_tcp_fallback: bool,
-    cover_domain: Option<&str>,
-) -> FallbackPolicy {
-    if opt_in && exit_tcp_fallback && cover_domain.is_some() {
-        FallbackPolicy::enabled()
-    } else {
-        FallbackPolicy::default()
-    }
-}
+// The dial policy, the cover-domain fingerprint constants and the per-dial
+// cover target are single-homed in `warrenguard-tcp-fallback` (next to the
+// carrier and the UDP-vs-TCP race primitive), so the privileged transport here
+// and the userland SDK transport cannot skew them. Re-exported under the same
+// names for the internal callers (`client`, `multihop`).
+pub(crate) use warrenguard_tcp_fallback::{
+    COVER_TCP_ALPN, COVER_TCP_PORT, CoverTls, resolve_fallback_policy,
+};
 
 /// Builds the WebPKI client config for the OUTER cover-domain TLS handshake of
 /// the carrier. `der_roots` = explicit DER trust anchors (a self-hosted CA or a
@@ -172,37 +135,9 @@ pub(crate) async fn connect_tcp_carrier(
 mod tests {
     use super::*;
 
-    #[test]
-    fn policy_enabled_only_when_opt_in_and_advertised_and_cover_present() {
-        assert!(
-            resolve_fallback_policy(true, true, Some("cover.example")).tcp_fallback_enabled,
-            "client prefers fallback + exit advertises + cover present must arm the carrier"
-        );
-    }
-
-    #[test]
-    fn policy_off_when_the_client_disabled_the_preference() {
-        assert!(
-            !resolve_fallback_policy(false, true, Some("cover.example")).tcp_fallback_enabled,
-            "an explicit client opt-out must keep the carrier off even for a capable exit"
-        );
-    }
-
-    #[test]
-    fn policy_off_when_the_exit_does_not_advertise_the_carrier() {
-        assert!(
-            !resolve_fallback_policy(true, false, Some("cover.example")).tcp_fallback_enabled,
-            "an exit that does not advertise tcp_fallback must not be dialled over TCP"
-        );
-    }
-
-    #[test]
-    fn policy_off_without_a_cover_domain() {
-        assert!(
-            !resolve_fallback_policy(true, true, None).tcp_fallback_enabled,
-            "no cover domain means no TLS SNI to present, so the carrier stays off"
-        );
-    }
+    // The dial-policy resolution and cover-fingerprint constants are tested in
+    // their single home (`warrenguard_tcp_fallback::policy`); the tests below
+    // cover the transport-owned cover-config builder and carrier dial.
 
     #[test]
     fn cover_config_with_no_valid_der_root_fails_closed() {

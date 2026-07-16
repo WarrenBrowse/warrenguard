@@ -57,6 +57,7 @@
 
 mod activation;
 mod client;
+mod policy;
 mod terminator;
 pub mod tls;
 
@@ -64,6 +65,7 @@ pub use activation::{
     DEFAULT_UDP_HANDSHAKE_TIMEOUT, FallbackError, FallbackPolicy, connect_with_fallback,
 };
 pub use client::{TcpCarrierSocket, build_carrier_client_endpoint};
+pub use policy::{COVER_TCP_ALPN, COVER_TCP_PORT, CoverTls, resolve_fallback_policy};
 pub use terminator::{TerminatorConfig, serve_carrier, terminate_carrier};
 
 use thiserror::Error;
