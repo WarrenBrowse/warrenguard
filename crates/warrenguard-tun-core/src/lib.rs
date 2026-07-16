@@ -7,42 +7,27 @@
 //! - [`frame`]: OS-agnostic TUN packet framing (macOS utun's 4-byte address
 //!   family prefix vs the bare-IP framing on Linux/Windows) and IP-version
 //!   detection. Pure, fully unit-tested.
-//! - [`plan`]: routing and killswitch PLAN computation (which routes and firewall
-//!   rules a backend would install). Pure, fully unit-tested. Computing the plan
-//!   is separated from applying it so the policy is testable without privilege.
-//!   **Status**: `KillswitchPlan`/`RoutingPlan` here are the ORIGINAL design
-//!   (nft table `warren_killswitch`, `ip rule` table 100), consumed only by
-//!   `warrenguard-tun-device`'s `apply` module - itself gated behind the
-//!   `experimental-tun` feature and explicitly documented as NOT YET
-//!   REAL-EXIT VALIDATED. The PRODUCTION, real-exit-validated killswitch and
-//!   routing stack is `warrenguard-killswitch-os` (nft table
-//!   `warrenguard_killswitch_os`) + `warrenguard-route-split` (the `ip
-//!   rule`/table 100 split-default with the socket-mark Port Fail /
-//!   TunnelCrack ServerIP fix), used unconditionally by the deployed
-//!   system-VPN datapath (no experimental gate). New routing/killswitch
-//!   policy work belongs in those two crates, not here. This module is kept
-//!   (not removed) only because `warrenguard-tun-device` re-exports it
-//!   unconditionally (`pub use warrenguard_tun_core::{.. plan}`, not itself
-//!   feature-gated), so deleting it would break that crate's default build;
-//!   per the workspace CORE-FIRST rule the validated stack wins for new
-//!   work, this one is frozen.
+//! - [`bypass`]: the [`SocketBypass`] primitive and [`WARREN_TUNNEL_FWMARK`],
+//!   the socket-keyed carrier escape shared by the transport, socket-bypass,
+//!   route-split and the app. It lives here in the zero-dep seam so every one
+//!   of those crates can name the same type without a dependency cycle.
 //! - [`gateway`]: default-gateway parsing from the host routing table.
 //! - [`device`]: the device seam ([`device::RawTunDevice`] / [`device::TunIo`])
 //!   and a framing adapter over any byte stream ([`device::FramedTun`]),
 //!   unit-tested over an in-memory mock.
 //!
-//! The actual per-OS device open (`open_tun`) and the routing/killswitch applier
-//! are the privileged half and live in the `warrenguard-tun-device` crate behind
-//! its `experimental-tun` feature.
+//! The production, real-exit-validated routing/killswitch/DNS stack is
+//! `warrenguard-route-split` + `warrenguard-killswitch-os`; new routing or
+//! killswitch policy belongs there, not here. The actual per-OS device open
+//! (`open_tun`) is the privileged half and lives in the `warrenguard-tun-device`
+//! crate behind its `experimental-tun` feature.
 
+pub mod bypass;
 pub mod device;
 pub mod frame;
 pub mod gateway;
-pub mod plan;
 
+pub use bypass::{SocketBypass, WARREN_TUNNEL_FWMARK};
 pub use device::{FramedTun, RawTunDevice, TunIo};
 pub use frame::{Framing, PacketFamily};
 pub use gateway::parse_default_gateway;
-pub use plan::{
-    KillswitchPlan, RouteOp, RoutingPlan, SocketBypass, TunConfig, WARREN_TUNNEL_FWMARK,
-};

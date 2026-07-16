@@ -1,6 +1,6 @@
 [package]
 name = "warrenguard-tun-device"
-description = "Warren privileged TUN backend (EXPERIMENTAL / NOT YET REAL-EXIT VALIDATED): OS-agnostic TUN packet framing and routing/killswitch plan computation, plus a feature-gated per-OS device open. The default build is dependency-free and unsafe-free; only the `experimental-tun` feature compiles the privileged device code."
+description = "Warren privileged TUN backend (EXPERIMENTAL / NOT YET REAL-EXIT VALIDATED): OS-agnostic TUN packet framing plus a feature-gated per-OS device open. The default build is dependency-free and unsafe-free; only the `experimental-tun` feature compiles the privileged device code. Routing/killswitch/DNS live in warrenguard-route-split + warrenguard-killswitch-os."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,7 +10,7 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
-# The safe, always-on seam (framing, plan, gateway, device traits + adapter).
+# The safe, always-on seam (framing, gateway, SocketBypass, device traits + adapter).
 warrenguard-tun-core = { path = "../warrenguard-tun-core" }
 # Only the privileged device open (TUNSETIFF ioctl on Linux, utun control socket
 # on macOS) needs raw OS calls; it is gated behind `experimental-tun` so the
@@ -19,8 +19,8 @@ libc = { version = "0.2", optional = true }
 
 [features]
 # Compiles the privileged per-OS TUN device open (requires root / CAP_NET_ADMIN
-# at runtime). OFF by default: the framing and plan logic compile and test
-# without it. NOT YET validated against a real exit (see the crate docs).
+# at runtime). OFF by default: the framing seam compiles and tests without it.
+# NOT YET validated against a real exit (see the crate docs).
 experimental-tun = ["dep:libc", "warrenguard-tun-core/experimental-tun"]
 
 [lints.rust]

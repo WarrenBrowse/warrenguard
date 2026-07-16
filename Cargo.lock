@@ -3738,9 +3738,6 @@ dependencies = [
 [[package]]
 name = "warrenguard-tun-core"
 version = "0.1.0"
-dependencies = [
- "warrenguard-config",
-]
 
 [[package]]
 name = "warrenguard-tun-device"

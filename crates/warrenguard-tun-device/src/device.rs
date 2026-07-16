@@ -355,9 +355,9 @@ mod macos {
 ///
 /// # Not yet a datapath
 ///
-/// This is only the device layer. There is no Windows routing/killswitch plan
-/// (`crate::plan` emits `ip`/`route`/`pfctl`/`nft` argv for Unix only), so
-/// nothing in this crate drives this end to end yet. Opening the device here
+/// This is only the device layer. The routing/killswitch/DNS glue lives in
+/// `warrenguard-route-split` + `warrenguard-killswitch-os`, so nothing in this
+/// crate drives this end to end yet. Opening the device here
 /// does not produce a working tunnel; a deployer still has to wire up Windows
 /// routing, killswitch, and the driver loop on top of this device layer.
 ///

@@ -1,5 +1,5 @@
-//! Default-gateway discovery: the physical-link gateway the exit carrier route
-//! pins to (see [`crate::plan::RouteOp::PinExitToPhysical`]).
+//! Default-gateway discovery: the physical-link gateway a carrier route escape
+//! pins to (consumed by the routing stack in `warrenguard-route-split`).
 //!
 //! The PARSING is pure and unit-tested here; running `ip route` to obtain the
 //! input is feature-gated (it is a process call, only meaningful with the host's

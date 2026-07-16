@@ -1,6 +1,6 @@
 [package]
 name = "warrenguard-tun-core"
-description = "Safe, always-on TUN seam for the WarrenGuard datapath: OS-agnostic framing, RawTunDevice/TunIo traits + adapter, gateway parsing, routing/killswitch plan. Zero unsafe, zero deps."
+description = "Safe, always-on TUN seam for the WarrenGuard datapath: OS-agnostic framing, RawTunDevice/TunIo traits + adapter, gateway parsing, and the shared SocketBypass carrier-escape primitive. Zero unsafe, zero deps."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,12 +10,6 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
-
-[dev-dependencies]
-# Dev-only (does not taint the zero-dep production build): cross-checks that
-# `plan::MACOS_TUN_GATEWAY_IP` cannot silently drift from the shared
-# `TUNNEL_GATEWAY_IP` constant (see the `plan` module tests).
-warrenguard-config = { path = "../warrenguard-config" }
 
 [features]
 # Gates the live-host routing-table probes (`gateway::discover_default_gateway`
