@@ -214,23 +214,58 @@ pub trait CoverSink: Send + Sync + 'static {
     fn cover_seed(&self) -> u64;
 }
 
+/// How the driver holds its session. A [`Strong`](SessionRef::Strong) ref pins
+/// the session for the driver's lifetime; a [`Weak`](SessionRef::Weak) ref ties
+/// the cover loop to the session's own lifetime so teardown (the last strong
+/// ref dropped) stops cover cleanly instead of the driver keeping the tunnel
+/// alive forever.
+enum SessionRef<S> {
+    Strong(std::sync::Arc<S>),
+    Weak(std::sync::Weak<S>),
+}
+
+impl<S> SessionRef<S> {
+    /// A live handle to the session, or `None` once every strong reference is
+    /// gone (only possible for the [`Weak`](SessionRef::Weak) variant).
+    fn get(&self) -> Option<std::sync::Arc<S>> {
+        match self {
+            SessionRef::Strong(s) => Some(std::sync::Arc::clone(s)),
+            SessionRef::Weak(w) => w.upgrade(),
+        }
+    }
+}
+
 /// Drives idle cover traffic for a [`CoverSink`] session. Construct with
-/// [`new`](Self::new), spawn [`run`](Self::run), and report real traffic
-/// through a [`handle`](Self::handle) so cover stays silent under load.
+/// [`new`](Self::new) (pins the session) or [`new_weak`](Self::new_weak)
+/// (teardown-tied), spawn [`run`](Self::run), and report real traffic through a
+/// [`handle`](Self::handle) so cover stays silent under load.
 ///
 /// This is the session-scoped driver: it owns one session for that session's
 /// lifetime (the SDK re-creates it per dial). The multi-hop supervised pump,
 /// whose session is swapped on reconnect behind a watch channel, drives the
 /// same [`IdleCover`] scheduler directly instead of holding a fixed session.
+///
+/// # Teardown safety
+///
+/// [`new`](Self::new) holds a strong reference: the driver keeps the session
+/// alive, and because cover traffic resets the idle timeout, a caller that
+/// never stops the loop leaks the tunnel forever. Prefer
+/// [`new_weak`](Self::new_weak) (or [`run_idle_cover`]) when the cover loop must
+/// not outlive the session: it holds only a `Weak`, so when the caller drops its
+/// last strong reference on teardown the next scheduled cover fails to upgrade
+/// and the loop ends on its own.
 pub struct IdleCoverDriver<S: CoverSink> {
-    session: std::sync::Arc<S>,
+    session: SessionRef<S>,
     cover: std::sync::Mutex<IdleCover>,
     wake: tokio::sync::Notify,
     covers_sent: std::sync::atomic::AtomicU64,
 }
 
 impl<S: CoverSink> IdleCoverDriver<S> {
-    /// Builds a driver for `session`, arming the first cover deadline now.
+    /// Builds a driver holding a STRONG reference to `session`, arming the first
+    /// cover deadline now. The driver keeps the session alive for its lifetime;
+    /// see [`new_weak`](Self::new_weak) / [`run_idle_cover`] for the
+    /// teardown-tied variant that does not pin the session.
     #[must_use]
     pub fn new(session: std::sync::Arc<S>) -> std::sync::Arc<Self> {
         let cover = IdleCover::new(
@@ -238,6 +273,27 @@ impl<S: CoverSink> IdleCoverDriver<S> {
             Instant::now(),
             Some(session.max_inner_payload()),
         );
+        Self::from_ref(SessionRef::Strong(session), cover)
+    }
+
+    /// Builds a driver holding only a WEAK reference to `session`, arming the
+    /// first cover deadline now. The driver never keeps the tunnel alive: once
+    /// the caller drops its last strong reference (teardown), the next scheduled
+    /// cover fails to upgrade and [`run`](Self::run) ends on its own. This is the
+    /// safe way to arm cover over a session the caller also owns, since cover
+    /// traffic otherwise resets the idle timeout and a strong-ref driver would
+    /// keep the session alive forever.
+    #[must_use]
+    pub fn new_weak(session: &std::sync::Arc<S>) -> std::sync::Arc<Self> {
+        let cover = IdleCover::new(
+            session.cover_seed(),
+            Instant::now(),
+            Some(session.max_inner_payload()),
+        );
+        Self::from_ref(SessionRef::Weak(std::sync::Arc::downgrade(session)), cover)
+    }
+
+    fn from_ref(session: SessionRef<S>, cover: IdleCover) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             session,
             cover: std::sync::Mutex::new(cover),
@@ -279,11 +335,18 @@ impl<S: CoverSink> IdleCoverDriver<S> {
                 () = stop.notified() => return,
             }
 
+            // Upgrade once per emission. For a weak-held session a failed
+            // upgrade means teardown released the last strong reference, so the
+            // loop ends cleanly rather than the driver outliving the tunnel.
+            let Some(session) = self.session.get() else {
+                return;
+            };
+
             // A cover dummy is one discriminator byte plus `padding_len`
             // padding bytes, so the on-wire plaintext size equals the
             // scheduler's chosen datagram size.
             let padding_len = self.lock().fire_size(Instant::now()).saturating_sub(1);
-            if !self.session.send_cover(padding_len) {
+            if !session.send_cover(padding_len) {
                 // The tunnel is gone; stop (the session is finished).
                 return;
             }
@@ -311,6 +374,61 @@ impl<S: CoverSink> IdleCoverDriverHandle<S> {
         self.0.lock().note_activity(Instant::now());
         self.0.wake.notify_one();
     }
+}
+
+/// A drop-to-stop guard for an idle-cover loop: dropping it ends the loop.
+///
+/// [`IdleCoverDriver::run`] takes an `Arc<Notify>` stop signal; this RAII guard
+/// wraps the paired sender so cover is torn down when the guard is dropped,
+/// without the caller having to remember an explicit stop call. Store it next to
+/// the tunnel that owns the cover and teardown stops cover for free.
+pub struct CoverStop {
+    stop: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl CoverStop {
+    /// Builds a stop guard and the paired [`tokio::sync::Notify`] to hand to
+    /// [`IdleCoverDriver::run`]. Dropping the returned [`CoverStop`] notifies the
+    /// signal, so the loop stops at its next scheduler poll.
+    #[must_use]
+    pub fn new() -> (Self, std::sync::Arc<tokio::sync::Notify>) {
+        let stop = std::sync::Arc::new(tokio::sync::Notify::new());
+        (
+            Self {
+                stop: std::sync::Arc::clone(&stop),
+            },
+            stop,
+        )
+    }
+}
+
+impl Drop for CoverStop {
+    fn drop(&mut self) {
+        // `notify_one` (not `notify_waiters`) so a stop that races ahead of the
+        // loop reaching its `stop.notified()` await still stops it: the stored
+        // permit is consumed by the next poll.
+        self.stop.notify_one();
+    }
+}
+
+/// Arms teardown-safe idle cover for `session`, returning the loop future to
+/// spawn plus a drop-to-stop [`CoverStop`] guard.
+///
+/// The loop stops when EITHER the returned [`CoverStop`] is dropped OR the last
+/// strong reference to `session` is released, whichever comes first: the guard
+/// is the prompt teardown path, and the weak reference is the safety net if the
+/// caller forgets to stop. Either way cover can never outlive the tunnel, which
+/// a bare [`IdleCoverDriver::new`] arming does (its strong ref plus the idle
+/// timeout that cover keeps resetting keeps the session alive forever).
+pub fn run_idle_cover<S: CoverSink>(
+    session: &std::sync::Arc<S>,
+) -> (
+    impl std::future::Future<Output = ()> + Send + 'static,
+    CoverStop,
+) {
+    let driver = IdleCoverDriver::new_weak(session);
+    let (guard, stop) = CoverStop::new();
+    (driver.run(stop), guard)
 }
 
 #[cfg(test)]
@@ -541,6 +659,69 @@ mod tests {
             .expect("run must return once the sink reports the tunnel gone")
             .expect("run task must not panic");
         assert_eq!(driver.covers_sent(), 0, "a failed send emits no cover");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn weak_driver_stops_when_the_last_strong_session_reference_is_dropped() {
+        // Teardown safety: a weak-held driver must not keep the tunnel alive. It
+        // holds no strong reference, so when the caller drops its last strong
+        // reference the next scheduled cover fails to upgrade and the loop ends.
+        let sink = std::sync::Arc::new(RecordingSink {
+            sent: std::sync::Mutex::new(Vec::new()),
+            alive: std::sync::atomic::AtomicBool::new(true),
+        });
+        let driver = IdleCoverDriver::new_weak(&sink);
+        // A never-fired stop: the ONLY thing that may end the loop is the dropped
+        // session, so the test isolates the weak-upgrade teardown path.
+        let stop = std::sync::Arc::new(tokio::sync::Notify::new());
+        let run = tokio::spawn(driver.clone().run(stop));
+
+        drop(sink); // teardown: no strong reference to the session remains.
+        // Advance past a cover deadline so the loop reaches the send site, where
+        // the weak upgrade now fails and returns.
+        for _ in 0..3 {
+            tokio::time::advance(IDLE_COVER_MAX_INTERVAL).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            run.is_finished(),
+            "a weak-held cover loop must end once the last strong session reference is dropped, \
+             not keep the tunnel alive forever"
+        );
+        assert_eq!(
+            driver.covers_sent(),
+            0,
+            "a session dropped before the first deadline must emit no cover"
+        );
+        let _ = run.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cover_stop_guard_ends_the_loop_when_dropped() {
+        // The RAII stop guard is the prompt teardown path: the session stays
+        // alive here (the weak safety net never triggers), so dropping the guard
+        // is the sole cause that ends the loop.
+        let sink = std::sync::Arc::new(RecordingSink {
+            sent: std::sync::Mutex::new(Vec::new()),
+            alive: std::sync::atomic::AtomicBool::new(true),
+        });
+        let (fut, guard) = run_idle_cover(&sink);
+        let run = tokio::spawn(fut);
+        tokio::task::yield_now().await;
+        assert!(
+            !run.is_finished(),
+            "the cover loop must be running while the guard is held"
+        );
+
+        drop(guard); // drop-to-stop.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(
+            run.is_finished(),
+            "dropping the CoverStop guard must end the cover loop"
+        );
+        drop(sink); // keep the session strong until here so only the guard stops it.
+        let _ = run.await;
     }
 
     #[test]
