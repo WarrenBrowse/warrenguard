@@ -104,6 +104,27 @@ impl From<ControlError> for SetupError {
     }
 }
 
+impl SetupError {
+    /// The engine's supervisor-facing verdict for a setup-stream failure.
+    ///
+    /// A policy rejection is fatal (unauthorized account); exhaustion reselects
+    /// another exit (a capacity issue on this exit, not the account, matching
+    /// [`crate::RejectionReason::retryability`]). Every other setup failure is a
+    /// transient wire/HPKE error on a warming stream, worth an immediate redial
+    /// of the same target.
+    #[must_use]
+    pub fn retryability(&self) -> warrenguard_wire::Retryability {
+        use warrenguard_wire::{FatalCause, Retryability};
+        match self {
+            SetupError::Rejected => Retryability::Fatal(FatalCause::NotAuthorized),
+            SetupError::IpExhausted => Retryability::RetryReselect,
+            SetupError::Session(_) | SetupError::Control(_) | SetupError::UnexpectedReply => {
+                Retryability::RetrySameTarget
+            }
+        }
+    }
+}
+
 impl ClientSession {
     /// Build the `IpRequest` control message for this session.
     ///
@@ -421,5 +442,25 @@ mod tests {
             client.open_setup_reply(&reply),
             Err(SetupError::UnexpectedReply)
         ));
+    }
+
+    #[test]
+    fn setup_error_verdicts_are_pinned() {
+        use warrenguard_wire::{FatalCause, Retryability};
+        assert_eq!(
+            SetupError::Rejected.retryability(),
+            Retryability::Fatal(FatalCause::NotAuthorized),
+            "a policy rejection must be fatal, never a silent reconnect loop"
+        );
+        assert_eq!(
+            SetupError::IpExhausted.retryability(),
+            Retryability::RetryReselect,
+            "exhaustion reselects another exit"
+        );
+        assert_eq!(
+            SetupError::UnexpectedReply.retryability(),
+            Retryability::RetrySameTarget,
+            "a warming-stream wire glitch retries the same target"
+        );
     }
 }

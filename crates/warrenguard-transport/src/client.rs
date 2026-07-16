@@ -1252,6 +1252,11 @@ fn rejection_from_close_code(code: quinn::VarInt) -> Option<TunnelError> {
         // The exit is draining for maintenance: retrying THIS exit is
         // pointless, the caller must re-select another one.
         Some(TunnelError::ExitDrainingRefused)
+    } else if code == warrenguard_transport_core::constants::WARREN_NO_CAPACITY {
+        // The exit's IP pool is exhausted: not the account's fault, but the same
+        // exit re-hits it, so the caller reselects another (aligns with the
+        // multi-hop IpExhausted verdict, audit C3.3).
+        Some(TunnelError::PoolExhausted)
     } else {
         None
     }
@@ -1671,6 +1676,24 @@ mod tests {
                 Some(TunnelError::DeviceLimitReached)
             ),
             "WARREN_DEVICE_LIMIT must surface as the non-retryable DeviceLimitReached"
+        );
+    }
+
+    #[test]
+    fn no_capacity_close_code_maps_to_pool_exhausted_and_reselects() {
+        // WARREN_NO_CAPACITY used to fall through to a generic transport error;
+        // it now surfaces the typed PoolExhausted, whose verdict reselects a
+        // different exit rather than hammering the full one (audit C3.3).
+        let mapped =
+            rejection_from_close_code(warrenguard_transport_core::constants::WARREN_NO_CAPACITY);
+        assert!(
+            matches!(mapped, Some(TunnelError::PoolExhausted)),
+            "WARREN_NO_CAPACITY must surface as the typed PoolExhausted"
+        );
+        assert_eq!(
+            mapped.unwrap().retryability(),
+            warrenguard_wire::Retryability::RetryReselect,
+            "pool exhaustion reselects another exit, matching multi-hop IpExhausted"
         );
     }
 

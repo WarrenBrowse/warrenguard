@@ -128,6 +128,25 @@ impl RejectionReason {
             Self::PolicyRefused => "policy-refused",
         }
     }
+
+    /// The engine's supervisor-facing verdict for this rejection.
+    ///
+    /// Not-allowlisted and the opaque policy refusal are fatal: the account is
+    /// unauthorized (or the cause is unknown and definitive), and no other exit
+    /// resolves it. Pool exhaustion is NOT fatal and NOT worth redialing the
+    /// same exit: it is not the client's fault and a different exit likely has
+    /// capacity, so it reselects, exactly like a drain. This is the single home
+    /// for the exhaustion classification the single-hop path
+    /// (`WARREN_NO_CAPACITY`) shares (audit C3.3).
+    #[must_use]
+    pub fn retryability(self) -> warrenguard_wire::Retryability {
+        use warrenguard_wire::{FatalCause, Retryability};
+        match self {
+            Self::NotAllowlisted => Retryability::Fatal(FatalCause::NotAuthorized),
+            Self::PolicyRefused => Retryability::Fatal(FatalCause::PolicyRefused),
+            Self::IpExhausted => Retryability::RetryReselect,
+        }
+    }
 }
 
 impl core::fmt::Display for RejectionReason {
@@ -208,6 +227,30 @@ mod tests {
         assert_eq!(WARREN_MH_DRAINING, 0x57_4D_44_31);
         assert_ne!(WARREN_MH_DRAINING, WARREN_MH_REJECTED);
         assert_ne!(WARREN_MH_DRAINING, WARREN_MH_FORCED_RECONNECT);
+    }
+
+    #[test]
+    fn rejection_verdicts_are_pinned_per_cause() {
+        use warrenguard_wire::{FatalCause, Retryability};
+        // Fatal set: an unauthorized account (or an opaque definitive refusal)
+        // must STOP the supervisor, never loop as a reconnect. If this flips to
+        // a retryable verdict, a rejected user spins "Reconnecting" forever.
+        assert_eq!(
+            RejectionReason::NotAllowlisted.retryability(),
+            Retryability::Fatal(FatalCause::NotAuthorized),
+            "not-allowlisted must be fatal (unauthorized account)"
+        );
+        assert_eq!(
+            RejectionReason::PolicyRefused.retryability(),
+            Retryability::Fatal(FatalCause::PolicyRefused),
+            "an opaque policy refusal is definitive, so fatal"
+        );
+        // Exhaustion is a capacity issue on THIS exit, not the account: reselect.
+        assert_eq!(
+            RejectionReason::IpExhausted.retryability(),
+            Retryability::RetryReselect,
+            "pool exhaustion must reselect another exit, not surface fatal"
+        );
     }
 
     #[test]

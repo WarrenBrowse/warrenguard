@@ -170,6 +170,17 @@ pub enum TunnelError {
     #[error("exit rejected the handshake: identity not authorized (no active subscription)")]
     AuthRejected,
 
+    /// The exit closed the handshake with `WARREN_NO_CAPACITY`: its tunnel IP
+    /// pool has no free address left. Surfaces on the **client** side. Unlike
+    /// [`TunnelError::AuthRejected`] the account is fine, and unlike a transient
+    /// loss redialing the SAME exit re-hits the exhaustion, so the caller should
+    /// reselect a different exit. The multi-hop equivalent is
+    /// `RejectionReason::IpExhausted`; both classify as
+    /// [`warrenguard_wire::Retryability::RetryReselect`] (audit C3.3). No
+    /// identity material is carried.
+    #[error("exit rejected the handshake: ip pool exhausted")]
+    PoolExhausted,
+
     /// Failed to encode or decode a Setup / SetupAck frame (postcard
     /// returned an error, or the wire bytes were malformed).
     #[error("setup wire format error: {context}: {source}")]
@@ -263,6 +274,31 @@ pub enum TunnelError {
     DaitaFramework(String),
 }
 
+impl TunnelError {
+    /// The engine's supervisor-facing verdict for a (re)connect failure.
+    ///
+    /// The fatal set matches the app's proven single-hop classification
+    /// (`AuthRejected`/`DeviceLimitReached` are non-retryable business
+    /// rejections) plus the exit-side authorization refusals; the draining and
+    /// pool-exhaustion refusals reselect another exit; everything else is a
+    /// transient network/QUIC failure worth an immediate redial of the same
+    /// target. The client `match`es this instead of re-deriving the policy.
+    #[must_use]
+    pub fn retryability(&self) -> warrenguard_wire::Retryability {
+        use warrenguard_wire::{FatalCause, Retryability};
+        match self {
+            TunnelError::AuthRejected
+            | TunnelError::AllowlistDenied
+            | TunnelError::InbandAuthFailed => Retryability::Fatal(FatalCause::NotAuthorized),
+            TunnelError::DeviceLimitReached => Retryability::Fatal(FatalCause::DeviceLimit),
+            TunnelError::ExitDrainingRefused | TunnelError::PoolExhausted => {
+                Retryability::RetryReselect
+            }
+            _ => Retryability::RetrySameTarget,
+        }
+    }
+}
+
 /// Convenience alias for `Result<T, TunnelError>`. Mirrors the
 /// `anyhow::Result` ergonomics callers had before the migration.
 pub type Result<T> = std::result::Result<T, TunnelError>;
@@ -322,6 +358,36 @@ mod tests {
         assert!(
             matches!(te, TunnelError::DaitaFramework(ref s) if s == "rejected"),
             "framework failure must keep its message, got {te:?}"
+        );
+    }
+
+    #[test]
+    fn business_rejections_are_fatal_transport_errors_are_transient() {
+        use warrenguard_wire::{FatalCause, Retryability};
+        // The fatal set must STOP a supervisor. If any of these flips to a
+        // retryable verdict, a rejected user loops "Reconnecting" forever.
+        assert_eq!(
+            TunnelError::AuthRejected.retryability(),
+            Retryability::Fatal(FatalCause::NotAuthorized)
+        );
+        assert_eq!(
+            TunnelError::DeviceLimitReached.retryability(),
+            Retryability::Fatal(FatalCause::DeviceLimit)
+        );
+        // Reselect set: not the account's fault, but the same exit re-hits it.
+        assert_eq!(
+            TunnelError::ExitDrainingRefused.retryability(),
+            Retryability::RetryReselect
+        );
+        assert_eq!(
+            TunnelError::PoolExhausted.retryability(),
+            Retryability::RetryReselect,
+            "pool exhaustion aligns single-hop with multi-hop IpExhausted (C3.3)"
+        );
+        // A plain network loss retries the same target.
+        assert_eq!(
+            TunnelError::NoExitAddr.retryability(),
+            Retryability::RetrySameTarget
         );
     }
 }

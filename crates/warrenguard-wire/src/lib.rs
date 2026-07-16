@@ -6,11 +6,13 @@
 mod exit_addr;
 mod exit_id;
 mod pubkey;
+mod retry;
 mod setup_v7;
 
 pub use exit_addr::{WarrenExitAddr, WarrenTransportAddr};
 pub use exit_id::{EXIT_ID_LEN, ExitId, ExitIdError};
 pub use pubkey::{PUBKEY_LEN, WarrenPubkey, WarrenPubkeyError};
+pub use retry::{FatalCause, Retryability};
 pub use setup_v7::{
     ATTACH_SECRET_LEN, AnySetup, MAX_SESSION_TOKENS, SESSION_TOKEN_LEN, SessionToken, SetupAckV7,
     SetupV7, decode_setup_ack_v7, decode_setup_any, decode_setup_v7, encode_setup_ack_v7,

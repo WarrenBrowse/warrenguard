@@ -36,3 +36,4 @@ pub use transport_config::{
     warren_transport_config_relay_outbound_multihop_with_gso,
     warren_transport_config_relay_outbound_with_gso,
 };
+pub use warrenguard_wire::{FatalCause, Retryability};

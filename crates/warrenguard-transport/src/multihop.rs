@@ -230,6 +230,27 @@ impl MultiHopError {
             _ => None,
         }
     }
+
+    /// The engine's supervisor-facing verdict for this failure: fatal (stop),
+    /// retry-same-target (transient), or retry-with-reselect (a deliberate
+    /// refusal a different exit would not share). The single home for the
+    /// multi-hop reconnect policy, consumed by a supervisor instead of being
+    /// re-derived per client.
+    ///
+    /// A policy rejection carries its own verdict (fatal for an unauthorized
+    /// account, reselect for exhaustion). A dial refusal by the entry relay or
+    /// the exit's drain reselects (redialing the same circuit re-hits the closed
+    /// admission gate). Everything else retries the same target under backoff.
+    #[must_use]
+    pub fn retryability(&self) -> warrenguard_wire::Retryability {
+        if let MultiHopError::Rejected(reason) = self {
+            return reason.retryability();
+        }
+        if self.dial_refusal().is_some() {
+            return warrenguard_wire::Retryability::RetryReselect;
+        }
+        warrenguard_wire::Retryability::RetrySameTarget
+    }
 }
 
 /// Which hop of the dialed circuit refused a dial attempt (see
@@ -2823,6 +2844,35 @@ mod tests {
             }),
         );
         assert_eq!(other_transport_close.dial_refusal(), None);
+    }
+
+    #[test]
+    fn retryability_verdicts_pin_the_reconnect_policy() {
+        use warrenguard_wire::{FatalCause, Retryability};
+        // A policy rejection is fatal and STOPS the supervisor (never a silent
+        // reconnect loop): the single most important arm of this classifier.
+        assert_eq!(
+            MultiHopError::Rejected(RejectionReason::NotAllowlisted).retryability(),
+            Retryability::Fatal(FatalCause::NotAuthorized)
+        );
+        // Exhaustion reselects rather than surfacing fatal.
+        assert_eq!(
+            MultiHopError::Rejected(RejectionReason::IpExhausted).retryability(),
+            Retryability::RetryReselect
+        );
+        // A drained-exit dial refusal reselects a different exit.
+        let drain = MultiHopError::Handshake(quinn::ConnectionError::ApplicationClosed(
+            quinn::ApplicationClose {
+                error_code: quinn::VarInt::from_u32(warrenguard_multihop::WARREN_MH_DRAINING),
+                reason: bytes::Bytes::from_static(b""),
+            },
+        ));
+        assert_eq!(drain.retryability(), Retryability::RetryReselect);
+        // A plain timeout retries the same target.
+        assert_eq!(
+            MultiHopError::Handshake(quinn::ConnectionError::TimedOut).retryability(),
+            Retryability::RetrySameTarget
+        );
     }
 
     #[test]

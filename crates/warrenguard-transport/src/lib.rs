@@ -44,3 +44,6 @@ pub use ip_assign::{IpAssignChannel, IpAssignSpec};
 pub use multi_session::MultiSession;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub use real_tun::RealTun;
+// The engine's supervisor-facing reconnect verdict, re-exported so a consumer
+// naming it through the transport crate does not reach into `warrenguard-wire`.
+pub use warrenguard_wire::{FatalCause, Retryability};
