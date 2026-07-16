@@ -542,4 +542,35 @@ mod tests {
             .expect("run task must not panic");
         assert_eq!(driver.covers_sent(), 0, "a failed send emits no cover");
     }
+
+    #[test]
+    fn unified_cover_size_constants_are_pinned() {
+        // Single home for the idle-cover wire footprint (ADR-0006). The now
+        // deleted SDK twin expressed the same bytes as a PADDING length
+        // (MIN_PADDING 63 / cap 1279); this home expresses them as the total
+        // datagram SIZE (marker byte included), so the two are wire-identical
+        // iff padding == size - 1. Pinning both the size constants and that
+        // one-byte relation is what makes a future edit that skews either home
+        // fail here rather than silently split the idle signature per datapath.
+        assert_eq!(
+            IDLE_COVER_MIN_SIZE, 64,
+            "min cover datagram size (marker + padding)"
+        );
+        assert_eq!(
+            IDLE_COVER_MAX_SIZE_CAP, 1280,
+            "cover datagram size cap (path-MTU floor)"
+        );
+        assert_eq!(
+            IDLE_COVER_MIN_SIZE - 1,
+            63,
+            "padding floor must equal the deleted SDK twin's MIN_PADDING (size - 1 marker byte)"
+        );
+        assert_eq!(
+            IDLE_COVER_MAX_SIZE_CAP - 1,
+            1279,
+            "padding cap must equal the deleted SDK twin's cap (size - 1 marker byte)"
+        );
+        assert_eq!(IDLE_COVER_MIN_INTERVAL.as_secs(), 10, "jitter floor");
+        assert_eq!(IDLE_COVER_MAX_INTERVAL.as_secs(), 20, "jitter ceiling");
+    }
 }
