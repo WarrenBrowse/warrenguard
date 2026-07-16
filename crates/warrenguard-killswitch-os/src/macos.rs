@@ -13,124 +13,143 @@ use crate::{KillswitchError, KillswitchOpts, validate_tun_name};
 /// pf anchor path used by Warren.
 pub const PF_ANCHOR_PATH: &str = "com.apple/250.warrenguard_killswitch_os";
 
-/// Builds the filter rules for the killswitch. Pure: no privileges
-/// needed, fully testable.
-pub fn build_pf_rules(opts: &KillswitchOpts) -> Result<Vec<FilterRule>, KillswitchError> {
-    let mut rules = Vec::new();
+/// One pf filter rule, in a form pure enough to unit-test the ORDER and the
+/// `quick` flags. The load-bearing invariant lives here: the default block must
+/// NOT be `quick`. pf stops at the first `quick` match, so a `quick` block would
+/// fire for every packet before the pass exceptions below and drop all egress,
+/// the tunnel included (the datapath then forwards uplink but the host, and its
+/// own in-tunnel probes, egress nothing). A plain block is the last-match
+/// default that the `quick` pass exceptions override.
+#[derive(Debug, Clone, PartialEq)]
+struct PfRuleSpec {
+    /// `true` = Pass, `false` = Drop(Return) (the default block).
+    pass: bool,
+    quick: bool,
+    iface: Option<String>,
+    udp: bool,
+    v6: bool,
+    dest: Option<PfDest>,
+}
 
-    // 1. Block all outbound by default.
-    rules.push(
-        FilterRuleBuilder::default()
-            .action(FilterRuleAction::Drop(pfctl::DropAction::Return))
-            .direction(pfctl::Direction::Out)
-            .quick(true)
-            .build()
-            .map_err(|e| KillswitchError::Pf(format!("block-all rule: {e}")))?,
-    );
+#[derive(Debug, Clone, PartialEq)]
+enum PfDest {
+    /// `to <net>` (port any).
+    Net(IpNetwork),
+    /// `to any port <p>`.
+    AnyPort(u16),
+}
 
-    // 2. Allow loopback.
-    rules.push(
-        FilterRuleBuilder::default()
-            .action(FilterRuleAction::Pass)
-            .direction(pfctl::Direction::Out)
-            .quick(true)
-            .interface(pfctl::Interface::from("lo0"))
-            .build()
-            .map_err(|e| KillswitchError::Pf(format!("loopback rule: {e}")))?,
-    );
+/// The ordered killswitch rule specs. Pure and fully testable.
+fn pf_rule_specs(opts: &KillswitchOpts) -> Vec<PfRuleSpec> {
+    let pass = |iface: Option<String>, udp: bool, v6: bool, dest: Option<PfDest>| PfRuleSpec {
+        pass: true,
+        quick: true,
+        iface,
+        udp,
+        v6,
+        dest,
+    };
+    let mut specs = vec![
+        // Default block, first but NON-quick (see [`PfRuleSpec`]); a partial
+        // install (block present, passes not yet added) still fails closed.
+        PfRuleSpec {
+            pass: false,
+            quick: false,
+            iface: None,
+            udp: false,
+            v6: false,
+            dest: None,
+        },
+        // Loopback.
+        pass(Some("lo0".into()), false, false, None),
+        // The tunnel interface: every captured packet egresses here.
+        pass(Some(opts.tun_name.clone()), false, false, None),
+    ];
 
-    // 3. Allow tunnel interface.
-    rules.push(
-        FilterRuleBuilder::default()
-            .action(FilterRuleAction::Pass)
-            .direction(pfctl::Direction::Out)
-            .quick(true)
-            .interface(pfctl::Interface::from(opts.tun_name.as_str()))
-            .build()
-            .map_err(|e| KillswitchError::Pf(format!("tunnel rule: {e}")))?,
-    );
-
-    // 4. Allow UDP to exit IPs (QUIC handshake + keepalive).
+    // The exit carrier (QUIC/UDP to each exit IP). Scoped to the physical
+    // interface when the carrier socket is IP_BOUND_IF-bound (Port Fail /
+    // TunnelCrack ServerIP fix: an unscoped rule would let ANY app dialing the
+    // exit IP escape the tunnel). Unscoped in the macOS unbound-carrier model,
+    // which instead escapes via a <exit>/32 physical host route.
     for addr in &opts.exit_addrs {
-        let ip_net = match addr {
+        let net = match addr {
             IpAddr::V4(v4) => IpNetwork::V4(Ipv4Network::new(*v4, 32).expect("single-host mask")),
             IpAddr::V6(v6) => IpNetwork::V6(Ipv6Network::new(*v6, 128).expect("single-host mask")),
         };
-        let mut builder = FilterRuleBuilder::default();
-        builder
-            .action(FilterRuleAction::Pass)
-            .direction(pfctl::Direction::Out)
-            .quick(true)
-            .proto(pfctl::Proto::Udp)
-            .to(pfctl::Endpoint::new(ip_net, pfctl::Port::Any));
-        if addr.is_ipv6() {
-            builder.af(pfctl::AddrFamily::Ipv6);
-        }
-        if let Some(iface) = &opts.phys_iface {
-            // Port Fail / TunnelCrack-ServerIP fix: an unscoped pass
-            // rule matches this destination from ANY interface, so any
-            // app dialing the exit IP escapes the tunnel. Scoping to
-            // the physical interface the daemon's socket is bound to
-            // (IP_BOUND_IF) means only that socket still matches once
-            // the exit route is captured into the tunnel for everyone
-            // else.
-            builder.interface(pfctl::Interface::from(iface.as_str()));
-        }
-        rules.push(
-            builder
-                .build()
-                .map_err(|e| KillswitchError::Pf(format!("exit IP rule: {e}")))?,
-        );
+        specs.push(pass(
+            opts.phys_iface.clone(),
+            true,
+            addr.is_ipv6(),
+            Some(PfDest::Net(net)),
+        ));
     }
 
-    // 5. Optional LAN exceptions.
     if opts.allow_lan {
-        let lan_ranges = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"];
-        for cidr in &lan_ranges {
-            let net: IpNetwork = cidr.parse().expect("valid CIDR");
-            rules.push(
-                FilterRuleBuilder::default()
-                    .action(FilterRuleAction::Pass)
-                    .direction(pfctl::Direction::Out)
-                    .quick(true)
-                    .to(pfctl::Endpoint::new(net, pfctl::Port::Any))
-                    .build()
-                    .map_err(|e| KillswitchError::Pf(format!("LAN rule: {e}")))?,
-            );
+        for cidr in ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"] {
+            specs.push(pass(
+                None,
+                false,
+                false,
+                Some(PfDest::Net(cidr.parse().expect("valid CIDR"))),
+            ));
         }
-        let lan_v6 = ["fc00::/7", "fe80::/10"];
-        for cidr in &lan_v6 {
-            let net: IpNetwork = cidr.parse().expect("valid CIDR");
-            rules.push(
-                FilterRuleBuilder::default()
-                    .action(FilterRuleAction::Pass)
-                    .direction(pfctl::Direction::Out)
-                    .quick(true)
-                    .af(pfctl::AddrFamily::Ipv6)
-                    .to(pfctl::Endpoint::new(net, pfctl::Port::Any))
-                    .build()
-                    .map_err(|e| KillswitchError::Pf(format!("LAN v6 rule: {e}")))?,
-            );
+        for cidr in ["fc00::/7", "fe80::/10"] {
+            specs.push(pass(
+                None,
+                false,
+                true,
+                Some(PfDest::Net(cidr.parse().expect("valid CIDR"))),
+            ));
         }
     }
 
-    // 6. Optional DHCP.
     if opts.allow_dhcp {
         for port in [67u16, 68] {
-            rules.push(
-                FilterRuleBuilder::default()
-                    .action(FilterRuleAction::Pass)
-                    .direction(pfctl::Direction::Out)
-                    .quick(true)
-                    .proto(pfctl::Proto::Udp)
-                    .to(pfctl::Endpoint::new(pfctl::Ip::Any, port))
-                    .build()
-                    .map_err(|e| KillswitchError::Pf(format!("DHCP rule: {e}")))?,
-            );
+            specs.push(pass(None, true, false, Some(PfDest::AnyPort(port))));
         }
     }
 
-    Ok(rules)
+    specs
+}
+
+/// Renders one [`PfRuleSpec`] into a pfctl [`FilterRule`].
+fn spec_to_filter_rule(spec: &PfRuleSpec) -> Result<FilterRule, KillswitchError> {
+    let mut b = FilterRuleBuilder::default();
+    b.direction(pfctl::Direction::Out).quick(spec.quick);
+    b.action(if spec.pass {
+        FilterRuleAction::Pass
+    } else {
+        FilterRuleAction::Drop(pfctl::DropAction::Return)
+    });
+    if let Some(iface) = &spec.iface {
+        b.interface(pfctl::Interface::from(iface.as_str()));
+    }
+    if spec.udp {
+        b.proto(pfctl::Proto::Udp);
+    }
+    if spec.v6 {
+        b.af(pfctl::AddrFamily::Ipv6);
+    }
+    match &spec.dest {
+        Some(PfDest::Net(net)) => {
+            b.to(pfctl::Endpoint::new(*net, pfctl::Port::Any));
+        }
+        Some(PfDest::AnyPort(port)) => {
+            b.to(pfctl::Endpoint::new(pfctl::Ip::Any, *port));
+        }
+        None => {}
+    }
+    b.build()
+        .map_err(|e| KillswitchError::Pf(format!("pf rule: {e}")))
+}
+
+/// Builds the filter rules for the killswitch. Pure: no privileges needed,
+/// fully testable through [`pf_rule_specs`].
+pub fn build_pf_rules(opts: &KillswitchOpts) -> Result<Vec<FilterRule>, KillswitchError> {
+    pf_rule_specs(opts)
+        .iter()
+        .map(spec_to_filter_rule)
+        .collect()
 }
 
 /// Seam over the pf operations the killswitch lifecycle performs.
@@ -425,6 +444,37 @@ mod tests {
     }
 
     #[test]
+    fn default_block_is_non_quick_so_pass_exceptions_are_reachable() {
+        // pf stops at the first `quick` match. A `quick` default block (the old
+        // bug) therefore fires for every packet before the pass exceptions and
+        // blocks all egress, the tunnel included: the datapath forwards uplink
+        // but the host egresses nothing. The block must be a plain (non-quick)
+        // last-match default that the quick pass exceptions override.
+        let specs = pf_rule_specs(&opts_minimal());
+        let block = specs.first().expect("at least the default block");
+        assert!(!block.pass, "the first rule is the default block");
+        assert!(
+            block.iface.is_none() && block.dest.is_none() && !block.udp,
+            "the default block must match ALL outbound"
+        );
+        assert!(
+            !block.quick,
+            "the default block MUST be non-quick, else it preempts every pass \
+             exception and blocks the tunnel too"
+        );
+        assert!(
+            specs
+                .iter()
+                .any(|s| s.pass && s.quick && s.iface.as_deref() == Some("utun7")),
+            "the tun interface must be a quick pass exception that overrides the block"
+        );
+        assert!(
+            specs.iter().skip(1).all(|s| s.pass && s.quick),
+            "every rule after the default block is a quick pass exception"
+        );
+    }
+
+    #[test]
     fn build_rules_with_lan_adds_extra_rules() {
         let mut o = opts_minimal();
         o.allow_lan = true;
@@ -533,12 +583,13 @@ mod tests {
         let expected_block_all = FilterRuleBuilder::default()
             .action(FilterRuleAction::Drop(pfctl::DropAction::Return))
             .direction(pfctl::Direction::Out)
-            .quick(true)
+            .quick(false)
             .build()
             .expect("expected block-all rule");
         assert_eq!(
             rules[0], expected_block_all,
-            "the block-all default must be unchanged when phys_iface is set"
+            "the block-all default is first but NON-quick (so the quick pass \
+             exceptions override it), regardless of phys_iface"
         );
     }
 
