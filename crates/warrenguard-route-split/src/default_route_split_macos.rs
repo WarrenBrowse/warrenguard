@@ -1556,7 +1556,7 @@ default                                 fe80::1234:56ff:fe78:9abc%en1           
 
     #[test]
     fn v6_repair_is_a_no_op_while_egress_still_rides_a_tunnel() {
-        // THE talpid<->route-split timing contract: the app's route manager
+        // THE deployer-glue timing contract: a consumer's route manager
         // clears tunnel routes asynchronously relative to its reset path, so
         // its immediate repair call (and any retry racing a reconnect) is
         // only safe because a snapshot whose v6 egress still resolves through
