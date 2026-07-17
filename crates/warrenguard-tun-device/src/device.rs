@@ -1,7 +1,8 @@
 //! Privileged per-OS TUN device open: Linux `TUNSETIFF` ioctl, macOS `utun`
-//! control socket, Windows `wintun`. EXPERIMENTAL, requires root /
-//! `CAP_NET_ADMIN`, and NOT YET validated against a real exit. Compiled only
-//! under the `experimental-tun` feature, so the default build pulls none of it.
+//! control socket, Windows `wintun`. Requires root / `CAP_NET_ADMIN`. The macOS
+//! open is real-exit validated through the privileged system-VPN datapath; the
+//! Linux and Windows opens are not yet. Compiled only under the
+//! `experimental-tun` feature, so the default build pulls none of it.
 //!
 //! The safe device seam (the [`warrenguard_tun_core::RawTunDevice`] / `TunIo` traits
 //! and the [`warrenguard_tun_core::FramedTun`] framing adapter) lives in
@@ -35,10 +36,10 @@ const fn generic_linux_iow_code(ioctl_type: u8, nr: u8, size: u32) -> u32 {
         | (nr as u32)
 }
 
-/// Opens the kernel TUN device named `name` (EXPERIMENTAL, requires root /
-/// `CAP_NET_ADMIN`). Compiled only under the `experimental-tun` feature.
+/// Opens the kernel TUN device named `name` (requires root / `CAP_NET_ADMIN`).
+/// Compiled only under the `experimental-tun` feature.
 ///
-/// NOT YET VALIDATED against a real exit: do not rely on this in production.
+/// NOT YET real-exit validated on Linux: do not rely on this in production.
 ///
 /// # Errors
 ///
@@ -183,11 +184,12 @@ mod linux {
     }
 }
 
-/// Opens a macOS `utun` device (EXPERIMENTAL, requires root). `name` of the form
-/// `utunN` requests that unit; anything else lets the kernel pick a free unit.
+/// Opens a macOS `utun` device (requires root). `name` of the form `utunN`
+/// requests that unit; anything else lets the kernel pick a free unit.
 /// Compiled only under the `experimental-tun` feature.
 ///
-/// NOT YET VALIDATED against a real exit: do not rely on this in production.
+/// Real-exit validated end to end through the privileged system-VPN datapath
+/// (egress via the exit, DNS through the tunnel, clean restore on teardown).
 ///
 /// # Errors
 ///

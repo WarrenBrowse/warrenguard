@@ -1,31 +1,30 @@
-//! Warren privileged TUN backend. EXPERIMENTAL, NOT YET REAL-EXIT VALIDATED.
+//! Warren privileged TUN backend: the single engine home for the raw kernel
+//! device open (the injectable async `PacketDevice` wrappers live in
+//! `warrenguard-transport`).
 //!
-//! The non-root proxy datapath (SOCKS5/HTTP over the netstack) is the supported,
-//! validated path. This crate is the foundation for the optional privileged
-//! backend: a real kernel TUN device that captures all OS traffic transparently,
-//! with split-default routing, DNS push and a killswitch.
+//! The non-root proxy datapath (SOCKS5/HTTP over the netstack) is the default
+//! path. This crate is the optional privileged backend's device layer: a real
+//! kernel TUN device that captures all OS traffic transparently, composed
+//! downstream with split-default routing, DNS push and a killswitch.
 //!
 //! # Status
-//!
-//! Per the project rule that tunnel features are validated against a real exit
-//! with privilege before being claimed done (and that cannot happen from the dev
-//! sandbox), this crate ships ONLY the parts that are reviewable and testable
-//! without a device or root:
 //!
 //! - [`frame`]: the OS-agnostic TUN packet framing (macOS utun's 4-byte address
 //!   family prefix vs the bare-IP framing on Linux/Windows) and IP-version
 //!   detection. Pure, fully unit-tested.
 //! - [`device`]: the device seam ([`device::TunIo`]) and a framing adapter over
 //!   any byte stream ([`device::FramedTun`]), unit-tested over an in-memory mock.
-//!   The actual per-OS device open (`device::open_tun`) is compiled ONLY under
-//!   the `experimental-tun` feature and is NOT exercised by any test (it needs
-//!   root and a real kernel device).
+//!   The per-OS device open (`device::open_tun`) is compiled ONLY under the
+//!   `experimental-tun` feature (it needs root and a real kernel device).
+//!   The macOS utun open is REAL-EXIT VALIDATED end to end (privileged
+//!   system-VPN datapath: egress via the exit, DNS through the tunnel, clean
+//!   restore). The Linux and Windows opens compile and are review-covered but
+//!   are NOT yet real-exit validated; do not claim them working end to end.
 //!
-//! Nothing here may be claimed to work end to end until it is validated against a
-//! real Warren exit with privilege. Opening a device is gated behind
-//! `experimental-tun` so it cannot be reached by accident. The routing, killswitch
-//! and DNS glue is NOT here: the production, real-exit-validated stack lives in
-//! `warrenguard-route-split` + `warrenguard-killswitch-os`, the single home.
+//! Opening a device is gated behind `experimental-tun` so it cannot be reached
+//! by accident. The routing, killswitch and DNS glue is NOT here: the
+//! production, real-exit-validated stack lives in `warrenguard-route-split` +
+//! `warrenguard-killswitch-os`, the single home.
 //!
 //! # Unsafe exception
 //!
