@@ -660,7 +660,20 @@ impl MultiHopSupervisor {
             }
 
             let reconnect_start = Instant::now();
-            let client = self.connect_with_unbounded_retry().await?;
+            // Race the dial against the receivers disappearing: a teardown
+            // landing while the retry loop is spinning would otherwise never
+            // be observed (the loop-top check runs only between sessions,
+            // and a dial that never succeeds re-enters neither).
+            let client = tokio::select! {
+                biased;
+                () = self.tx.closed() => {
+                    tracing::info!(
+                        "supervisor watch receivers dropped during dial, terminating"
+                    );
+                    return Ok(());
+                }
+                result = self.connect_with_unbounded_retry() => result?,
+            };
             let primary = Arc::new(client);
 
             if !first_session {
@@ -2262,6 +2275,39 @@ mod run_tests {
         drop(rx);
         drop(handle);
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    #[tokio::test]
+    async fn run_terminates_when_receivers_drop_during_the_cold_dial_retry_loop() {
+        // A teardown landing while the supervisor is INSIDE its cold-dial
+        // retry loop must stop the retries: the loop-top receiver check
+        // cannot see it, and a dial that never succeeds means the loop is
+        // never left. Observed live on Windows as a supervisor still
+        // redialing at attempt=948 long after the daemon reported
+        // Disconnected. The TEST-NET bind address makes every attempt fail
+        // instantly with the same retriable Bind error as the field case.
+        let operational_key = SigningKey::from_bytes(&[0x46; 32]);
+        let exit_id = ExitId::from_bytes([0x55; 16]);
+        let exit = spawn_fake_multihop_exit(&operational_key, exit_id);
+        let mut config = config_with_fake_exit(&exit, &operational_key);
+        config.bind_addr = "192.0.2.1:0".parse().expect("static addr parses");
+
+        let (supervisor, rx) = MultiHopSupervisor::new(config);
+        let task = tokio::spawn(supervisor.run());
+
+        // Let run() pass its loop-top no-receivers check and enter the
+        // retry loop before the teardown drops the last receiver.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(rx);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("run() must terminate promptly when every receiver drops mid-dial")
+            .expect("run() task must not panic");
+        assert!(
+            result.is_ok(),
+            "a receiverless teardown must terminate run() cleanly, got {result:?}"
+        );
     }
 
     #[tokio::test]
