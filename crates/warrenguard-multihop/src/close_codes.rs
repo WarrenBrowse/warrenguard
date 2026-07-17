@@ -137,7 +137,7 @@ impl RejectionReason {
     /// same exit: it is not the client's fault and a different exit likely has
     /// capacity, so it reselects, exactly like a drain. This is the single home
     /// for the exhaustion classification the single-hop path
-    /// (`WARREN_NO_CAPACITY`) shares (audit C3.3).
+    /// (`WARREN_NO_CAPACITY`) shares.
     #[must_use]
     pub fn retryability(self) -> warrenguard_wire::Retryability {
         use warrenguard_wire::{FatalCause, Retryability};

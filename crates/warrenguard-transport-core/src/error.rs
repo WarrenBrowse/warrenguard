@@ -176,7 +176,7 @@ pub enum TunnelError {
     /// loss redialing the SAME exit re-hits the exhaustion, so the caller should
     /// reselect a different exit. The multi-hop equivalent is
     /// `RejectionReason::IpExhausted`; both classify as
-    /// [`warrenguard_wire::Retryability::RetryReselect`] (audit C3.3). No
+    /// [`warrenguard_wire::Retryability::RetryReselect`]. No
     /// identity material is carried.
     #[error("exit rejected the handshake: ip pool exhausted")]
     PoolExhausted,
@@ -382,7 +382,7 @@ mod tests {
         assert_eq!(
             TunnelError::PoolExhausted.retryability(),
             Retryability::RetryReselect,
-            "pool exhaustion aligns single-hop with multi-hop IpExhausted (C3.3)"
+            "pool exhaustion aligns single-hop with multi-hop IpExhausted"
         );
         // A plain network loss retries the same target.
         assert_eq!(

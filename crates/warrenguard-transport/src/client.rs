@@ -1255,7 +1255,7 @@ fn rejection_from_close_code(code: quinn::VarInt) -> Option<TunnelError> {
     } else if code == warrenguard_transport_core::constants::WARREN_NO_CAPACITY {
         // The exit's IP pool is exhausted: not the account's fault, but the same
         // exit re-hits it, so the caller reselects another (aligns with the
-        // multi-hop IpExhausted verdict, audit C3.3).
+        // multi-hop IpExhausted verdict).
         Some(TunnelError::PoolExhausted)
     } else {
         None
@@ -1683,7 +1683,7 @@ mod tests {
     fn no_capacity_close_code_maps_to_pool_exhausted_and_reselects() {
         // WARREN_NO_CAPACITY used to fall through to a generic transport error;
         // it now surfaces the typed PoolExhausted, whose verdict reselects a
-        // different exit rather than hammering the full one (audit C3.3).
+        // different exit rather than hammering the full one.
         let mapped =
             rejection_from_close_code(warrenguard_transport_core::constants::WARREN_NO_CAPACITY);
         assert!(

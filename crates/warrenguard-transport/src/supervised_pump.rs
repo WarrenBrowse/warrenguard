@@ -40,8 +40,8 @@ use crate::multihop::MultiHopError;
 use crate::supervisor::ClientWatch;
 
 pub use crate::{IpAssignChannel, IpAssignSpec};
-// The advisory type moved to `drain_policy` (the single drain-reaction home,
-// doc-94 B6); re-exported here so pump-side consumers keep their import path.
+// The advisory type moved to `drain_policy` (the single drain-reaction home);
+// re-exported here so pump-side consumers keep their import path.
 pub use crate::drain_policy::ExitDrainAdvisory;
 
 /// `tokio::sync::watch` channel the downlink pump uses to publish an
