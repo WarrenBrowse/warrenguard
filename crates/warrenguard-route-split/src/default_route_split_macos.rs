@@ -438,6 +438,60 @@ fn scutil_show(key: &str) -> Option<String> {
     }
 }
 
+/// The repair [`plan_primary_defaults_repair_v6`] computed for one teardown
+/// snapshot: which of the primary service's v6 default routes to re-add, and
+/// the exact `route` argvs (program name excluded) that re-add them.
+#[derive(Debug, PartialEq, Eq)]
+struct PrimaryV6Repair {
+    /// SC's `PrimaryInterface`: the interface whose defaults are repaired and
+    /// the zone a link-local router is scoped to.
+    pif: String,
+    /// Re-adds the missing UNSCOPED default, when the table proves it missing.
+    unscoped_add: Option<Vec<String>>,
+    /// Re-adds the primary's missing IFSCOPE default, when proven missing.
+    scoped_add: Option<Vec<String>>,
+}
+
+/// Pure decision core of [`restore_primary_defaults_v6`]: the contract between
+/// the app's teardown glue and this repair, pinned here so neither side can
+/// drift.
+///
+/// 1. **Never fabricate**: a plan exists only when SC's
+///    `State:/Network/Global/IPv6` names BOTH `PrimaryInterface` and `Router`,
+///    and re-adds exactly the route they describe.
+/// 2. **Fingerprint-gated, idempotent**: only a default the `netstat` table
+///    proves missing is re-added; a healed table plans nothing, so retries and
+///    raced reconnects are no-ops.
+/// 3. **Leak guard wins over the fingerprint**: while unscoped v6 egress still
+///    resolves through a tunnel interface, nothing is planned even if defaults
+///    look missing. The app's route manager clears tunnel routes
+///    ASYNCHRONOUSLY relative to its reset path, so its immediate call plus a
+///    short retry schedule is only safe because an early call here is a
+///    guaranteed no-op; re-opening a physical path while a tunnel still
+///    carries traffic would leak v6 (and the scoped resolver) outside it.
+///    `None` egress (no v6 route resolves at all) is the post-teardown shape
+///    and must NOT block the repair.
+fn plan_primary_defaults_repair_v6(
+    sc_global_ipv6: &str,
+    netstat_v6: &str,
+    v6_egress_iface: Option<&str>,
+) -> Option<PrimaryV6Repair> {
+    let (pif, router) = parse_primary_ipv6(sc_global_ipv6)?;
+    let need_unscoped = unscoped_default_missing_v6(netstat_v6);
+    let need_scoped = primary_scoped_default_missing(netstat_v6, &pif);
+    if !need_unscoped && !need_scoped {
+        return None;
+    }
+    if v6_egress_iface.is_some_and(is_tunnel_iface) {
+        return None;
+    }
+    Some(PrimaryV6Repair {
+        unscoped_add: need_unscoped.then(|| build_unscoped_default_add_v6(&pif, &router)),
+        scoped_add: need_scoped.then(|| build_scoped_default_add_v6(&pif, &router)),
+        pif,
+    })
+}
+
 /// Restore the primary interface's IPv6 default routes (unscoped and scoped)
 /// if the tunnel teardown stranded them. TWO production root causes on macOS:
 ///
@@ -462,47 +516,30 @@ pub fn restore_primary_defaults_v6() {
     let Some(global) = scutil_show("State:/Network/Global/IPv6") else {
         return;
     };
-    let Some((pif, router)) = parse_primary_ipv6(&global) else {
-        return;
-    };
     let Some(table) = run_blocking_bounded("netstat", &["-rn", "-f", "inet6"])
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
     else {
         return;
     };
-    let need_unscoped = unscoped_default_missing_v6(&table);
-    let need_scoped = primary_scoped_default_missing(&table, &pif);
-    if !need_unscoped && !need_scoped {
+    // The `2000::` probe resolves current unscoped v6 egress for the planner's
+    // leak guard (see [`plan_primary_defaults_repair_v6`] point 3).
+    let egress = route_iface_v6("2000::");
+    let Some(plan) = plan_primary_defaults_repair_v6(&global, &table, egress.as_deref()) else {
         return;
-    }
-    // Leak guard (defense in depth): NEVER re-open a physical path while a
-    // tunnel is still carrying traffic. All callers run this on teardown after
-    // the tunnel routes are torn down, but if unscoped v6 egress still resolves
-    // through a `utun`, the tunnel is up (or teardown is unfinished): adding a
-    // physical default now would route v6 traffic (and the primary-scoped
-    // system DNS resolver) OUTSIDE the tunnel (a leak). Restore only once
-    // egress is back on a physical NIC.
-    if route_iface_v6("2000::")
-        .as_deref()
-        .is_some_and(is_tunnel_iface)
-    {
-        return;
-    }
-    if need_unscoped {
+    };
+    if let Some(argv) = &plan.unscoped_add {
         tracing::warn!(
-            interface = %pif,
+            interface = %plan.pif,
             "No unscoped IPv6 default survived tunnel teardown; restoring from SC's primary router so native IPv6 recovers before the next RA"
         );
-        let argv = build_unscoped_default_add_v6(&pif, &router);
         let args: Vec<&str> = argv.iter().map(String::as_str).collect();
         let _ = run_blocking_bounded("route", &args);
     }
-    if need_scoped {
+    if let Some(argv) = &plan.scoped_add {
         tracing::warn!(
-            interface = %pif,
+            interface = %plan.pif,
             "Primary interface lost its scoped IPv6 default route at tunnel teardown; restoring so the scoped DNS resolver is reachable again"
         );
-        let argv = build_scoped_default_add_v6(&pif, &router);
         let args: Vec<&str> = argv.iter().map(String::as_str).collect();
         let _ = run_blocking_bounded("route", &args);
     }
@@ -1448,6 +1485,116 @@ default                                 fe80::1234:56ff:fe78:9abc%en1           
         // An already-scoped router is passed through unchanged.
         let cmd = build_scoped_default_add_v6("en1", "fe80::1%en1");
         assert_eq!(cmd.last().unwrap(), "fe80::1%en1");
+    }
+
+    /// Teardown residue: only an en0-scoped default survives, so for primary
+    /// en1 BOTH the unscoped default and the en1-scoped default are missing.
+    const NETSTAT_V6_BOTH_DEFAULTS_MISSING: &str = "\
+default                                 fe80::1234:56ff:fe78:9abc%en0           UGdScIg               en0
+::1                                     ::1                                     UHL                   lo0
+";
+
+    #[test]
+    fn v6_repair_plans_exactly_the_missing_defaults_from_sc_primary_and_router() {
+        // The composed contract: the plan is derived ONLY from SC's
+        // PrimaryInterface + Router, and re-adds exactly the defaults the
+        // table proves missing. `None` egress (no v6 route resolves, the
+        // normal post-teardown shape) must not block the repair.
+        let plan = plan_primary_defaults_repair_v6(
+            SCUTIL_GLOBAL_IPV6,
+            NETSTAT_V6_BOTH_DEFAULTS_MISSING,
+            None,
+        )
+        .expect("both defaults missing and egress off-tunnel: a plan is due");
+        assert_eq!(plan.pif, "en1");
+        assert_eq!(
+            plan.unscoped_add.as_deref(),
+            Some(
+                &[
+                    "-n".to_owned(),
+                    "add".into(),
+                    "-inet6".into(),
+                    "default".into(),
+                    "fe80::1234:56ff:fe78:9abc%en1".into()
+                ][..]
+            ),
+            "the unscoped default is rebuilt from SC's router, zone-scoped to \
+             SC's primary interface"
+        );
+        assert_eq!(
+            plan.scoped_add.as_deref(),
+            Some(
+                &[
+                    "-n".to_owned(),
+                    "add".into(),
+                    "-inet6".into(),
+                    "default".into(),
+                    "-ifscope".into(),
+                    "en1".into(),
+                    "fe80::1234:56ff:fe78:9abc%en1".into()
+                ][..]
+            ),
+            "the scoped default is pinned to SC's primary interface"
+        );
+    }
+
+    #[test]
+    fn v6_repair_plans_only_the_unscoped_default_when_the_scoped_survives() {
+        // The two fingerprints gate independently: en1 still carries its
+        // scoped default, so only the unscoped one is re-added.
+        let table = "\
+default                                 fe80::1234:56ff:fe78:9abc%en1           UGScIg                en1
+";
+        let plan = plan_primary_defaults_repair_v6(SCUTIL_GLOBAL_IPV6, table, Some("en1"))
+            .expect("unscoped default missing: a plan is due");
+        assert!(plan.unscoped_add.is_some());
+        assert_eq!(
+            plan.scoped_add, None,
+            "a surviving scoped default must never be re-added"
+        );
+    }
+
+    #[test]
+    fn v6_repair_is_a_no_op_while_egress_still_rides_a_tunnel() {
+        // THE talpid<->route-split timing contract: the app's route manager
+        // clears tunnel routes asynchronously relative to its reset path, so
+        // its immediate repair call (and any retry racing a reconnect) is
+        // only safe because a snapshot whose v6 egress still resolves through
+        // a tunnel plans NOTHING, missing defaults notwithstanding.
+        let plan = plan_primary_defaults_repair_v6(
+            SCUTIL_GLOBAL_IPV6,
+            NETSTAT_V6_BOTH_DEFAULTS_MISSING,
+            Some("utun5"),
+        );
+        assert_eq!(
+            plan, None,
+            "the leak guard must win over the missing-default fingerprint"
+        );
+    }
+
+    #[test]
+    fn v6_repair_is_a_no_op_on_a_healed_table() {
+        // Idempotency half of the contract: retries on an already-healed
+        // table (late retry, raced reconnect) must plan nothing.
+        let healed = "\
+default                                 fe80::1234:56ff:fe78:9abc%en1           UGdScg                en1
+default                                 fe80::1234:56ff:fe78:9abc%en1           UGScIg                en1
+";
+        assert_eq!(
+            plan_primary_defaults_repair_v6(SCUTIL_GLOBAL_IPV6, healed, Some("en1")),
+            None
+        );
+    }
+
+    #[test]
+    fn v6_repair_never_fabricates_from_missing_sc_data() {
+        // Half-data must never become a route: no Router in SC's global v6
+        // state means nothing trustworthy to re-add, whatever the table says.
+        let no_router = "<dictionary> {\n  PrimaryInterface : en1\n}\n";
+        assert_eq!(
+            plan_primary_defaults_repair_v6(no_router, NETSTAT_V6_BOTH_DEFAULTS_MISSING, None),
+            None
+        );
     }
 
     #[test]
