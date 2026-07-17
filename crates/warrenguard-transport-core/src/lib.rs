@@ -18,7 +18,10 @@ pub mod transport_config;
 pub use client_metrics::{ClientMetrics, ClientMetricsSnapshot, MetricsRegistry};
 pub use error::{Result, TunnelError};
 pub use flow_hash::flow_hash_5tuple;
-pub use inner_mtu::{build_frag_needed, clamp_syn_mss, effective_mss, is_tcp_syn};
+pub use inner_mtu::{
+    PROXY_BUDGET_MARGIN, build_frag_needed, clamp_downlink_syn, clamp_syn_mss, clamp_uplink_syn,
+    effective_mss, is_tcp_syn, uplink_frag_needed,
+};
 pub use ip_parse::{
     extract_dst_ipv4, extract_dst_ipv6, extract_src_ipv4, extract_src_ipv6, source_ip_matches,
 };

@@ -29,11 +29,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use parking_lot::Mutex as PlMutex;
-use warrenguard_config::{TUNNEL_GATEWAY_IP, TUNNEL_GATEWAY_IPV6};
 use warrenguard_daita::DaitaState;
 use warrenguard_multihop::WarrenControlMessage;
 use warrenguard_pump::{TunIoTolerance, is_daita_dummy, record_uplink_too_large_drop};
-use warrenguard_transport_core::{PacketDevice, build_frag_needed, clamp_syn_mss, is_tcp_syn};
+use warrenguard_transport_core::{
+    PacketDevice, clamp_downlink_syn, clamp_uplink_syn, is_tcp_syn, uplink_frag_needed,
+};
 
 use crate::bundle::MultiHopBundle;
 use crate::multihop::MultiHopError;
@@ -361,23 +362,26 @@ pub async fn run_reassign_loop<T: ReassignableTun>(
 /// this tunnel's datagrams, so clamping at both pump directions keeps
 /// end-to-end TCP flowing on reduced-MTU underlays (train/satellite
 /// backhauls, nested tunnels) instead of black-holing full-size segments
-/// while the tunnel looks Connected.
-/// Asymmetry allowance for MSS options crossing the UPLINK pump: their
-/// beneficiary segments will cross the EXIT's transmit budget, which this
-/// client cannot read. The local budget is a same-path proxy; the margin
-/// absorbs the exit converging a little lower (its own DPLPMTUD, its own
-/// frame overhead). On paths that fit the default inner MTU the clamped
-/// value stays above the default MSS, so this costs nothing there.
-const PROXY_BUDGET_MARGIN: u16 = 48;
-
-fn clamp_syn_to_budget(client: &MultiHopBundle, pkt: &mut [u8], margin: u16) {
+/// while the tunnel looks Connected. The per-leg policy (uplink margined,
+/// downlink exact) is single-homed in
+/// [`warrenguard_transport_core::inner_mtu`], shared with the userland TUN
+/// pump so budget fixes land once.
+fn clamp_uplink_to_budget(client: &MultiHopBundle, pkt: &mut [u8]) {
     if !is_tcp_syn(pkt) {
         return;
     }
-    let budget = u16::try_from(client.max_inner_payload())
-        .unwrap_or(u16::MAX)
-        .saturating_sub(margin);
-    if let Some((old, new)) = clamp_syn_mss(pkt, budget) {
+    let budget = u16::try_from(client.max_inner_payload()).unwrap_or(u16::MAX);
+    if let Some((old, new)) = clamp_uplink_syn(pkt, budget) {
+        tracing::debug!(old, new, budget, "clamped inner TCP MSS to tunnel budget");
+    }
+}
+
+fn clamp_downlink_to_budget(client: &MultiHopBundle, pkt: &mut [u8]) {
+    if !is_tcp_syn(pkt) {
+        return;
+    }
+    let budget = u16::try_from(client.max_inner_payload()).unwrap_or(u16::MAX);
+    if let Some((old, new)) = clamp_downlink_syn(pkt, budget) {
         tracing::debug!(old, new, budget, "clamped inner TCP MSS to tunnel budget");
     }
 }
@@ -388,7 +392,7 @@ fn clamp_syn_to_budget(client: &MultiHopBundle, pkt: &mut [u8], margin: u16) {
 /// non-TCP flows (inner QUIC, UDP) that the MSS clamp cannot cover.
 async fn reflect_frag_needed<T: PacketDevice>(tun: &T, client: &MultiHopBundle, dropped: &[u8]) {
     let eff = u16::try_from(client.max_inner_payload()).unwrap_or(u16::MAX);
-    if let Some(ptb) = build_frag_needed(dropped, eff, TUNNEL_GATEWAY_IP, TUNNEL_GATEWAY_IPV6)
+    if let Some(ptb) = uplink_frag_needed(dropped, eff)
         && let Err(e) = tun.send(&ptb).await
     {
         tracing::trace!(error = %e, "frag-needed reflection tun write failed");
@@ -428,7 +432,7 @@ pub async fn run_uplink<T: PacketDevice>(rx: ClientWatch, tun: T) -> Result<()> 
             );
             continue;
         };
-        clamp_syn_to_budget(&client, &mut packet, PROXY_BUDGET_MARGIN);
+        clamp_uplink_to_budget(&client, &mut packet);
         match client.send(&packet).await {
             Ok(()) => {}
             Err(MultiHopError::Send(quinn::SendDatagramError::TooLarge)) => {
@@ -522,7 +526,7 @@ pub async fn run_uplink_with_daita<T: PacketDevice>(
                     continue;
                 };
                 let mut packet = packet;
-                clamp_syn_to_budget(&client, &mut packet, PROXY_BUDGET_MARGIN);
+                clamp_uplink_to_budget(&client, &mut packet);
                 match client.send(&packet).await {
                     Ok(()) => {
                         sent_real += 1;
@@ -655,7 +659,7 @@ pub async fn run_downlink<T: PacketDevice>(
                             continue;
                         }
                         let mut payload = payload;
-                        clamp_syn_to_budget(&client, &mut payload, 0);
+                        clamp_downlink_to_budget(&client, &mut payload);
                         match tun.send(&payload).await {
                             Ok(()) => {
                                 tun_io.ok();
@@ -785,7 +789,7 @@ pub async fn run_downlink_with_daita<T: PacketDevice>(
                             // anyway as a malformed IP packet.
                         } else {
                             let mut payload = payload;
-                            clamp_syn_to_budget(&client, &mut payload, 0);
+                            clamp_downlink_to_budget(&client, &mut payload);
                             match tun.send(&payload).await {
                                 Ok(()) => {
                                     tun_io.ok();

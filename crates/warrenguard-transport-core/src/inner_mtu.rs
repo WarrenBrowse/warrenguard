@@ -157,6 +157,46 @@ pub fn clamp_syn_mss(pkt: &mut [u8], max_inner: u16) -> Option<(u16, u16)> {
     None
 }
 
+/// Asymmetry allowance for MSS options crossing the client UPLINK leg: their
+/// beneficiary segments will cross the EXIT's transmit budget, which the
+/// client cannot read. The local budget is a same-path proxy; the margin
+/// absorbs the exit converging a little lower (its own DPLPMTUD, its own
+/// frame overhead). On paths that fit the default inner MTU the clamped
+/// value stays above the default MSS, so this costs nothing there.
+pub const PROXY_BUDGET_MARGIN: u16 = 48;
+
+/// Clamps an UPLINK-crossing SYN/SYN-ACK's MSS to `budget` minus
+/// [`PROXY_BUDGET_MARGIN`]. The one home for the client uplink-leg clamp
+/// policy: every client pump (engine supervised pump, userland TUN pump)
+/// calls this so a budget fix lands once.
+#[must_use]
+pub fn clamp_uplink_syn(pkt: &mut [u8], budget: u16) -> Option<(u16, u16)> {
+    clamp_syn_mss(pkt, budget.saturating_sub(PROXY_BUDGET_MARGIN))
+}
+
+/// Clamps a DOWNLINK-crossing SYN/SYN-ACK's MSS to `budget` EXACTLY: the
+/// option governs segments that later cross this node's OWN transmit
+/// budget, which is known precisely, so no asymmetry margin applies.
+#[must_use]
+pub fn clamp_downlink_syn(pkt: &mut [u8], budget: u16) -> Option<(u16, u16)> {
+    clamp_syn_mss(pkt, budget)
+}
+
+/// [`build_frag_needed`] preconfigured for the client uplink: the reflected
+/// ICMP error is sourced from the tunnel gateway
+/// ([`warrenguard_config::TUNNEL_GATEWAY_IP`] / `_IPV6`) and carries the
+/// live transmit `budget` as the next-hop MTU. The one home for the
+/// client-side PTB reflection policy.
+#[must_use]
+pub fn uplink_frag_needed(dropped: &[u8], budget: u16) -> Option<Vec<u8>> {
+    build_frag_needed(
+        dropped,
+        budget,
+        warrenguard_config::TUNNEL_GATEWAY_IP,
+        warrenguard_config::TUNNEL_GATEWAY_IPV6,
+    )
+}
+
 /// True when the packet is an ICMP/ICMPv6 *error* message, about which no
 /// further ICMP error may be generated (RFC 1122 / RFC 4443 loop guard).
 fn is_icmp_error(pkt: &[u8]) -> bool {
@@ -446,6 +486,58 @@ mod tests {
         // DAITA dummy (non-IP first nibble).
         let mut dummy = vec![0xff; 64];
         assert_eq!(clamp_syn_mss(&mut dummy, 1000), None);
+    }
+
+    #[test]
+    fn uplink_clamp_applies_the_proxy_budget_margin() {
+        let mut pkt = v4_syn(&linux_syn_options(1460), 0x02);
+        let r = clamp_uplink_syn(&mut pkt, 1200);
+        // 1200 budget - 48 margin - 40 v4 headers: the literal pins the margin
+        // value itself against silent drift.
+        assert_eq!(
+            r,
+            Some((1460, 1112)),
+            "the uplink leg must reserve the 48-byte proxy-budget margin for the exit's own transmit budget"
+        );
+        assert_eq!(
+            tcp_v4_checksum_residual(&pkt),
+            0,
+            "checksum must stay valid"
+        );
+    }
+
+    #[test]
+    fn downlink_clamp_is_exact_with_no_margin() {
+        let mut pkt = v4_syn(&linux_syn_options(1460), 0x02);
+        let r = clamp_downlink_syn(&mut pkt, 1200);
+        assert_eq!(
+            r,
+            Some((1460, 1200 - 40)),
+            "the downlink leg clamps to this node's own precisely-known transmit budget"
+        );
+    }
+
+    #[test]
+    fn uplink_frag_needed_sources_the_tunnel_gateway_and_live_budget() {
+        let dropped = v4_syn(&linux_syn_options(1460), 0x02);
+        let ptb = uplink_frag_needed(&dropped, 1198).expect("ptb");
+        assert_eq!(
+            &ptb[12..16],
+            &warrenguard_config::TUNNEL_GATEWAY_IP.octets(),
+            "PTB source must be the single-homed tunnel gateway"
+        );
+        assert_eq!(
+            u16::from_be_bytes([ptb[26], ptb[27]]),
+            1198,
+            "next-hop MTU carries the live budget"
+        );
+        let dropped6 = v6_syn(&linux_syn_options(1440), 0x02);
+        let ptb6 = uplink_frag_needed(&dropped6, 1198).expect("ptb v6");
+        assert_eq!(
+            &ptb6[8..24],
+            &warrenguard_config::TUNNEL_GATEWAY_IPV6.octets(),
+            "v6 PTB source must be the single-homed tunnel gateway"
+        );
     }
 
     #[test]
