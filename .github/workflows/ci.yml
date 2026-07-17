@@ -2,8 +2,12 @@ name: CI
 
 # Runs exclusively on the WarrenBrowse org self-hosted runners (Default runner
 # group). Label sets are matched against the live runners:
-#   [self-hosted, Linux, X64, macstudio-rosetta] -> macstudio-linux-rosetta (the provisioned Rust runner)
+#   [self-hosted, Linux, ARM64, macstudio-arm64] -> native arm64 Linux fleet
 #   [self-hosted, macOS, ARM64]  -> axiomStudio
+# Verification jobs run on the NATIVE arm64 Linux fleet: the x86-under-Rosetta
+# containers wedge cargo/nextest when rustc dies unreaped (zombie jobserver
+# deadlock, 2026-07-08 and 2026-07-16). Only jobs that must PRODUCE x86_64
+# artifacts belong on macstudio-rosetta; this workflow has none.
 # Do not switch any job to a GitHub-hosted runner.
 
 on:
@@ -16,11 +20,6 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CARGO_INCREMENTAL: 0
-  # Rosetta-stable linker for the x86-linux jobs: rustc's default `cc` (gnu
-  # ld/collect2) SIGSEGVs under Rosetta on heavy links; clang+lld is stable and
-  # memory-light. Target-scoped, so the macos matrix job is unaffected. The
-  # `clang-lld` wrapper is baked into the runner image.
-  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang-lld
 
 concurrency:
   # A single self-hosted Linux runner serves these jobs; cancel superseded runs
@@ -31,7 +30,7 @@ concurrency:
 jobs:
   fmt:
     name: cargo fmt
-    runs-on: [self-hosted, Linux, X64, macstudio-rosetta]
+    runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -49,7 +48,7 @@ jobs:
       matrix:
         include:
           - name: linux
-            runner: [self-hosted, Linux, X64, macstudio-rosetta]
+            runner: [self-hosted, Linux, ARM64, macstudio-arm64]
           - name: macos
             runner: [self-hosted, macOS, ARM64]
     steps:
@@ -70,7 +69,7 @@ jobs:
 
   test:
     name: cargo test
-    runs-on: [self-hosted, Linux, X64, macstudio-rosetta]
+    runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
     timeout-minutes: 60
     steps:
       # The shared golden vectors are a private submodule (warren-vectors); the
@@ -105,7 +104,7 @@ jobs:
 
   audit:
     name: cargo audit
-    runs-on: [self-hosted, Linux, X64, macstudio-rosetta]
+    runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -120,7 +119,7 @@ jobs:
 
   deny:
     name: cargo deny
-    runs-on: [self-hosted, Linux, X64, macstudio-rosetta]
+    runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
