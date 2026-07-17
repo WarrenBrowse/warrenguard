@@ -39,6 +39,16 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  anti-refrag:
+    name: anti-refragmentation gate
+    runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - name: single-home twin detector (doc 94 / doc 47 s5)
+        run: bash scripts/ci/anti-refrag.sh
+
   clippy:
     name: cargo clippy (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
