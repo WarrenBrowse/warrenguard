@@ -39,6 +39,16 @@ pub const WARREN_HPKE_VERSION_V2: u8 = 0x02;
 /// AEAD tag, and postcard length prefixes.
 pub const MULTIHOP_FRAME_V2_MAX_OVERHEAD: usize = 83 + 1088 + 3;
 
+/// Maximum bytes the `/v2` frame header adds around the inner ciphertext on a
+/// STEADY-STATE data frame, where `pq_ct` is empty because the epoch session is
+/// already established (the 1088-byte ML-KEM ciphertext is carried only by the
+/// dedicated setup / bootstrap frame, never by a data frame). Sizing the tunnel
+/// MTU from this, rather than from the ~1 KB larger
+/// [`MULTIHOP_FRAME_V2_MAX_OVERHEAD`], gives a `/v2` session the same usable
+/// inner payload as `/v1`. The `- 1088` keeps one byte of slack for the
+/// empty-versus-full `pq_ct` postcard length prefix, so it never under-counts.
+pub const MULTIHOP_FRAME_V2_DATA_MAX_OVERHEAD: usize = MULTIHOP_FRAME_V2_MAX_OVERHEAD - 1088;
+
 /// `WarrenMultihopFrameV2` is the `/v2` C1 wire datagram carrying the X-Wing
 /// hybrid seal. Postcard-encoded, like `/v1`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -48,7 +48,7 @@ use warrenguard_multihop::{
 };
 #[cfg(feature = "pq-hpke")]
 use warrenguard_multihop::{
-    MULTIHOP_FRAME_V2_MAX_OVERHEAD, PqClientSession, XWingRecipientPublicKey, decode_frame_v2,
+    MULTIHOP_FRAME_V2_DATA_MAX_OVERHEAD, PqClientSession, XWingRecipientPublicKey, decode_frame_v2,
     encode_frame_v2,
 };
 use warrenguard_socket_bypass::SocketBypass;
@@ -518,16 +518,18 @@ impl ClientSessionKind {
         }
     }
 
-    /// Worst-case per-frame wire overhead of this session's version, for
-    /// [`MultiHopClient::max_inner_payload`]. The `/v2` bound is
-    /// deliberately the SETUP-frame overhead (with `pq_ct`) even though
-    /// most `/v2` frames are smaller: an MTU budget must hold for the
-    /// largest frame this session can emit.
+    /// Worst-case per-frame wire overhead of a PAYLOAD-BEARING frame of this
+    /// session's version, for [`MultiHopClient::max_inner_payload`]. The `/v2`
+    /// bound is the DATA-frame overhead (empty `pq_ct`), not the setup-frame
+    /// one: after the ML-KEM ciphertext was decoupled onto its own dedicated
+    /// empty-payload bootstrap ping, no datagram ever carries both `pq_ct` and
+    /// a caller payload, so reserving the 1088-byte ciphertext here would only
+    /// starve the tunnel MTU by ~1 KB for a frame shape that never occurs.
     fn max_frame_overhead(&self) -> usize {
         match self {
             Self::V1(_) => MULTIHOP_FRAME_MAX_OVERHEAD,
             #[cfg(feature = "pq-hpke")]
-            Self::V2 { .. } => MULTIHOP_FRAME_V2_MAX_OVERHEAD,
+            Self::V2 { .. } => MULTIHOP_FRAME_V2_DATA_MAX_OVERHEAD,
         }
     }
 
@@ -2133,10 +2135,11 @@ impl MultiHopClient {
 
     /// The largest inner IP packet that fits in one sealed datagram: the path
     /// datagram size minus the worst-case frame overhead. Falls back to the
-    /// 1280-byte base MTU before the first PMTU probe. On a `/v2` session
-    /// the overhead bound is the SETUP-frame one (`pq_ct` attached), so the
-    /// budget holds even for the largest frame this session can emit, not
-    /// just its (smaller) steady-state frames.
+    /// 1280-byte base MTU before the first PMTU probe. On a `/v2` session the
+    /// overhead bound is the DATA-frame one (empty `pq_ct`): every payload-
+    /// bearing datagram is a data frame, and the ML-KEM ciphertext rides only
+    /// its own empty-payload bootstrap ping, so a `/v2` session gets the same
+    /// usable payload as `/v1` instead of one starved by ~1 KB of `pq_ct`.
     #[must_use]
     pub fn max_inner_payload(&self) -> usize {
         const BASE_MTU: usize = 1280;
@@ -3300,6 +3303,42 @@ mod tests {
                 ),
                 "a full-size payload right after a PQ rekey must not be dropped as \
                  oversized; the epoch bootstrap must never ride a DATA frame, got {result:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn max_inner_payload_v2_reflects_the_data_frame_not_the_setup_bound() {
+            // Once the ML-KEM ciphertext is decoupled onto its own empty-payload
+            // bootstrap ping, a `/v2` DATA frame never carries `pq_ct`, so the
+            // advertised inner-payload budget must reflect the small data-frame
+            // overhead, not the ~1.1 KB setup-frame bound. A deployer sizes the
+            // tunnel MTU from this value, so reserving the pq_ct space here
+            // silently starves every `/v2` session of ~1088 bytes of payload.
+            let pair =
+                crate::test_support::spawn_loopback_multihop_pq(ExitId::from_bytes([0x78; 16]))
+                    .await;
+            let path = pair
+                .client
+                .max_datagram_size()
+                .expect("an established QUIC connection reports a datagram size");
+            let budget = pair.client.max_inner_payload();
+            assert!(
+                budget >= path.saturating_sub(128),
+                "a /v2 session's max_inner_payload ({budget}) must sit within a small \
+                 data-frame overhead of the path MTU ({path}), not be starved by the \
+                 1088-byte pq_ct that steady-state data frames no longer carry"
+            );
+
+            // The advertised budget must also be genuinely sendable in one
+            // datagram: guards the fix from over-correcting past the true cap.
+            let payload = vec![0x41u8; budget];
+            let result = pair.client.send(&payload).await;
+            assert!(
+                !matches!(
+                    result,
+                    Err(MultiHopError::Send(quinn::SendDatagramError::TooLarge))
+                ),
+                "a payload sized to max_inner_payload must fit in one datagram, got {result:?}"
             );
         }
 

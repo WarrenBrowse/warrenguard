@@ -98,8 +98,8 @@ pub use wire_format::{
     decode_frame, encode_frame,
 };
 pub use wire_format_v2::{
-    MULTIHOP_FRAME_V2_MAX_OVERHEAD, WARREN_HPKE_VERSION_V2, WarrenMultihopFrameV2, decode_frame_v2,
-    encode_frame_v2,
+    MULTIHOP_FRAME_V2_DATA_MAX_OVERHEAD, MULTIHOP_FRAME_V2_MAX_OVERHEAD, WARREN_HPKE_VERSION_V2,
+    WarrenMultihopFrameV2, decode_frame_v2, encode_frame_v2,
 };
 
 #[cfg(feature = "pq-hpke")]
