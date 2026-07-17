@@ -85,6 +85,14 @@ pub fn jitter_delay(deadline_unix_secs: u64, now_unix_secs: u64, fraction: f64) 
     Duration::from_secs_f64(window as f64 * frac)
 }
 
+/// Uniform draw in `[0.0, 1.0)` for the anti-stampede jitter: the per-client
+/// randomness that spreads the herd. One home so no client substitutes a
+/// deterministic or shared-seed source, which would re-synchronize the herd.
+#[must_use]
+pub fn stampede_fraction() -> f64 {
+    rand::random::<f64>()
+}
+
 /// `true` when a drain reconnect fired less than [`DRAIN_RECONNECT_COOLDOWN`]
 /// ago and a second one must be suppressed. `last_unix == 0` (never) is always
 /// allowed. Robust to clock skew: a `last` in the future reads as not-elapsed
@@ -147,6 +155,16 @@ mod tests {
         .expect("ExitDraining must decode into an advisory");
         assert_eq!(adv.deadline_unix_secs, 1_234);
         assert_eq!(adv.reason_code, 7);
+    }
+
+    #[test]
+    fn stampede_fraction_is_a_unit_interval_draw() {
+        let draws: Vec<f64> = (0..8).map(|_| stampede_fraction()).collect();
+        assert!(draws.iter().all(|f| (0.0..1.0).contains(f)));
+        assert!(
+            draws.windows(2).any(|w| w[0] != w[1]),
+            "eight draws must not all collide (the source must be random)"
+        );
     }
 
     #[test]
