@@ -40,40 +40,9 @@ use crate::multihop::MultiHopError;
 use crate::supervisor::ClientWatch;
 
 pub use crate::{IpAssignChannel, IpAssignSpec};
-
-/// Maintenance-drain advisory the exit sent mid-session
-/// (`WarrenControlMessage::ExitDraining`, ADR 36). The downlink pump
-/// publishes it on an [`ExitDrainingChannel`]; the orchestrator reacts by
-/// re-selecting a different exit and rebuilding the session
-/// (make-before-break), then lets the old session drain. `Copy + Eq` so a
-/// repeated advisory (the exit re-sends until the client leaves) is
-/// dedup'd by the subscriber's `current != new` check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExitDrainAdvisory {
-    /// Absolute Unix epoch seconds after which the exit hard-closes
-    /// stragglers. `u64::MAX` = soft drain (no hard deadline).
-    pub deadline_unix_secs: u64,
-    /// Opaque reason (`0` = maintenance).
-    pub reason_code: u8,
-}
-
-impl ExitDrainAdvisory {
-    /// Build from a [`WarrenControlMessage::ExitDraining`]. Returns `None`
-    /// for any other variant.
-    #[must_use]
-    pub fn from_control(msg: &WarrenControlMessage) -> Option<Self> {
-        match msg {
-            WarrenControlMessage::ExitDraining {
-                deadline_unix_secs,
-                reason_code,
-            } => Some(Self {
-                deadline_unix_secs: *deadline_unix_secs,
-                reason_code: *reason_code,
-            }),
-            _ => None,
-        }
-    }
-}
+// The advisory type moved to `drain_policy` (the single drain-reaction home,
+// doc-94 B6); re-exported here so pump-side consumers keep their import path.
+pub use crate::drain_policy::ExitDrainAdvisory;
 
 /// `tokio::sync::watch` channel the downlink pump uses to publish an
 /// [`ExitDrainAdvisory`] to the orchestrator (ADR 36), mirroring

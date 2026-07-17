@@ -13,6 +13,10 @@ mod client;
 // transport-agnostic scheduler plus a TUN-routed datapath probe, so every
 // client detects "QUIC alive but exit forwards nothing" with the same debounce
 // and escalation semantics instead of reimplementing them.
+// Single home of the client drain-reaction anti-stampede policy (ADR 36):
+// the advisory type plus the jitter/cooldown/avoid-TTL decisions every client
+// tier consumes instead of re-deciding its own constants.
+pub mod drain_policy;
 pub mod egress_probe;
 pub mod ip_assign;
 // `ios_tun` is portable (pure tokio + mpsc) so it compiles on every target for
