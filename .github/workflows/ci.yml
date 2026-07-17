@@ -32,6 +32,7 @@ jobs:
   fmt:
     name: cargo fmt
     runs-on: [self-hosted, Linux, X64, macstudio-rosetta]
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.89.0
@@ -42,6 +43,7 @@ jobs:
   clippy:
     name: cargo clippy (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -69,6 +71,7 @@ jobs:
   test:
     name: cargo test
     runs-on: [self-hosted, Linux, X64, macstudio-rosetta]
+    timeout-minutes: 60
     steps:
       # The shared golden vectors are a private submodule (warren-vectors); the
       # conformance tests read them at runtime, so this job needs them checked
@@ -103,6 +106,7 @@ jobs:
   audit:
     name: cargo audit
     runs-on: [self-hosted, Linux, X64, macstudio-rosetta]
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.89.0
@@ -117,6 +121,7 @@ jobs:
   deny:
     name: cargo deny
     runs-on: [self-hosted, Linux, X64, macstudio-rosetta]
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.89.0
