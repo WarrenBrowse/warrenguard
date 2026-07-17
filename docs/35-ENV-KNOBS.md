@@ -60,6 +60,7 @@ knob in `REGISTRY` must appear in the table below, or the test fails.
 | `WARREN_IDLE_COVER` | bool | on | "0"/"false"/"no"/"off" disables, else on | emit jittered, size-varied idle cover datagrams to mask the keep-alive beacon | warrenguard-pump/src/idle_cover.rs |
 | `WARREN_DAITA` | bool | off | "1"/"true" enables, else off | request the DAITA traffic-analysis defense (Maybenot padding/dummies); mutually exclusive with idle cover (DAITA supersedes it) | warrenguard-daita + warrenguard-pump (pump_*_with_daita) |
 | `WARREN_CLIENT_DATAPATH_SOCKETS` | usize | auto (one endpoint per connection) | unset/0 -> one per conn; else N; clamped to [1, num_conns] | client datapath UDP sockets/endpoints a multi-conn session spreads its connections across; auto = one source port per connection (distinct ports let the exit reuseport hash flows across cores and are required for the client multi-queue TUN downlink win, bench); 1 keeps a single NAT mapping | warrenguard-transport/src/client.rs (connect_multi) |
+| `WARREN_TUNNEL_INITIAL_MTU` | u16 | 1280 (TUNNEL_INITIAL_MTU) | clamped to [1200, 1280]; unparsable/absent -> default | client outer QUIC initial MTU + Initial-pad size; a client nested inside a full-tunnel system VPN lowers it below the nested cap so the data plane does not black-hole (quinn's DPLPMTUD only probes upward, never below its floor) | warrenguard-transport-core/src/transport_config.rs |
 
 ## Deployer-wired knobs
 

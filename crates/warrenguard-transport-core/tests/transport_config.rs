@@ -318,10 +318,11 @@ fn multihop_inbound_configs_omit_initial_padding() {
 #[test]
 fn multihop_client_pads_the_gfw_facing_leg_while_relay_outbound_stays_no_pad() {
     let src = include_str!("../src/transport_config.rs");
-    let client = fn_body(
-        src,
-        "warren_transport_config_client_multihop_with_idle_cover",
-    );
+    // The public `..._with_idle_cover` entry delegates to the MTU-parameterized
+    // inner impl, where the SNI-split pad knobs now live (the pad tracks
+    // `initial_mtu` so a nested-path client's lowered floor does not leave an
+    // oversized ClientHello). Introspect the impl that actually sets them.
+    let client = fn_body(src, "warren_transport_config_client_multihop_with_mtu");
     assert!(
         client.contains("initial_crypto_first_fragment_size"),
         "the multi-hop client must cap the first CRYPTO chunk: the client->relay leg \

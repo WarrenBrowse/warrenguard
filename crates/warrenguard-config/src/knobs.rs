@@ -189,6 +189,14 @@ pub const REGISTRY: &[KnobMeta] = &[
         effect: "request the DAITA traffic-analysis defense (Maybenot padding/dummies); mutually exclusive with idle cover (DAITA supersedes it)",
         home: "warrenguard-daita + warrenguard-pump (pump_*_with_daita)",
     },
+    KnobMeta {
+        name: "WARREN_TUNNEL_INITIAL_MTU",
+        kind: "u16",
+        default: "1280 (TUNNEL_INITIAL_MTU)",
+        clamp: "clamped to [1200, 1280]; unparsable/absent -> default",
+        effect: "client outer QUIC initial MTU + Initial-pad size; a client nested inside a full-tunnel system VPN lowers it below the nested cap so the data plane does not black-hole",
+        home: "warrenguard-transport-core/src/transport_config.rs",
+    },
 ];
 
 // ---------------------------------------------------------------------
@@ -292,6 +300,22 @@ pub fn parse_positive_usize_clamped(raw: Option<&str>, max: usize, default: usiz
         .unwrap_or(default)
 }
 
+/// Parses the client outer QUIC path-MTU cap knob
+/// (`WARREN_TUNNEL_INITIAL_MTU`), clamped to the QUIC-valid range
+/// [`crate::TUNNEL_MIN_MTU`, `crate::TUNNEL_INITIAL_MTU`]. Absent or
+/// unparsable keeps the full default, so a healthy path pays nothing. quinn
+/// rejects an initial MTU below its 1200 floor and the interface MTU caps it
+/// above, so a request outside the range clamps to the nearest valid bound
+/// rather than being ignored: a client on a path tighter than QUIC's floor
+/// still gets the smallest MTU QUIC allows (below which the TLS-over-TCP
+/// carrier takes over).
+#[must_use]
+pub fn parse_client_initial_mtu(raw: Option<&str>) -> u16 {
+    raw.and_then(|s| s.trim().parse::<u16>().ok())
+        .map(|mtu| mtu.clamp(crate::TUNNEL_MIN_MTU, crate::TUNNEL_INITIAL_MTU))
+        .unwrap_or(crate::TUNNEL_INITIAL_MTU)
+}
+
 // ---------------------------------------------------------------------
 // Typed accessors. Each reads its env var exactly once (OnceLock) and
 // delegates to a pure helper above. These are the only sanctioned way
@@ -308,6 +332,21 @@ pub fn cc_choice() -> Option<&'static str> {
     CACHE
         .get_or_init(|| std::env::var("WARREN_CC").ok())
         .as_deref()
+}
+
+/// Client outer QUIC initial MTU and Initial-pad size
+/// (`WARREN_TUNNEL_INITIAL_MTU`). Read once. Default
+/// [`crate::TUNNEL_INITIAL_MTU`]. A client nested inside a full-tunnel system
+/// VPN sets this below the nested path cap so its handshake and datagrams fit
+/// the reduced path instead of black-holing every full-size packet (quinn's
+/// DPLPMTUD only probes upward, so it never discovers a floor that is itself too
+/// big). See `docs/35-ENV-KNOBS.md`.
+#[must_use]
+pub fn client_initial_mtu() -> u16 {
+    static CACHE: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        parse_client_initial_mtu(std::env::var("WARREN_TUNNEL_INITIAL_MTU").ok().as_deref())
+    })
 }
 
 /// `WARREN_INITIAL_WINDOW`: optional positive congestion-controller
@@ -743,6 +782,30 @@ pub fn log_effective_overrides() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_initial_mtu_clamps_into_the_quic_valid_range() {
+        // Absent or unparsable keeps the full default: a healthy path is
+        // untouched.
+        assert_eq!(parse_client_initial_mtu(None), crate::TUNNEL_INITIAL_MTU);
+        assert_eq!(
+            parse_client_initial_mtu(Some("nope")),
+            crate::TUNNEL_INITIAL_MTU
+        );
+        // A nested-safe value inside the range passes through verbatim.
+        assert_eq!(
+            parse_client_initial_mtu(Some("1200")),
+            crate::TUNNEL_MIN_MTU
+        );
+        assert_eq!(parse_client_initial_mtu(Some("1240")), 1240);
+        // Below the QUIC floor clamps UP to the floor (quinn rejects < 1200);
+        // above the interface MTU clamps DOWN to the default.
+        assert_eq!(parse_client_initial_mtu(Some("900")), crate::TUNNEL_MIN_MTU);
+        assert_eq!(
+            parse_client_initial_mtu(Some("1500")),
+            crate::TUNNEL_INITIAL_MTU
+        );
+    }
 
     #[test]
     fn daita_supersedes_idle_cover_when_both_requested() {

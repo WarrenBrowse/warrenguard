@@ -253,9 +253,32 @@ pub fn warren_transport_config_client_full(
     pad_to_mtu: bool,
     idle_cover: bool,
 ) -> Arc<TransportConfig> {
+    warren_transport_config_client_full_with_mtu(
+        enable_gso,
+        pad_to_mtu,
+        idle_cover,
+        warrenguard_config::knobs::client_initial_mtu(),
+    )
+}
+
+/// [`warren_transport_config_client_full`] with an explicit outer QUIC
+/// `initial_mtu`. Lowering it below the default fits the handshake and datagrams
+/// through a reduced path (a client nested inside a full-tunnel system VPN);
+/// DPLPMTUD then probes upward from there. The Initial pad tracks `initial_mtu`
+/// so it never exceeds it (a pad larger than the initial MTU stalls the
+/// handshake, cf. the base-config docstring). The public entry reads the
+/// [`warrenguard_config::knobs::client_initial_mtu`] knob; this seam keeps the
+/// clamp testable without touching the process environment.
+fn warren_transport_config_client_full_with_mtu(
+    enable_gso: bool,
+    pad_to_mtu: bool,
+    idle_cover: bool,
+    initial_mtu: u16,
+) -> Arc<TransportConfig> {
     let mut cfg = warren_transport_config_base_with_pad(enable_gso, pad_to_mtu);
     apply_client_liveness(&mut cfg, idle_cover);
-    cfg.max_concurrent_bidi_streams(VarInt::from_u32(QUIC_MAX_CONCURRENT_BIDI_STREAMS_CLIENT))
+    cfg.initial_mtu(initial_mtu)
+        .max_concurrent_bidi_streams(VarInt::from_u32(QUIC_MAX_CONCURRENT_BIDI_STREAMS_CLIENT))
         .max_concurrent_uni_streams(VarInt::from_u32(0))
         // Force the TLS ClientHello to span 2 Initial
         // QUIC packets in 2 UDP datagrams (obfuscation baseline).
@@ -283,8 +306,13 @@ pub fn warren_transport_config_client_full(
         //   is padded to a full path-MTU datagram and the chunk cap
         //   still produces the 2-datagram split that defeats the
         //   GFW SNI extractor (invariant I3).
+        //
+        //   The pad tracks `initial_mtu` (not the literal 1280): a client
+        //   nested inside a full-tunnel system VPN lowers the floor, and the
+        //   pad must follow or the padded ClientHello overflows the reduced
+        //   path and is dropped (the same pad-vs-MTU stall, one layer out).
         .initial_crypto_first_fragment_size(Some(64))
-        .initial_datagram_min_size(1280);
+        .initial_datagram_min_size(initial_mtu);
     Arc::new(cfg)
 }
 
@@ -478,15 +506,36 @@ pub fn warren_transport_config_client_multihop_with_idle_cover(
     enable_gso: bool,
     idle_cover: bool,
 ) -> Arc<TransportConfig> {
+    warren_transport_config_client_multihop_with_mtu(
+        enable_gso,
+        idle_cover,
+        warrenguard_config::knobs::client_initial_mtu(),
+    )
+}
+
+/// [`warren_transport_config_client_multihop_with_idle_cover`] with an explicit
+/// outer QUIC `initial_mtu` for the GFW-facing client-to-relay leg. Same
+/// nested-path rationale as [`warren_transport_config_client_full_with_mtu`]:
+/// lowering the floor fits a reduced path and the Initial pad tracks it. The
+/// public entry reads the [`warrenguard_config::knobs::client_initial_mtu`]
+/// knob; this seam keeps the clamp testable without the process environment.
+fn warren_transport_config_client_multihop_with_mtu(
+    enable_gso: bool,
+    idle_cover: bool,
+    initial_mtu: u16,
+) -> Arc<TransportConfig> {
     let mut cfg = warren_transport_config_base(enable_gso);
     apply_client_liveness(&mut cfg, idle_cover);
-    cfg.max_concurrent_bidi_streams(VarInt::from_u32(QUIC_MAX_CONCURRENT_BIDI_STREAMS_CLIENT))
+    cfg.initial_mtu(initial_mtu)
+        .max_concurrent_bidi_streams(VarInt::from_u32(QUIC_MAX_CONCURRENT_BIDI_STREAMS_CLIENT))
         .max_concurrent_uni_streams(VarInt::from_u32(0))
         // SNI-split on the GFW-facing client->relay leg. See the doc above
         // for why this is safe on the multi-hop client while the inbound
-        // and relay-outbound multi-hop profiles must stay no-pad.
+        // and relay-outbound multi-hop profiles must stay no-pad. The pad
+        // tracks `initial_mtu` so a nested-path client's lowered floor does not
+        // leave an oversized ClientHello that the reduced path drops.
         .initial_crypto_first_fragment_size(Some(64))
-        .initial_datagram_min_size(1280);
+        .initial_datagram_min_size(initial_mtu);
     Arc::new(cfg)
 }
 
@@ -507,6 +556,55 @@ pub fn warren_transport_config_relay_outbound_multihop_with_gso(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_config_lowers_initial_mtu_and_pad_together_for_a_nested_path() {
+        // A client nested inside a full-tunnel system VPN sees a reduced path
+        // MTU. The outer QUIC floor must drop below the nested cap AND the
+        // Initial pad must drop with it: a pad larger than initial_mtu stalls the
+        // handshake (the 1500-vs-1280 class the base docstring warns about), so a
+        // handshake padded to 1280 on a 1200 floor would itself be dropped.
+        let cfg = warren_transport_config_client_full_with_mtu(true, false, false, 1200);
+        let rendered = format!("{cfg:?}");
+        assert!(
+            rendered.contains("initial_mtu: 1200"),
+            "outer QUIC floor must drop to the nested-safe MTU, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("initial_datagram_min_size: 1200"),
+            "the Initial pad must track the lowered MTU, never exceed it, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn client_config_keeps_the_full_mtu_and_pad_by_default() {
+        // A healthy path pays nothing: the default is the full 1280 floor and pad.
+        let cfg =
+            warren_transport_config_client_full_with_mtu(true, false, false, TUNNEL_INITIAL_MTU);
+        let rendered = format!("{cfg:?}");
+        assert!(
+            rendered.contains("initial_mtu: 1280"),
+            "default must keep the full outer MTU, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("initial_datagram_min_size: 1280"),
+            "default must keep the full Initial pad, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn multihop_client_config_lowers_initial_mtu_and_pad_together_for_a_nested_path() {
+        let cfg = warren_transport_config_client_multihop_with_mtu(true, false, 1200);
+        let rendered = format!("{cfg:?}");
+        assert!(
+            rendered.contains("initial_mtu: 1200"),
+            "multihop client outer QUIC floor must drop for a nested path, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("initial_datagram_min_size: 1200"),
+            "multihop Initial pad must track the lowered MTU, got: {rendered}"
+        );
+    }
 
     #[test]
     fn cc_kind_defaults_to_bbr_without_env() {
