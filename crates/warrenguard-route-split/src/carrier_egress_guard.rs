@@ -1,7 +1,7 @@
 //! Bootstrap egress guard for the carrier socket bypass, with a self-healing
 //! revert to the destination-route escape.
 //!
-//! This is the single home of the post-incident carrier policy that pairs with
+//! This is the single home of the carrier egress policy that pairs with
 //! [`socket_bypass::tunnel_socket_bypass`](crate::socket_bypass::tunnel_socket_bypass):
 //! the per-OS bind is PREFERRED, not mandatory, and only kept while egress is
 //! proven. The decision logic is pure over [`EgressGuardIo`], so every
@@ -9,7 +9,7 @@
 //! datapath) drives the same proven policy with its own thin I/O seam rather
 //! than re-deriving it.
 //!
-//! # Why (2026-07-13 carrier-blackhole incident)
+//! # Why (the carrier-blackhole failure mode)
 //!
 //! On a multi-interface host an `IP_BOUND_IF`-bound carrier socket loses ALL
 //! egress the instant the routing layer swaps the default onto the TUN (the
@@ -29,15 +29,15 @@
 //! bound carrier is black-holing, so the guard reverts to the proven-safe
 //! `<carrier_ip>/32` DefaultNode route AND unbinds the socket. The revert is the
 //! fail-safe net; the bind is kept only when confirmed working, never
-//! fail-closed (fail-closed is what took egress down).
+//! fail-closed (a fail-closed bind takes all egress down with it).
 //!
-//! # Why ACK progress, not received bytes (2026-07-15 incident)
+//! # Why ACK progress, not received bytes
 //!
-//! The original evidence was `udp_rx.bytes` ("a reply cannot arrive unless our
-//! request left the wire"). That axiom died when the fleet armed exit-side
-//! DAITA and idle cover: the exit now sends UNSOLICITED dummies downlink, so
-//! rx climbs on a client whose uplink is fully black-holed, and every
-//! reconnect false-confirmed the dead bind (VPN "Connected", no internet,
+//! `udp_rx.bytes` looks like the obvious evidence ("a reply cannot arrive
+//! unless our request left the wire"), but that axiom breaks under exit-side
+//! DAITA and idle cover: the exit sends UNSOLICITED dummies downlink, so
+//! rx climbs on a client whose uplink is fully black-holed and
+//! false-confirms the dead bind (VPN "Connected", no internet,
 //! NAT-PMP timeouts). ACK frames are different: the peer only emits them in
 //! response to receiving OUR ack-eliciting packets, so `frame_rx.acks`
 //! advancing proves client egress even under a rain of dummies. The baseline
@@ -271,8 +271,8 @@ mod tests {
 
     #[test]
     fn dead_when_sends_issued_but_none_acknowledged_after_the_window() {
-        // The exact incident shape: tx climbs (sends issued), acks frozen,
-        // window elapsed. This is the signal that was missing.
+        // The exact blackhole shape: tx climbs (sends issued), acks frozen,
+        // window elapsed.
         let base = reading(1, 10, 5);
         let cur = reading(1, 273, 5);
         assert_eq!(
@@ -283,8 +283,8 @@ mod tests {
 
     #[test]
     fn unsolicited_downlink_traffic_never_confirms_a_dead_uplink() {
-        // 2026-07-15 regression: an armed exit rains DAITA dummies on the
-        // downlink, so RECEIVED traffic is not proof of egress. Nothing in the
+        // An armed exit rains DAITA dummies on the downlink, so RECEIVED
+        // traffic is not proof of egress. Nothing in the
         // reading but ACK progress may confirm; a frozen ack counter with
         // climbing sends past the window must read Dead, whatever arrived.
         let base = reading(1, 10, 5);
@@ -402,7 +402,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn guard_reverts_to_the_route_when_the_carrier_blackholes() {
         // Post-baseline tx climbs but not one send is acknowledged for the
-        // whole adaptive window: the incident shape. Revert exactly once.
+        // whole adaptive window: the blackhole shape. Revert exactly once.
         let mut io = MockIo::new(reading(1, 10, 5), reading(1, 400, 5));
         let outcome = run_bootstrap_guard(&mut io).await;
         assert_eq!(outcome, GuardOutcome::RevertedToRoute);
@@ -415,7 +415,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn guard_ignores_acks_that_landed_during_the_burn_interval() {
-        // 2026-07-15 regression: on a reconnect, ACKs of the pre-swap
+        // On a reconnect, ACKs of the pre-swap
         // handshake land milliseconds after the swap. They arrive during the
         // burn interval, so they are already inside the baseline and must not
         // confirm; with the ack counter frozen after the baseline and sends

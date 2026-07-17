@@ -33,7 +33,7 @@
 //!   teardown at most once per revocation, and a healthy listener
 //!   drains the channel promptly); it grows without bound only if the
 //!   listener task itself is stuck, which is already a standalone
-//!   incident (no live session is being torn down at all) independent
+//!   failure (no live session is being torn down at all) independent
 //!   of this channel's capacity.
 //! - **Per-entry TTL**: each entry carries an `expires_at`
 //!   (unix secs) honoured by [`AllowlistHandle::is_allowed_at`] so a
@@ -1116,15 +1116,15 @@ mod tests {
 
     #[test]
     fn steady_state_polls_advance_last_success_without_mutating_payload() {
-        // Empirical bug reproduction. An exit
+        // Regression guard. An exit
         // restored from on-disk cache (gen=G, fetched_at=T_OLD) polls
         // a healthy control plane that has not mutated since. The server
         // returns the SAME generation on every tick, so the payload
-        // gate early-returns. Before the fix, last_success stayed
-        // frozen at T_OLD and the staleness sweep evicted the entire
-        // allowlist at T_OLD + grace, treating a healthy backend as
-        // a 5-minute outage. After the fix, last_success advances on
-        // every successful poll regardless of the gate, so the sweep
+        // gate early-returns. If last_success stayed frozen at T_OLD,
+        // the staleness sweep would evict the entire allowlist at
+        // T_OLD + grace, treating a healthy backend as a 5-minute
+        // outage. last_success must therefore advance on every
+        // successful poll regardless of the gate, so the sweep
         // never fires while the backend is reachable.
         let (handle, _rx) = AllowlistHandle::new();
         let cache_seed_time = 1_000;
@@ -1141,7 +1141,7 @@ mod tests {
             );
         }
         // 300 s past the cache seed, 0 s past the last poll: still
-        // alive. Before the fix this would evict.
+        // alive. A frozen last_success would evict here.
         let evicted = handle.clear_if_stale(cache_seed_time + 300, 60);
         assert_eq!(
             evicted, 0,

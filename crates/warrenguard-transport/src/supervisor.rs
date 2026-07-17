@@ -501,8 +501,8 @@ pub struct MultiHopSupervisor {
 /// dead datapath as fatal instead of redialing silently forever. Three
 /// windows (~45 s at the default 15 s watches) tolerate a slow one-off
 /// recovery while bounding how long a dead tunnel may masquerade as
-/// Connected (2026-07-13 carrier-blackhole incident: the UI said Connected
-/// for hours over a datapath that egressed nothing).
+/// Connected (without the bound, a UI can say Connected
+/// for hours over a datapath that egresses nothing).
 const DATAPATH_DEAD_FATAL_REDIALS: u32 = 3;
 
 /// Escalation counter behind [`MultiHopSupervisor::datapath_dead_rx`].
@@ -1642,9 +1642,9 @@ const APP_DOWNLINK_MIN_TX: u64 = 8;
 ///
 /// This is the watch the other two cannot replace: transport ACKs keep
 /// `udp_rx` advancing (RX-silence watch blind) and mark every send delivered
-/// (uplink-loss watch blind), yet the tunnel carries nothing. Observed for
-/// real on 2026-07-12: a relay ACKed 90 uplink datagrams and forwarded none;
-/// the client sat "connected" for ~39 s with zero traffic until quinn's idle
+/// (uplink-loss watch blind), yet the tunnel carries nothing. A relay that
+/// ACKs uplink datagrams and forwards none leaves the client sitting
+/// "connected" with zero traffic until quinn's idle
 /// timeout. A false positive only costs a ~30 ms redial (the exit's
 /// pubkey-sticky allocator preserves the inner IP); 15 s of genuinely one-way
 /// app traffic (no DNS reply, no TCP ACK, nothing) is a dead tunnel.
@@ -1872,7 +1872,7 @@ mod tests {
         }
     }
 
-    /// The 2026-07-12 incident shape: app datagrams keep going up, transport
+    /// The silent-relay shape: app datagrams keep going up, transport
     /// ACKs keep the RX-silence watch blind, yet not one application datagram
     /// ever comes back. The watch must fire within its window instead of
     /// leaving the session "connected" until quinn's ~40 s idle timeout.
@@ -2312,10 +2312,10 @@ mod run_tests {
         // A teardown landing while the supervisor is INSIDE its cold-dial
         // retry loop must stop the retries: the loop-top receiver check
         // cannot see it, and a dial that never succeeds means the loop is
-        // never left. Observed live on Windows as a supervisor still
-        // redialing at attempt=948 long after the daemon reported
+        // never left, so the supervisor would keep redialing for hundreds
+        // of attempts after the daemon reported
         // Disconnected. The TEST-NET bind address makes every attempt fail
-        // instantly with the same retriable Bind error as the field case.
+        // instantly with the same retriable Bind error a real host hits.
         let operational_key = SigningKey::from_bytes(&[0x46; 32]);
         let exit_id = ExitId::from_bytes([0x55; 16]);
         let exit = spawn_fake_multihop_exit(&operational_key, exit_id);

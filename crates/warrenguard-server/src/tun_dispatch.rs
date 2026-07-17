@@ -421,13 +421,13 @@ pub async fn pump_tun_downlink<T: PacketDevice>(
     // Survive transient TUN read errors (EINTR/ENOBUFS bursts under high
     // PPS): this single reader is the downlink for EVERY connected
     // client, so exiting on the first error silently blackholes the
-    // whole exit (cf. an earlier multihop incident). Only a long
+    // whole exit. Only a long
     // unbroken error streak (TUN truly gone) surfaces as Err.
     let mut tun_io = warrenguard_pump::TunIoTolerance::new("tun_dispatch recv_batch");
     // Dispatch errors are non-fatal (the per-connection pumps own the
     // connection lifecycle) but must stay visible: an exit silently
-    // swallowing send errors for every client is exactly the
-    // degradation an earlier incident hid. First error logged,
+    // swallowing send errors for every client is an invisible
+    // fleet-wide degradation. First error logged,
     // then one log every N (no client identifiers in the message).
     let mut dispatch_err_log = LogEveryN::new(10_000);
     loop {

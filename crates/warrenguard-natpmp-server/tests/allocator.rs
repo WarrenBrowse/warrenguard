@@ -1266,10 +1266,10 @@ fn take_active_for_port_returns_none_for_unknown_port() {
 
 // ---------------------------------------------------------------------------
 // allocate_collecting: every removed `active` entry must be surfaced so the
-// backend can tear down the matching nftables element. This is the
-// allocator<->nftables desync that leaked ghost DNAT rules for expired and
-// port-changed mappings (observed live: one client holding three UDP DNAT
-// elements under a quota of one).
+// backend can tear down the matching nftables element. An unsurfaced
+// removal is an allocator<->nftables desync that leaks ghost DNAT rules for
+// expired and port-changed mappings (one client ends up holding several UDP
+// DNAT elements under a quota of one).
 // ---------------------------------------------------------------------------
 
 #[test]

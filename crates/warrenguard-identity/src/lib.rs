@@ -348,7 +348,7 @@ mod tests {
 
     #[test]
     fn load_or_create_mnemonic_returns_zeroizing_string() {
-        // M4 regression: the mnemonic is seed-equivalent secret material, so
+        // Regression guard: the mnemonic is seed-equivalent secret material, so
         // the return type must be `Zeroizing<String>` (scrubbed on drop), not
         // a plain `String`. The explicit type annotation makes this a
         // compile-time check: reverting the signature to `String` fails to

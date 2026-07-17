@@ -121,8 +121,8 @@ fn warren_transport_config_base_calls_keep_alive_interval() {
     // `.keep_alive_interval(...)` call is removed from
     // `warren_transport_config_base_with_pad()` (the function
     // `warren_transport_config_base()` delegates to) - capturing the
-    // regression that would silently re-introduce the 15-minute-cycle
-    // tunnel death observed in the fork-stability diagnosis.
+    // regression that would silently re-introduce a 15-minute-cycle
+    // tunnel death.
     //
     // Source-level checks are normally avoided, but here the only
     // alternatives are (a) a 25 s+ behavioral test using the prod
@@ -165,10 +165,8 @@ const _: () = assert!(
 #[test]
 fn warren_transport_configs_have_180s_idle_timeout_to_absorb_backbone_blips() {
     // Regression guard: the Warren idle-timeout floor sits at 180s,
-    // not the historical 60s, because an instrumented cross-DC re-bench
-    // (tcpdump 3.2 GB) reproduced three distinct stalls
-    // where a >50s backbone blip on the relay-to-exit leg fired
-    // `max_idle_timeout` on C2.
+    // well above 60s, because a >50s backbone blip on the
+    // relay-to-exit leg can fire `max_idle_timeout` on C2.
     // The blind-forwarding relay does not propagate QUIC PING frames
     // from C1 (client-to-relay) to C2 (relay-to-exit), so the only
     // defense against a transient backbone blip is a generous idle

@@ -2,13 +2,13 @@
 //! the multi-hop dual-role dispatcher does NOT reintroduce the low-PMTU
 //! handshake stall that the no-pad multi-hop transport profile exists to avoid.
 //!
-//! The historical stall (see `warren_transport_config_exit_multihop_with_gso`
-//! doc) was caused by PADDING the ServerHello datagram to 1280 B: on an
-//! intercontinental hop whose path MTU dipped below ~1308 B the single padded
-//! datagram was silently dropped and the handshake never completed. The fix was
-//! the no-pad profile (Initial-padding knobs omitted, `initial_mtu = 1280`).
+//! The stall (see `warren_transport_config_exit_multihop_with_gso`
+//! doc) is caused by PADDING the ServerHello datagram to 1280 B: on an
+//! intercontinental hop whose path MTU dips below ~1308 B the single padded
+//! datagram is silently dropped and the handshake never completes. The remedy
+//! is the no-pad profile (Initial-padding knobs omitted, `initial_mtu = 1280`).
 //!
-//! The open question was whether an X.509 cert chain (much larger
+//! The question this test answers: whether an X.509 cert chain (much larger
 //! than a 32 B RFC 7250 raw public key) reintroduces the problem. It does not:
 //! QUIC fragments the server's Certificate flight across Handshake packets each
 //! sized to `initial_mtu` (1280), so a larger chain produces MORE 1280 B

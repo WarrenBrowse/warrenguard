@@ -220,7 +220,7 @@ async fn multi_hop_loopback_idle_90s_keeps_connection_alive() {
     // QUIC_MAX_IDLE_TIMEOUT_SECS = 180 wired on every Warren
     // TransportConfig, native Quinn PINGs should fire on C1 and C2
     // every 20s and keep both connections alive past the 180s idle
-    // window. This test stays at 90s because the historical regression
+    // window. This test stays at 90s because the regression
     // it captures (downlink-idle crash on the relay's blind
     // forwarder) reproduces well within that budget when keep-alive is
     // broken; bumping the test duration would only add wall-clock cost.

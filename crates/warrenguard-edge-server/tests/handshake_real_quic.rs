@@ -400,11 +400,11 @@ async fn direct_serve_edge_session_admits_over_loopback() {
 
 #[tokio::test]
 async fn a_client_that_never_opens_the_connect_stream_is_ended_within_the_setup_deadline() {
-    // Slowloris regression (fix 1): a client that completes the control-stream
+    // Slowloris guard: a client that completes the control-stream
     // SETTINGS handshake but never opens the CONNECT bidi stream must not pin
-    // the session forever. Before the fix, `run_handshake` awaited
-    // `conn.accept_bi()` with no bound at all, and `edge_transport_config`'s
-    // 10s keep-alive keeps such a connection alive indefinitely from the
+    // the session forever. If `run_handshake` awaited
+    // `conn.accept_bi()` with no bound at all, `edge_transport_config`'s
+    // 10s keep-alive would keep such a connection alive indefinitely from the
     // server's own side, so nothing would ever end the session on its own.
     //
     // Uses the injectable-deadline test entry point so the test does not have

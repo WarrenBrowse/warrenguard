@@ -387,8 +387,8 @@ impl MultiHopBundle {
     /// Quinn's datagram frame counters: an armed exit pads its downlink
     /// with dummies and a DAITA client pads its uplink, so frame counters
     /// keep advancing on a tunnel that carries no user traffic at all
-    /// (2026-07-15 incident: a dead uplink sat "Connected" behind a rain
-    /// of exit dummies).
+    /// (a dead uplink can sit "Connected" behind a rain of exit
+    /// dummies).
     #[must_use]
     pub fn real_traffic_totals(&self) -> (u64, u64) {
         (

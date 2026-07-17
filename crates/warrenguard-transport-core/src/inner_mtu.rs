@@ -4,7 +4,7 @@
 //! datagram (underlay path MTU below ~1350: train/satellite/cellular
 //! backhauls, nested tunnels), the datapath silently black-holes full-MSS
 //! traffic while small packets pass: the tunnel looks Connected yet no page
-//! loads (2026-07-15 SNCF incident). Two pure remedies, shared by the client
+//! loads. Two pure remedies, shared by the client
 //! pumps and the exit:
 //!
 //! - [`clamp_syn_mss`]: rewrite the TCP MSS option of SYN/SYN-ACK packets

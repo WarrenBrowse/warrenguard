@@ -824,7 +824,7 @@ mod tests {
 
     #[test]
     fn best_default_route_ranks_by_effective_metric_not_route_metric_alone() {
-        // Shape observed live (2026-07-13, multi-interface Windows host): a
+        // Real multi-interface Windows host shape: a
         // DHCP default with route metric 0 rides a deprioritized interface
         // (metric 5000) while the host's preferred NIC holds route metric 256
         // + interface metric 10. Windows routes by the sum, so the bypass
@@ -850,8 +850,8 @@ mod tests {
     #[test]
     fn best_default_route_skips_disconnected_interfaces() {
         // A statically-configured NIC keeps its persistent default route in
-        // the forward table with the cable unplugged (observed live,
-        // 2026-07-13 flap test): pinning it strands every redial on a dead
+        // the forward table with the cable unplugged:
+        // pinning it strands every redial on a dead
         // interface. The best CONNECTED candidate must win instead.
         let unplugged_best = DefaultRouteCandidate {
             connected: false,

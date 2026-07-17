@@ -78,10 +78,10 @@ async fn unattached_secondary_connection_is_closed_promptly_not_left_to_idle_tim
         "the SetupAck must tell the client it did not attach"
     );
 
-    // The regression: before the fix this connection was never closed by the
-    // exit and stayed alive until Quinn's idle timeout (tens of seconds),
+    // The guarded regression: an exit that never closes this connection
+    // leaves it alive until Quinn's idle timeout (tens of seconds),
     // with a no-op dispatch entry registered and a pump spawned for it. It
-    // must now close within a couple of seconds of the ack.
+    // must close within a couple of seconds of the ack.
     let close = tokio::time::timeout(Duration::from_secs(3), conn.closed())
         .await
         .expect("exit must close an unattached secondary promptly, not at idle timeout");
@@ -102,8 +102,8 @@ async fn unattached_secondary_connection_is_closed_promptly_not_left_to_idle_tim
 async fn unattached_secondary_via_handshake_only_surfaces_as_err_and_closes() {
     // Same scenario through `handshake_only` (the single-accept, no-TUN
     // driver behind `accept_one_with_tun` / `accept_one` / `accept_forever`),
-    // the second code location the fix touches: before the fix this path
-    // returned `Ok` for an unattached secondary and left the connection
+    // the second code path that must refuse: returning `Ok` for an
+    // unattached secondary here would leave the connection
     // open, letting a caller like `accept_one_with_tun` spawn a pump on it.
     let exit = ExitListener::bind_localhost().await.expect("bind exit");
     let exit_addr = exit.bound_addr();

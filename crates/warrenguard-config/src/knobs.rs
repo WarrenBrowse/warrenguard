@@ -427,7 +427,7 @@ pub fn dead_path_secs() -> u64 {
 /// comes back, before it redials. Complements `WARREN_DEAD_PATH_SECS`, which
 /// only sees transport-level RX silence: a relay that ACKs uplink packets but
 /// forwards nothing keeps that watch blind while the tunnel carries zero
-/// traffic (observed 2026-07-12). Default `15`; `0` disables the watch.
+/// traffic. Default `15`; `0` disables the watch.
 #[must_use]
 pub fn app_downlink_dead_secs() -> u64 {
     static CACHE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();

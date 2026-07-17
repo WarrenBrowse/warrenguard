@@ -51,11 +51,10 @@
 //! not a host-route exception. See `default_route_split_macos` and
 //! `default_route_split_windows`.
 //!
-//! ## Reference
+//! ## Why a dedicated table
 //!
-//! The recipe originates in a real-network postmortem: pinning the
-//! exit-bypass and split routes in a dedicated table was the fix for the
-//! tunnel self-poisoning its own QUIC socket.
+//! Pinning the exit-bypass and split routes in a dedicated table keeps the
+//! tunnel from self-poisoning its own QUIC socket.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 

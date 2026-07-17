@@ -31,8 +31,8 @@ pq-hpke = ["dep:ml-kem", "dep:kem", "dep:x25519-dalek", "dep:sha3", "dep:hkdf", 
 # HPKE RFC 9180 for client-to-exit end-to-end payload encryption (multi-message
 # session). Pin exact: pre-1.0, breaking changes possible.
 #
-# NOT `hpke-rs` (Cryspen) which had 5 vulns disclosed Feb 2026 (nonce reuse,
-# entropy reduction, zero-DH-check missing). See Symbolic Software 2026-02-05.
+# NOT `hpke-rs` (Cryspen) which had 5 publicly disclosed vulns (nonce reuse,
+# entropy reduction, zero-DH-check missing). See the Symbolic Software audit.
 hpke = { version = "=0.13.0", default-features = false, features = ["alloc", "x25519"] }
 
 # Per-packet AEAD used directly after deriving a one-time key via

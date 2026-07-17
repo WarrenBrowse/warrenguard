@@ -1,8 +1,8 @@
 //! Frozen HPKE Warren `/v1` test vectors - REVERSE direction.
 //!
 //! Companion of `hpke_vectors_v1.rs` for the exit -> client downlink
-//! path. The forward-only vector suite was approved by the audit
-//! but the reverse path was caught as a gap: a regression in
+//! path. A forward-only vector suite leaves the reverse path
+//! unpinned: a regression in
 //! `compose_export_info_reverse` (the `DIRECTION_TAG_REVERSE` byte
 //! at position 34) or in `ExitSession::seal_response` would not
 //! flip any forward vector and would land silently.

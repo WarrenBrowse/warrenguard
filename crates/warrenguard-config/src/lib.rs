@@ -35,8 +35,8 @@ pub const HKDF_INFO_NODEKEY: &[u8] = b"vpn-node-key";
 /// Initial UDP payload size targeted by every Warren Quinn endpoint
 /// (`TransportConfig::initial_mtu`).
 ///
-/// **This was lowered from 1350 to 1280**: the historical 1350 value
-/// derived from `1500 - 50 B QUIC/AEAD overhead`, which is fine on the
+/// **1280, not 1350**: a 1350 value
+/// derives from `1500 - 50 B QUIC/AEAD overhead`, which is fine on the
 /// open Internet but trips a PMTU black-hole on a cross-DC cloud
 /// backbone between two datacenters when the obfuscation pad layout
 /// (`initial_datagram_min_size = 1500`) forces the ServerHello-bearing
@@ -195,7 +195,7 @@ pub fn unix_now_i64() -> i64 {
 // ---- No-log helpers --------------------------------------------------
 
 /// Number of characters retained when truncating an identifier for
-/// logs. 8 chars is enough to grep for a specific incident across a
+/// logs. 8 chars is enough to grep for a specific event across a
 /// journal but far short of being reversible into the full identifier.
 ///
 /// For an SS58-style base58 pubkey the first 8 chars (address prefix
@@ -372,8 +372,7 @@ pub const QUIC_MAX_IDLE_TIMEOUT_SECS: u64 = 180;
 /// (especially CGNAT, mapping expiry ~30 s), the mapping vanishes
 /// and the next reply from the peer is dropped, breaking long-running
 /// flows. The exit-side then logs
-/// `pump session ended error=read_datagram failed` (diagnosed in the
-/// fork-stability investigation).
+/// `pump session ended error=read_datagram failed`.
 ///
 /// 20 s sits below the typical 30 s CGNAT UDP mapping while still
 /// being a fraction of the 60 s idle, keeping overhead negligible.
@@ -515,8 +514,8 @@ mod tests {
 
     #[test]
     fn unix_now_is_strictly_positive_after_2024() {
-        // Sanity: we are running in the future of 2024-01-01
-        // (= 1_704_067_200). If `unix_now` returns 0, the system
+        // Sanity: we are running after the start of 2024
+        // (epoch 1_704_067_200). If `unix_now` returns 0, the system
         // clock or the function are broken - this test catches it
         // either way.
         assert!(

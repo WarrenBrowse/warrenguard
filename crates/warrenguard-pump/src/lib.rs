@@ -2386,7 +2386,7 @@ mod tests {
         assert_eq!(spoof_log.total, 1, "the drop must be tallied");
     }
 
-    /// M5 regression: a hostile client spoofing source IPs at line rate must
+    /// Regression guard: a hostile client spoofing source IPs at line rate must
     /// not cost one WARN per packet. Drains far more than the 64-cadence
     /// through `accept_downlink` and confirms the counter keeps every drop
     /// (`total`) while the log-worthy cadence stays at `first + every 64th`

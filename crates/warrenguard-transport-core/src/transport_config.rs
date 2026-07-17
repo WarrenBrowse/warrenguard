@@ -148,8 +148,7 @@ fn warren_transport_config_base_with_pad(enable_gso: bool, pad_to_mtu: bool) -> 
         // expiry and brief packet loss on a single path. Without this,
         // a quinn `Connection` dies silently after `max_idle_timeout` of
         // silence and the exit logs `pump session ended
-        // error=read_datagram failed` (observed in the
-        // fork-stability diagnosis).
+        // error=read_datagram failed`.
         .keep_alive_interval(Some(Duration::from_secs(QUIC_KEEP_ALIVE_INTERVAL_SECS)))
         .pad_to_mtu(pad_to_mtu);
     cfg
@@ -490,10 +489,10 @@ pub fn warren_transport_config_client_multihop_with_gso(enable_gso: bool) -> Arc
 /// `initial_datagram_min_size(1280)`). The client-to-relay leg (C1) is the
 /// ONLY hop a GFW-class censor observes - the relay and exit sit outside
 /// the censored region - so the SNI-split that defeats the QUIC SNI
-/// extractor (USENIX Security 2025) must apply here. The historical
-/// multi-hop stall was a SERVER-side problem: padding the *ServerHello*
-/// to 1280 B is dropped on a low-PMTU intercontinental relay-to-exit hop
-/// (DE<->SG), which is why the inbound and relay-outbound multi-hop
+/// extractor (USENIX Security 2025) must apply here. The multi-hop
+/// stall risk is a SERVER-side problem: padding the *ServerHello*
+/// to 1280 B is dropped on a low-PMTU intercontinental relay-to-exit
+/// hop, which is why the inbound and relay-outbound multi-hop
 /// profiles stay no-pad. The CLIENT padding its own ClientHello to 1280 B
 /// is the exact mechanism the single-hop default
 /// ([`warren_transport_config_client_with_gso`]) ships in production, and

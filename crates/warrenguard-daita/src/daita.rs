@@ -1069,7 +1069,7 @@ mod tests {
 
     #[test]
     fn from_config_repeated_sessions_do_not_leak_machines() {
-        // Regression guard for the M2 defect: `DaitaFramework` must never
+        // Regression guard: `DaitaFramework` must never
         // `Box::leak` its machine allocation to satisfy a `'static` bound
         // on `Framework` (that leaks once per DAITA session, unbounded
         // growth on a long-running exit). `Framework<Vec<Machine>, _>`

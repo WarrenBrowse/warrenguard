@@ -361,7 +361,7 @@ pub async fn run_reassign_loop<T: ReassignableTun>(
 /// this tunnel's datagrams, so clamping at both pump directions keeps
 /// end-to-end TCP flowing on reduced-MTU underlays (train/satellite
 /// backhauls, nested tunnels) instead of black-holing full-size segments
-/// while the tunnel looks Connected (2026-07-15 SNCF incident).
+/// while the tunnel looks Connected.
 /// Asymmetry allowance for MSS options crossing the UPLINK pump: their
 /// beneficiary segments will cross the EXIT's transmit budget, which this
 /// client cannot read. The local budget is a same-path proxy; the margin
@@ -1695,7 +1695,7 @@ mod live_pump_tests {
         // so a client on the PLAIN pump still receives 0xFF dummies. They
         // must be dropped here: written to the TUN the kernel rejects each
         // one ("IP version 15") and the tolerance path stalls the pump
-        // 1 ms per dummy (2026-07-15 incident).
+        // 1 ms per dummy.
         exit_send_datagram(&pair, 0, vec![0xFF; 64]).await;
         tokio::time::sleep(ABSENCE_WINDOW).await;
         assert!(
@@ -1729,7 +1729,7 @@ mod live_pump_tests {
         let tun = warrenguard_transport_core::FakeTun::new();
         let task = tokio::spawn(run_downlink(rx, tun.clone(), None));
 
-        // The incident shape: a dead uplink under an armed exit still
+        // The failure shape: a dead uplink under an armed exit still
         // RECEIVES dummies, so quinn's datagram counter climbs on a session
         // that carried zero real downlink. If the escalation judged that
         // counter it would reset on every close and the "datapath dead"

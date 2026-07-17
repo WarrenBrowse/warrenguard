@@ -85,7 +85,7 @@ mod tests {
 
     #[test]
     fn source_date_epoch_is_formatted_as_utc_rfc3339() {
-        // 1717200000 == 2024-06-01T00:00:00Z (verified against `date -u`).
+        // The epoch constant's expected rendering was verified against `date -u`.
         let out = resolve_build_time(None, Some("1717200000"), Some("2099-12-31T23:59:59Z"));
         assert_eq!(
             out, "2024-06-01T00:00:00Z",
@@ -144,7 +144,6 @@ mod tests {
 
     #[test]
     fn epoch_handles_a_leap_day() {
-        // 1709164800 == 2024-02-29T00:00:00Z (a leap day).
         assert_eq!(
             format_epoch_utc("1709164800").as_deref(),
             Some("2024-02-29T00:00:00Z")

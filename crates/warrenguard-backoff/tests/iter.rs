@@ -91,7 +91,7 @@ fn len_tracks_remaining_attempts() {
 
 #[test]
 fn base_zero_does_not_loop_forever_at_zero_delay() {
-    // M17 regression: `Backoff { base: Duration::ZERO, .. }` used to
+    // Regression guard: `Backoff { base: Duration::ZERO, .. }` used to
     // collapse `jitter_step`'s `next.is_zero()` first-call sentinel
     // forever, since the seeded `next` (`base.min(max)`) was itself zero:
     // every following call re-entered the "first call" branch and
