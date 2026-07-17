@@ -323,3 +323,45 @@ async fn pool_concurrent_get_or_create_yields_a_single_connection() {
         "pool must converge to a single cached entry"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn labeled_leg_stats_report_live_legs_by_exit_id() {
+    let op = det_signing_key(0x42);
+    let key_a = det_signing_key(0x55);
+    let key_b = det_signing_key(0x66);
+    let exit_a = spawn_fake_exit(&key_a);
+    let exit_b = spawn_fake_exit(&key_b);
+
+    let id_a = ExitId::from_bytes([0xAA; 16]);
+    let id_b = ExitId::from_bytes([0xBB; 16]);
+    let desc_a = signed_descriptor_for(&op, id_a, pubkey_bytes(&key_a), exit_a.addr);
+    let desc_b = signed_descriptor_for(&op, id_b, pubkey_bytes(&key_b), exit_b.addr);
+
+    let pool = build_pool();
+    let conn_a = pool.get_or_create(&desc_a).await.expect("dial exit A");
+    pool.get_or_create(&desc_b).await.expect("dial exit B");
+
+    let mut labeled = pool.labeled_leg_stats();
+    labeled.sort_by_key(|(id, _)| *id.as_bytes());
+    assert_eq!(
+        labeled.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec![id_a, id_b],
+        "every live leg is labeled with its destination exit id"
+    );
+    for (_, stats) in &labeled {
+        assert!(
+            stats.rtt_ms < 10_000,
+            "loopback smoothed RTT must be sane, got {}",
+            stats.rtt_ms
+        );
+    }
+
+    // A closed leg must disappear, like the anonymous snapshot.
+    conn_a.close(VarInt::from_u32(0), b"test close");
+    let after = pool.labeled_leg_stats();
+    assert_eq!(
+        after.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec![id_b],
+        "closed legs are skipped"
+    );
+}

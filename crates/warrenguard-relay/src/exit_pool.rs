@@ -328,6 +328,33 @@ impl ExitConnPool {
             })
             .collect()
     }
+
+    /// Like [`Self::leg_stats`], but each live leg is labeled with the
+    /// destination exit id it was pooled under. For the authenticated
+    /// control-plane heartbeat only (path-quality aggregation), where the
+    /// destination is required to attribute a leg; the identifiers are
+    /// infrastructure exit ids, never client material. The anonymous
+    /// [`Self::leg_stats`] stays the only snapshot wired to the metrics
+    /// exposition.
+    #[must_use]
+    pub fn labeled_leg_stats(&self) -> Vec<(ExitId, ExitLegStats)> {
+        let map = self.state.lock();
+        map.iter()
+            .filter(|(_, conn)| conn.close_reason().is_none())
+            .map(|(key, conn)| {
+                let stats = conn.stats();
+                (
+                    ExitId::from_bytes(*key),
+                    ExitLegStats {
+                        rtt_ms: u64::try_from(stats.path.rtt.as_millis()).unwrap_or(u64::MAX),
+                        cwnd_bytes: stats.path.cwnd,
+                        lost_packets: stats.path.lost_packets,
+                        congestion_events: stats.path.congestion_events,
+                    },
+                )
+            })
+            .collect()
+    }
 }
 
 /// Anonymous QUIC path health of one pooled relay->exit connection
