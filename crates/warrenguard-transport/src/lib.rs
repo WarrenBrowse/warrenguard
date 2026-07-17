@@ -25,6 +25,9 @@ mod ios_tun;
 pub mod multi_hop_pump;
 mod multi_session;
 pub mod multihop;
+// Single home of the "host moved to another network" detection (route/source
+// change watcher); consumers react through their own redial machinery.
+pub mod network_monitor;
 pub mod redial_policy;
 #[cfg(target_os = "android")]
 pub mod socket_protect;
