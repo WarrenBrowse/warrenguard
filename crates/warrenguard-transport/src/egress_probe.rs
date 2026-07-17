@@ -63,11 +63,14 @@ const GATEWAY_DNS: SocketAddr =
     SocketAddr::new(IpAddr::V4(warrenguard_config::TUNNEL_GATEWAY_IP), 53);
 
 /// Name resolved by the probe. Warren infrastructure, queried against Warren's
-/// own exit resolver, so no third party learns anything.
-const PROBE_QNAME: &str = "warrenbrowse.com";
+/// own exit resolver, so no third party learns anything. Exported so external
+/// probe drivers (the SDK userland prober) query the same name rather than
+/// re-declaring it.
+pub const PROBE_QNAME: &str = "warrenbrowse.com";
 
-/// Overall wait for an answer within one probe (two sends inside).
-const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+/// Overall wait for an answer within one probe (two sends inside). Exported
+/// for external probe drivers, like [`PROBE_QNAME`].
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 /// Retransmit offset of the second datagram inside one probe, so a single lost
 /// UDP packet does not count as an egress failure.
 const PROBE_RETRANSMIT: Duration = Duration::from_secs(2);

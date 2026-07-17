@@ -25,6 +25,7 @@ mod ios_tun;
 pub mod multi_hop_pump;
 mod multi_session;
 pub mod multihop;
+pub mod redial_policy;
 #[cfg(target_os = "android")]
 pub mod socket_protect;
 // `real_tun` drives `tun-rs::AsyncDevice`, which has no Android nor iOS backend.
