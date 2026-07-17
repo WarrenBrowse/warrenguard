@@ -486,6 +486,14 @@ pub struct MultiHopSupervisor {
     /// make-before-break overlap then swaps in gap-free (cross-exit
     /// migration). `SupervisorHandle`s share the same `Arc<Mutex<_>>`.
     target: Arc<Mutex<CircuitTarget>>,
+    /// Inner IPv4 the exit assigned to the LAST established session.
+    /// Redials send it as the `prefer_ipv4` session-placement hint so the
+    /// exit keeps the session on its address (overlap and fast reconnects
+    /// join the predecessor instead of minting a new IP); a first session
+    /// sends the 0.0.0.0 session-fresh sentinel instead, which is what
+    /// stops two independent same-wallet sessions from sharing one inner
+    /// IP and stealing each other's downlink.
+    last_assigned_v4: Mutex<Option<std::net::Ipv4Addr>>,
 }
 
 /// Consecutive watchdog-forced redials, each of a session whose ENTIRE life
@@ -558,6 +566,7 @@ impl MultiHopSupervisor {
             metrics: Arc::new(SupervisorMetrics::default()),
             overlap: Arc::new(Notify::new()),
             target,
+            last_assigned_v4: Mutex::new(None),
         };
         (supervisor, rx)
     }
@@ -988,12 +997,24 @@ impl MultiHopSupervisor {
         // exit's `IpAssign` reply drives the reassign flow. With v7 tokens the
         // request is an anonymous `IpRequestV7` (no wallet pubkey); otherwise
         // the v6 wallet-signed `IpRequest` + PoP.
+        // Session-placement hint: a redial names its session's current
+        // address so the exit keeps it there (joining, then stale-evicting,
+        // the predecessor); a first session sends the session-fresh
+        // sentinel so it can never be co-housed with another live session
+        // of the same identity. Exits predating the hint ignore it.
+        let placement = Some(
+            self.last_assigned_v4
+                .lock()
+                .expect("last_assigned_v4 lock poisoned")
+                .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+        );
         let setup_result = primary
-            .setup_over_stream_with_tokens(
+            .setup_over_stream_with_options(
                 Some(&self.config.client_signing),
                 self.config.wants_ipv6,
                 self.config.enable_daita,
                 session_tokens,
+                placement,
             )
             .await;
 
@@ -1009,6 +1030,10 @@ impl MultiHopSupervisor {
                 let spec = Self::decode_ip_assign(&reply);
                 if let Some(spec) = &spec {
                     self.publish_setup_ip_assign(spec);
+                    *self
+                        .last_assigned_v4
+                        .lock()
+                        .expect("last_assigned_v4 lock poisoned") = Some(spec.assigned);
                 }
                 spec
             }
@@ -1360,12 +1385,17 @@ impl MultiHopSupervisor {
                     continue;
                 }
             };
+            // Join hint: a bonded secondary names its session's address so
+            // a per-session exit lands it on the primary's IP even when
+            // another live session of the same identity holds the sticky
+            // binding.
             let setup = client
-                .setup_over_stream_with_tokens(
+                .setup_over_stream_with_options(
                     Some(&config.client_signing),
                     config.wants_ipv6,
                     config.enable_daita,
                     session_tokens,
+                    Some(primary_spec.assigned),
                 )
                 .await;
             if let Some(reason) = client.rejection_reason() {

@@ -1950,60 +1950,46 @@ impl MultiHopClient {
         wants_daita: bool,
         session_tokens: Option<&[SessionToken]>,
     ) -> Result<Vec<u8>, MultiHopError> {
-        // v7 anonymous admission: the token is the authorization, so the
-        // request carries no account pubkey and no PoP. The exit verifies the
-        // token offline and keys the session by its anonymous serial. Chosen
-        // over the v6 `IpRequest` whenever tokens are supplied and non-empty.
-        let request_msg = match session_tokens {
-            Some(tokens) if !tokens.is_empty() => WarrenControlMessage::IpRequestV7 {
-                prefer_ipv4: None,
-                wants_ipv6,
-                session_tokens: tokens.to_vec(),
-                wants_daita,
-            },
-            _ => {
-                // Single `IpRequest`: carries the sticky/allowlist pubkey, the
-                // Ed25519 proof of possession of that pubkey, and whether the
-                // client wants a dual-stack v6. The exit answers with an
-                // `IpAssign` whose `ipv6` is `Some` only when it actually
-                // granted v6 - so the caller surfaces a "v6 requested but not
-                // granted" gap (never a silent v4-only fallback) just by
-                // checking that field.
-                //
-                // `identity` is the ACCOUNT signing key: when present, the
-                // request asserts its pubkey and signs this session's HPKE
-                // `encapsulated_key` (domain-separated, exit-bound) so a
-                // strict exit can verify possession instead of trusting a bare
-                // assertion. The production binary always passes the key;
-                // `None` is for permissive/bench exits only.
-                let (client_pubkey, pop_sig) = match identity {
-                    Some(key) => {
-                        // Sign over the session's CURRENT encapsulated_key.
-                        // Setup runs before any traffic, so no rekey can race
-                        // the seal below; if one ever did, the exit would
-                        // reject the stale PoP and the supervisor would redial
-                        // cleanly.
-                        let encapsulated_key = self.session.encapsulated_key();
-                        (
-                            Some(key.verifying_key().to_bytes()),
-                            Some(warrenguard_multihop::sign_pop(
-                                key,
-                                &self.exit_id,
-                                &encapsulated_key,
-                            )),
-                        )
-                    }
-                    None => (None, None),
-                };
-                WarrenControlMessage::IpRequest {
-                    prefer_ipv4: None,
-                    client_pubkey,
-                    wants_ipv6,
-                    pop_sig,
-                    wants_daita,
-                }
-            }
-        };
+        self.setup_over_stream_with_options(identity, wants_ipv6, wants_daita, session_tokens, None)
+            .await
+    }
+
+    /// Variant of [`Self::setup_over_stream_with_tokens`] that also carries
+    /// a session-placement hint in the request's `prefer_ipv4` field.
+    ///
+    /// The hint closes the two-live-sessions downlink collision on the
+    /// exit: `Some(0.0.0.0)` declares an INDEPENDENT session start (the
+    /// exit never co-houses it on an inner IP another live session of the
+    /// same identity holds), `Some(addr)` declares this connection part of
+    /// the session currently assigned `addr` (bonded secondaries, overlap
+    /// and fast reconnects keep their session's address), `None` keeps the
+    /// legacy hint-less request. Advisory on the wire: exits predating the
+    /// hint ignore the field entirely.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::setup_over_stream`].
+    pub async fn setup_over_stream_with_options(
+        &self,
+        identity: Option<&SigningKey>,
+        wants_ipv6: bool,
+        wants_daita: bool,
+        session_tokens: Option<&[SessionToken]>,
+        prefer_ipv4: Option<std::net::Ipv4Addr>,
+    ) -> Result<Vec<u8>, MultiHopError> {
+        // Sign over the session's CURRENT encapsulated_key. Setup runs
+        // before any traffic, so no rekey can race the seal below; if one
+        // ever did, the exit would reject the stale PoP and the supervisor
+        // would redial cleanly.
+        let request_msg = compose_setup_request(
+            identity,
+            &self.exit_id,
+            &self.session.encapsulated_key(),
+            wants_ipv6,
+            wants_daita,
+            session_tokens,
+            prefer_ipv4,
+        );
         let plaintext = encode_control(&request_msg).map_err(|e| match e {
             warrenguard_multihop::ControlError::Decode(p) => MultiHopError::Encode(p),
             _ => MultiHopError::Encode(postcard::Error::SerializeBufferFull),
@@ -2412,6 +2398,60 @@ impl WarrenPumpHandle for MultiHopClient {
 /// loopback test harness can build the matching exit-side
 /// [`warrenguard_multihop::ExitSession`] without going through the
 /// setup-stream wire exchange. `session` is private to this module;
+/// Builds the setup-stream control request. Pure so the request shape,
+/// notably the session-placement `prefer_ipv4` hint pass-through, is
+/// testable without a live session.
+///
+/// v7 anonymous admission: the token is the authorization, so the request
+/// carries no account pubkey and no PoP. The exit verifies the token
+/// offline and keys the session by its anonymous serial. Chosen over the
+/// v6 `IpRequest` whenever tokens are supplied and non-empty.
+///
+/// v6 `IpRequest`: carries the sticky/allowlist pubkey and the Ed25519
+/// proof of possession over this session's HPKE `encapsulated_key`
+/// (domain-separated, exit-bound) so a strict exit can verify possession
+/// instead of trusting a bare assertion. The production binary always
+/// passes the key; `None` is for permissive/bench exits only.
+fn compose_setup_request(
+    identity: Option<&SigningKey>,
+    exit_id: &ExitId,
+    encapsulated_key: &warrenguard_multihop::EncapsulatedKeyBytes,
+    wants_ipv6: bool,
+    wants_daita: bool,
+    session_tokens: Option<&[SessionToken]>,
+    prefer_ipv4: Option<std::net::Ipv4Addr>,
+) -> WarrenControlMessage {
+    let prefer_ipv4 = prefer_ipv4.map(|ip| ip.octets());
+    match session_tokens {
+        Some(tokens) if !tokens.is_empty() => WarrenControlMessage::IpRequestV7 {
+            prefer_ipv4,
+            wants_ipv6,
+            session_tokens: tokens.to_vec(),
+            wants_daita,
+        },
+        _ => {
+            let (client_pubkey, pop_sig) = match identity {
+                Some(key) => (
+                    Some(key.verifying_key().to_bytes()),
+                    Some(warrenguard_multihop::sign_pop(
+                        key,
+                        exit_id,
+                        encapsulated_key,
+                    )),
+                ),
+                None => (None, None),
+            };
+            WarrenControlMessage::IpRequest {
+                prefer_ipv4,
+                client_pubkey,
+                wants_ipv6,
+                pop_sig,
+                wants_daita,
+            }
+        }
+    }
+}
+
 /// exposed crate-wide (not just to this file's own `mod tests`) so the
 /// shared loopback helper in `crate::test_support` can reach it.
 #[cfg(test)]
@@ -2470,6 +2510,67 @@ mod tests {
             got: 0,
             expected: 1,
         })
+    }
+
+    #[test]
+    fn compose_setup_request_carries_the_session_placement_hint_v6_and_v7() {
+        // The exit keys per-session downlink ownership off this hint: it
+        // must reach the wire on BOTH admission variants, and its absence
+        // must keep the legacy hint-less request byte-identical.
+        let exit_id = ExitId::from_bytes([0x0E; 16]);
+        let encap = [0x33; 32];
+        let key = SigningKey::from_bytes(&[0x11; 32]);
+        let hint = std::net::Ipv4Addr::new(10, 66, 0, 42);
+
+        match compose_setup_request(Some(&key), &exit_id, &encap, true, false, None, Some(hint)) {
+            WarrenControlMessage::IpRequest {
+                prefer_ipv4,
+                client_pubkey,
+                pop_sig,
+                ..
+            } => {
+                assert_eq!(prefer_ipv4, Some([10, 66, 0, 42]));
+                assert_eq!(client_pubkey, Some(key.verifying_key().to_bytes()));
+                let sig = pop_sig.expect("identity present implies a PoP");
+                assert!(
+                    warrenguard_multihop::verify_pop(
+                        &key.verifying_key().to_bytes(),
+                        &exit_id,
+                        &encap,
+                        &sig
+                    ),
+                    "the PoP must still cover (exit_id, encapsulated_key)"
+                );
+            }
+            other => panic!("expected a v6 IpRequest, got {other:?}"),
+        }
+
+        let tokens = vec![SessionToken([0xAB; warrenguard_wire::SESSION_TOKEN_LEN])];
+        match compose_setup_request(
+            None,
+            &exit_id,
+            &encap,
+            false,
+            true,
+            Some(&tokens),
+            Some(std::net::Ipv4Addr::UNSPECIFIED),
+        ) {
+            WarrenControlMessage::IpRequestV7 { prefer_ipv4, .. } => {
+                assert_eq!(
+                    prefer_ipv4,
+                    Some([0, 0, 0, 0]),
+                    "the session-fresh sentinel must ride the v7 request too"
+                );
+            }
+            other => panic!("expected a v7 IpRequestV7, got {other:?}"),
+        }
+
+        match compose_setup_request(Some(&key), &exit_id, &encap, false, false, None, None) {
+            WarrenControlMessage::IpRequest { prefer_ipv4, .. } => {
+                assert_eq!(prefer_ipv4, None, "no hint stays a legacy request");
+            }
+            other => panic!("expected a v6 IpRequest, got {other:?}"),
+        }
     }
 
     #[test]
