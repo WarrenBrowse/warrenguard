@@ -84,6 +84,15 @@ pub type OverlapSwapObserver = Arc<dyn Fn(&CircuitTarget) + Send + Sync>;
 pub type DialRefusedObserver =
     Arc<dyn Fn(multihop::DialRefusedHop, [u8; 16], [u8; 16]) + Send + Sync>;
 
+/// Observer of the measured client->entry QUIC path RTT, fired at
+/// connection lifecycle points (session publish post-handshake, and once
+/// more when the serving session ends) with
+/// `(relay_ed25519_pubkey, rtt_ms)` of the DIALED first hop (captured at
+/// dial time, so a concurrent retarget can never mis-key a sample). The
+/// engine stays store-agnostic: an embedder feeds its own RTT store (the
+/// client-measured half of the shared path-aware selection signal).
+pub type PathRttObserver = Arc<dyn Fn([u8; 32], u32) + Send + Sync>;
+
 /// Source of anonymous v7 session tokens (Privacy Pass). Called ONCE
 /// per session establishment to obtain the token stack the primary and all its
 /// bonded secondaries present; because they share one stack they resolve to the
@@ -219,6 +228,10 @@ pub struct SupervisorConfig {
     /// on its next attempt. `None` = refusals retry like any other
     /// transient error.
     pub on_dial_refused: Option<DialRefusedObserver>,
+    /// Optional observer of the measured client->entry path RTT
+    /// ([`PathRttObserver`]): fired on each session publish and once
+    /// more when the serving session ends. `None` = not observed.
+    pub on_path_rtt: Option<PathRttObserver>,
     /// Optional source of anonymous v7 session tokens
     /// ([`SessionTokenProvider`]). When set and it yields a non-empty stack,
     /// each session presents `IpRequestV7` (the exit admits on the token and
@@ -673,7 +686,7 @@ impl MultiHopSupervisor {
             // landing while the retry loop is spinning would otherwise never
             // be observed (the loop-top check runs only between sessions,
             // and a dial that never succeeds re-enters neither).
-            let client = tokio::select! {
+            let (client, mut session_relay) = tokio::select! {
                 biased;
                 () = self.tx.closed() => {
                     tracing::info!(
@@ -740,6 +753,7 @@ impl MultiHopSupervisor {
             ));
             self.spawn_background_bond(&bundle, assign, session_tokens);
             self.notify_on_reconnect(first_session);
+            self.notify_path_rtt(session_relay, bundle.quinn_stats().path.rtt);
             first_session = false;
 
             // Inner serve loop. The current session serves until it dies (cold
@@ -824,7 +838,7 @@ impl MultiHopSupervisor {
                         // dial keeps the current session (the cold path still
                         // covers a real death).
                         match self.try_overlap().await {
-                            Some((new_bundle, new_primary)) => {
+                            Some((new_bundle, new_primary, new_relay)) => {
                                 if !pre_swap_allows(
                                     self.config.pre_swap_check.as_ref(),
                                     new_bundle.clone(),
@@ -854,12 +868,18 @@ impl MultiHopSupervisor {
                                 ));
                                 self.notify_on_reconnect(false);
                                 self.metrics.reconnect_count.fetch_add(1, Ordering::Relaxed);
+                                // Last sample of the OLD session before its
+                                // deferred close, then the fresh session's
+                                // post-handshake sample under ITS dialed key.
+                                self.notify_path_rtt(session_relay, bundle.quinn_stats().path.rtt);
                                 Self::spawn_deferred_close(bundle.clone(), primary.clone());
                                 tracing::info!(
                                     "multi-hop overlap migration: swapped to a fresh session, old draining"
                                 );
                                 bundle = new_bundle;
                                 primary = new_primary;
+                                session_relay = new_relay;
+                                self.notify_path_rtt(session_relay, bundle.quinn_stats().path.rtt);
                                 continue;
                             }
                             None => continue,
@@ -867,7 +887,11 @@ impl MultiHopSupervisor {
                     }
                 };
 
-                // The current session closed (cold path).
+                // The current session closed (cold path). Its last smoothed
+                // RTT is still readable on the closed connection handle and
+                // is the session's parting sample (a degraded path records
+                // high, correctly biasing later selection away).
+                self.notify_path_rtt(session_relay, bundle.quinn_stats().path.rtt);
                 //
                 // A definitive policy rejection (the exit closed with a known
                 // rejection code) is not a transient loss: redialing hits the
@@ -947,10 +971,15 @@ impl MultiHopSupervisor {
         }
     }
 
-    async fn connect_once(&self) -> Result<MultiHopClient, MultiHopError> {
+    /// Dial the LIVE target once. Returns the client together with the
+    /// dialed relay's Ed25519 pubkey, captured from the SAME target
+    /// snapshot the dial used, so a concurrent `migrate_to` can never
+    /// mis-key the session's RTT samples ([`PathRttObserver`]).
+    async fn connect_once(&self) -> Result<(MultiHopClient, [u8; 32]), MultiHopError> {
         // Read the LIVE target (not config): a `migrate_to` retargets this
         // so the next dial lands on a different exit (cross-exit migration).
         let target = self.current_target();
+        let relay_pubkey = target.relay.relay_ed25519_pubkey;
         MultiHopClient::connect_with_transport_config(
             &target.relay,
             target.exit_id,
@@ -962,6 +991,7 @@ impl MultiHopSupervisor {
             self.config.socket_bypass,
         )
         .await
+        .map(|client| (client, relay_pubkey))
     }
 
     /// Run the primary's reliable setup-stream round-trip and detect a
@@ -1231,16 +1261,16 @@ impl MultiHopSupervisor {
     /// `(bundle, primary)` on success, or `None` to keep the current session
     /// (a failed or rejected overlap dial must never tear down the still
     /// healthy current session - the natural cold path covers a real death).
-    async fn try_overlap(&self) -> Option<(Arc<MultiHopBundle>, Arc<MultiHopClient>)> {
-        let primary = match self.connect_once().await {
-            Ok(c) => Arc::new(c),
+    async fn try_overlap(&self) -> Option<(Arc<MultiHopBundle>, Arc<MultiHopClient>, [u8; 32])> {
+        let (primary, relay_pubkey) = match self.connect_once().await {
+            Ok((c, relay_pubkey)) => (Arc::new(c), relay_pubkey),
             Err(e) => {
                 tracing::warn!(error = %e, "overlap dial failed; keeping the current session");
                 return None;
             }
         };
         match self.establish_session(primary).await {
-            Established::Session { bundle, primary } => Some((bundle, primary)),
+            Established::Session { bundle, primary } => Some((bundle, primary, relay_pubkey)),
             Established::Rejected(reason) => {
                 tracing::warn!(%reason, "overlap dial rejected by exit; keeping the current session");
                 None
@@ -1257,6 +1287,19 @@ impl MultiHopSupervisor {
             old.force_close_for_reconnect();
             drop(old_primary);
         });
+    }
+
+    /// Fire the [`SupervisorConfig::on_path_rtt`] observer with a
+    /// measured path RTT for the session dialed to `relay_pubkey`.
+    /// Extracted as a helper so the millisecond conversion and dispatch
+    /// are testable without a real QUIC connection.
+    fn notify_path_rtt(&self, relay_pubkey: [u8; 32], rtt: std::time::Duration) {
+        if let Some(observer) = self.config.on_path_rtt.as_ref() {
+            observer(
+                relay_pubkey,
+                u32::try_from(rtt.as_millis()).unwrap_or(u32::MAX),
+            );
+        }
     }
 
     /// Fire the [`SupervisorConfig::on_reconnect`] observer when a
@@ -1477,7 +1520,9 @@ impl MultiHopSupervisor {
     /// operator misconfiguration (rotated operational pubkey, broken
     /// TLS provider) is visible instead of burning the user's battery
     /// in a retry loop.
-    async fn connect_with_unbounded_retry(&self) -> Result<MultiHopClient, MultiHopError> {
+    async fn connect_with_unbounded_retry(
+        &self,
+    ) -> Result<(MultiHopClient, [u8; 32]), MultiHopError> {
         loop {
             let mut attempt_count = 0u64;
             for delay in self.config.backoff.take(usize::MAX) {
@@ -1749,6 +1794,7 @@ mod tests {
             pre_swap_check: None,
             on_overlap_swapped: None,
             on_dial_refused: None,
+            on_path_rtt: None,
             session_token_provider: None,
         }
     }
@@ -1969,6 +2015,38 @@ mod tests {
     }
 
     #[test]
+    fn notify_path_rtt_reports_millis_keyed_by_the_dialed_relay() {
+        // The observer must receive the DIALED relay pubkey unchanged and
+        // the RTT converted to whole milliseconds: this pair is the exact
+        // record an embedder feeds its client-side RTT store, so a key or
+        // unit slip here silently poisons path-aware selection downstream.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let observer: PathRttObserver = Arc::new(move |pubkey, rtt_ms| {
+            sink.lock()
+                .expect("observer sink lock")
+                .push((pubkey, rtt_ms));
+        });
+        let mut cfg = dummy_config();
+        cfg.on_path_rtt = Some(observer);
+        let (supervisor, _rx) = MultiHopSupervisor::new(cfg);
+        supervisor.notify_path_rtt([7u8; 32], Duration::from_micros(23_400));
+        assert_eq!(
+            seen.lock().expect("observer sink lock").as_slice(),
+            &[([7u8; 32], 23)]
+        );
+        drop(supervisor);
+    }
+
+    #[test]
+    fn notify_path_rtt_is_a_noop_when_unwired() {
+        let cfg = dummy_config();
+        let (supervisor, _rx) = MultiHopSupervisor::new(cfg);
+        supervisor.notify_path_rtt([7u8; 32], Duration::from_millis(10));
+        drop(supervisor);
+    }
+
+    #[test]
     fn notify_on_reconnect_skips_first_session() {
         // Anti-regression: the initial connect must NOT fire the
         // observer. A fresh session is not a reconnect, and bumping a
@@ -2184,6 +2262,7 @@ mod run_tests {
             pre_swap_check: None,
             on_overlap_swapped: None,
             on_dial_refused: None,
+            on_path_rtt: None,
             session_token_provider: None,
         }
     }
