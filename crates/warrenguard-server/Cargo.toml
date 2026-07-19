@@ -1,6 +1,6 @@
 # WarrenGuard engine crate: the exit-side tunnel datapath (QUIC server,
 # handshake, downlink dispatcher, allowlist). No Warren-specific policy; the
-# subscription/account enforcement plugs in via the Authorizer/DeviceCapEnforcer
+# subscription/account enforcement plugs in via the Authorizer / SessionTokenAdmitter
 # traits implemented in the private backend.
 [package]
 name = "warrenguard-server"

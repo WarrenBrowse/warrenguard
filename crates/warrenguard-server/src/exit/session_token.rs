@@ -1,12 +1,12 @@
 //! Protocol v7 anonymous session-token admission hook for the exit.
 //!
-//! Where v6 gates a PRIMARY connection through the [`DeviceCapEnforcer`]
-//! (which names the wallet), v7 gates it through a [`SessionTokenAdmitter`]:
+//! Where the older per-wallet device cap named the wallet, v7 gates a PRIMARY
+//! connection through a [`SessionTokenAdmitter`]:
 //! the exit hands over the client's Privacy Pass tokens and gets back an
 //! anonymous 32-byte serial, having verified one offline and spent it against
 //! the control plane's per-serial lease. The exit never learns the wallet.
 //!
-//! Like [`DeviceCapEnforcer`], the concrete implementation lives in the
+//! Like the other admission seams, the concrete implementation lives in the
 //! deployer's exit binary: it holds the synced issuer
 //! directory (for the offline verify) and the control-plane API client (for
 //! the spend/renew). The engine stays token-agnostic, treating a token as an
@@ -35,7 +35,7 @@
 use sha2::{Digest, Sha256};
 use warrenguard_wire::{ATTACH_SECRET_LEN, SessionToken, WarrenPubkey};
 
-use super::device_cap::BoxFuture;
+use super::BoxFuture;
 
 /// Length of a Privacy Pass token serial: SHA-256 of the token input.
 pub const TOKEN_SERIAL_LEN: usize = 32;
