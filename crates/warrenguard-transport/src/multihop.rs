@@ -532,11 +532,12 @@ impl ClientSessionKind {
     }
 
     /// Borrow the classical `/v1` session, or `None` when this is a `/v2`
-    /// session. Used by call sites whose logic has no `/v2` counterpart yet
-    /// (e.g. the [`crate::multihop::MultiHopClient::setup_over_stream`]
-    /// `IpAssignment` capture, which depends on
-    /// [`warrenguard_multihop::IpAssignment`] being `#[non_exhaustive]` and
-    /// buildable only from inside `warrenguard-multihop`).
+    /// session. Used by the
+    /// [`crate::multihop::MultiHopClient::setup_over_stream`] `IpAssignment`
+    /// capture to take the `/v1`-specific re-open path
+    /// ([`ClientSession::open_setup_reply`]); a `/v2` session instead parses
+    /// its already-opened reply plaintext through the version-agnostic
+    /// [`warrenguard_multihop::ip_assignment_from_setup_plaintext`].
     fn as_v1(&self) -> Option<&RwLock<ClientSession>> {
         match self {
             Self::V1(s) => Some(s),
@@ -2096,17 +2097,26 @@ impl MultiHopClient {
             self.pq_setup_acked.store(true, Ordering::Release);
         }
         // Opportunistically capture the typed IP allocation for
-        // `Self::assignment` and friends: a second, cheap `open_setup_reply`
-        // over the same reply bytes (HPKE open is a pure function of the
-        // ciphertext, so re-running it is idempotent, not a state mutation).
-        // Best-effort: a `Rejected` / `IpExhausted` reply (or any other
-        // non-IpAssign control message) leaves `assignment` at `None`; the
-        // caller still gets the raw plaintext back to interpret itself.
-        // `/v2` only: `warrenguard_multihop::IpAssignment` is `#[non_exhaustive]`
-        // and buildable only from inside `warrenguard-multihop` via the
-        // classical `ClientSession::open_setup_reply`, which has no `/v2`
-        // counterpart yet; `self.session.as_v1()` is `None` there, so
-        // `assignment` simply stays unset for a PQ session.
+        // `Self::assignment` and friends. Best-effort: a `Rejected` /
+        // `IpExhausted` reply (or any other non-IpAssign control message)
+        // leaves `assignment` at `None`; the caller still gets the raw
+        // plaintext back to interpret itself.
+        //
+        // `/v2`: the reply plaintext is already opened above; the inner
+        // `IpAssign` is byte-identical to `/v1`, so it parses through the
+        // version-agnostic `ip_assignment_from_setup_plaintext` (which builds
+        // `IpAssignment` inside `warrenguard-multihop`, honoring its
+        // `#[non_exhaustive]` boundary).
+        #[cfg(feature = "pq-hpke")]
+        if matches!(self.session, ClientSessionKind::V2 { .. })
+            && let Ok(assignment) =
+                warrenguard_multihop::ip_assignment_from_setup_plaintext(&opened)
+        {
+            *self.assignment.lock() = Some(assignment);
+        }
+        // `/v1`: a second, cheap `open_setup_reply` over the same reply bytes
+        // (HPKE open is a pure function of the ciphertext, so re-running it is
+        // idempotent, not a state mutation).
         if let Some(v1) = self.session.as_v1()
             && let Ok(frame) = decode_frame(&reply)
             && let Ok(assignment) = v1.read().open_setup_reply(&frame)
@@ -3406,6 +3416,39 @@ mod tests {
         assert_eq!(recovered, b"\x45reply-epoch-1");
     }
 
+    #[tokio::test]
+    async fn setup_over_stream_populates_the_ip_assignment_v1() {
+        // The classical capture, unchanged: a `/v1` setup reply carrying
+        // `IpAssign` must land in `assignment()`. Guards the shared-parse
+        // refactor (`open_setup_reply` now delegates to
+        // `ip_assignment_from_setup_plaintext`) against a `/v1` regression.
+        let pair =
+            crate::test_support::spawn_loopback_multihop(ExitId::from_bytes([0x64; 16])).await;
+        assert!(
+            pair.client.assignment().is_none(),
+            "no assignment before the setup exchange"
+        );
+
+        let server_task = pair.spawn_setup_stream_server();
+        pair.client
+            .setup_over_stream(None, false, false)
+            .await
+            .expect("setup_over_stream must succeed");
+        server_task.await.expect("server task");
+
+        let assignment = pair
+            .client
+            .assignment()
+            .expect("a /v1 setup reply carrying IpAssign must populate assignment()");
+        assert_eq!(assignment.ipv4, [10, 66, 0, 2]);
+        assert_eq!(assignment.prefix_len, 24);
+        assert_eq!(assignment.gateway_ipv4, [10, 66, 0, 1]);
+        assert_eq!(
+            pair.client.assigned_ipv4(),
+            Some(std::net::Ipv4Addr::new(10, 66, 0, 2))
+        );
+    }
+
     // ------------------------------------------------------------------
     // `/v2` PQ (X-Wing) twins of the rekey tests above, plus the
     // resend-until-ack state machine itself.
@@ -3791,6 +3834,63 @@ mod tests {
                 frame.pq_ct.is_empty(),
                 "epoch 0 must count as acked right after setup_over_stream, \
                  with no separate bootstrap ping needed"
+            );
+        }
+
+        #[tokio::test]
+        async fn setup_over_stream_populates_the_ip_assignment_pq() {
+            // The bug this guards: a `/v2` (PQ X-Wing) setup must capture the
+            // exit's IP allocation into `assignment()` exactly like `/v1`, or a
+            // consumer that needs the tunnel IP (and `.expect()`s it) panics.
+            let pair =
+                crate::test_support::spawn_loopback_multihop_pq(ExitId::from_bytes([0x79; 16]))
+                    .await;
+            assert!(
+                pair.client.assignment().is_none(),
+                "no assignment before the setup exchange"
+            );
+
+            let server_task = pair.spawn_setup_stream_server();
+            pair.client
+                .setup_over_stream(None, false, false)
+                .await
+                .expect("setup_over_stream must succeed");
+            server_task.await.expect("server task");
+
+            let assignment = pair.client.assignment().expect(
+                "a /v2 setup reply carrying IpAssign must populate assignment(), not stay None",
+            );
+            // The exact allocation the loopback exit assigned in
+            // `spawn_setup_stream_server`.
+            assert_eq!(assignment.ipv4, [10, 88, 0, 2]);
+            assert_eq!(assignment.prefix_len, 24);
+            assert_eq!(assignment.gateway_ipv4, [10, 88, 0, 1]);
+            assert_eq!(
+                pair.client.assigned_ipv4(),
+                Some(std::net::Ipv4Addr::new(10, 88, 0, 2))
+            );
+        }
+
+        #[tokio::test]
+        async fn a_policy_refusal_leaves_the_ip_assignment_unset_pq() {
+            // A `Rejected` setup reply is best-effort: the round trip still
+            // returns the opened plaintext, but `assignment()` stays `None`
+            // rather than panicking, mirroring `/v1`.
+            let pair =
+                crate::test_support::spawn_loopback_multihop_pq(ExitId::from_bytes([0x7a; 16]))
+                    .await;
+            let server_task = pair.spawn_setup_stream_server_with_reply(
+                warrenguard_multihop::WarrenControlMessage::Rejected,
+            );
+            pair.client
+                .setup_over_stream(None, false, false)
+                .await
+                .expect("setup_over_stream returns the opened plaintext even on a refusal");
+            server_task.await.expect("server task");
+
+            assert!(
+                pair.client.assignment().is_none(),
+                "a Rejected setup reply must leave assignment() at None, never panic"
             );
         }
     }

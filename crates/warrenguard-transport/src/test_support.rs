@@ -60,6 +60,49 @@ impl LoopbackMultiHop {
         self.exit_session = ExitSession::new(&self.exit_priv, &encapsulated_key, self.exit_id)
             .expect("exit-side session rebuild after rekey");
     }
+
+    /// Spawns a task that answers exactly one classical (`/v1`)
+    /// `setup_over_stream` round trip on `exit_conn`, establishing the
+    /// exit-side session from the request frame and replying with a trivial
+    /// `IpAssign`. The `/v1` twin of
+    /// [`LoopbackMultiHopPq::spawn_setup_stream_server`], for a test that needs
+    /// epoch 0 to go through the real reliable-stream admission path.
+    pub(crate) fn spawn_setup_stream_server(&self) -> tokio::task::JoinHandle<()> {
+        let exit_conn = self.exit_conn.clone();
+        let exit_id = self.exit_id;
+        tokio::spawn(async move {
+            let (mut send, mut recv) = exit_conn.accept_bi().await.expect("accept_bi");
+            let bytes = recv
+                .read_to_end(crate::multihop::MAX_MULTIHOP_SETUP_FRAME_BYTES)
+                .await
+                .expect("read request");
+            let frame = decode_frame(&bytes).expect("decode v1 setup frame");
+            // Same fixed IKM `spawn_loopback_multihop` derives its exit key
+            // from: deterministic, so re-deriving here (rather than threading
+            // the non-Clone zeroize-on-drop private key through the task)
+            // yields the identical key.
+            let (exit_priv, _exit_pub) = derive_exit_keypair(&[0x99; 32]);
+            let exit_session = ExitSession::new(&exit_priv, &frame.encapsulated_key, exit_id)
+                .expect("exit establishes the session from the setup frame");
+            let _plaintext = exit_session.open(&frame).expect("exit opens setup frame");
+            let reply_msg = WarrenControlMessage::IpAssign {
+                ipv4: [10, 66, 0, 2],
+                prefix_len: 24,
+                gateway_ipv4: [10, 66, 0, 1],
+                ipv6: None,
+                prefix_len_v6: 0,
+                gateway_ipv6: None,
+                daita_spec: None,
+            };
+            let reply_plaintext = encode_control(&reply_msg).expect("encode reply");
+            let reply_frame = exit_session
+                .seal_response(&reply_plaintext, frame.epoch, frame.seq)
+                .expect("seal reply");
+            let reply_wire = encode_frame(&reply_frame).expect("encode reply frame");
+            send.write_all(&reply_wire).await.expect("write reply");
+            let _ = send.finish();
+        })
+    }
 }
 
 /// Bare RPK loopback QUIC bootstrap (no relay-auth proof, no setup-stream
@@ -197,6 +240,26 @@ impl LoopbackMultiHopPq {
     /// reliable-stream admission path instead of being pre-seeded via
     /// `client_pq_setup_material_for_test`.
     pub(crate) fn spawn_setup_stream_server(&self) -> tokio::task::JoinHandle<()> {
+        self.spawn_setup_stream_server_with_reply(WarrenControlMessage::IpAssign {
+            ipv4: [10, 88, 0, 2],
+            prefix_len: 24,
+            gateway_ipv4: [10, 88, 0, 1],
+            ipv6: None,
+            prefix_len_v6: 0,
+            gateway_ipv6: None,
+            daita_spec: None,
+        })
+    }
+
+    /// As [`Self::spawn_setup_stream_server`], but the exit replies with an
+    /// arbitrary control message (e.g. a `Rejected` refusal) so a test can
+    /// exercise the non-`IpAssign` setup-reply paths, where the best-effort
+    /// `IpAssignment` capture must leave `assignment()` unset without failing
+    /// the round trip.
+    pub(crate) fn spawn_setup_stream_server_with_reply(
+        &self,
+        reply_msg: WarrenControlMessage,
+    ) -> tokio::task::JoinHandle<()> {
         let exit_conn = self.exit_conn.clone();
         let exit_id = self.exit_id;
         tokio::spawn(async move {
@@ -220,15 +283,6 @@ impl LoopbackMultiHopPq {
                 PqExitSession::new(&exit_secret, &frame.encapsulated_key, &frame.pq_ct, exit_id)
                     .expect("exit establishes the pq session from the setup frame");
             let _plaintext = exit_session.open(&frame).expect("exit opens setup frame");
-            let reply_msg = WarrenControlMessage::IpAssign {
-                ipv4: [10, 88, 0, 2],
-                prefix_len: 24,
-                gateway_ipv4: [10, 88, 0, 1],
-                ipv6: None,
-                prefix_len_v6: 0,
-                gateway_ipv6: None,
-                daita_spec: None,
-            };
             let reply_plaintext = encode_control(&reply_msg).expect("encode reply");
             let reply_frame = exit_session
                 .seal_response(&reply_plaintext, frame.epoch, frame.seq)

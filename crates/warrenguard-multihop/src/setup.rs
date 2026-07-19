@@ -125,6 +125,57 @@ impl SetupError {
     }
 }
 
+/// Interpret an already-opened setup-reply plaintext as the exit's
+/// [`IpAssignment`], independent of the HPKE version that sealed it.
+///
+/// The inner `IpAssign` control message is byte-identical on `/v1` and `/v2`:
+/// only the outer HPKE seal differs, so the `/v2` datapath (whose reply
+/// plaintext is opened by [`crate::PqClientSession::open_response`]) reuses the
+/// exact same parse as the classical [`ClientSession::open_setup_reply`].
+/// Building [`IpAssignment`] here keeps its construction inside this crate,
+/// honoring the `#[non_exhaustive]` boundary.
+///
+/// # Errors
+///
+/// [`SetupError::Control`] on a malformed control plaintext,
+/// [`SetupError::Rejected`] / [`SetupError::IpExhausted`] on a policy reply,
+/// [`SetupError::UnexpectedReply`] for any other control variant or a
+/// non-control plaintext.
+pub fn ip_assignment_from_setup_plaintext(plaintext: &[u8]) -> Result<IpAssignment, SetupError> {
+    match try_decode_control(plaintext)? {
+        Some(WarrenControlMessage::IpAssign {
+            ipv4,
+            prefix_len,
+            gateway_ipv4,
+            ipv6,
+            prefix_len_v6,
+            gateway_ipv6,
+            daita_spec,
+        }) => Ok(IpAssignment {
+            ipv4,
+            prefix_len,
+            gateway_ipv4,
+            ipv6,
+            prefix_len_v6,
+            gateway_ipv6,
+            daita_spec,
+        }),
+        Some(WarrenControlMessage::Rejected) => Err(SetupError::Rejected),
+        Some(WarrenControlMessage::IpExhausted) => Err(SetupError::IpExhausted),
+        // An IpRequest (client->exit direction), a mid-session ExitDraining
+        // advisory (data-plane only, never a setup reply), or a non-control
+        // plaintext on the reply path is a protocol violation by the peer. The
+        // control enum is exhaustive, so a new variant surfaces here as a
+        // compile error rather than being silently swallowed.
+        Some(
+            WarrenControlMessage::IpRequest { .. }
+            | WarrenControlMessage::IpRequestV7 { .. }
+            | WarrenControlMessage::ExitDraining { .. },
+        )
+        | None => Err(SetupError::UnexpectedReply),
+    }
+}
+
 impl ClientSession {
     /// Build the `IpRequest` control message for this session.
     ///
@@ -238,39 +289,7 @@ impl ClientSession {
         frame: &WarrenMultihopFrame,
     ) -> Result<IpAssignment, SetupError> {
         let plaintext = self.open_response(frame)?;
-        match try_decode_control(&plaintext)? {
-            Some(WarrenControlMessage::IpAssign {
-                ipv4,
-                prefix_len,
-                gateway_ipv4,
-                ipv6,
-                prefix_len_v6,
-                gateway_ipv6,
-                daita_spec,
-            }) => Ok(IpAssignment {
-                ipv4,
-                prefix_len,
-                gateway_ipv4,
-                ipv6,
-                prefix_len_v6,
-                gateway_ipv6,
-                daita_spec,
-            }),
-            Some(WarrenControlMessage::Rejected) => Err(SetupError::Rejected),
-            Some(WarrenControlMessage::IpExhausted) => Err(SetupError::IpExhausted),
-            // An IpRequest (client->exit direction), a mid-session
-            // ExitDraining advisory (data-plane only, never a setup reply),
-            // or a non-control plaintext on the reply path is a protocol
-            // violation by the peer. The control enum is exhaustive, so a
-            // new variant surfaces here as a compile error rather than
-            // being silently swallowed.
-            Some(
-                WarrenControlMessage::IpRequest { .. }
-                | WarrenControlMessage::IpRequestV7 { .. }
-                | WarrenControlMessage::ExitDraining { .. },
-            )
-            | None => Err(SetupError::UnexpectedReply),
-        }
+        ip_assignment_from_setup_plaintext(&plaintext)
     }
 }
 
@@ -442,6 +461,49 @@ mod tests {
             client.open_setup_reply(&reply),
             Err(SetupError::UnexpectedReply)
         ));
+    }
+
+    #[test]
+    fn ip_assignment_from_plaintext_parses_a_dual_stack_assign() {
+        // The version-agnostic parse the `/v2` datapath reuses: it decodes the
+        // SAME inner `IpAssign` plaintext the classical `open_setup_reply`
+        // does, so a `/v2` caller that already holds the opened reply gets the
+        // identical typed allocation.
+        let assign = WarrenControlMessage::IpAssign {
+            ipv4: [10, 88, 0, 2],
+            prefix_len: 24,
+            gateway_ipv4: [10, 88, 0, 1],
+            ipv6: Some([
+                0xfd, 0xcc, 0, 0x0f, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02,
+            ]),
+            prefix_len_v6: 64,
+            gateway_ipv6: Some([
+                0xfd, 0xcc, 0, 0x0f, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+            ]),
+            daita_spec: None,
+        };
+        let plaintext = encode_control(&assign).unwrap();
+        let got = ip_assignment_from_setup_plaintext(&plaintext).expect("parse assign");
+        assert_eq!(got.ipv4, [10, 88, 0, 2]);
+        assert_eq!(got.prefix_len, 24);
+        assert_eq!(got.gateway_ipv4, [10, 88, 0, 1]);
+        assert_eq!(got.ipv6.unwrap()[15], 0x02);
+        assert_eq!(got.prefix_len_v6, 64);
+    }
+
+    #[test]
+    fn ip_assignment_from_plaintext_maps_refusals_and_never_yields_an_assignment() {
+        for (msg, expect_exhausted) in [
+            (WarrenControlMessage::Rejected, false),
+            (WarrenControlMessage::IpExhausted, true),
+        ] {
+            let plaintext = encode_control(&msg).unwrap();
+            match ip_assignment_from_setup_plaintext(&plaintext) {
+                Err(SetupError::IpExhausted) if expect_exhausted => {}
+                Err(SetupError::Rejected) if !expect_exhausted => {}
+                other => panic!("a policy refusal must never parse to an assignment: {other:?}"),
+            }
+        }
     }
 
     #[test]

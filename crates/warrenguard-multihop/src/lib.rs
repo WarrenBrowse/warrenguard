@@ -92,7 +92,7 @@ pub use session::{
     ClientSession, ExitId, ExitSession, WARREN_AAD_TOTAL_LEN, WarrenAead, WarrenKdf, WarrenKem,
     compose_aad, parse_exit_x25519_pubkey,
 };
-pub use setup::{IpAssignment, SetupError};
+pub use setup::{IpAssignment, SetupError, ip_assignment_from_setup_plaintext};
 pub use wire_format::{
     EncapsulatedKeyBytes, MULTIHOP_FRAME_MAX_OVERHEAD, WARREN_HPKE_VERSION, WarrenMultihopFrame,
     decode_frame, encode_frame,
