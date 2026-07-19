@@ -17,9 +17,8 @@ pub const PUBKEY_LEN: usize = 32;
 
 /// 32-byte Ed25519 public key identifying a Warren peer.
 ///
-/// Used as the on-the-wire identity of a client or exit in
-/// [`SetupAck::exit_pubkey`](crate::SetupAck::exit_pubkey),
-/// TLS raw-public-key certificates, exit allowlists and signed
+/// Used as the on-the-wire identity of a client or exit in the tunnel setup
+/// reply, TLS raw-public-key certificates, exit allowlists and signed
 /// `relays.json` blobs. Equality and hashing are byte-wise, which is
 /// sufficient for protocol identifier comparison; cryptographic
 /// equality (rejecting non-canonical encodings of the same Ed25519
