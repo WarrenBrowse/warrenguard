@@ -80,7 +80,7 @@ const _AAD_PREFIX_LEN_CHECK: () = assert!(WARREN_HPKE_AAD_V1.len() == 22);
 /// authentication.
 ///
 /// Re-export of the canonical `warrenguard_wire::ExitId` so the multi-hop
-/// AAD identifier and the single-hop relay-list identifier are the SAME
+/// AAD identifier and the relay-list identifier are the SAME
 /// Rust type, not parallel duplicates that happen to share the wire
 /// shape. Wire-compat is preserved: postcard emits exactly 16 raw bytes
 /// from either path.

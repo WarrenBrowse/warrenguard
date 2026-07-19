@@ -39,8 +39,8 @@ pub fn extract_src_ipv6(pkt: &[u8]) -> Option<Ipv6Addr> {
 /// tunnel IP. DAITA dummies (non-IP) pass unconditionally because they are
 /// filtered separately by `is_daita_dummy`.
 ///
-/// This is the anti-spoof gate shared by every exit-side uplink path (single-hop
-/// pump, single-hop dispatcher, multihop termination): a packet whose inner
+/// This is the anti-spoof gate shared by every exit-side uplink path (the exit
+/// dispatcher and multihop termination): a packet whose inner
 /// source IP is not the address the exit allocated to that connection must never
 /// reach the TUN, otherwise one tunnel client could impersonate another on the
 /// inner subnet. An IPv6 packet from a client without a v6 allocation is rejected

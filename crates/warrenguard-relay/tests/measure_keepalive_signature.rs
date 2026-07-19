@@ -3,7 +3,7 @@
 //! the idle keep-alive wire signature so measured numbers can be
 //! cited instead of asserted ones.
 //!
-//! It brings up a single-hop client <-> exit QUIC connection over
+//! It brings up a client <-> exit QUIC connection over
 //! loopback with the production client transport config (5s keep-alive
 //! via `warren_transport_config_client`) and the production exit config,
 //! then leaves the connection idle and samples `Connection::stats()`.

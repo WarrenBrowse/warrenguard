@@ -530,8 +530,8 @@ impl DaitaState {
     /// Fire the event sequence for ONE real (non-dummy) packet sent uplink.
     ///
     /// Centralizes the maybenot choreography so it cannot drift between the
-    /// 5 pump variants (single-hop, multi-conn, multi-hop client, supervised
-    /// uplink, exit). `NormalSent` then `TunnelSent`, in that order.
+    /// pump variants (multi-conn, multi-hop client, supervised uplink, exit).
+    /// `NormalSent` then `TunnelSent`, in that order.
     pub fn on_real_uplink_sent(&mut self, now: Instant) {
         self.fire_events(&[DaitaEvent::NormalSent, DaitaEvent::TunnelSent], now);
     }

@@ -238,7 +238,7 @@ pub enum TunnelError {
 impl TunnelError {
     /// The engine's supervisor-facing verdict for a (re)connect failure.
     ///
-    /// The fatal set matches the app's proven single-hop classification
+    /// The fatal set is the proven client classification
     /// (`AuthRejected`/`DeviceLimitReached` are non-retryable business
     /// rejections) plus the exit-side authorization refusals; the draining and
     /// pool-exhaustion refusals reselect another exit; everything else is a
@@ -343,7 +343,7 @@ mod tests {
         assert_eq!(
             TunnelError::PoolExhausted.retryability(),
             Retryability::RetryReselect,
-            "pool exhaustion aligns single-hop with multi-hop IpExhausted"
+            "pool exhaustion maps to the same RetryReselect verdict as IpExhausted"
         );
         // A plain network loss retries the same target.
         assert_eq!(

@@ -172,9 +172,8 @@ mod imp {
             let Some(ip) = exit_ip_v4 else {
                 return Ok(None);
             };
-            // The single-hop client binary does not yet expose
-            // --bypass-cidr; pass an empty list and no fwmark. The multihop
-            // POC binary is the wired consumer of those optional features.
+            // This caller does not expose --bypass-cidr; pass an empty
+            // list and no fwmark.
             let inner = crate::default_route_split::DefaultRouteSplitGuard::install(
                 ip,
                 tun_name,

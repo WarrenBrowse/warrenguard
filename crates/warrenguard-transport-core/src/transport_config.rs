@@ -467,7 +467,7 @@ pub fn warren_transport_config_relay_outbound_with_gso(enable_gso: bool) -> Arc<
 /// Warren **multi-hop client** `TransportConfig`: the idle-cover-off form of
 /// [`warren_transport_config_client_multihop_with_idle_cover`]. It carries the
 /// Initial-padding knobs (`initial_datagram_min_size` + 64 B first CRYPTO chunk)
-/// on the GFW-facing client-to-relay leg, exactly like the single-hop client;
+/// on the GFW-facing client-to-relay leg;
 /// see that function's doc for why the SNI-split is safe here while the inbound
 /// and relay-outbound multi-hop profiles must stay no-pad.
 #[must_use]
@@ -494,8 +494,8 @@ pub fn warren_transport_config_client_multihop_with_gso(enable_gso: bool) -> Arc
 /// to 1280 B is dropped on a low-PMTU intercontinental relay-to-exit
 /// hop, which is why the inbound and relay-outbound multi-hop
 /// profiles stay no-pad. The CLIENT padding its own ClientHello to 1280 B
-/// is the exact mechanism the single-hop default
-/// ([`warren_transport_config_client_with_gso`]) ships in production, and
+/// is the exact mechanism
+/// [`warren_transport_config_client_with_gso`] ships on the client-to-relay leg, and
 /// the C1 first hop (user ISP to relay) is the same class of path as a
 /// direct client-to-exit dial, so it carries no extra stall risk. The
 /// relay answers C1 with an unpadded ServerHello (its inbound profile),

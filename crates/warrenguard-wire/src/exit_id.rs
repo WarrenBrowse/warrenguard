@@ -10,8 +10,8 @@
 //! key rotations.
 //!
 //! The byte layout is 16 raw bytes with no length prefix, so that the
-//! multihop HPKE AAD identifier and the single-hop relay-list
-//! identifier are byte-equal for the same exit.
+//! multihop HPKE AAD identifier and the relay-list identifier are
+//! byte-equal for the same exit.
 
 use core::fmt;
 

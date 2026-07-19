@@ -17,9 +17,9 @@
 /// Not SipHash: we don't need adversarial resistance and FNV-1a is ~3x
 /// faster on the hot path. Distribution is fine for N=2..16 conns.
 ///
-/// Public so every bonded dispatch point (single-hop `MultiSession`,
-/// single-hop exit `DispatchSlot`, multi-hop client bundle, multi-hop
-/// exit TUN router) keys flows with the same function.
+/// Public so every bonded dispatch point (the exit `DispatchSlot`, the
+/// multi-hop client bundle, and the exit TUN router) keys flows with the
+/// same function.
 #[must_use]
 pub fn flow_hash_5tuple(pkt: &[u8]) -> Option<u64> {
     let first = *pkt.first()?;

@@ -44,8 +44,8 @@ pub const TOKEN_SERIAL_LEN: usize = 32;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenAdmission {
     /// A token verified offline and its serial was spent (or the spend
-    /// could not reach the control plane and was failed-open, matching the
-    /// v6 device-cap availability policy). The session is keyed by `serial`.
+    /// could not reach the control plane and was failed-open: availability
+    /// over strict enforcement). The session is keyed by `serial`.
     Admit {
         /// The 32-byte serial of the admitted token.
         serial: [u8; TOKEN_SERIAL_LEN],

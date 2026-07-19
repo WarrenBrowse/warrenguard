@@ -6,9 +6,9 @@
 //! client opens it, writes one finish-delimited
 //! [`WarrenMultihopFrame`], and waits for the reply on the same
 //! stream). On a real network path the first QUIC datagram is
-//! frequently lost, which previously stranded the HPKE setup; single-hop
-//! avoids this with a stream handshake and multi-hop now mirrors it.
-//! DATA still flows over datagrams via [`crate::forward::forward_session`].
+//! frequently lost, so the HPKE setup is carried on a reliable stream
+//! rather than a datagram. DATA still flows over datagrams via
+//! [`crate::forward::forward_session`].
 //!
 //! The relay never decrypts the HPKE ciphertext; the only field it
 //! reads is the cleartext `exit_id`, carried at the same wire position in

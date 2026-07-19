@@ -233,8 +233,8 @@ fn allocate_on_first_frame(
 /// asserted in its setup control message, and the Ed25519 proof of
 /// possession (PoP) covering this session's HPKE `encapsulated_key`.
 ///
-/// In permissive/bench mode (`allowlist == None`) every client is admitted,
-/// matching the single-hop exit. In strict mode the client must assert an
+/// In permissive/bench mode (`allowlist == None`) every client is admitted.
+/// In strict mode the client must assert an
 /// allowlisted account pubkey via the `IpRequest` `client_pubkey` field
 /// AND prove possession of its private key: `pop_sig` must be a valid
 /// signature by `client_pubkey` over
@@ -2561,8 +2561,7 @@ struct Ipv4Owner {
 pub struct MultihopSessionRegistry<C: ClosableConn = Connection> {
     live: Mutex<HashMap<WarrenPubkey, HashMap<ConnId, C>>>,
     /// Reverse map `assigned tunnel IPv4 -> owning account`, recorded at setup
-    /// once the IP is allocated. The multi-hop analogue of the single-hop
-    /// `ExitSessionsHandle`: it lets `port_forward_sync` attribute each NAT-PMP
+    /// once the IP is allocated. Lets `port_forward_sync` attribute each NAT-PMP
     /// allocation (keyed by internal tunnel IP) to the owning subscriber in the
     /// admin view instead of showing `unknown`. A bonded client's connections
     /// share one sticky IP, so this holds one entry per client; a departed
@@ -2641,11 +2640,9 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
         }
     }
 
-    /// Snapshot of `tunnel IPv4 -> 64-char pubkey hex`. The multi-hop
-    /// analogue of `ExitSessionsHandle::snapshot_ipv4_to_pubkey_hex`,
-    /// consumed by `port_forward_sync` to attribute NAT-PMP allocations to
-    /// the owning subscriber in the admin view. Admin-only surface (behind
-    /// admin auth), exactly like the single-hop path.
+    /// Snapshot of `tunnel IPv4 -> 64-char pubkey hex`, consumed by
+    /// `port_forward_sync` to attribute NAT-PMP allocations to the owning
+    /// subscriber in the admin view. Admin-only surface (behind admin auth).
     #[must_use]
     pub fn snapshot_ipv4_to_pubkey_hex(&self) -> HashMap<Ipv4Addr, String> {
         self.snapshot_ipv4_to_pubkey_hex_at(Instant::now())
@@ -2757,9 +2754,8 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
 
 /// Extract the IPv4 source of a peer socket address for the Port Fail guard:
 /// a native v4 address as-is, a v4-mapped v6 address unmapped to its v4 form,
-/// and a genuine v6 address skipped (`None`). Mirrors the single-hop
-/// `warrenguard-server` `ipv4_source_of` so both datapaths key the guard set the
-/// same way.
+/// and a genuine v6 address skipped (`None`). Shares the `ipv4_source_of`
+/// keying used by the exit's Port-Fail guard set.
 #[must_use]
 fn ipv4_source_of(addr: std::net::SocketAddr) -> Option<Ipv4Addr> {
     match addr.ip() {
@@ -2928,7 +2924,7 @@ pub struct ExitTerminateCtx<T: PacketDevice + Clone> {
     /// Exit allowlist gate. `Some` in strict mode (warren-api configured):
     /// a client must assert an allowlisted account pubkey before it is
     /// granted a tunnel IP. `None` in permissive/bench mode admits any
-    /// client, matching the single-hop exit's behaviour.
+    /// client.
     allowlist: Option<AllowlistHandle>,
     /// Live-session registry for mid-session revocation teardown. `Some`
     /// only in the production dispatcher (set via
@@ -3111,8 +3107,7 @@ impl<T: PacketDevice + Clone> ExitTerminateCtx<T> {
 /// Cloneable, read-only view of the multi-hop dispatcher's live tunnel IPv4s
 /// (the keys of its downlink [`RouteTable`]). Decouples the NAT-PMP orphan
 /// reaper from the private router type while keeping the snapshot a cheap
-/// lock-and-copy. The single-hop counterpart is
-/// [`warrenguard_server::ExitSessionsHandle`].
+/// lock-and-copy.
 #[derive(Clone)]
 pub struct ActiveTunnelIpv4s(Arc<MultihopTunRouter>);
 
@@ -3531,8 +3526,8 @@ async fn serve_one_connection_with_tun<T>(
                 continue;
             }
             // Anti-spoof: the decrypted packet's inner source IP must be
-            // the address allocated to this connection, same gate as the
-            // single-hop uplink. The counter (not the address) is logged.
+            // the address allocated to this connection. The counter (not the
+            // address) is logged.
             if let Some(expected_v4) = spoof_gate_v4
                 && !source_ip_matches(&plaintext, expected_v4, spoof_gate_v6)
             {
@@ -3898,7 +3893,7 @@ async fn serve_pq_datagram_pump<T>(
 ///   actually sealed and queued for transmission.
 ///
 /// Lock model: `Arc<parking_lot::Mutex<DaitaState>>` shared across the
-/// three tasks (same pattern as the single-hop multi-conn pump in
+/// three tasks (same pattern as
 /// `warrenguard_pump::pump_multi_bidirectional_with_daita`).
 #[allow(clippy::too_many_arguments)]
 async fn serve_one_connection_with_tun_and_daita<T>(
@@ -4209,9 +4204,8 @@ async fn serve_one_connection_with_tun_and_daita<T>(
                 && !source_ip_matches(&plaintext, expected_v4, spoof_gate_v6)
             {
                 // Anti-spoof: the decrypted packet's inner source IP must
-                // be the address allocated to this connection, same gate
-                // as the single-hop uplink. The counter (not the address)
-                // is logged.
+                // be the address allocated to this connection. The counter
+                // (not the address) is logged.
                 spoofed_drops += 1;
                 if spoofed_drops == 1 || spoofed_drops.is_multiple_of(10_000) {
                     tracing::warn!(

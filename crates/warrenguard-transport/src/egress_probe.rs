@@ -203,7 +203,7 @@ pub trait EgressProbeIo {
     /// teardown, so the loop exits.
     fn next_tick(&mut self, settled: bool) -> impl Future<Output = bool> + Send;
     /// `true` while the supervisor has a live published session (always `true`
-    /// on single-hop, which has no supervisor).
+    /// for an unsupervised pump, which has no supervisor).
     fn session_present(&mut self) -> bool;
     /// One end-to-end probe through the tunnel. `true` = egress alive.
     fn probe(&mut self) -> impl Future<Output = bool> + Send;

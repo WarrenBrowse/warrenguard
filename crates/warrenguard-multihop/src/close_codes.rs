@@ -136,8 +136,7 @@ impl RejectionReason {
     /// resolves it. Pool exhaustion is NOT fatal and NOT worth redialing the
     /// same exit: it is not the client's fault and a different exit likely has
     /// capacity, so it reselects, exactly like a drain. This is the single home
-    /// for the exhaustion classification the single-hop path
-    /// (`WARREN_NO_CAPACITY`) shares.
+    /// for the `WARREN_NO_CAPACITY` exhaustion classification.
     #[must_use]
     pub fn retryability(self) -> warrenguard_wire::Retryability {
         use warrenguard_wire::{FatalCause, Retryability};

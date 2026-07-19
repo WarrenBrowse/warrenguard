@@ -173,7 +173,7 @@ fn multihop_identity_block(
 }
 
 /// Build the QUIC server endpoint for the multi-hop exit: an Ed25519 raw-public
-/// key TLS config (same RPK-via-SNI shape the single-hop path serves) with ALPN
+/// key TLS config (RPK-via-SNI) with ALPN
 /// `h3`, plus the exit multi-hop inbound transport profile (no Initial padding,
 /// which stalls the handshake on a low-PMTU path).
 fn build_multihop_endpoint(listen: SocketAddr, signing_key: &SigningKey) -> Result<Endpoint> {

@@ -31,8 +31,8 @@ use warrenguard_multihop::{MULTIHOP_FRAME_MAX_OVERHEAD, RejectionReason};
 
 use crate::multihop::{MultiHopClient, MultiHopError};
 
-/// Hard cap on bonded connections per session. Mirrors the single-hop
-/// `n_connections` operating range; the exit-side router slot cap (16)
+/// Hard cap on bonded connections per session, matching the `n_connections`
+/// operating range; the exit-side router slot cap (16)
 /// leaves headroom for the reconnect-overlap window on top of this.
 pub const MAX_BONDED_CONNECTIONS: usize = 8;
 

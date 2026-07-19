@@ -1,9 +1,8 @@
 //! Multi-hop client tunnel.
 //!
 //! This module also exposes [`WarrenPumpHandle`], the minimal `send` /
-//! `recv` surface a deployer's pump loop consumes regardless of whether
-//! the client is single-hop or multi-hop. Multi-hop wires [`MultiHopClient`]
-//! into the trait below so the pump loop stays mode-agnostic.
+//! `recv` surface a deployer's pump loop consumes. [`MultiHopClient`]
+//! implements the trait below so the pump loop stays transport-agnostic.
 //!
 //! Wraps a QUIC connection to a Warren relay with an HPKE multi-message
 //! session bound to the destination exit's long-lived X25519 pubkey. Every
@@ -279,8 +278,7 @@ fn carrier_armed(relay: &RelayDescriptorSigned) -> bool {
 /// QUIC WebPKI handshake (in cover mode) and the outer carrier cover-TLS.
 /// `None` (production) selects the bundled Mozilla program, i.e. the
 /// public-ACME cover cert a real relay presents. A `#[cfg(test)]` seam injects
-/// a throwaway CA so a loopback test completes a genuine cover handshake,
-/// mirroring the single-hop client's `x509_der_roots`.
+/// a throwaway CA so a loopback test completes a genuine cover handshake.
 #[must_use]
 fn cover_trust_anchors() -> Option<Vec<Vec<u8>>> {
     #[cfg(test)]
