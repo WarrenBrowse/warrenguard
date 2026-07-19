@@ -12,8 +12,7 @@ mod unauthenticated;
 pub use allowlist::{AllowlistHandle, AllowlistSnapshot};
 pub use authorizer::{AllowAll, Authorizer, StaticAllowlist};
 pub use exit::{
-    BoxFuture, ExitPeerSourcesHandle, ExitRevocationHandle, ExitSessionsHandle,
-    SessionTokenAdmitter, TOKEN_SERIAL_LEN, TokenAdmission, attach_secret_for_serial,
-    session_key_value,
+    BoxFuture, ExitRevocationHandle, ExitSessionsHandle, SessionTokenAdmitter, TOKEN_SERIAL_LEN,
+    TokenAdmission, attach_secret_for_serial, session_key_value,
 };
 pub use unauthenticated::{UnauthenticatedHandler, UnauthenticatedProbe};

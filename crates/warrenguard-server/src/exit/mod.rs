@@ -14,7 +14,7 @@ mod session_token;
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 // Re-export public types so external consumers keep the same path.
-pub use session::{ExitPeerSourcesHandle, ExitRevocationHandle, ExitSessionsHandle};
+pub use session::{ExitRevocationHandle, ExitSessionsHandle};
 pub use session_token::{
     SessionTokenAdmitter, TOKEN_SERIAL_LEN, TokenAdmission, attach_secret_for_serial,
     session_key_value,

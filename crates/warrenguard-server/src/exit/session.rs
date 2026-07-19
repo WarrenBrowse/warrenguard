@@ -106,48 +106,6 @@ impl ExitSessionsHandle {
     }
 }
 
-/// Extract the IPv4 source of a QUIC peer address for the Port Fail guard
-/// set, unmapping a v4-mapped-v6 address. Returns `None` for a genuine IPv6
-/// peer: the guard set is v4-only, so a native-v6 client's real address
-/// cannot be added (a documented coverage gap, not a fabricated entry).
-///
-/// Kept pure (no `quinn::Connection`) so it is unit-tested directly; the
-/// handle below only maps every live connection's `remote_address()` through
-/// it.
-pub(crate) fn ipv4_source_of(addr: std::net::SocketAddr) -> Option<Ipv4Addr> {
-    match addr {
-        std::net::SocketAddr::V4(v4) => Some(*v4.ip()),
-        std::net::SocketAddr::V6(v6) => v6.ip().to_ipv4_mapped(),
-    }
-}
-
-/// Cloneable read-only view over the REAL (outer, 5-tuple) source IPv4s of the
-/// exit's currently-connected subscribers. Consumed by an exit binary's Port
-/// Fail defense-in-depth maintainer, which mirrors this set into an nftables
-/// set so a packet from a connected subscriber's real IP to another's
-/// forwarded port is dropped on the exit (closing the Port Fail leak for old
-/// clients whose route-split is not yet narrowed).
-///
-/// Reads the live connection map only; never a data-plane hot path.
-#[derive(Clone)]
-pub struct ExitPeerSourcesHandle {
-    pub(super) active_conns: Arc<parking_lot::Mutex<HashMap<SessionKey, Vec<quinn::Connection>>>>,
-}
-
-impl ExitPeerSourcesHandle {
-    /// Snapshot the set of connected subscribers' real source IPv4s. Native
-    /// IPv6-only peers are absent (the v4 guard cannot cover them). Sorted
-    /// (BTreeSet) so the rendered nft sync is deterministic.
-    #[must_use]
-    pub fn snapshot_ipv4_sources(&self) -> std::collections::BTreeSet<Ipv4Addr> {
-        let map = self.active_conns.lock();
-        map.values()
-            .flatten()
-            .filter_map(|conn| ipv4_source_of(conn.remote_address()))
-            .collect()
-    }
-}
-
 /// Cheap, clonable handle that lets a task running independently of the exit's
 /// accept loop tear down connections whose pubkey was revoked.
 ///
