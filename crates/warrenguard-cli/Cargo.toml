@@ -19,6 +19,13 @@ path = "src/main.rs"
 [dependencies]
 warrenguard-server = { path = "../warrenguard-server" }
 warrenguard-transport = { path = "../warrenguard-transport" }
+# Multi-hop exit termination datapath: the terminator loop, IP pool allocator,
+# and the X25519 identity derivation the `serve --multihop` mode wires.
+warrenguard-multihop-server = { path = "../warrenguard-multihop-server" }
+# Multi-hop wire types (`ExitId`) shared with the dialing client.
+warrenguard-multihop = { path = "../warrenguard-multihop" }
+# The exit multi-hop inbound transport profile served to dialers.
+warrenguard-transport-core = { path = "../warrenguard-transport-core" }
 warrenguard-tls = { path = "../warrenguard-tls" }
 warrenguard-identity = { path = "../warrenguard-identity", default-features = false }
 warrenguard-wire = { path = "../warrenguard-wire" }
@@ -26,11 +33,19 @@ warrenguard-config = { path = "../warrenguard-config" }
 anyhow = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
+quinn = { workspace = true }
+ed25519-dalek = { workspace = true }
+parking_lot = { workspace = true }
 data-encoding = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
 tracing-subscriber = { workspace = true }
 zeroize = { workspace = true }
+
+[dev-dependencies]
+# The multi-hop loopback test drives a real `ClientSession`, whose HPKE setup
+# consumes the rand_core 0.9 `CryptoRng + RngCore` surface (OsRng via UnwrapErr).
+rand_core = { version = "0.9", default-features = false, features = ["os_rng"] }
 
 [lints]
 workspace = true
