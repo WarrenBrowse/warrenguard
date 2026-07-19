@@ -2,12 +2,12 @@
 //! clients (the active-probe decoy hook).
 
 /// Handler for a connection that completed the QUIC + TLS handshake but did
-/// not present a valid, authenticated Warren `Setup`: the setup frame was
+/// not present a valid, authenticated Warren setup: the setup frame was
 /// absent or undecodable, the channel binding could not be exported, or the
-/// in-band auth proof did not verify. With a handler configured on
-/// [`crate::ExitBindOpts::unauthenticated_handler`], the exit hands such a
-/// connection to it instead of closing - the seam a deployer uses to mount an
-/// active-probe decoy (a real HTTP/3 site, a reverse proxy, ...).
+/// in-band auth proof did not verify. With a handler configured on the exit,
+/// the exit hands such a connection to it instead of closing - the seam a
+/// deployer uses to mount an active-probe decoy (a real HTTP/3 site, a reverse
+/// proxy, ...).
 ///
 /// The engine stays policy-free: it carries no HTTP/3 dependency and bundles
 /// no decoy. WHAT to serve is the deployer's choice; the

@@ -1,12 +1,12 @@
 //! No-log privacy invariants for the exit data-plane (source-level scan).
 //!
 //! This crate hosts the parts of the engine a deployer points at the open
-//! Internet: the accept loop (`exit/accept.rs`, `exit/mod.rs`), the in-band
-//! handshake, the TUN<->datagram dispatch (`tun_dispatch.rs`), the per-session
-//! reconnect/eviction state (`exit/session.rs`) and the on-disk state
-//! persistence (`exit_state.rs`). It is the spine of Warren's public no-log
-//! claim: the egress path never writes a user's real source IP, a full peer
-//! pubkey, a per-session correlation handle, or any payload byte to a log.
+//! Internet: the TUN<->datagram dispatch (`tun_dispatch.rs`), the exit session
+//! handles (`exit/session.rs`) and the token admission and decoy seams
+//! (`exit/session_token.rs`, `unauthenticated.rs`). It is the spine of Warren's
+//! public no-log claim: the egress path never writes a user's real source IP, a
+//! full peer pubkey, a per-session correlation handle, or any payload byte to a
+//! log.
 //!
 //! Since the data-plane was carved out of the product backend into this engine,
 //! that claim can only be certified here. This test anchors it at the source

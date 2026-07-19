@@ -1,8 +1,7 @@
 //! Dynamic allowlist handle for the exit-side handshake gate.
 //!
-//! Wraps the static `HashSet<WarrenPubkey>` previously stored in
-//! [`crate::ExitBindOpts`] in a `RwLock` so it can be refreshed by a
-//! polling task without restarting the [`crate::ExitListener`].
+//! Wraps a `HashSet<WarrenPubkey>` in a `RwLock` so the exit's admission set can
+//! be refreshed by a polling task without restarting the exit.
 //!
 //! Security invariants enforced here:
 //!
