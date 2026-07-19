@@ -20,8 +20,8 @@
 //!
 //! 1. Exit-side: pick one machine from the pool at the start of each
 //!    new session (uniform random, optionally weighted in the future).
-//! 2. Send [`DaitaConfig`] in the handshake [`warrenguard_wire::SetupAck`] (warren-protocol
-//!    PROTOCOL_VERSION 3 in-band extension).
+//! 2. Send [`DaitaConfig`] to the client in the handshake `IpAssign`
+//!    control message (`daita_spec` field).
 //! 3. Both sides instantiate a [`DaitaFramework`] from the same config.
 //! 4. The Quinn pump feeds packet events ([`DaitaEvent::NormalSent`] /
 //!    [`DaitaEvent::NormalRecv`]) into the framework and applies the
@@ -81,7 +81,7 @@ pub const DAITA_PLACEHOLDER_SLEEP: Duration = Duration::from_secs(3600);
 pub trait DaitaConfigExt {
     /// Builds a config with DAITA disabled (no machines, no caps).
     /// Convenience constructor for sites that need an explicit
-    /// "off" config (vs `daita_spec: None` in `SetupAck`).
+    /// "off" config (vs `daita_spec: None` in `IpAssign`).
     fn disabled() -> Self;
 
     /// Builds a config from already-built [`Machine`]s.

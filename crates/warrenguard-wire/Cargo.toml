@@ -2,7 +2,7 @@
 # Warren-specific logic, reusable by any deployer.
 [package]
 name = "warrenguard-wire"
-description = "Application wire frames for the tunnel handshake (Setup/SetupAck), exit address/id and pubkey codecs (WarrenGuard engine)"
+description = "Application wire types for the tunnel handshake (DAITA config, session tokens, retry hints), exit address/id and pubkey codecs (WarrenGuard engine)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

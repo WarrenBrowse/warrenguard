@@ -130,9 +130,9 @@ impl Serialize for WarrenPubkey {
     ///   expects, so signed relay blobs and the exit descriptor
     ///   (`--info-out`) JSON stay parseable end-to-end.
     /// - postcard / bincode / any binary codec: 32 raw bytes with no
-    ///   length prefix. Matches the existing `SetupAck.exit_pubkey:
-    ///   [u8; 32]` postcard layout exactly, so swapping that field to
-    ///   `WarrenPubkey` later is a byte-identical wire change.
+    ///   length prefix. Matches the naked `[u8; 32]` postcard layout
+    ///   exactly, so a field carrying a raw pubkey as `[u8; 32]` stays
+    ///   byte-identical when typed as `WarrenPubkey`.
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -344,8 +344,8 @@ mod tests {
     fn postcard_serializes_to_32_raw_bytes_byte_equal_with_naked_array() {
         // Cross-pin: WarrenPubkey postcard wire format must be
         // bit-identical to `[u8; 32]` postcard wire format. This is
-        // what makes the `SetupAck.exit_pubkey: WarrenPubkey` typing a
-        // no-op on the wire.
+        // what makes typing a raw-`[u8; 32]` pubkey field as
+        // `WarrenPubkey` a no-op on the wire.
         let bytes = [
             0xaa, 0xbb, 0xcc, 0xdd, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
             0xa0, 0xb0, 0xc0, 0xd0, 0xe0, 0xf0, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
@@ -356,7 +356,7 @@ mod tests {
         let arr_wire = postcard::to_allocvec(&bytes).expect("postcard array");
         assert_eq!(
             pk_wire, arr_wire,
-            "WarrenPubkey postcard bytes must equal naked [u8; 32] for SetupAck wire compat"
+            "WarrenPubkey postcard bytes must equal naked [u8; 32] for wire compat"
         );
         assert_eq!(
             pk_wire.len(),

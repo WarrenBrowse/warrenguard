@@ -85,8 +85,7 @@ pub enum ControlError {
 
     /// The payload decoded to a valid message but was followed by
     /// unexpected trailing bytes. Rejected to keep the wire encoding
-    /// unambiguous (one plaintext = exactly one control message), same
-    /// rationale as `warrenguard_wire::decode_setup`.
+    /// unambiguous (one plaintext = exactly one control message).
     #[error("trailing bytes after a valid control message")]
     TrailingBytes,
 
@@ -253,8 +252,8 @@ pub enum WarrenControlMessage {
         reason_code: u8,
     },
 
-    /// Client -> exit, **v7 anonymous admission** (Privacy Pass). The
-    /// multi-hop counterpart of [`warrenguard_wire::SetupV7`]: it replaces the
+    /// Client -> exit, **v7 anonymous admission** (Privacy Pass). It
+    /// replaces the
     /// [`Self::IpRequest`] `client_pubkey` + `pop_sig` subscription proof with
     /// a stack of Privacy Pass [session tokens](warrenguard_wire::SessionToken)
     /// the exit verifies OFFLINE and spends anonymously, so the exit never
@@ -332,8 +331,8 @@ pub fn try_decode_control(plaintext: &[u8]) -> Result<Option<WarrenControlMessag
         });
     }
     // `take_from_bytes` + explicit rest check rejects trailing bytes after
-    // a valid message (anti-ambiguity, same rule as warrenguard_wire's
-    // decode_setup): one plaintext is exactly one control message.
+    // a valid message (anti-ambiguity): one plaintext is exactly one
+    // control message.
     let (msg, rest): (WarrenControlMessage, &[u8]) = postcard::take_from_bytes(&plaintext[2..])?;
     if !rest.is_empty() {
         return Err(ControlError::TrailingBytes);
@@ -692,7 +691,7 @@ mod tests {
     fn trailing_bytes_after_a_valid_message_are_rejected() {
         // One plaintext = exactly one control message. A stale or hostile
         // sender appending bytes after a valid message must be rejected,
-        // not silently truncated (same rule as warrenguard_wire's Setup).
+        // not silently truncated.
         let mut encoded = encode_control(&WarrenControlMessage::IpExhausted).unwrap();
         encoded.push(0x00);
         assert!(

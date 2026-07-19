@@ -20,8 +20,8 @@ use quinn::VarInt;
 /// `Connection::close_reason()` to map an otherwise-generic "connection lost"
 /// into [`crate::TunnelError::AuthRejected`].
 ///
-/// It is NOT sent to an UNAUTHENTICATED peer (absent or undecodable `Setup`,
-/// channel-binding failure, or an auth proof that did not verify): such a peer
+/// It is NOT sent to an UNAUTHENTICATED peer (absent or undecodable setup
+/// request, channel-binding failure, or an auth proof that did not verify): such a peer
 /// is indistinguishable from an active prober and gets
 /// [`H3_GENERAL_PROTOCOL_ERROR`], so the exit leaks no Warren-specific
 /// close-code tell.
@@ -67,7 +67,7 @@ pub const WARREN_EXIT_DRAINING: VarInt = VarInt::from_u32(0x5744_524e);
 pub const WARREN_EXIT_DRAINING_REASON: &[u8] = b"exit draining";
 
 /// Close code for a handshake-complete but UNAUTHENTICATED connection when no
-/// decoy handler is configured: absent or undecodable `Setup`, channel-binding
+/// decoy handler is configured: absent or undecodable setup request, channel-binding
 /// export failure, or an in-band auth proof that did not verify. It is the
 /// standard HTTP/3 `H3_GENERAL_PROTOCOL_ERROR` (RFC 9114), paired with an empty
 /// reason, so an active prober sees exactly what a real HTTP/3 endpoint emits

@@ -106,7 +106,7 @@ async fn main() {
                 let Ok(conn) = incoming.await else { return };
                 if let Ok((mut send, mut recv)) = conn.accept_bi().await {
                     let _ = recv.read_to_end(64 * 1024).await;
-                    // Canned reply (opaque to the edge; a real exit seals a SetupAck).
+                    // Canned reply (opaque to the edge; a real exit seals an IpAssign).
                     let _ = send.write_all(b"warren-edge-entry-probe-setup-reply").await;
                     let _ = send.finish();
                 }

@@ -1897,11 +1897,11 @@ impl MultiHopClient {
     /// The first multi-hop frame carries the HPKE `encapsulated_key`. On
     /// a real network path the very first QUIC DATAGRAM is frequently
     /// lost (the path is still warming up, the datagram queue is not yet
-    /// ACK-paced), which strands the HPKE setup. Single-hop avoids this
-    /// by carrying its `Setup`/`SetupAck` over a finish-delimited bidi
-    /// stream; this mirrors that for multi-hop. The relay shuttles the
-    /// raw stream bytes between this stream and the relay→exit stream
-    /// without ever decrypting them.
+    /// ACK-paced), which would strand the HPKE setup. To avoid that, the
+    /// setup round-trip runs over a reliable finish-delimited bidi stream
+    /// rather than datagrams. The relay shuttles the raw stream bytes
+    /// between this stream and the relay→exit stream without ever
+    /// decrypting them.
     ///
     /// DATA continues to flow over datagrams via [`Self::send`] /
     /// [`Self::recv`] after this returns. The seq allocated to the setup

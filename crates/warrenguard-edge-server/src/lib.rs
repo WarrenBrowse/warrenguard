@@ -561,7 +561,7 @@ async fn serve_edge_session_inner<A: SessionTokenAdmitter + ?Sized>(
 /// without an ingress token check, exactly as the native Warren relay is blind.
 /// A browser cannot set the CONNECT `Authorization` header, so admission is
 /// necessarily end-to-end at the exit, which verifies-and-spends the v7 session
-/// tokens the browser tunnels inside the `SetupV7` (the exit's
+/// tokens the browser tunnels inside the `IpRequestV7` control message (the exit's
 /// `SessionTokenAdmitter`, wired on `ExitTerminateCtx`). Ingress DoS protection
 /// is a separate rate-limiting concern, not a token gate here.
 ///

@@ -160,14 +160,14 @@ pub const NATPMP_RATE_LIMIT_MAX_PER_WINDOW: usize = 12;
 /// Sliding-window length (seconds) for [`NATPMP_RATE_LIMIT_MAX_PER_WINDOW`].
 pub const NATPMP_RATE_LIMIT_WINDOW_SECS: u64 = 60;
 
-/// Hard upper bound on the time the exit-side handshake (accept →
-/// accept_bi → read Setup → SetupAck) may take, per accept iteration.
-/// Without this cap, a slow-loris client that completes the QUIC
-/// handshake but never sends the Setup frame would hold a tokio task
-/// alive until Quinn's own idle timeout (multiple minutes). The cap is
-/// applied by `accept_forever` and `accept_forever_with_tun`; honest
-/// clients complete a Warren handshake in single-digit milliseconds
-/// even across continents, so 30 s is a generous ceiling.
+/// Hard upper bound on the time the exit-side handshake (accept the
+/// connection, then the sealed setup round-trip over the reliable
+/// stream) may take, per accept iteration. Without this cap, a
+/// slow-loris client that completes the QUIC handshake but never sends
+/// its setup request would hold a tokio task alive until Quinn's own
+/// idle timeout (multiple minutes). Honest clients complete a Warren
+/// handshake in single-digit milliseconds even across continents, so
+/// 30 s is a generous ceiling.
 pub const WARREN_HANDSHAKE_TIMEOUT_SECS: u64 = 30;
 
 /// Current Unix epoch seconds, saturating to 0 on a misconfigured

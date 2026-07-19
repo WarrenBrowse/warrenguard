@@ -473,9 +473,9 @@ pub fn idle_cover_enabled() -> bool {
 }
 
 /// `WARREN_DAITA`: request the DAITA traffic-analysis defense. Off by
-/// default; `"1"`/`"true"` enables. When on, the client advertises
-/// `Setup::daita_support` so the exit assigns a per-session Maybenot machine
-/// config (padding + dummy datagrams, bidirectional) applied by the
+/// default; `"1"`/`"true"` enables. When on, the client sets
+/// `wants_daita` in its setup request so the exit assigns a per-session
+/// Maybenot machine config (padding + dummy datagrams, bidirectional) applied by the
 /// `pump_*_with_daita` variants. DAITA and idle cover are mutually exclusive
 /// covers: DAITA already emits `0xFF` cover datagrams that mask the idle
 /// keep-alive, so idle cover is suppressed whenever DAITA is requested (see
@@ -697,11 +697,10 @@ const MAX_TUN_QUEUES: usize = 32;
 /// `[1, 32]`. On non-Linux the requested count is silently capped to what the
 /// platform can create (one queue).
 ///
-/// This resolver has no in-repo caller: `ExitListener::accept_forever_with_tun_queues`
-/// takes an already-opened `Vec<T>` of TUN queues, and opening N platform TUN
-/// fds is device code the engine does not own. A deployer's own binary calls
-/// this resolver, opens that many queues, and hands the `Vec` to
-/// `accept_forever_with_tun_queues`. See the "Deployer-wired knobs" section of
+/// This resolver has no in-repo caller: opening N platform TUN fds is
+/// device code the engine does not own. A deployer's own binary calls
+/// this resolver, opens that many queues, and hands them to the exit
+/// serve loop. See the "Deployer-wired knobs" section of
 /// `docs/35-ENV-KNOBS.md`.
 #[must_use]
 pub fn exit_tun_queues() -> usize {

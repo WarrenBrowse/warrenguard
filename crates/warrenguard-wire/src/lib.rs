@@ -140,7 +140,7 @@ impl DaitaConfig {
 
     /// True if the config has at least one machine spec. An empty
     /// [`DaitaConfig`] is a wire-format error (the exit must use
-    /// `SetupAck::daita_spec = None` instead).
+    /// `IpAssign::daita_spec = None` instead).
     #[must_use]
     pub fn is_enabled(&self) -> bool {
         !self.machine_specs.is_empty()
@@ -148,7 +148,7 @@ impl DaitaConfig {
 
     /// Returns `true` if the fractional caps are within `[0.0, 1.0]`
     /// and finite. A remote peer can send arbitrary values via
-    /// `SetupAck`; callers must validate before passing to maybenot.
+    /// `IpAssign`; callers must validate before passing to maybenot.
     #[must_use]
     pub fn fractions_valid(&self) -> bool {
         (0.0..=1.0).contains(&self.max_padding_frac)
@@ -161,7 +161,7 @@ impl Default for DaitaConfig {
     /// config: no machines, both fractional caps set to `0.0`. Useful
     /// as a struct-update base in tests and as the sentinel for "this
     /// session does not run DAITA". On the wire we still prefer
-    /// `SetupAck::daita_spec = None`.
+    /// `IpAssign::daita_spec = None`.
     fn default() -> Self {
         Self {
             machine_specs: Vec::new(),
@@ -181,8 +181,8 @@ pub mod features {
     pub const IPV6: u32 = 1 << 2;
     /// Advisory: the client pads its own uplink QUIC packets to the path MTU
     /// (uniform packet sizes, a traffic-analysis defense for the Stealth
-    /// profile). The client enables uplink padding locally via
-    /// `ClientTunnel::with_pad_to_mtu`; this bit signals it did so. Exit
+    /// profile). The client enables uplink padding locally; this bit
+    /// signals it did so. Exit
     /// downlink padding is a per-deployment transport-config choice: the
     /// pre-handshake config model does not reconfigure padding per connection
     /// from this bit.

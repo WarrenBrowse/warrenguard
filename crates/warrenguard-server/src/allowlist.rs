@@ -1005,8 +1005,8 @@ mod tests {
 
     #[test]
     fn revocation_diff_is_broadcast_on_channel() {
-        // Contract feeds the ExitListener to close live sessions
-        // mid-flight. A revocation that doesn't reach the listener
+        // The exit consumes this broadcast to close live sessions
+        // mid-flight. A revocation that doesn't reach it
         // = a paid-then-cancelled user keeps tunneling.
         let (handle, mut rx) = AllowlistHandle::new();
         handle.apply_snapshot(snapshot(1, &[1, 2, 3], 100));

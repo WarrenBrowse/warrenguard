@@ -307,7 +307,7 @@ mod tests {
         assert_eq!(parsed, addr);
     }
 
-    // ---------------- serde: postcard (binary, SetupAck wire compat) ---------------- //
+    // ---------------- serde: postcard (binary, raw-pubkey wire compat) ---------------- //
 
     #[test]
     fn postcard_roundtrips_for_dual_nic_exit() {
@@ -339,9 +339,9 @@ mod tests {
     }
 
     /// Cross-pin: the first 32 wire bytes of a postcard-serialized
-    /// `WarrenExitAddr` must be the raw pubkey. This is what makes
-    /// `SetupAck.exit_pubkey: WarrenPubkey` byte-equal with a naked
-    /// `[u8; 32]` at the wire level.
+    /// `WarrenExitAddr` must be the raw pubkey. This keeps a raw
+    /// `[u8; 32]` pubkey field byte-equal with a `WarrenPubkey` at the
+    /// wire level.
     #[test]
     fn postcard_pubkey_bytes_appear_raw_at_the_start_of_the_buffer() {
         let pubkey_bytes = [
@@ -355,7 +355,7 @@ mod tests {
             &wire[..32],
             &pubkey_bytes,
             "the first 32 wire bytes must be the raw pubkey (no length prefix), \
-             so swapping SetupAck.exit_pubkey to WarrenPubkey is byte-identical"
+             so a raw [u8; 32] pubkey field and a WarrenPubkey are byte-identical"
         );
     }
 

@@ -5,15 +5,15 @@
 //! HTTP/3 server demands a client certificate, so a censor that completes
 //! a handshake to the exit could fingerprint it as "not a real website".
 //!
-//! Instead the client proves possession of its Ed25519 identity inside the
-//! `Setup` frame. It signs a domain-separated message binding:
+//! Instead the client proves possession of its Ed25519 identity in-band
+//! during the handshake. It signs a domain-separated message binding:
 //!   - the 32-byte channel binding exported from the QUIC TLS key schedule
 //!     (RFC 5705) under a Warren-specific label, AND
 //!   - the session's 16-byte `device_id`.
 //!
 //! The channel binding makes the proof unforgeable and connection-bound:
 //! both peers, and only both peers, can derive that value, so a captured
-//! `Setup` replayed onto another exit fails (the other exit derives a
+//! proof replayed onto another exit fails (the other exit derives a
 //! different exporter). Folding the `device_id` in makes the proof
 //! self-contained: the authenticated identity is bound to the `device_id`
 //! the exit will key its session and device-cap on, without relying on the
@@ -80,7 +80,7 @@ pub fn client_auth_signing_message(
 }
 
 /// Signs the in-band client auth proof with the client's Ed25519 identity
-/// key. The 64-byte result goes into `Setup::auth_sig`.
+/// key. The 64-byte result is the client's in-band auth signature.
 #[must_use]
 pub fn sign_client_auth(
     secret: &SigningKey,
@@ -261,7 +261,7 @@ mod tests {
     #[test]
     fn proof_signed_by_another_key_is_rejected() {
         // The attack this exists to stop: asserting someone else's
-        // allowlisted pubkey in `Setup` without holding its private key.
+        // allowlisted pubkey in-band without holding its private key.
         let owner = key_from(0x11);
         let attacker = key_from(0x22);
         let sig = sign_client_auth(&attacker, &CB, &DEV);

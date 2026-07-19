@@ -11,8 +11,8 @@
 //! requests no client certificate (that mutual-auth CertificateRequest
 //! was an active-probing tell). The client instead
 //! authenticates in-band: it signs the QUIC TLS channel binding (see the
-//! [`auth`] module) and carries the proof in the `Setup` frame, which the
-//! exit verifies before its allowlist gate.
+//! [`auth`] module) and carries the proof in-band during the handshake,
+//! which the exit verifies before its allowlist gate.
 //!
 //! Three deliberate properties of this RPK layer:
 //!
@@ -126,8 +126,8 @@ pub fn pq_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
 ///
 /// The client is anonymous at the TLS layer: it presents no client
 /// certificate (since protocol v5 the exit requests none, and the client
-/// proves its identity in-band via the [`auth`] module and the `Setup`
-/// frame). The exit's pubkey is still verified against the SNI by the
+/// proves its identity in-band via the [`auth`] module). The exit's
+/// pubkey is still verified against the SNI by the
 /// embedded [`ServerCertificateVerifier`]. `alpns` is the **ordered** list
 /// of ALPN protocols the client offers in its ClientHello, most preferred
 /// first; the server picks the first entry of its own list that also
@@ -192,7 +192,7 @@ pub fn make_server_config(
     // No client certificate is requested. Demanding mutual TLS auth was an
     // active-probing tell (no public HTTP/3 server sends a
     // CertificateRequest); since protocol v5 the client authenticates
-    // in-band in the Setup frame instead.
+    // in-band during the handshake instead.
     let mut crypto = rustls::ServerConfig::builder_with_provider(crypto_provider)
         .with_protocol_versions(PROTOCOL_VERSIONS)?
         .with_no_client_auth()
@@ -258,7 +258,7 @@ pub fn make_server_config_with_rotation(
 /// ordinary HTTPS/h3 endpoint instead of presenting an RFC 7250 raw public
 /// key (the browser-anomalous ClientHello tell). The exit's
 /// Warren Ed25519 identity is no longer in TLS; it is proven in-band via
-/// [`auth::sign_server_auth`] in `SetupAck`.
+/// [`auth::sign_server_auth`].
 ///
 /// `cert_chain` is the leaf-first DER chain (leaf wildcard cert issued for
 /// the cover domain, then any intermediates); `key` is its private key

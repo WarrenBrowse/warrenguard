@@ -1,11 +1,10 @@
 //! Multihop termination on the exit side.
 //!
-//! When `warren-exit` runs with `--multihop`, the QUIC datagrams it
-//! receives no longer carry the legacy single-hop `Setup`/`SetupAck`
-//! handshake plus inline IP payload. Instead each datagram is a
-//! [`WarrenMultihopFrame`] sealed by a [`ClientSession`] on the user's
-//! laptop, forwarded transparently through a `warren-relay`, and
-//! delivered to the exit's QUIC server. The exit must:
+//! When `warren-exit` runs with `--multihop`, each QUIC datagram it
+//! receives is a [`WarrenMultihopFrame`] sealed by a [`ClientSession`]
+//! on the user's laptop, forwarded transparently through a
+//! `warren-relay`, and delivered to the exit's QUIC server. The exit
+//! must:
 //!
 //! 1. Decode the cleartext header (`exit_id`, `epoch`, `seq`,
 //!    `encapsulated_key`).
@@ -3446,8 +3445,8 @@ async fn serve_one_connection_with_tun<T>(
         spawn_drain_emitter(drain_rx, current.clone(), reverse_seq.clone(), conn.clone());
 
     // Transport path probe (Lever 1a): the unified prod dispatcher
-    // terminates clients HERE, not in `ExitListener::accept`, so the
-    // multihop path needs its own probe spawn for observability parity.
+    // terminates clients HERE, so the multihop path needs its own probe
+    // spawn for observability parity.
     drop(warrenguard_transport_core::spawn_path_probe(
         "exit-mh",
         vec![conn.clone()],

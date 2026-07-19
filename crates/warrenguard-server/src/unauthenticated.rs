@@ -21,7 +21,7 @@
 ///
 /// Hand-off contract: by the time `handle` is called the engine has already
 /// accepted the peer's first bidi stream and read its first message (which did
-/// not decode as a valid Warren `Setup`). Rather than dropping that stream, the
+/// not decode as a valid Warren setup request). Rather than dropping that stream, the
 /// engine hands it back in [`UnauthenticatedProbe`] (its send half plus the
 /// bytes already read), so a decoy can answer the probe's own request - an
 /// active prober that GETs the cover domain expects an HTTP/3 response on the

@@ -18,8 +18,8 @@
 //! reproduction.
 //!
 //! Bench-only: this module is not wired into the production client
-//! flow and does not interact with the legacy single-hop handshake
-//! features (TUN, NAT-PMP, allowlist).
+//! flow and touches none of the higher-level session features (TUN,
+//! NAT-PMP, allowlist).
 //!
 //! # Exit mode requirement (echo loopback only)
 //!

@@ -1,8 +1,8 @@
 //! Server-side pool of DAITA v2 machines.
 //!
 //! The exit picks one [`DaitaConfig`] from the pool at the start of
-//! every new session and ships it back to the client in
-//! [`warrenguard_wire::SetupAck::daita_spec`]. Different connections see different
+//! every new session and ships it back to the client in the handshake
+//! `IpAssign` control message (`daita_spec`). Different connections see different
 //! machines: this is the "dynamic per-connection configuration" that
 //! distinguishes DAITA v2 from v1's four hardcoded client-side machines.
 //!
