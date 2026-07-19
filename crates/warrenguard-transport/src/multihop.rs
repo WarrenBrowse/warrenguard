@@ -773,6 +773,48 @@ impl MultiHopClient {
         .await
     }
 
+    /// PQ (`/v2` X-Wing) twin of [`Self::connect_with_warren_obfuscation`].
+    ///
+    /// Builds the identical obfuscated client transport config
+    /// ([`warren_transport_config_client_with_gso`]) so the QUIC/TLS
+    /// fingerprint is unchanged, then dials the PQ hybrid HPKE session.
+    /// `mlkem768_ek` and `require_pq` carry the same meaning as in
+    /// [`Self::connect_with_transport_config_pq`]: `require_pq` fails closed
+    /// on a bad ML-KEM key, otherwise falls back to the classical `/v1`
+    /// session over the same `exit_x25519_multihop_pubkey`.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::connect_with_transport_config_pq`].
+    #[cfg(feature = "pq-hpke")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn connect_with_warren_obfuscation_pq(
+        relay: &RelayDescriptorSigned,
+        exit_id: ExitId,
+        exit_x25519_multihop_pubkey: &[u8; 32],
+        mlkem768_ek: &[u8],
+        require_pq: bool,
+        operational_pubkey: &VerifyingKey,
+        client_signing_key: &SigningKey,
+        bind_addr: SocketAddr,
+        enable_gso: bool,
+        socket_bypass: Option<SocketBypass>,
+    ) -> Result<Self, MultiHopError> {
+        Self::connect_with_transport_config_pq(
+            relay,
+            exit_id,
+            exit_x25519_multihop_pubkey,
+            mlkem768_ek,
+            require_pq,
+            operational_pubkey,
+            client_signing_key,
+            bind_addr,
+            warren_transport_config_client_with_gso(enable_gso),
+            socket_bypass,
+        )
+        .await
+    }
+
     /// Bench-internal expert API. Promoted to `pub` for the
     /// multi-hop bench profiling probe so it can
     /// dial with an ad-hoc [`TransportConfig`] (alternate congestion
