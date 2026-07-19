@@ -3484,6 +3484,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "warrenguard-multihop-server"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "hex",
+ "hkdf",
+ "parking_lot",
+ "rand 0.10.1",
+ "rand_core 0.9.5",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "warren-quinn",
+ "warrenguard-config",
+ "warrenguard-daita",
+ "warrenguard-multihop",
+ "warrenguard-pump",
+ "warrenguard-server",
+ "warrenguard-tls",
+ "warrenguard-token",
+ "warrenguard-transport-core",
+ "warrenguard-wire",
+]
+
+[[package]]
 name = "warrenguard-natpmp-client"
 version = "0.1.0"
 dependencies = [

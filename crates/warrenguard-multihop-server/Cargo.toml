@@ -1,0 +1,69 @@
+# WarrenGuard engine crate: the exit-side multi-hop termination datapath
+# (HPKE-aware Quinn datagram loop + IPv4/IPv6 pool allocator), reusable by any
+# deployer running a multihop-1-hop exit.
+[package]
+name = "warrenguard-multihop-server"
+description = "Multi-hop exit termination: HPKE Quinn datagram loop and IPv4/IPv6 pool allocator (WarrenGuard engine)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Exit-side server datapath: allowlist, session ledger, token admission, the
+# TUN downlink dispatcher (`tun_dispatch::source_ip_matches`) and the injected
+# trait seams (`SessionTokenAdmitter`, `ExitSessionsHandle`, `TokenAdmission`,
+# `BoxFuture`).
+warrenguard-server = { path = "../warrenguard-server" }
+# Multi-hop wire format + HPKE client/exit sessions terminated here.
+warrenguard-multihop = { path = "../warrenguard-multihop" }
+warrenguard-wire = { path = "../warrenguard-wire" }
+# Inner-packet MTU adaptation (SYN MSS clamp, ICMP frag-needed reflection),
+# the packet device trait, the flow-hash and path-probe primitives.
+warrenguard-transport-core = { path = "../warrenguard-transport-core" }
+# DAITA dummy-packet sentinel (`DAITA_DUMMY_FIRST_BYTE`, `is_daita_dummy`).
+warrenguard-pump = { path = "../warrenguard-pump" }
+# DAITA framework state driven per-conn on the termination loop.
+warrenguard-daita = { path = "../warrenguard-daita" }
+# Generic engine constants (`unix_now`, tunnel gateway IPs, ALPN).
+warrenguard-config = { path = "../warrenguard-config" }
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+quinn = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+# rand_core 0.9 trait surface (CryptoRng + RngCore) consumed by the
+# `warrenguard-multihop` ExitSession setup paths. Same pin as warrenguard-multihop.
+rand_core = { version = "0.9", default-features = false, features = ["os_rng"] }
+
+[features]
+# Post-quantum hybrid seal (X-Wing / ML-KEM-768). OFF by default: enabling it
+# pulls the engine's `pq-hpke` crypto and lets the exit derive, hold and publish
+# an ML-KEM key plus terminate `/v2` frames. Additive over the classical `/v1`
+# datapath, which stays byte-identical when the feature is off.
+pq-hpke = ["warrenguard-multihop/pq-hpke"]
+
+[dev-dependencies]
+# Build the rustls server/client configs the loopback termination tests drive.
+warrenguard-tls = { path = "../warrenguard-tls" }
+# Mint a real blind-RSA Privacy Pass token in the admission e2e test so the
+# exit's admitter verifies a genuinely-valid token (fixed test issuer, no live
+# API / wallet needed). warrenguard-token uses rand 0.10, so its keygen/blind
+# RNG must come from a matching rand (aliased to avoid the rand_core 0.9 clash).
+warrenguard-token = { path = "../warrenguard-token" }
+rand_v10 = { package = "rand", version = "0.10" }
+ed25519-dalek = { workspace = true }
+quinn = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+# Loopback integration tests drive `ClientSession::new` from `OsRng`.
+rand_core = { version = "0.9", default-features = false, features = ["os_rng"] }
+
+[lints]
+workspace = true
