@@ -160,12 +160,6 @@ pub enum TunnelError {
     #[error("exit rejected the handshake: ip pool exhausted")]
     PoolExhausted,
 
-    /// The peer answered a Setup with semantically invalid SetupAck
-    /// fields (multiconn flag mismatch, tunnel_ip changed across
-    /// secondary attaches, version downgrade, ...).
-    #[error("protocol violation: {0}")]
-    Protocol(String),
-
     /// Filesystem I/O on the persisted exit state (path = the file
     /// being touched, source = the underlying io error). The
     /// allow-list refresh, the state snapshot, and the identity store
