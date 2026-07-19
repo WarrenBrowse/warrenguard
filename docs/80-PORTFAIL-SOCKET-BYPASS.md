@@ -124,9 +124,8 @@ daddr; fail-closed is preserved; and the socket applier really performs the
   daemon app-id (`-Program` / `FWPM_CONDITION_ALE_APP_ID`) needs a Windows host
   to validate and is deferred.
 - **Consumer wiring of the bypass value.** The engine exposes
-  `ClientTunnel::with_socket_bypass`, a `socket_bypass` field on
-  `MultiHopClient::connect*` and `SupervisorConfig`, and
-  `discover_physical_ifindex()` (Windows) / the physical ifindex discovery a
+  a `socket_bypass` field on `MultiHopClient::connect*` and `SupervisorConfig`,
+  and `discover_physical_ifindex()` (Windows) / the physical ifindex discovery a
   macOS consumer needs. A privileged TUN consumer MUST set the bypass to
   `Fwmark(WARREN_TUNNEL_FWMARK)` (Linux) or `BoundIf(ifindex)` /
   `UnicastIf(ifindex)` (macOS/Windows) AND set `KillswitchOpts.socket_mark` /
