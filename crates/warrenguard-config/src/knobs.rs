@@ -78,6 +78,30 @@ pub const REGISTRY: &[KnobMeta] = &[
         home: "warrenguard-transport-core/src/transport_config.rs",
     },
     KnobMeta {
+        name: "WARREN_DG_AQM",
+        kind: "bool",
+        default: "on",
+        clamp: "\"0\"/\"false\"/\"no\"/\"off\" disables, else on",
+        effect: "CoDel AQM on the QUIC datagram send queue (bounds queue latency on slow last miles)",
+        home: "warrenguard-transport-core/src/transport_config.rs",
+    },
+    KnobMeta {
+        name: "WARREN_DG_AQM_TARGET_MS",
+        kind: "u64 (ms)",
+        default: "15",
+        clamp: "clamped to [1, 1000]; unparsable -> default",
+        effect: "AQM sojourn-time target: queue latency persistently above it starts head-dropping",
+        home: "warrenguard-transport-core/src/transport_config.rs",
+    },
+    KnobMeta {
+        name: "WARREN_DG_AQM_INTERVAL_MS",
+        kind: "u64 (ms)",
+        default: "100",
+        clamp: "clamped to [10, 10000]; unparsable -> default",
+        effect: "AQM grace window before the first drop and base period of the drop-rate ramp",
+        home: "warrenguard-transport-core/src/transport_config.rs",
+    },
+    KnobMeta {
         name: "WARREN_UPLINK_BATCH_MAX",
         kind: "usize",
         default: "1",
@@ -381,6 +405,44 @@ pub fn datagram_send_buffer(default: usize) -> usize {
             .map(|v| v.min(MAX_DG_SEND_BUF))
     });
     override_val.unwrap_or(default)
+}
+
+/// `WARREN_DG_AQM`: CoDel AQM on the QUIC datagram send queue. Default
+/// on; `"0"`/`"false"`/`"no"`/`"off"` disables (production kill switch).
+#[must_use]
+pub fn dg_aqm_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| parse_bool_default_on(std::env::var("WARREN_DG_AQM").ok().as_deref()))
+}
+
+/// `WARREN_DG_AQM_TARGET_MS`: AQM sojourn-time target in milliseconds.
+/// Clamped to `[1, 1000]`, default `15`.
+#[must_use]
+pub fn dg_aqm_target_ms() -> u64 {
+    static CACHE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        parse_usize_clamped(
+            std::env::var("WARREN_DG_AQM_TARGET_MS").ok().as_deref(),
+            1,
+            1000,
+            15,
+        ) as u64
+    })
+}
+
+/// `WARREN_DG_AQM_INTERVAL_MS`: AQM interval (grace window / drop-ramp
+/// base period) in milliseconds. Clamped to `[10, 10000]`, default `100`.
+#[must_use]
+pub fn dg_aqm_interval_ms() -> u64 {
+    static CACHE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        parse_usize_clamped(
+            std::env::var("WARREN_DG_AQM_INTERVAL_MS").ok().as_deref(),
+            10,
+            10_000,
+            100,
+        ) as u64
+    })
 }
 
 /// `WARREN_UPLINK_BATCH_MAX`: max TUN reads drained per uplink batch.

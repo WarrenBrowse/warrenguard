@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use quinn::TransportConfig;
 use quinn::congestion::{BbrConfig, CubicConfig, NewRenoConfig};
-use quinn::{IdleTimeout, MtuDiscoveryConfig, VarInt};
+use quinn::{DatagramAqmConfig, IdleTimeout, MtuDiscoveryConfig, VarInt};
 use warrenguard_config::{
     QUIC_DATAGRAM_RECV_BUFFER, QUIC_DATAGRAM_SEND_BUFFER, QUIC_DATAGRAM_SEND_BUFFER_EXIT,
     QUIC_KEEP_ALIVE_INTERVAL_SECS, QUIC_MAX_CONCURRENT_BIDI_STREAMS_CLIENT,
@@ -119,9 +119,45 @@ fn datagram_send_buffer_size(default: usize) -> usize {
     warrenguard_config::knobs::datagram_send_buffer(default)
 }
 
+/// Datagram send-queue AQM (CoDel) knobs. The deep 4/16 MiB send buffers
+/// bound memory, but on a last mile slower than the offered load they hold
+/// seconds of standing queue (16 MiB at 25 Mbps = 5.4 s) and every inner
+/// flow multiplexed on the connection freezes behind it. The fork's
+/// head-drop CoDel bounds queue latency at any link speed; these knobs are
+/// the production kill switch (`WARREN_DG_AQM=0`) and the A/B levers for
+/// target/interval, so a bad interaction on a real path can be disabled or
+/// retuned without a rebuild.
+fn apply_datagram_aqm(cfg: &mut TransportConfig) {
+    apply_datagram_aqm_values(
+        cfg,
+        warrenguard_config::knobs::dg_aqm_enabled(),
+        warrenguard_config::knobs::dg_aqm_target_ms(),
+        warrenguard_config::knobs::dg_aqm_interval_ms(),
+    );
+}
+
+/// Pure seam of [`apply_datagram_aqm`], testable without the process
+/// environment.
+fn apply_datagram_aqm_values(
+    cfg: &mut TransportConfig,
+    enabled: bool,
+    target_ms: u64,
+    interval_ms: u64,
+) {
+    if !enabled {
+        cfg.datagram_send_aqm(None);
+        return;
+    }
+    let mut aqm = DatagramAqmConfig::default();
+    aqm.target(Duration::from_millis(target_ms))
+        .interval(Duration::from_millis(interval_ms));
+    cfg.datagram_send_aqm(Some(aqm));
+}
+
 fn warren_transport_config_base_with_pad(enable_gso: bool, pad_to_mtu: bool) -> TransportConfig {
     let mut cfg = TransportConfig::default();
     apply_congestion_controller(&mut cfg);
+    apply_datagram_aqm(&mut cfg);
     cfg.initial_mtu(TUNNEL_INITIAL_MTU)
         .min_mtu(TUNNEL_MIN_MTU)
         .mtu_discovery_config(Some(MtuDiscoveryConfig::default()))
@@ -602,6 +638,44 @@ mod tests {
         assert!(
             rendered.contains("initial_datagram_min_size: 1200"),
             "multihop Initial pad must track the lowered MTU, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn default_configs_carry_the_datagram_aqm() {
+        // The AQM is the latency bound of the datagram queue on slow last
+        // miles; it must be on by default on BOTH sides of the tunnel.
+        for cfg in [
+            warren_transport_config_client(),
+            warren_transport_config_exit(),
+        ] {
+            let rendered = format!("{cfg:?}");
+            assert!(
+                rendered.contains("datagram_send_aqm: Some"),
+                "AQM must default on, got: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn datagram_aqm_off_renders_none() {
+        let mut cfg = TransportConfig::default();
+        apply_datagram_aqm_values(&mut cfg, false, 15, 100);
+        let rendered = format!("{cfg:?}");
+        assert!(
+            rendered.contains("datagram_send_aqm: None"),
+            "the kill switch must disable the AQM entirely, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn datagram_aqm_tuned_values_reach_the_config() {
+        let mut cfg = TransportConfig::default();
+        apply_datagram_aqm_values(&mut cfg, true, 25, 200);
+        let rendered = format!("{cfg:?}");
+        assert!(
+            rendered.contains("target: 25ms") && rendered.contains("interval: 200ms"),
+            "tuned AQM values must reach the transport config, got: {rendered}"
         );
     }
 

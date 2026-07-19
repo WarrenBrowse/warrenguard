@@ -52,6 +52,9 @@ knob in `REGISTRY` must appear in the table below, or the test fails.
 | `WARREN_CC` | enum {bbr,cubic,newreno} | bbr | unknown name -> warn + bbr | QUIC congestion controller (A/B bench lever) | warrenguard-transport-core/src/transport_config.rs |
 | `WARREN_INITIAL_WINDOW` | u64 | controller default | must be > 0, else warn + ignore | congestion-controller initial window (bytes) | warrenguard-transport-core/src/transport_config.rs |
 | `WARREN_DG_SEND_BUF` | usize (bytes) | per-side default (client 4 MiB / exit 16 MiB) | must be > 0, capped at 64 MiB | QUIC datagram send-buffer cap per connection | warrenguard-transport-core/src/transport_config.rs |
+| `WARREN_DG_AQM` | bool | on | "0"/"false"/"no"/"off" disables, else on | CoDel AQM on the QUIC datagram send queue (bounds queue latency on slow last miles) | warrenguard-transport-core/src/transport_config.rs |
+| `WARREN_DG_AQM_TARGET_MS` | u64 (ms) | 15 | clamped to [1, 1000]; unparsable -> default | AQM sojourn-time target: queue latency persistently above it starts head-dropping | warrenguard-transport-core/src/transport_config.rs |
+| `WARREN_DG_AQM_INTERVAL_MS` | u64 (ms) | 100 | clamped to [10, 10000]; unparsable -> default | AQM grace window before the first drop and base period of the drop-rate ramp | warrenguard-transport-core/src/transport_config.rs |
 | `WARREN_UPLINK_BATCH_MAX` | usize | 1 | must be >= 1, capped at 1024 | max TUN reads drained per uplink datagram batch | warrenguard-pump/src/lib.rs |
 | `WARREN_PATH_PROBE` | bool | on | "0" disables, anything else enables | per-connection throughput/RTT probe logging | warrenguard-transport-core/src/path_probe.rs |
 | `WARREN_DEAD_PATH_SECS` | u64 (seconds) | 15 | 0 disables the watch; unparsable -> default | RX-silence window before the client redials | warrenguard-transport/src/supervisor.rs |

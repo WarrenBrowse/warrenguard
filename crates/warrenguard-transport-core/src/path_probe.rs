@@ -7,10 +7,14 @@
 //!
 //! - `cwnd`, `rtt_ms`, `lost`, `congestion`: is the OUTER congestion
 //!   controller throttling below the link, or is the path lossy?
-//! - `dg_buf_free`: Quinn silently drops the OLDEST queued datagram
-//!   when the send buffer is full (`Datagrams::send(_, drop=true)`);
-//!   there is no drop counter in `ConnectionStats`, so a buffer
-//!   pinned near 0 is the overflow signal.
+//! - `dg_buf_free`: remaining space in the datagram send buffer; a
+//!   buffer pinned near 0 means the queue is absorbing an app-vs-link
+//!   rate mismatch.
+//! - `dg_drop_aqm` / `dg_drop_full`: datagrams the send queue dropped
+//!   this interval, split by cause (CoDel sojourn-time head-drop vs
+//!   buffer-overflow oldest-first eviction). Both are silent from the
+//!   sender's point of view, so these counters are the only direct
+//!   evidence of send-queue pressure.
 //! - `app_tx` vs `dg_tx` (exit side, where [`crate::ClientMetrics`]
 //!   counts app-level sends): a sustained gap means datagrams accepted
 //!   by `send_datagram` never reached the wire (buffer overflow).
@@ -47,6 +51,10 @@ pub struct PathProbeDelta {
     pub udp_tx_datagrams: u64,
     /// UDP I/O operations (< `udp_tx_datagrams` when GSO batches).
     pub udp_tx_ios: u64,
+    /// Outgoing datagrams head-dropped by the CoDel AQM.
+    pub dg_dropped_aqm: u64,
+    /// Outgoing datagrams evicted oldest-first on send-buffer overflow.
+    pub dg_dropped_overflow: u64,
 }
 
 impl PathProbeDelta {
@@ -64,6 +72,14 @@ impl PathProbeDelta {
             dg_frames_rx: cur.frame_rx.datagram.saturating_sub(prev.frame_rx.datagram),
             udp_tx_datagrams: cur.udp_tx.datagrams.saturating_sub(prev.udp_tx.datagrams),
             udp_tx_ios: cur.udp_tx.ios.saturating_sub(prev.udp_tx.ios),
+            dg_dropped_aqm: cur
+                .datagram_tx
+                .dropped_aqm
+                .saturating_sub(prev.datagram_tx.dropped_aqm),
+            dg_dropped_overflow: cur
+                .datagram_tx
+                .dropped_overflow
+                .saturating_sub(prev.datagram_tx.dropped_overflow),
         }
     }
 
@@ -159,6 +175,8 @@ pub fn spawn_path_probe(
                         dg_tx = delta.dg_frames_tx,
                         dg_rx = delta.dg_frames_rx,
                         dg_buf_free = conn.datagram_send_buffer_space(),
+                        dg_drop_aqm = delta.dg_dropped_aqm,
+                        dg_drop_full = delta.dg_dropped_overflow,
                         udp_gso = format_args!("{:.1}", delta.udp_gso_ratio()),
                         app_tx,
                         app_rx,
@@ -176,6 +194,8 @@ pub fn spawn_path_probe(
                         dg_tx = delta.dg_frames_tx,
                         dg_rx = delta.dg_frames_rx,
                         dg_buf_free = conn.datagram_send_buffer_space(),
+                        dg_drop_aqm = delta.dg_dropped_aqm,
+                        dg_drop_full = delta.dg_dropped_overflow,
                         udp_gso = format_args!("{:.1}", delta.udp_gso_ratio()),
                         "path probe"
                     ),
@@ -227,10 +247,28 @@ mod tests {
     }
 
     #[test]
+    fn between_computes_datagram_drop_deltas() {
+        // The AQM head-drops and the buffer-overflow evictions are the
+        // only visibility into send-queue pressure; the probe must
+        // surface both as per-interval deltas.
+        let mut prev = stats_with(100, 0, 0, 90, 80, 95, 10);
+        prev.datagram_tx.dropped_aqm = 3;
+        prev.datagram_tx.dropped_overflow = 1;
+        let mut cur = stats_with(200, 0, 0, 180, 160, 190, 20);
+        cur.datagram_tx.dropped_aqm = 10;
+        cur.datagram_tx.dropped_overflow = 6;
+        let d = PathProbeDelta::between(&prev, &cur);
+        assert_eq!(d.dg_dropped_aqm, 7);
+        assert_eq!(d.dg_dropped_overflow, 5);
+    }
+
+    #[test]
     fn between_saturates_on_counter_regression() {
         // A stats reset (e.g. path migration rebuilding PathStats) must
         // yield 0, never an underflow panic or a giant wrapped value.
-        let prev = stats_with(1000, 10, 5, 900, 800, 950, 100);
+        let mut prev = stats_with(1000, 10, 5, 900, 800, 950, 100);
+        prev.datagram_tx.dropped_aqm = 9;
+        prev.datagram_tx.dropped_overflow = 9;
         let cur = stats_with(50, 0, 0, 40, 30, 45, 5);
         let d = PathProbeDelta::between(&prev, &cur);
         assert_eq!(d.sent_packets, 0);
@@ -240,6 +278,8 @@ mod tests {
         assert_eq!(d.dg_frames_rx, 0);
         assert_eq!(d.udp_tx_datagrams, 0);
         assert_eq!(d.udp_tx_ios, 0);
+        assert_eq!(d.dg_dropped_aqm, 0);
+        assert_eq!(d.dg_dropped_overflow, 0);
     }
 
     #[test]
