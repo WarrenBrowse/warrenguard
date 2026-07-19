@@ -139,6 +139,13 @@ pub struct SupervisorConfig {
     pub exit_id: ExitId,
     /// Long-lived X25519 HPKE recipient pubkey of the exit.
     pub exit_x25519_multihop_pubkey: [u8; 32],
+    /// Raw ML-KEM-768 encapsulation key of the exit (`MLKEM768_ENCAPS_KEY_LEN`
+    /// bytes) from its PQ-signed descriptor, or `None`/empty when the exit
+    /// advertises no PQ key. When present the supervisor dials the `/v2` X-Wing
+    /// hybrid seal with `require_pq = false`, so an exit publishing no PQ
+    /// descriptor still falls back to the byte-identical classical `/v1` session
+    /// over `exit_x25519_multihop_pubkey`.
+    pub exit_mlkem768_pubkey: Option<Vec<u8>>,
     /// Operational pubkey used to verify signed descriptors.
     pub operational_pubkey: VerifyingKey,
     /// Local Ed25519 signing key (TLS raw public key authentication).
@@ -258,6 +265,10 @@ pub struct CircuitTarget {
     pub exit_id: ExitId,
     /// Long-lived X25519 HPKE recipient pubkey of the exit.
     pub exit_x25519_multihop_pubkey: [u8; 32],
+    /// Raw ML-KEM-768 encapsulation key of the exit, or `None` when it
+    /// advertises no PQ descriptor (classical seal). Carried per-target so a
+    /// cross-exit `migrate_to` retargets the PQ key together with the exit.
+    pub exit_mlkem768_pubkey: Option<Vec<u8>>,
 }
 
 impl CircuitTarget {
@@ -266,6 +277,7 @@ impl CircuitTarget {
             relay: config.relay.clone(),
             exit_id: config.exit_id,
             exit_x25519_multihop_pubkey: config.exit_x25519_multihop_pubkey,
+            exit_mlkem768_pubkey: config.exit_mlkem768_pubkey.clone(),
         }
     }
 }
@@ -980,18 +992,51 @@ impl MultiHopSupervisor {
         // so the next dial lands on a different exit (cross-exit migration).
         let target = self.current_target();
         let relay_pubkey = target.relay.relay_ed25519_pubkey;
+        Self::dial_target(&self.config, &target, self.config.bind_addr)
+            .await
+            .map(|client| (client, relay_pubkey))
+    }
+
+    /// Dial one fresh session to `target`, preferring the post-quantum X-Wing
+    /// (`/v2`) seal when the target carries an ML-KEM key and falling back to
+    /// the classical X25519 (`/v1`) seal otherwise. `require_pq = false`: an
+    /// exit advertising no PQ key stays on the byte-identical classical session,
+    /// so this is inert on the wire until exits publish PQ descriptors. Shared
+    /// by the primary dial ([`Self::connect_once`], itself the overlap re-dial
+    /// and cold-retry path) and each bonded secondary ([`Self::dial_secondary`])
+    /// so a make-before-break swap never downgrades a live PQ circuit.
+    async fn dial_target(
+        config: &SupervisorConfig,
+        target: &CircuitTarget,
+        bind_addr: std::net::SocketAddr,
+    ) -> Result<MultiHopClient, MultiHopError> {
+        #[cfg(feature = "pq-hpke")]
+        if let Some(mlkem768_ek) = pq_dial_key(target) {
+            return MultiHopClient::connect_with_transport_config_pq(
+                &target.relay,
+                target.exit_id,
+                &target.exit_x25519_multihop_pubkey,
+                mlkem768_ek,
+                false,
+                &config.operational_pubkey,
+                &config.client_signing,
+                bind_addr,
+                Self::dial_transport_config(config),
+                config.socket_bypass,
+            )
+            .await;
+        }
         MultiHopClient::connect_with_transport_config(
             &target.relay,
             target.exit_id,
             &target.exit_x25519_multihop_pubkey,
-            &self.config.operational_pubkey,
-            &self.config.client_signing,
-            self.config.bind_addr,
-            Self::dial_transport_config(&self.config),
-            self.config.socket_bypass,
+            &config.operational_pubkey,
+            &config.client_signing,
+            bind_addr,
+            Self::dial_transport_config(config),
+            config.socket_bypass,
         )
         .await
-        .map(|client| (client, relay_pubkey))
     }
 
     /// Run the primary's reliable setup-stream round-trip and detect a
@@ -1403,17 +1448,7 @@ impl MultiHopSupervisor {
     ) -> Option<Arc<MultiHopClient>> {
         let bind_addr = secondary_bind_addr(config.bind_addr);
         for attempt in 0..2u8 {
-            let result = MultiHopClient::connect_with_transport_config(
-                &target.relay,
-                target.exit_id,
-                &target.exit_x25519_multihop_pubkey,
-                &config.operational_pubkey,
-                &config.client_signing,
-                bind_addr,
-                Self::dial_transport_config(config),
-                config.socket_bypass,
-            )
-            .await;
+            let result = Self::dial_target(config, target, bind_addr).await;
             let client = match result {
                 Ok(c) => Arc::new(c),
                 Err(e) => {
@@ -1583,6 +1618,18 @@ fn secondary_bind_addr(primary: std::net::SocketAddr) -> std::net::SocketAddr {
     let mut addr = primary;
     addr.set_port(0);
     addr
+}
+
+/// The exit ML-KEM key to seal a dial with, or `None` for the classical seal.
+/// Empty key material counts as absent so an exit that publishes no PQ
+/// descriptor keeps the classical `/v1` session (inert on the wire until a
+/// fleet PQ flip).
+#[cfg(feature = "pq-hpke")]
+fn pq_dial_key(target: &CircuitTarget) -> Option<&[u8]> {
+    target
+        .exit_mlkem768_pubkey
+        .as_deref()
+        .filter(|key| !key.is_empty())
 }
 
 /// Sampling cadence of the dead-path watch.
@@ -1778,6 +1825,7 @@ mod tests {
             }),
             exit_id: ExitId::from_bytes([0u8; 16]),
             exit_x25519_multihop_pubkey: [0u8; 32],
+            exit_mlkem768_pubkey: None,
             operational_pubkey: SigningKey::from_bytes(&[0x42; 32]).verifying_key(),
             client_signing: SigningKey::from_bytes(&[0x88; 32]),
             bind_addr: "0.0.0.0:0".parse().expect("static addr parses"),
@@ -1820,6 +1868,31 @@ mod tests {
         let hung: PreSwapCheckFn<()> =
             Arc::new(|()| Box::pin(async { std::future::pending::<bool>().await }));
         assert!(!pre_swap_allows(Some(&hung), ()).await);
+    }
+
+    #[cfg(feature = "pq-hpke")]
+    #[test]
+    fn supervisor_prefers_pq_seal_only_with_a_non_empty_exit_mlkem_key() {
+        use warrenguard_multihop::MLKEM768_ENCAPS_KEY_LEN;
+
+        // No PQ descriptor: the target carries no key and the dial stays
+        // classical, byte-identical to today (the de-risk property).
+        let classical = CircuitTarget::from_config(&dummy_config());
+        assert!(classical.exit_mlkem768_pubkey.is_none());
+        assert!(pq_dial_key(&classical).is_none());
+
+        // An advertised-but-empty key must NOT force the PQ seal.
+        let mut empty = classical.clone();
+        empty.exit_mlkem768_pubkey = Some(Vec::new());
+        assert!(pq_dial_key(&empty).is_none());
+
+        // A real ML-KEM key threads through `from_config` and selects PQ.
+        let mut cfg = dummy_config();
+        let key = vec![7u8; MLKEM768_ENCAPS_KEY_LEN];
+        cfg.exit_mlkem768_pubkey = Some(key.clone());
+        let pq = CircuitTarget::from_config(&cfg);
+        assert_eq!(pq.exit_mlkem768_pubkey.as_deref(), Some(key.as_slice()));
+        assert_eq!(pq_dial_key(&pq), Some(key.as_slice()));
     }
 
     #[test]
@@ -2246,6 +2319,7 @@ mod run_tests {
             relay: exit.relay.clone(),
             exit_id: exit.exit_id,
             exit_x25519_multihop_pubkey: exit.exit_x25519_pubkey,
+            exit_mlkem768_pubkey: None,
             operational_pubkey: operational_key.verifying_key(),
             client_signing: SigningKey::from_bytes(&[0x24; 32]),
             bind_addr: "127.0.0.1:0".parse().expect("static addr parses"),
