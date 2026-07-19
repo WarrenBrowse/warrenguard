@@ -387,27 +387,6 @@ pub const QUIC_MAX_CONCURRENT_BIDI_STREAMS_EXIT: u32 = 100;
 /// the client side we only expect one control stream + 1-2 RPC.
 pub const QUIC_MAX_CONCURRENT_BIDI_STREAMS_CLIENT: u32 = 10;
 
-/// Maximum number of parallel QUIC connections per multi-conn session.
-///
-/// **Why a cap?** Without a limit, a malicious client could announce
-/// `total_connections = 255` (u8 max) and force the exit to maintain
-/// 255 active `Connection`s per Ed25519 identity, multiplying RAM /
-/// CPU / file-descriptor usage by 255 vs an honest client.
-///
-/// **Why 32?** Profiling showed the main bottleneck is the internal
-/// `quinn::Connection` mutex (lock_contended #1 hot stack at N=8). N=16
-/// gave +39% uplink / +25% downlink vs N=8, hitting ~2 Gbps sustained
-/// tunnel throughput at P=8 multi-flow. 32 is the reasonable limit to
-/// scale further (N=32 ≈ 2 cores RAM total on the exit, 32
-/// file-descriptors per client) while bounding the DoS attack surface
-/// to a 32× factor instead of 255×.
-///
-/// The exit rejects `Setup` messages with `total_connections >
-/// MAX_CONNECTIONS_PER_SESSION` by replying `multiconn_attached:
-/// false`; the client then has to close the connection and retry with
-/// a smaller total.
-pub const MAX_CONNECTIONS_PER_SESSION: u8 = 32;
-
 #[cfg(test)]
 mod tests {
     use super::*;
