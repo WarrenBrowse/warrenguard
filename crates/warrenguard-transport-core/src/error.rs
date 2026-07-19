@@ -104,27 +104,6 @@ pub enum TunnelError {
         source: quinn::ConnectionError,
     },
 
-    /// The QUIC TLS channel binding could not be exported (e.g. the
-    /// handshake state is not where the in-band auth expected it).
-    /// Surfaces a server-side rejection. See in-band auth in
-    /// `warrenguard-tls`.
-    #[error("could not export QUIC TLS channel binding for in-band auth")]
-    ChannelBindingExport,
-
-    /// The in-band client auth proof in `Setup` did not verify against the
-    /// asserted `client_pubkey` (wrong key, replayed proof, or tamper).
-    /// Surfaces a server-side rejection before the allowlist gate.
-    #[error("in-band client auth signature did not verify")]
-    InbandAuthFailed,
-
-    /// The in-band EXIT proof in `SetupAck` (`exit_auth_sig`) did not verify
-    /// against the exit pubkey the client dialed (v6 X.509 exit mode). The
-    /// peer holds a valid TLS cert but not the expected Warren exit's
-    /// Ed25519 identity: a man-in-the-middle, or the wrong exit. The client
-    /// MUST abort rather than tunnel through an unauthenticated exit.
-    #[error("in-band exit identity proof did not verify")]
-    ExitAuthFailed,
-
     /// Not a real error: the connection completed the handshake but was not an
     /// authenticated Warren client, and a decoy handler was configured, so the
     /// exit handed the live connection to it instead of closing.
@@ -180,18 +159,6 @@ pub enum TunnelError {
     /// identity material is carried.
     #[error("exit rejected the handshake: ip pool exhausted")]
     PoolExhausted,
-
-    /// Failed to encode or decode a Setup / SetupAck frame (postcard
-    /// returned an error, or the wire bytes were malformed).
-    #[error("setup wire format error: {context}: {source}")]
-    SetupWire {
-        /// Short tag describing the direction (encode / decode). `Cow`
-        /// keeps literal call sites allocation-free.
-        context: Cow<'static, str>,
-        /// Underlying postcard / protocol error reason.
-        #[source]
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
 
     /// The peer answered a Setup with semantically invalid SetupAck
     /// fields (multiconn flag mismatch, tunnel_ip changed across
@@ -287,9 +254,9 @@ impl TunnelError {
     pub fn retryability(&self) -> warrenguard_wire::Retryability {
         use warrenguard_wire::{FatalCause, Retryability};
         match self {
-            TunnelError::AuthRejected
-            | TunnelError::AllowlistDenied
-            | TunnelError::InbandAuthFailed => Retryability::Fatal(FatalCause::NotAuthorized),
+            TunnelError::AuthRejected | TunnelError::AllowlistDenied => {
+                Retryability::Fatal(FatalCause::NotAuthorized)
+            }
             TunnelError::DeviceLimitReached => Retryability::Fatal(FatalCause::DeviceLimit),
             TunnelError::ExitDrainingRefused | TunnelError::PoolExhausted => {
                 Retryability::RetryReselect

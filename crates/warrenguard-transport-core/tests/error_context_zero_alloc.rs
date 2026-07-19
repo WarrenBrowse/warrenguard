@@ -24,7 +24,7 @@ fn code_only(body: &str) -> String {
 fn error_context_fields_avoid_string_for_zero_alloc_hot_path() {
     let src = code_only(&read_error_rs());
 
-    // The five hot-path variants must use Cow<'static, str> (or
+    // The four hot-path variants must use Cow<'static, str> (or
     // &'static str) instead of String for their `context` field.
     // We assert via the *negative* pattern: under each variant's
     // declaration, the context field MUST NOT type as `String`.
@@ -36,9 +36,9 @@ fn error_context_fields_avoid_string_for_zero_alloc_hot_path() {
     let forbidden = ["context", ": ", "String,"].concat();
     assert!(
         !src.contains(&forbidden),
-        "TunnelError still has a `{forbidden}` field. The 5 hot-path variants \
+        "TunnelError still has a `{forbidden}` field. The 4 hot-path variants \
          require Cow<'static, str> \
-         (QuicStream, QuicSendDatagram, QuicReadDatagram, SetupWire, Tun) \
+         (QuicStream, QuicSendDatagram, QuicReadDatagram, Tun) \
          so a string-literal call site does not allocate `String` per \
          error event."
     );
