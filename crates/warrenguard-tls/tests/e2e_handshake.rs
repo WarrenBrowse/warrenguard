@@ -8,9 +8,10 @@
 //! validation is handled separately.
 //!
 //! Since protocol v5 the exit requests no client certificate (removing an
-//! active-probing tell). The client is anonymous at
-//! the TLS layer and authenticates in-band by signing the QUIC TLS
-//! channel binding; the first test proves that flow end-to-end.
+//! active-probing tell). The client is anonymous at the TLS layer; the first
+//! test proves the handshake completes with no client identity and that both
+//! peers derive the same QUIC TLS channel binding (RFC 5705), the anchor the
+//! in-band entry-relay identity proof binds to.
 
 use std::net::{Ipv4Addr, SocketAddr};
 
@@ -18,7 +19,7 @@ use ed25519_dalek::SigningKey;
 use warrenguard_config::ALPN_H3;
 use warrenguard_tls::{
     WarrenPubkey, channel_binding, default_crypto_provider, make_client_config, make_server_config,
-    name, sign_client_auth, verify_client_auth,
+    name,
 };
 
 fn loopback() -> SocketAddr {
@@ -60,11 +61,9 @@ fn endpoint_pair(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn handshake_completes_without_client_cert_and_inband_proof_verifies() {
+async fn handshake_completes_without_client_cert_and_channel_binding_matches() {
     let server_key = SigningKey::from_bytes(&[1u8; 32]);
-    let client_key = SigningKey::from_bytes(&[2u8; 32]);
     let server_pubkey = pubkey_of(&server_key);
-    let client_pubkey = pubkey_of(&client_key);
 
     let (server, client, server_addr, client_cfg) =
         endpoint_pair(&server_key, &[ALPN_H3], &[ALPN_H3]);
@@ -89,37 +88,15 @@ async fn handshake_completes_without_client_cert_and_inband_proof_verifies() {
         .await
         .expect("client handshake completes");
 
-    // The client authenticates in-band: derive the channel binding and sign
-    // a message binding it and the session device_id (this is what goes into
-    // Setup).
-    let device_id = [0xD1u8; 16]; // warrenguard_wire::DEVICE_ID_LEN
     let client_cb = channel_binding(&client_conn).expect("client derives channel binding");
-    let proof = sign_client_auth(&client_key, &client_cb, &device_id);
 
     let (server, server_conn, server_cb) = server_task.await.expect("server task");
 
-    // RFC 5705: both peers derive the identical exporter value.
+    // RFC 5705: both peers derive the identical exporter value. This is the
+    // anchor the in-band entry-relay identity proof binds to.
     assert_eq!(
         client_cb, server_cb,
         "client and exit must derive the same channel binding"
-    );
-    // The exit accepts a valid proof against the asserted pubkey + device_id.
-    assert!(
-        verify_client_auth(&client_pubkey, &server_cb, &device_id, &proof),
-        "the exit must accept a valid in-band auth proof"
-    );
-    // An attacker asserting someone else's allowlisted pubkey, without
-    // holding its key, is rejected.
-    let attacker = pubkey_of(&SigningKey::from_bytes(&[99u8; 32]));
-    assert!(
-        !verify_client_auth(&attacker, &server_cb, &device_id, &proof),
-        "a proof must not verify against a pubkey that did not sign it"
-    );
-    // The proof is bound to the device_id: a different device_id is rejected.
-    let other_device = [0xD2u8; 16];
-    assert!(
-        !verify_client_auth(&client_pubkey, &server_cb, &other_device, &proof),
-        "a proof must not verify against a different device_id"
     );
 
     client_conn.close(0u32.into(), b"bye");

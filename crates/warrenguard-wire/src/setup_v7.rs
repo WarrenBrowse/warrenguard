@@ -25,7 +25,7 @@ pub const ATTACH_SECRET_LEN: usize = 16;
 pub const MAX_SESSION_TOKENS: usize = 8;
 
 /// One serialized Privacy Pass token, carried as [`SESSION_TOKEN_LEN`] raw
-/// bytes with no length prefix (like [`crate::AuthSig`]). The wire crate does
+/// bytes with no length prefix. The wire crate does
 /// not interpret the bytes; the exit parses them with `warrenguard_token::Token`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SessionToken(pub [u8; SESSION_TOKEN_LEN]);

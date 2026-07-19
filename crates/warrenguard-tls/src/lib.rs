@@ -40,10 +40,7 @@ pub mod name;
 pub(crate) mod resolver;
 mod verifier;
 
-pub use auth::{
-    channel_binding, sign_client_auth, sign_relay_auth, sign_server_auth, verify_client_auth,
-    verify_relay_auth, verify_server_auth,
-};
+pub use auth::{channel_binding, sign_relay_auth, verify_relay_auth};
 pub use certs::{
     CertLoadError, load_cert_chain_pem, load_private_key_pem, mozilla_root_store,
     root_store_from_der, root_store_from_pem,
@@ -256,9 +253,9 @@ pub fn make_server_config_with_rotation(
 /// Builds the rustls **server** config a v6 exit serves: a real X.509
 /// certificate chain (v6 X.509 exit mode), so the TLS handshake looks like an
 /// ordinary HTTPS/h3 endpoint instead of presenting an RFC 7250 raw public
-/// key (the browser-anomalous ClientHello tell). The exit's
-/// Warren Ed25519 identity is no longer in TLS; it is proven in-band via
-/// [`auth::sign_server_auth`].
+/// key (the browser-anomalous ClientHello tell). A cover-domain peer's
+/// Warren Ed25519 identity is not in TLS; the entry relay proves it in-band
+/// via [`auth::sign_relay_auth`].
 ///
 /// `cert_chain` is the leaf-first DER chain (leaf wildcard cert issued for
 /// the cover domain, then any intermediates); `key` is its private key
@@ -288,9 +285,9 @@ pub fn build_server_rustls_config_x509(
 /// verification of the exit's real X.509 chain against `roots` (Mozilla
 /// roots in prod; a test CA in tests), exactly like a browser. This
 /// replaces the custom RPK verifier (which decoded the exit pubkey from the
-/// SNI). The exit's Warren identity is checked SEPARATELY, in-band, via
-/// [`auth::verify_server_auth`] against the pubkey the client expects from
-/// the signed roster.
+/// SNI). A cover-domain peer's Warren identity is checked SEPARATELY,
+/// in-band: the entry relay via [`auth::verify_relay_auth`] against the
+/// pubkey the client expects from the signed directory.
 ///
 /// Going pure X.509 (the client no longer offers
 /// `server_certificate_type=RawPublicKey`) sidesteps the mixed cert-type

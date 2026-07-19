@@ -35,61 +35,11 @@ pub const DEVICE_ID_LEN: usize = 16;
 /// Length in bytes of a client Ed25519 public key.
 pub const CLIENT_PUBKEY_LEN: usize = 32;
 
-/// Length in bytes of an in-band auth signature (Ed25519 over the QUIC TLS
-/// exporter, binding the proof to a specific connection).
-pub const AUTH_SIG_LEN: usize = 64;
-
 /// Memory cap when reading a setup frame: 16 KB, generous enough to absorb a
 /// [`DaitaConfig`] carrying several serialized maybenot machines while still
 /// preventing a hostile peer from amplifying heap allocations through an
 /// over-sized frame.
 pub const MAX_SETUP_FRAME_BYTES: usize = 16 * 1024;
-
-/// Ed25519 in-band client-auth signature, carried on the wire as 64 raw
-/// bytes (no length prefix). Newtype because serde has no built-in
-/// `[u8; 64]` impls; the manual impl serialises as a fixed 64-tuple so
-/// postcard emits exactly the 64 signature bytes, deterministically.
-/// Mirrors the established `warrenguard-multihop` `PopSignature` pattern.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AuthSig(pub [u8; AUTH_SIG_LEN]);
-
-impl Serialize for AuthSig {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeTuple;
-        let mut tuple = serializer.serialize_tuple(AUTH_SIG_LEN)?;
-        for byte in &self.0 {
-            tuple.serialize_element(byte)?;
-        }
-        tuple.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for AuthSig {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct SigVisitor;
-        impl<'de> serde::de::Visitor<'de> for SigVisitor {
-            type Value = AuthSig;
-
-            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-                f.write_str("64 raw Ed25519 signature bytes")
-            }
-
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(
-                self,
-                mut seq: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut out = [0u8; AUTH_SIG_LEN];
-                for (i, slot) in out.iter_mut().enumerate() {
-                    *slot = seq
-                        .next_element()?
-                        .ok_or_else(|| serde::de::Error::invalid_length(i, &self))?;
-                }
-                Ok(AuthSig(out))
-            }
-        }
-        deserializer.deserialize_tuple(AUTH_SIG_LEN, SigVisitor)
-    }
-}
 
 /// Wire-transmissible DAITA v2 configuration negotiated at handshake.
 ///
