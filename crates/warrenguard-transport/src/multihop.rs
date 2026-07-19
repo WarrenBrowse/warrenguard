@@ -937,9 +937,8 @@ impl MultiHopClient {
         // underlying physical network) BEFORE it sends anything, or the VPN
         // routes loop the QUIC handshake back into the TUN. We bind the socket
         // ourselves so we can `VpnService.protect` its fd, then hand it to
-        // quinn. Mirrors the single-hop path in
-        // `crate::client::ClientTunnel::connect`. On every other
-        // platform `Endpoint::client` (bind + `Endpoint::new`) is kept verbatim.
+        // quinn. On every other platform `Endpoint::client` (bind +
+        // `Endpoint::new`) is kept verbatim.
         #[cfg(target_os = "android")]
         let mut endpoint = {
             use std::os::fd::AsRawFd;

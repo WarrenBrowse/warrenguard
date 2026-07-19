@@ -1,20 +1,18 @@
 //! Client orchestration for the TLS-over-TCP fallback carrier.
 //!
 //! When outbound UDP/443 is blocked or throttled, a QUIC/UDP-only dial does not
-//! connect. This module decides WHEN the [`crate::ClientTunnel`] retries the
-//! same QUIC session inside one real TLS 1.3 stream to the exit's cover domain
-//! on `:443/tcp` (the [`warrenguard_tcp_fallback`] carrier). It plugs in at the
-//! quinn abstract-socket seam only: the QUIC state machine, HPKE and obfuscation
-//! are unchanged, so the fallback path is byte-for-byte the UDP dial's session
+//! connect. This module lets the multihop client retry the same QUIC session
+//! inside one real TLS 1.3 stream to the exit's cover domain on `:443/tcp` (the
+//! [`warrenguard_tcp_fallback`] carrier). It plugs in at the quinn
+//! abstract-socket seam only: the QUIC state machine, HPKE and obfuscation are
+//! unchanged, so the fallback path is byte-for-byte the UDP dial's session
 //! carried over a different socket.
 //!
-//! The decision is [`resolve_fallback_policy`]. The carrier is armed ONLY when
-//! all three hold: the client prefers it (on by default, see
-//! [`crate::ClientTunnel::with_tcp_fallback`]), the selected exit advertises the
-//! capability in its signed descriptor (`WarrenExitAddr::tcp_fallback`), and it
-//! carries a cover domain to present as the SNI. A non-capable exit is never
-//! dialled over TCP: it would only refuse the connection, so probing it is
-//! pointless.
+//! The carrier is armed ONLY when all three hold: the client prefers it (on by
+//! default), the selected exit advertises the capability in its signed
+//! descriptor (`WarrenExitAddr::tcp_fallback`), and it carries a cover domain to
+//! present as the SNI. A non-capable exit is never dialled over TCP: it would
+//! only refuse the connection, so probing it is pointless.
 
 use std::io;
 use std::net::SocketAddr;
@@ -24,14 +22,12 @@ use tokio::net::TcpStream;
 use warrenguard_socket_bypass::SocketBypass;
 use warrenguard_transport_core::error::{Result, TunnelError};
 
-// The dial policy, the cover-domain fingerprint constants and the per-dial
-// cover target are single-homed in `warrenguard-tcp-fallback` (next to the
-// carrier and the UDP-vs-TCP race primitive), so the privileged transport here
-// and the userland SDK transport cannot skew them. Re-exported under the same
-// names for the internal callers (`client`, `multihop`).
-pub(crate) use warrenguard_tcp_fallback::{
-    COVER_TCP_ALPN, COVER_TCP_PORT, CoverTls, resolve_fallback_policy,
-};
+// The cover-domain fingerprint constants are single-homed in
+// `warrenguard-tcp-fallback` (next to the carrier and the UDP-vs-TCP race
+// primitive), so the privileged transport here and the userland SDK transport
+// cannot skew them. Re-exported under the same names for the internal multihop
+// carrier dial.
+pub(crate) use warrenguard_tcp_fallback::{COVER_TCP_ALPN, COVER_TCP_PORT};
 
 /// Builds the WebPKI client config for the OUTER cover-domain TLS handshake of
 /// the carrier. `der_roots` = explicit DER trust anchors (a self-hosted CA or a
@@ -75,9 +71,8 @@ pub(crate) fn build_cover_client_config(
     Ok(Arc::new(cfg))
 }
 
-/// Opens the TLS-over-TCP carrier's underlying TCP connection to `addr`, shared
-/// by the single-hop ([`crate::client`]) and multi-hop ([`crate::multihop`])
-/// dials.
+/// Opens the TLS-over-TCP carrier's underlying TCP connection to `addr`, used by
+/// the multi-hop ([`crate::multihop`]) carrier dial.
 ///
 /// With no `socket_bypass` (userland proxy, mobile, or no system VPN) this is
 /// exactly `TcpStream::connect(addr)`: behaviour-neutral. With a bypass the

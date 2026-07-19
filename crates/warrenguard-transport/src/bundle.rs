@@ -9,9 +9,9 @@
 //!
 //! - **Uplink**: each packet is pinned to one session by 5-tuple flow
 //!   hash ([`warrenguard_transport_core::flow_hash_5tuple`], the exact function the
-//!   single-hop `MultiSession` and both exit dispatchers use), with an
-//!   atomic round-robin fallback for non-TCP/UDP packets. Per-flow
-//!   ordering is preserved; N flows spread across N connections.
+//!   exit dispatchers use), with an atomic round-robin fallback for
+//!   non-TCP/UDP packets. Per-flow ordering is preserved; N flows spread
+//!   across N connections.
 //! - **Downlink**: one reader task per session HPKE-opens its frames
 //!   and feeds a single merged channel, so the consumer keeps the
 //!   exact `recv().await` shape it had against a lone client (and the

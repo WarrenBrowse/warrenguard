@@ -7,7 +7,7 @@
 //! is the platform fix: it binds a socket to the underlying physical
 //! network so it bypasses the VPN.
 //!
-//! The socket is created deep inside [`crate::client`] (quinn owns it), so
+//! The socket is created deep inside [`crate::multihop`] (quinn owns it), so
 //! the protect call cannot be made from the Android FFI layer directly. A
 //! deployer's JNI bridge registers a protector here once per process; the
 //! client invokes [`protect`] on every freshly bound endpoint socket before
