@@ -42,7 +42,7 @@ fn initial_crypto_first_fragment_size_present_on_client_path() {
     // as at least 2 of the OTHER 4 call sites stayed in place. Pin the
     // exact number of call sites today so removing any one of them
     // (including the client's) trips this test:
-    //   1. warren_transport_config_client_full (single-hop client)
+    //   1. warren_transport_config_client_full (client)
     //   2. warren_transport_config_exit_full (server mirror)
     //   3. warren_transport_config_relay_inbound_with_gso (server mirror)
     //   4. warren_transport_config_relay_outbound_with_gso (relay-to-exit dial)
