@@ -51,6 +51,14 @@ pub const TUNNEL_INITIAL_MTU: u16 = 1280;
 /// Minimum MTU (DPLPMTUD will not go below this).
 pub const TUNNEL_MIN_MTU: u16 = 1200;
 
+/// Minimum size every padded QUIC Initial datagram is inflated to
+/// (`initial_datagram_min_size`). 1200 fits nested/reduced-MTU paths where 1280
+/// black-holes, is the RFC 9000 floor every major stack pads to, and matches
+/// current browser Initials, so it is mimicry-neutral. Kept distinct from
+/// [`TUNNEL_INITIAL_MTU`] (the DPLPMTUD start MTU): the pad must never exceed the
+/// Initial MTU, and coupling the two is exactly the drift this constant removes.
+pub const PADDED_INITIAL_MIN_SIZE: u16 = 1200;
+
 /// IPv4 address of the TUN gateway on the exit side.
 ///
 /// This is the IP the client uses as a "virtual router" behind the
@@ -441,6 +449,13 @@ mod tests {
         // DPLPMTUD starts at initial and may probe down towards min.
         // Need min < initial otherwise DPLPMTUD cannot adapt.
         const _: () = assert!(TUNNEL_MIN_MTU < TUNNEL_INITIAL_MTU);
+    }
+
+    #[test]
+    fn padded_initial_never_exceeds_the_initial_mtu() {
+        // A pad target larger than the Initial MTU stalls the handshake
+        // (the datagram overflows the path and is dropped).
+        const _: () = assert!(PADDED_INITIAL_MIN_SIZE <= TUNNEL_INITIAL_MTU);
     }
 
     #[test]

@@ -1,15 +1,15 @@
 //! Behavioural freeze of the CLIENT-side QUIC-Initial obfuscation.
 //!
 //! `warren_transport_config_client` must pad the first Initial datagram via the
-//! fork's `initial_datagram_min_size` knob (1280), the client half of the anti-DPI
-//! handshake. A plain UDP "tap" (it never speaks QUIC) captures the client's
-//! first emitted datagram and asserts it is padded. This is the missing client
-//! counterpart to `server_mirror_initial_pad_loopback.rs`: that one proves the
-//! server mirror's padded handshake completes, this one proves the client config
-//! actually applies the padding. The knob *presence* in the fork itself is
-//! guarded separately by `warrenguard-tls/tests/quinn_fork_patch.rs`; this guards
-//! that `warren_transport_config_client` keeps *applying* it, so a refactor of
-//! the transport config cannot silently drop the client obfuscation.
+//! fork's `initial_datagram_min_size` knob (1200 B RFC floor), the client half of
+//! the anti-DPI handshake. A plain UDP "tap" (it never speaks QUIC) captures the
+//! client's first emitted datagram and asserts it is padded. This is the missing
+//! client counterpart to `server_mirror_initial_pad_loopback.rs`: that one proves
+//! the server mirror's padded handshake completes, this one proves the client
+//! config actually applies the padding + split. The knob *presence* in the fork
+//! itself is guarded separately by `warrenguard-tls/tests/quinn_fork_patch.rs`;
+//! this guards that `warren_transport_config_client` keeps *applying* it, so a
+//! refactor of the transport config cannot silently drop the client obfuscation.
 //!
 //! No root, no live exit, no secret: a loopback UDP socket and a single dial.
 
@@ -23,10 +23,12 @@ use warrenguard_tls::{
     WarrenPubkey, default_crypto_provider, make_client_config, name as tls_name,
 };
 
-/// The fork pads the obfuscated client Initial to `initial_datagram_min_size`
-/// (1280). The default upstream Initial is the RFC-9000 floor (1200), so a
-/// `>= 1280` first datagram is the obfuscation signature.
-const OBFUSCATED_MIN_FIRST_DATAGRAM: usize = 1280;
+/// The fork pads every obfuscated client Initial to `initial_datagram_min_size`
+/// (1200 B RFC 9000 floor). At the floor the size alone matches an RFC-compliant
+/// client Initial; the load-bearing obfuscation signature is the >= 2-datagram
+/// SNI split asserted below. This bound stays a floor sanity check: without the
+/// pad knob the tiny 64 B first-fragment datagram would fall well under 1200.
+const OBFUSCATED_MIN_FIRST_DATAGRAM: usize = 1200;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_first_initial_datagram_is_padded_for_obfuscation() {
@@ -84,9 +86,9 @@ async fn client_first_initial_datagram_is_padded_for_obfuscation() {
     endpoint.close(quinn::VarInt::from_u32(0), b"test done");
     let _ = tokio::time::timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
 
-    // Padding knob (`initial_datagram_min_size`). Empirically: the obfuscated config
-    // emits 1280 here, a default quinn config emits 1200 (the RFC floor), so this
-    // bound is a real guard, not a tautology.
+    // Padding knob (`initial_datagram_min_size`, 1200 B RFC floor). With the
+    // SNI-split the first datagram carries only the 64 B first CRYPTO fragment;
+    // dropping the pad knob would leave it near ~90 B, so this floor still bites.
     assert!(
         first_len >= OBFUSCATED_MIN_FIRST_DATAGRAM,
         "obfuscated client Initial must be padded to >= {OBFUSCATED_MIN_FIRST_DATAGRAM} bytes \

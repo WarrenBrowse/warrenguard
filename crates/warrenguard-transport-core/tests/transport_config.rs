@@ -27,9 +27,9 @@ fn relay_inbound_emits_bidirectional_warren_initial_pad_knobs() {
     // The chunk-cap side of the mirror only fires server-side once
     // the fork patch is bumped to `0.11.13-warren.2`
     // (cf. `crates/warren-tls/tests/quinn_fork_patch.rs::vendored_quinn_proto_first_initial_chunk_cap_is_bidirectional`).
-    // The pad target sits at 1280 B (== `TUNNEL_INITIAL_MTU`) because
-    // a 1500 B target combined with a 1280 B MTU stalls the server-
-    // side coalesce loop (loopback bench finding).
+    // The pad target sits at the 1200 B RFC 9000 floor
+    // (`PADDED_INITIAL_MIN_SIZE`): 1200 fits nested/reduced-MTU paths where
+    // 1280 black-holes, and is the size every major stack pads to.
     let src = include_str!("../src/transport_config.rs");
     let relay_inbound = src
         .split_once("pub fn warren_transport_config_relay_inbound_with_gso")
@@ -46,11 +46,10 @@ fn relay_inbound_emits_bidirectional_warren_initial_pad_knobs() {
          ride in a single Initial datagram and breaks the bidirectional invariant."
     );
     assert!(
-        relay_inbound.contains(".initial_datagram_min_size(1280)"),
-        "relay_inbound must pad Initial datagrams to 1280 B \
-         (= TUNNEL_INITIAL_MTU). The historical 1500 B Chrome H/3 figure was \
-         lowered because a pad target > initial_mtu stalls \
-         the server-side coalesce loop."
+        relay_inbound.contains(".initial_datagram_min_size(PADDED_INITIAL_MIN_SIZE)"),
+        "relay_inbound must pad Initial datagrams to PADDED_INITIAL_MIN_SIZE \
+         (1200 B RFC floor). A pad target > initial_mtu stalls the server-side \
+         coalesce loop, and 1200 fits nested/reduced-MTU paths where 1280 black-holes."
     );
 }
 
@@ -75,9 +74,9 @@ fn warren_transport_config_exit_emits_bidirectional_warren_initial_pad_knobs() {
          (obfuscation mirror)."
     );
     assert!(
-        exit.contains(".initial_datagram_min_size(1280)"),
-        "warren_transport_config_exit must pad Initial datagrams to 1280 B \
-         (= TUNNEL_INITIAL_MTU)."
+        exit.contains(".initial_datagram_min_size(PADDED_INITIAL_MIN_SIZE)"),
+        "warren_transport_config_exit must pad Initial datagrams to \
+         PADDED_INITIAL_MIN_SIZE (1200 B RFC floor)."
     );
 }
 
@@ -85,7 +84,7 @@ fn warren_transport_config_exit_emits_bidirectional_warren_initial_pad_knobs() {
 fn relay_outbound_emits_warren_initial_pad_knobs() {
     // Obfuscation invariant: the relay-to-exit dial is the wire signature the
     // relay's *upstream observer* can capture, so the outbound profile
-    // must replicate the same 1500 B Initial floor and 64 B first
+    // must replicate the same Initial pad floor and 64 B first
     // CRYPTO chunk as `warren_transport_config_client`. The inbound
     // profile deliberately omits these knobs: forcing a 64 B cap on a
     // ServerHello stalls the handshake, and padding inbound Initials
@@ -106,10 +105,9 @@ fn relay_outbound_emits_warren_initial_pad_knobs() {
          Initial datagram, fingerprinting the relay-to-exit dial."
     );
     assert!(
-        relay_outbound.contains(".initial_datagram_min_size(1280)"),
-        "relay_outbound must pad Initial datagrams to 1280 B \
-         (the historical 1500 B Chrome H/3 figure was lowered to match \
-         TUNNEL_INITIAL_MTU after the server-side coalesce stall)."
+        relay_outbound.contains(".initial_datagram_min_size(PADDED_INITIAL_MIN_SIZE)"),
+        "relay_outbound must pad Initial datagrams to PADDED_INITIAL_MIN_SIZE \
+         (1200 B RFC floor)."
     );
 }
 
@@ -317,9 +315,10 @@ fn multihop_inbound_configs_omit_initial_padding() {
 fn multihop_client_pads_the_gfw_facing_leg_while_relay_outbound_stays_no_pad() {
     let src = include_str!("../src/transport_config.rs");
     // The public `..._with_idle_cover` entry delegates to the MTU-parameterized
-    // inner impl, where the SNI-split pad knobs now live (the pad tracks
-    // `initial_mtu` so a nested-path client's lowered floor does not leave an
-    // oversized ClientHello). Introspect the impl that actually sets them.
+    // inner impl, where the SNI-split pad knobs now live (the pad is the fixed
+    // 1200 floor, at or below `initial_mtu`, so a nested-path client's lowered
+    // floor never leaves an oversized ClientHello). Introspect the impl that
+    // actually sets them.
     let client = fn_body(src, "warren_transport_config_client_multihop_with_mtu");
     assert!(
         client.contains("initial_crypto_first_fragment_size"),
