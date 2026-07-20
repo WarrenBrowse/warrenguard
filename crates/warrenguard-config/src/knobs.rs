@@ -221,6 +221,22 @@ pub const REGISTRY: &[KnobMeta] = &[
         effect: "client outer QUIC initial MTU + Initial-pad size; a client nested inside a full-tunnel system VPN lowers it below the nested cap so the data plane does not black-hole",
         home: "warrenguard-transport-core/src/transport_config.rs",
     },
+    KnobMeta {
+        name: "WARREN_ENABLE_TCP_FALLBACK",
+        kind: "bool",
+        default: "on",
+        clamp: "\"0\"/\"false\"/\"no\"/\"off\" disables, else on",
+        effect: "arm the TLS-over-TCP fallback carrier when the exit advertises it and carries a cover domain; fail-closed (disabled keeps the plain UDP dial and never opens :443/tcp)",
+        home: "warrenguard-transport/src/multihop.rs (dial_relay)",
+    },
+    KnobMeta {
+        name: "WARREN_TCP_FALLBACK_RACE_MS",
+        kind: "u64 (ms)",
+        default: "400",
+        clamp: "clamped to [100, 5000]; unparsable/absent -> default",
+        effect: "head start the UDP handshake gets before the armed TCP carrier is dialled in parallel; first successful handshake wins (the 5s UDP deadline is the overall guard)",
+        home: "warrenguard-transport/src/multihop.rs (dial_relay_with_carrier)",
+    },
 ];
 
 // ---------------------------------------------------------------------
@@ -340,6 +356,31 @@ pub fn parse_client_initial_mtu(raw: Option<&str>) -> u16 {
         .unwrap_or(crate::TUNNEL_INITIAL_MTU)
 }
 
+/// Floor of the TCP-carrier race head start: below this a healthy UDP path would
+/// pay a same-RTT TCP dial on essentially every connect.
+const TCP_FALLBACK_RACE_MIN_MS: u64 = 100;
+/// Ceiling of the head start: it never exceeds the 5 s overall UDP deadline, so
+/// the top of the range degenerates to a sequential fallback rather than ever
+/// disabling the race.
+const TCP_FALLBACK_RACE_MAX_MS: u64 = 5000;
+/// Default head start: long enough that a healthy sub-400 ms-RTT UDP handshake
+/// wins without ever constructing the TCP dial, short enough that a UDP-hostile
+/// network starts the carrier well before the 5 s deadline.
+const TCP_FALLBACK_RACE_DEFAULT_MS: u64 = 400;
+
+/// Parses the TCP-carrier race head start (`WARREN_TCP_FALLBACK_RACE_MS`) in
+/// milliseconds, clamped into [`TCP_FALLBACK_RACE_MIN_MS`,
+/// `TCP_FALLBACK_RACE_MAX_MS`]. Absent or unparsable keeps
+/// [`TCP_FALLBACK_RACE_DEFAULT_MS`]. A value outside the range clamps to the
+/// nearest bound (never disables the race): the floor protects a healthy path,
+/// the ceiling never outlives the overall UDP deadline.
+#[must_use]
+pub fn parse_race_delay_ms(raw: Option<&str>) -> u64 {
+    raw.and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|ms| ms.clamp(TCP_FALLBACK_RACE_MIN_MS, TCP_FALLBACK_RACE_MAX_MS))
+        .unwrap_or(TCP_FALLBACK_RACE_DEFAULT_MS)
+}
+
 // ---------------------------------------------------------------------
 // Typed accessors. Each reads its env var exactly once (OnceLock) and
 // delegates to a pure helper above. These are the only sanctioned way
@@ -371,6 +412,33 @@ pub fn client_initial_mtu() -> u16 {
     *CACHE.get_or_init(|| {
         parse_client_initial_mtu(std::env::var("WARREN_TUNNEL_INITIAL_MTU").ok().as_deref())
     })
+}
+
+/// `WARREN_ENABLE_TCP_FALLBACK`: arm the TLS-over-TCP fallback carrier. ON by
+/// default; `"0"`/`"false"`/`"no"`/`"off"` disables it (any other value keeps it
+/// on, so a typo cannot silently strip the anti-censorship carrier). Fail-closed:
+/// with the carrier disabled the client keeps the plain UDP dial and never opens
+/// a `:443/tcp` connection, so an unset or garbage value can only ever leave the
+/// carrier armed, never dial TCP against the deployer's intent. Read once.
+#[must_use]
+pub fn tcp_fallback_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        parse_bool_default_on(std::env::var("WARREN_ENABLE_TCP_FALLBACK").ok().as_deref())
+    })
+}
+
+/// `WARREN_TCP_FALLBACK_RACE_MS`: milliseconds the UDP handshake runs before the
+/// armed TCP carrier is dialled in parallel. Default `400`, clamped to
+/// `[100, 5000]`. Returned as a [`std::time::Duration`] for the race primitive.
+/// Read once.
+#[must_use]
+pub fn tcp_fallback_race_delay() -> std::time::Duration {
+    static CACHE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *CACHE.get_or_init(|| {
+        parse_race_delay_ms(std::env::var("WARREN_TCP_FALLBACK_RACE_MS").ok().as_deref())
+    });
+    std::time::Duration::from_millis(ms)
 }
 
 /// `WARREN_INITIAL_WINDOW`: optional positive congestion-controller
@@ -865,6 +933,36 @@ mod tests {
         assert_eq!(
             parse_client_initial_mtu(Some("1500")),
             crate::TUNNEL_INITIAL_MTU
+        );
+    }
+
+    #[test]
+    fn race_delay_defaults_to_400ms_and_clamps_into_range() {
+        // Absent or unparsable keeps the 400 ms default.
+        assert_eq!(parse_race_delay_ms(None), TCP_FALLBACK_RACE_DEFAULT_MS);
+        assert_eq!(parse_race_delay_ms(None), 400);
+        assert_eq!(parse_race_delay_ms(Some("nope")), 400);
+        assert_eq!(parse_race_delay_ms(Some("")), 400);
+        // A value inside the range passes through verbatim.
+        assert_eq!(parse_race_delay_ms(Some("250")), 250);
+        assert_eq!(parse_race_delay_ms(Some("100")), 100);
+        assert_eq!(parse_race_delay_ms(Some("5000")), 5000);
+        // Outside the range clamps to the nearest bound, never disabling the
+        // race: below the floor -> floor, above the ceiling -> ceiling.
+        assert_eq!(
+            parse_race_delay_ms(Some("50")),
+            TCP_FALLBACK_RACE_MIN_MS,
+            "a below-floor value clamps up, so a healthy path still gets a head start"
+        );
+        assert_eq!(
+            parse_race_delay_ms(Some("0")),
+            TCP_FALLBACK_RACE_MIN_MS,
+            "0 does not mean 'sequential forever'; it clamps to the floor"
+        );
+        assert_eq!(
+            parse_race_delay_ms(Some("99999")),
+            TCP_FALLBACK_RACE_MAX_MS,
+            "an above-ceiling value clamps to the 5s deadline, never past it"
         );
     }
 

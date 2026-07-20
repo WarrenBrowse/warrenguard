@@ -49,13 +49,19 @@ pub struct CoverTls<'a> {
     pub client_config: Arc<rustls::ClientConfig>,
 }
 
-/// Resolves the fallback policy for one dial. Enabled ONLY when all three hold:
-/// the client prefers the fallback (`opt_in`), the selected exit advertises the
-/// carrier (`exit_tcp_fallback`, from its signed descriptor), and it carries a
-/// cover domain to present as the TLS SNI. Any missing precondition yields the
-/// default OFF policy, so a UDP failure is surfaced and no `:443/tcp` connection
-/// is attempted: a non-capable exit would only refuse the TCP connection, so
-/// probing it is pointless.
+/// Resolves the fallback policy for one dial. Armed ONLY when all three hold:
+/// the client prefers the fallback (`opt_in`, on by default unless the deployer
+/// disables it), the selected exit advertises the carrier (`exit_tcp_fallback`,
+/// from its signed descriptor), and it carries a cover domain to present as the
+/// TLS SNI. Any missing precondition yields the fail-closed disarmed policy, so a
+/// UDP failure is surfaced and no `:443/tcp` connection is attempted: a
+/// non-capable exit would only refuse the TCP connection, so probing it is
+/// pointless.
+///
+/// The disarmed branch returns [`FallbackPolicy::disabled`] explicitly, NOT
+/// [`FallbackPolicy::default`]: the default now arms the carrier, so a missing
+/// precondition must select the disarmed policy directly or the fail-closed
+/// guarantee would invert.
 #[must_use]
 pub fn resolve_fallback_policy(
     opt_in: bool,
@@ -65,7 +71,7 @@ pub fn resolve_fallback_policy(
     if opt_in && exit_tcp_fallback && cover_domain.is_some() {
         FallbackPolicy::enabled()
     } else {
-        FallbackPolicy::default()
+        FallbackPolicy::disabled()
     }
 }
 

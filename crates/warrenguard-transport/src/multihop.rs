@@ -265,10 +265,12 @@ pub enum DialRefusedHop {
 /// Whether the TLS-over-TCP fallback carrier is armed for `relay`: it both
 /// advertises the carrier (`tcp_fallback`) AND carries a cover domain. The
 /// cover domain is the outer TLS SNI and implies X.509 mode, so without it
-/// there is no carrier to dial. Gated purely on the descriptor (no client
-/// opt-in threaded through the connect variants), so an RPK relay (no cover
-/// domain) is never dialed over TCP even if the flag is set, and a relay that
-/// does not advertise the carrier keeps the plain UDP dial.
+/// there is no carrier to dial. Gated purely on the descriptor, so an RPK relay
+/// (no cover domain) is never dialed over TCP even if the flag is set, and a
+/// relay that does not advertise the carrier keeps the plain UDP dial. The
+/// deployer's `WARREN_ENABLE_TCP_FALLBACK` master switch is applied on top of
+/// this at the call site (see `dial_relay`), keeping this a pure descriptor
+/// predicate.
 #[must_use]
 fn carrier_armed(relay: &RelayDescriptorSigned) -> bool {
     relay.tcp_fallback && relay.cover_domain.is_some()
@@ -971,8 +973,12 @@ impl MultiHopClient {
         // consumes it via `set_default_client_config`: the carrier dials the
         // relay with the IDENTICAL config so the TCP path is byte-for-byte the
         // UDP session (same X.509 identity check, transport params). Only when
-        // armed (`quinn::ClientConfig: Clone`).
-        let carrier_client_cfg = carrier_armed(relay).then(|| client_cfg.clone());
+        // armed (`quinn::ClientConfig: Clone`) AND the deployer has not disabled
+        // the carrier via `WARREN_ENABLE_TCP_FALLBACK` (fail-closed: a disabled
+        // carrier keeps the plain UDP dial and never opens :443/tcp).
+        let carrier_client_cfg = (carrier_armed(relay)
+            && warrenguard_config::knobs::tcp_fallback_enabled())
+        .then(|| client_cfg.clone());
 
         // On Android the endpoint socket must be protected (routed onto the
         // underlying physical network) BEFORE it sends anything, or the VPN
@@ -1165,7 +1171,16 @@ impl MultiHopClient {
             Ok::<(Endpoint, Connection), std::io::Error>((carrier_ep, conn))
         };
 
-        connect_with_fallback(&FallbackPolicy::enabled(), udp, tcp)
+        // Armed (this path is only reached when the carrier is armed): race the
+        // UDP handshake against the TCP carrier, with the parallel-dial head
+        // start taken from `WARREN_TCP_FALLBACK_RACE_MS`. A UDP-hostile network
+        // then connects in ~race-delay + one TCP RTT instead of stalling out the
+        // full UDP deadline first.
+        let policy = FallbackPolicy {
+            tcp_race_delay: warrenguard_config::knobs::tcp_fallback_race_delay(),
+            ..FallbackPolicy::enabled()
+        };
+        connect_with_fallback(&policy, udp, tcp)
             .await
             .map_err(|source| MultiHopError::TcpFallback(std::io::Error::other(source)))
     }

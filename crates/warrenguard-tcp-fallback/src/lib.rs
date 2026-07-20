@@ -20,9 +20,10 @@
 //!   fresh loopback UDP socket per connection, so the dispatcher sees each
 //!   fallback client as a distinct 5-tuple. [`serve_carrier`] adds the decoy
 //!   hand-off for a connection that is not a Warren carrier.
-//! - [`FallbackPolicy`] / [`connect_with_fallback`] (client): retry over TCP
-//!   after the UDP handshake times out. OFF by default (opt-in): with the
-//!   policy disabled, a UDP failure is surfaced and TCP is never attempted.
+//! - [`FallbackPolicy`] / [`connect_with_fallback`] (client): race the TCP
+//!   carrier once the UDP handshake stalls past a short delay. Armed by default
+//!   but fail-closed: with the policy disarmed, a UDP failure is surfaced and TCP
+//!   is never attempted.
 //!
 //! The obfuscation guarantee is load-bearing: the wrap is a real WebPKI TLS 1.3
 //! handshake to the cover domain (see [`tls`]), not a bespoke tunnel. The ALPN
@@ -62,7 +63,8 @@ mod terminator;
 pub mod tls;
 
 pub use activation::{
-    DEFAULT_UDP_HANDSHAKE_TIMEOUT, FallbackError, FallbackPolicy, connect_with_fallback,
+    DEFAULT_TCP_FALLBACK_RACE, DEFAULT_UDP_HANDSHAKE_TIMEOUT, FallbackError, FallbackPolicy,
+    connect_with_fallback,
 };
 pub use client::{TcpCarrierSocket, build_carrier_client_endpoint};
 pub use policy::{COVER_TCP_ALPN, COVER_TCP_PORT, CoverTls, resolve_fallback_policy};
