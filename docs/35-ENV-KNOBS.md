@@ -58,7 +58,7 @@ knob in `REGISTRY` must appear in the table below, or the test fails.
 | `WARREN_DG_FQ_QUEUES` | usize | 1024 | clamped to [1, 65536]; unparsable -> default | flow-queue count of the datagram send AQM (FQ-CoDel per-flow fairness); 1 = single shared queue (plain CoDel fallback) | warrenguard-transport-core/src/transport_config.rs |
 | `WARREN_DG_BDP_BUF` | bool | on | "0"/"false"/"no"/"off" disables, else on | BDP-adaptive datagram send-buffer sizing (shrinks the fixed 4/16 MiB cap toward the path's measured BDP) | warrenguard-transport-core/src/transport_config.rs |
 | `WARREN_DG_BDP_MULT` | u64 | 4 | clamped to [1, 64]; unparsable -> default | adaptive send-buffer size as a multiple of the smoothed BDP estimate | warrenguard-transport-core/src/transport_config.rs |
-| `WARREN_DG_BDP_FLOOR` | usize (bytes) | 262144 (256 KiB) | clamped to [16384, 64 MiB]; unparsable -> default | lower bound of the adaptive send buffer (ramp-up and tiny-BDP guard) | warrenguard-transport-core/src/transport_config.rs |
+| `WARREN_DG_BDP_FLOOR` | usize (bytes) | 1048576 (1 MiB) | clamped to [16384, 64 MiB]; unparsable -> default | lower bound of the adaptive send buffer (ramp-up and tiny-BDP guard) | warrenguard-transport-core/src/transport_config.rs |
 | `WARREN_UPLINK_BATCH_MAX` | usize | 1 | must be >= 1, capped at 1024 | max TUN reads drained per uplink datagram batch | warrenguard-pump/src/lib.rs |
 | `WARREN_PATH_PROBE` | bool | on | "0" disables, anything else enables | per-connection throughput/RTT probe logging | warrenguard-transport-core/src/path_probe.rs |
 | `WARREN_DEAD_PATH_SECS` | u64 (seconds) | 15 | 0 disables the watch; unparsable -> default | RX-silence window before the client redials | warrenguard-transport/src/supervisor.rs |

@@ -128,7 +128,7 @@ pub const REGISTRY: &[KnobMeta] = &[
     KnobMeta {
         name: "WARREN_DG_BDP_FLOOR",
         kind: "usize (bytes)",
-        default: "262144 (256 KiB)",
+        default: "1048576 (1 MiB)",
         clamp: "clamped to [16384, 64 MiB]; unparsable -> default",
         effect: "lower bound of the adaptive send buffer (ramp-up and tiny-BDP guard)",
         home: "warrenguard-transport-core/src/transport_config.rs",
@@ -587,7 +587,7 @@ pub fn dg_bdp_mult() -> u64 {
 }
 
 /// `WARREN_DG_BDP_FLOOR`: lower bound of the adaptive send buffer in bytes.
-/// Clamped to `[16 KiB, 64 MiB]`, default `262144` (256 KiB).
+/// Clamped to `[16 KiB, 64 MiB]`, default `1048576` (1 MiB).
 #[must_use]
 pub fn dg_bdp_floor() -> usize {
     static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -596,7 +596,7 @@ pub fn dg_bdp_floor() -> usize {
             std::env::var("WARREN_DG_BDP_FLOOR").ok().as_deref(),
             16 * 1024,
             64 * 1024 * 1024,
-            256 * 1024,
+            1024 * 1024,
         )
     })
 }
