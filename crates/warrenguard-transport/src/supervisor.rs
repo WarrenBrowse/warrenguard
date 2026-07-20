@@ -1186,7 +1186,10 @@ impl MultiHopSupervisor {
         primary_assign: Option<IpAssignSpec>,
         session_tokens: Option<Vec<SessionToken>>,
     ) {
-        let want = self.config.n_connections.clamp(1, MAX_BONDED_CONNECTIONS);
+        let want = resolve_bonded_want(
+            self.config.n_connections,
+            warrenguard_config::knobs::multihop_conns_override(),
+        );
         let Some(primary_spec) = primary_assign else {
             if want > 1 {
                 tracing::warn!(
@@ -1267,7 +1270,10 @@ impl MultiHopSupervisor {
         // identity (the exit's sticky allocator gives them ONE inner IP).
         // Requires the primary's `IpAssign` as the stickiness witness.
         let mut clients = vec![primary.clone()];
-        let want = self.config.n_connections.clamp(1, MAX_BONDED_CONNECTIONS);
+        let want = resolve_bonded_want(
+            self.config.n_connections,
+            warrenguard_config::knobs::multihop_conns_override(),
+        );
         if want > 1 {
             match primary_assign {
                 Some(primary_spec) => {
@@ -1608,6 +1614,16 @@ fn control_message_variant_name(msg: &WarrenControlMessage) -> &'static str {
     }
 }
 
+/// Bonded width for a session: the `WARREN_MULTIHOP_CONNS` env override
+/// when set, else the deployer-configured `n_connections`, clamped to
+/// the bundle's hard cap. Pure so the resolution is unit-testable
+/// without touching the process environment.
+fn resolve_bonded_want(configured: usize, env_override: Option<usize>) -> usize {
+    env_override
+        .unwrap_or(configured)
+        .clamp(1, MAX_BONDED_CONNECTIONS)
+}
+
 /// Bind address for a bonded secondary dial: the primary's IP with the
 /// port forced to 0 (kernel-picked). Every bonded connection needs its
 /// own UDP socket; reusing a caller-pinned non-zero `bind_addr` port
@@ -1845,6 +1861,38 @@ mod tests {
             on_path_rtt: None,
             session_token_provider: None,
         }
+    }
+
+    #[test]
+    fn bonded_want_keeps_the_configured_width_without_an_override() {
+        assert_eq!(resolve_bonded_want(1, None), 1);
+        assert_eq!(resolve_bonded_want(4, None), 4);
+        assert_eq!(
+            resolve_bonded_want(0, None),
+            1,
+            "a zero config still dials the mandatory primary"
+        );
+        assert_eq!(resolve_bonded_want(99, None), MAX_BONDED_CONNECTIONS);
+    }
+
+    #[test]
+    fn bonded_want_env_override_wins_over_the_configured_width() {
+        assert_eq!(
+            resolve_bonded_want(1, Some(4)),
+            4,
+            "the A/B env override must widen a deployer stuck on the default width"
+        );
+        assert_eq!(
+            resolve_bonded_want(8, Some(1)),
+            1,
+            "the override must also narrow, as the rollback lever"
+        );
+        assert_eq!(resolve_bonded_want(1, Some(99)), MAX_BONDED_CONNECTIONS);
+        assert_eq!(
+            resolve_bonded_want(4, Some(0)),
+            1,
+            "a zero override is clamped to the mandatory primary, never zero sessions"
+        );
     }
 
     #[tokio::test]

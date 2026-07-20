@@ -254,6 +254,14 @@ pub const REGISTRY: &[KnobMeta] = &[
         home: "warrenguard-transport-core/src/transport_config.rs",
     },
     KnobMeta {
+        name: "WARREN_MULTIHOP_CONNS",
+        kind: "usize",
+        default: "0 (deployer-configured n_connections)",
+        clamp: "unset/0/garbage -> deployer value; else clamped to [1, 8]",
+        effect: "bonded QUIC connections per multi-hop session (overrides the deployer's SupervisorConfig::n_connections for A/B rollouts without a rebuild); N sessions under one identity share one inner IP, flows shard sticky per 5-tuple",
+        home: "warrenguard-transport/src/supervisor.rs",
+    },
+    KnobMeta {
         name: "WARREN_ENABLE_TCP_FALLBACK",
         kind: "bool",
         default: "on",
@@ -388,6 +396,33 @@ pub fn parse_client_initial_mtu(raw: Option<&str>) -> u16 {
         .unwrap_or(crate::TUNNEL_INITIAL_MTU)
 }
 
+/// Ceiling on the `WARREN_MULTIHOP_CONNS` override, mirroring
+/// `MAX_BONDED_CONNECTIONS` in warrenguard-transport (importing it here would
+/// invert the crate dependency). The supervisor re-clamps against the real
+/// constant, so a drift here can never over-provision a bundle.
+const MULTIHOP_CONNS_MAX: usize = 8;
+
+/// Parses the bonded multi-hop width override (`WARREN_MULTIHOP_CONNS`).
+/// Absent or `0` yields `None` (keep the deployer-configured
+/// `n_connections`); unparsable warns and yields `None`; a positive value
+/// is clamped to `[1, MULTIHOP_CONNS_MAX]`.
+#[must_use]
+pub fn parse_multihop_conns(raw: Option<&str>) -> Option<usize> {
+    let s = raw?;
+    match s.trim().parse::<usize>() {
+        Ok(0) => None,
+        Ok(n) => Some(n.min(MULTIHOP_CONNS_MAX)),
+        Err(_) => {
+            tracing::warn!(
+                knob = "WARREN_MULTIHOP_CONNS",
+                value = s,
+                "unparsable usize, ignoring"
+            );
+            None
+        }
+    }
+}
+
 /// Floor of the TCP-carrier race head start: below this a healthy UDP path would
 /// pay a same-RTT TCP dial on essentially every connect.
 const TCP_FALLBACK_RACE_MIN_MS: u64 = 100;
@@ -483,6 +518,19 @@ pub fn initial_window() -> Option<u64> {
             "WARREN_INITIAL_WINDOW",
             std::env::var("WARREN_INITIAL_WINDOW").ok().as_deref(),
         )
+    })
+}
+
+/// `WARREN_MULTIHOP_CONNS`: bonded multi-hop width override. `None`
+/// (default) keeps the deployer-configured
+/// `SupervisorConfig::n_connections`; `Some(n)` overrides it, letting an
+/// operator A/B the bonded width on any deployer binary without a
+/// rebuild. Read once.
+#[must_use]
+pub fn multihop_conns_override() -> Option<usize> {
+    static CACHE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        parse_multihop_conns(std::env::var("WARREN_MULTIHOP_CONNS").ok().as_deref())
     })
 }
 
@@ -1021,6 +1069,36 @@ mod tests {
         assert_eq!(
             parse_client_initial_mtu(Some("1500")),
             crate::TUNNEL_INITIAL_MTU
+        );
+    }
+
+    #[test]
+    fn multihop_conns_absent_zero_or_garbage_keeps_deployer_value() {
+        assert_eq!(
+            parse_multihop_conns(None),
+            None,
+            "unset must keep the deployer-configured n_connections"
+        );
+        assert_eq!(
+            parse_multihop_conns(Some("0")),
+            None,
+            "0 means 'no override' (the registry's 0=deployer-value convention)"
+        );
+        assert_eq!(
+            parse_multihop_conns(Some("four")),
+            None,
+            "garbage must never change the bonded width"
+        );
+    }
+
+    #[test]
+    fn multihop_conns_positive_values_clamp_to_the_bonded_cap() {
+        assert_eq!(parse_multihop_conns(Some("1")), Some(1));
+        assert_eq!(parse_multihop_conns(Some("4")), Some(4));
+        assert_eq!(
+            parse_multihop_conns(Some("99")),
+            Some(MULTIHOP_CONNS_MAX),
+            "an over-cap request clamps to the MAX_BONDED_CONNECTIONS mirror, never past it"
         );
     }
 
