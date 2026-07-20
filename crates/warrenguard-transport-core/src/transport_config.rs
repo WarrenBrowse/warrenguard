@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use quinn::TransportConfig;
 use quinn::congestion::{BbrConfig, ControllerFactory, CubicConfig, NewRenoConfig};
-use quinn::{DatagramAqmConfig, IdleTimeout, MtuDiscoveryConfig, VarInt};
+use quinn::{DatagramAqmConfig, DatagramBdpBufferConfig, IdleTimeout, MtuDiscoveryConfig, VarInt};
 use warrenguard_config::{
     PADDED_INITIAL_MIN_SIZE, QUIC_DATAGRAM_RECV_BUFFER, QUIC_DATAGRAM_SEND_BUFFER,
     QUIC_DATAGRAM_SEND_BUFFER_EXIT, QUIC_KEEP_ALIVE_INTERVAL_SECS,
@@ -167,6 +167,7 @@ fn apply_datagram_aqm(cfg: &mut TransportConfig) {
         warrenguard_config::knobs::dg_aqm_enabled(),
         warrenguard_config::knobs::dg_aqm_target_ms(),
         warrenguard_config::knobs::dg_aqm_interval_ms(),
+        warrenguard_config::knobs::dg_fq_queues(),
     );
 }
 
@@ -177,6 +178,7 @@ fn apply_datagram_aqm_values(
     enabled: bool,
     target_ms: u64,
     interval_ms: u64,
+    flow_queues: usize,
 ) {
     if !enabled {
         cfg.datagram_send_aqm(None);
@@ -184,14 +186,44 @@ fn apply_datagram_aqm_values(
     }
     let mut aqm = DatagramAqmConfig::default();
     aqm.target(Duration::from_millis(target_ms))
-        .interval(Duration::from_millis(interval_ms));
+        .interval(Duration::from_millis(interval_ms))
+        .flow_queues(flow_queues);
     cfg.datagram_send_aqm(Some(aqm));
+}
+
+/// BDP-adaptive datagram send-buffer sizing knobs. The fixed 4/16 MiB caps
+/// are 1-2 orders of magnitude above a slow last mile's real BDP, so the
+/// CoDel AQM had a deep standing queue to fight; the adaptation shrinks the
+/// buffer toward `mult x` the path's measured BDP (BBR bandwidth x min_rtt)
+/// so the queue the AQM polices stays shallow by construction. `WARREN_DG_BDP_BUF=0`
+/// is the production kill switch (fixed sizing restored, WARREN_DG_SEND_BUF
+/// stays the manual override/cap either way).
+fn apply_bdp_buffer(cfg: &mut TransportConfig) {
+    apply_bdp_buffer_values(
+        cfg,
+        warrenguard_config::knobs::dg_bdp_buf_enabled(),
+        warrenguard_config::knobs::dg_bdp_mult(),
+        warrenguard_config::knobs::dg_bdp_floor(),
+    );
+}
+
+/// Pure seam of [`apply_bdp_buffer`], testable without the process
+/// environment.
+fn apply_bdp_buffer_values(cfg: &mut TransportConfig, enabled: bool, mult: u64, floor: usize) {
+    if !enabled {
+        cfg.datagram_send_buffer_bdp(None);
+        return;
+    }
+    let mut bdp = DatagramBdpBufferConfig::default();
+    bdp.multiple(mult as f64).floor(floor);
+    cfg.datagram_send_buffer_bdp(Some(bdp));
 }
 
 fn warren_transport_config_base_with_pad(enable_gso: bool, pad_to_mtu: bool) -> TransportConfig {
     let mut cfg = TransportConfig::default();
     apply_congestion_controller(&mut cfg);
     apply_datagram_aqm(&mut cfg);
+    apply_bdp_buffer(&mut cfg);
     cfg.initial_mtu(TUNNEL_INITIAL_MTU)
         .min_mtu(TUNNEL_MIN_MTU)
         .mtu_discovery_config(Some(MtuDiscoveryConfig::default()))
@@ -693,7 +725,7 @@ mod tests {
     #[test]
     fn datagram_aqm_off_renders_none() {
         let mut cfg = TransportConfig::default();
-        apply_datagram_aqm_values(&mut cfg, false, 15, 100);
+        apply_datagram_aqm_values(&mut cfg, false, 15, 100, 1024);
         let rendered = format!("{cfg:?}");
         assert!(
             rendered.contains("datagram_send_aqm: None"),
@@ -704,11 +736,64 @@ mod tests {
     #[test]
     fn datagram_aqm_tuned_values_reach_the_config() {
         let mut cfg = TransportConfig::default();
-        apply_datagram_aqm_values(&mut cfg, true, 25, 200);
+        apply_datagram_aqm_values(&mut cfg, true, 25, 200, 128);
         let rendered = format!("{cfg:?}");
         assert!(
-            rendered.contains("target: 25ms") && rendered.contains("interval: 200ms"),
+            rendered.contains("target: 25ms")
+                && rendered.contains("interval: 200ms")
+                && rendered.contains("flow_queues: 128"),
             "tuned AQM values must reach the transport config, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn datagram_fq_single_queue_fallback_reaches_the_config() {
+        // WARREN_DG_FQ_QUEUES=1 is the per-flow-fairness A/B lever: it must
+        // collapse the AQM to one shared queue (plain CoDel), not disable it.
+        let mut cfg = TransportConfig::default();
+        apply_datagram_aqm_values(&mut cfg, true, 15, 100, 1);
+        let rendered = format!("{cfg:?}");
+        assert!(
+            rendered.contains("datagram_send_aqm: Some") && rendered.contains("flow_queues: 1"),
+            "single-queue fallback must keep the AQM on, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn default_configs_carry_the_bdp_adaptive_buffer() {
+        // The adaptive buffer is the root fix for the fixed-cap bufferbloat;
+        // it must be on by default on BOTH sides of the tunnel.
+        for cfg in [
+            warren_transport_config_client(),
+            warren_transport_config_exit(),
+        ] {
+            let rendered = format!("{cfg:?}");
+            assert!(
+                rendered.contains("datagram_send_buffer_bdp: Some"),
+                "BDP-adaptive sizing must default on, got: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn bdp_buffer_off_renders_none() {
+        let mut cfg = TransportConfig::default();
+        apply_bdp_buffer_values(&mut cfg, false, 4, 256 * 1024);
+        let rendered = format!("{cfg:?}");
+        assert!(
+            rendered.contains("datagram_send_buffer_bdp: None"),
+            "the kill switch must restore fixed sizing, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn bdp_buffer_tuned_values_reach_the_config() {
+        let mut cfg = TransportConfig::default();
+        apply_bdp_buffer_values(&mut cfg, true, 2, 128 * 1024);
+        let rendered = format!("{cfg:?}");
+        assert!(
+            rendered.contains("multiple: 2.0") && rendered.contains("floor: 131072"),
+            "tuned BDP-buffer values must reach the transport config, got: {rendered}"
         );
     }
 

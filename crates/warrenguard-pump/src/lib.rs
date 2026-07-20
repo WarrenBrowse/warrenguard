@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
-use quinn::{Connection, SendDatagramError};
+use quinn::{Connection, DatagramClass, SendDatagramError};
 use warrenguard_ratelimit::IdentityLimiter;
 use warrenguard_wire::WarrenPubkey;
 
@@ -277,7 +277,10 @@ fn send_datagram_drop_too_large_pooled(
         return Ok(());
     }
     let pkt_len = pkt.len();
-    if let Err(e) = conn.send_datagram(pool.wrap(pkt)) {
+    // The payload IS the inner IP packet on this plain-TUN path: classify
+    // in place for the ECN distribution counters and per-flow queueing.
+    let class = DatagramClass::of_inner_ip_packet(&pkt);
+    if let Err(e) = conn.send_datagram_classified(pool.wrap(pkt), class) {
         if matches!(e, SendDatagramError::TooLarge) {
             record_uplink_too_large_drop(pkt_len, conn.max_datagram_size());
             return Ok(());
@@ -304,7 +307,10 @@ pub fn send_datagram_drop_too_large(conn: &Connection, pkt: Vec<u8>) -> Result<(
         return Ok(());
     }
     let pkt_len = pkt.len();
-    if let Err(e) = conn.send_datagram(Bytes::from(pkt)) {
+    // The payload IS the inner IP packet on this plain-TUN path: classify
+    // in place for the ECN distribution counters and per-flow queueing.
+    let class = DatagramClass::of_inner_ip_packet(&pkt);
+    if let Err(e) = conn.send_datagram_classified(Bytes::from(pkt), class) {
         // Typed `SendDatagramError::TooLarge` signal instead of string
         // matching. The `max_datagram_size()` pre-check catches most
         // cases; this path is the safety net for the PMTU race (PMTU

@@ -31,7 +31,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ed25519_dalek::SigningKey;
 use hkdf::Hkdf;
 use parking_lot::Mutex;
-use quinn::{Connection, Endpoint, SendDatagramError, SendStream, VarInt};
+use quinn::{Connection, DatagramClass, Endpoint, SendDatagramError, SendStream, VarInt};
 use sha2::Sha256;
 use thiserror::Error;
 use tokio::sync::watch;
@@ -3607,6 +3607,10 @@ async fn serve_one_connection_with_tun<T>(
                 continue;
             }
             let seq = reverse_seq_tx.fetch_add(1, Ordering::AcqRel);
+            // Classify while the plaintext is still readable: the sealed
+            // frame is opaque to quinn, so the inner ECN/flow key must
+            // travel with the datagram.
+            let class = DatagramClass::of_inner_ip_packet(&packet);
             let frame = match session.seal_response_owned(packet, epoch, seq) {
                 Ok(f) => f,
                 Err(_) => continue,
@@ -3615,7 +3619,7 @@ async fn serve_one_connection_with_tun<T>(
                 Ok(b) => b,
                 Err(_) => continue,
             };
-            match conn_tx.send_datagram(bytes.into()) {
+            match conn_tx.send_datagram_classified(bytes.into(), class) {
                 Ok(()) => {}
                 // Transient PMTU dip under loss: drop, never die (see
                 // the DAITA tx_task below for the full rationale).
@@ -3845,6 +3849,8 @@ async fn serve_pq_datagram_pump<T>(
                 continue;
             }
             let seq = reverse_seq_tx.fetch_add(1, Ordering::AcqRel);
+            // Same plaintext-side classification as the v1 tx_task above.
+            let class = DatagramClass::of_inner_ip_packet(&packet);
             let frame = match session.seal_response(&packet, epoch, seq) {
                 Ok(f) => f,
                 Err(_) => continue,
@@ -3853,7 +3859,7 @@ async fn serve_pq_datagram_pump<T>(
                 Ok(b) => b,
                 Err(_) => continue,
             };
-            match conn_tx.send_datagram(bytes.into()) {
+            match conn_tx.send_datagram_classified(bytes.into(), class) {
                 Ok(()) => {}
                 Err(SendDatagramError::TooLarge) => {}
                 Err(_) => return,
@@ -4333,6 +4339,8 @@ async fn serve_one_connection_with_tun_and_daita<T>(
             // the new events may have scheduled a SendPadding action timer.
             daita_tx.lock().on_real_uplink_sent(Instant::now());
             state_changed_tx.notify_one();
+            // Same plaintext-side classification as the non-DAITA tx_task.
+            let class = DatagramClass::of_inner_ip_packet(&packet);
             let frame = match session.seal_response_owned(packet, epoch, seq) {
                 Ok(f) => f,
                 Err(_) => {
@@ -4347,7 +4355,7 @@ async fn serve_one_connection_with_tun_and_daita<T>(
                     continue;
                 }
             };
-            match conn_tx.send_datagram(bytes.into()) {
+            match conn_tx.send_datagram_classified(bytes.into(), class) {
                 Ok(()) => sent += 1,
                 // Transient: Quinn's black-hole detector can lower the
                 // path-MTU estimate under a loss burst, making an

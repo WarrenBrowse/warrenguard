@@ -55,6 +55,14 @@ pub struct PathProbeDelta {
     pub dg_dropped_aqm: u64,
     /// Outgoing datagrams evicted oldest-first on send-buffer overflow.
     pub dg_dropped_overflow: u64,
+    /// Enqueued inner packets classified Not-ECT.
+    pub ecn_not_ect: u64,
+    /// Enqueued inner packets classified ECT(0).
+    pub ecn_ect0: u64,
+    /// Enqueued inner packets classified ECT(1).
+    pub ecn_ect1: u64,
+    /// Enqueued inner packets classified CE.
+    pub ecn_ce: u64,
 }
 
 impl PathProbeDelta {
@@ -80,6 +88,22 @@ impl PathProbeDelta {
                 .datagram_tx
                 .dropped_overflow
                 .saturating_sub(prev.datagram_tx.dropped_overflow),
+            ecn_not_ect: cur
+                .datagram_tx
+                .ecn_not_ect
+                .saturating_sub(prev.datagram_tx.ecn_not_ect),
+            ecn_ect0: cur
+                .datagram_tx
+                .ecn_ect0
+                .saturating_sub(prev.datagram_tx.ecn_ect0),
+            ecn_ect1: cur
+                .datagram_tx
+                .ecn_ect1
+                .saturating_sub(prev.datagram_tx.ecn_ect1),
+            ecn_ce: cur
+                .datagram_tx
+                .ecn_ce
+                .saturating_sub(prev.datagram_tx.ecn_ce),
         }
     }
 
@@ -177,6 +201,10 @@ pub fn spawn_path_probe(
                         dg_buf_free = conn.datagram_send_buffer_space(),
                         dg_drop_aqm = delta.dg_dropped_aqm,
                         dg_drop_full = delta.dg_dropped_overflow,
+                        ecn_not = delta.ecn_not_ect,
+                        ecn_ect0 = delta.ecn_ect0,
+                        ecn_ect1 = delta.ecn_ect1,
+                        ecn_ce = delta.ecn_ce,
                         udp_gso = format_args!("{:.1}", delta.udp_gso_ratio()),
                         app_tx,
                         app_rx,
@@ -196,6 +224,10 @@ pub fn spawn_path_probe(
                         dg_buf_free = conn.datagram_send_buffer_space(),
                         dg_drop_aqm = delta.dg_dropped_aqm,
                         dg_drop_full = delta.dg_dropped_overflow,
+                        ecn_not = delta.ecn_not_ect,
+                        ecn_ect0 = delta.ecn_ect0,
+                        ecn_ect1 = delta.ecn_ect1,
+                        ecn_ce = delta.ecn_ce,
                         udp_gso = format_args!("{:.1}", delta.udp_gso_ratio()),
                         "path probe"
                     ),
@@ -260,6 +292,27 @@ mod tests {
         let d = PathProbeDelta::between(&prev, &cur);
         assert_eq!(d.dg_dropped_aqm, 7);
         assert_eq!(d.dg_dropped_overflow, 5);
+    }
+
+    #[test]
+    fn between_computes_ecn_distribution_deltas() {
+        // The inner-ECN counters are the measurement basis for any future
+        // mark-vs-drop decision; the probe must surface them per interval.
+        let mut prev = stats_with(100, 0, 0, 90, 80, 95, 10);
+        prev.datagram_tx.ecn_not_ect = 50;
+        prev.datagram_tx.ecn_ect0 = 5;
+        prev.datagram_tx.ecn_ect1 = 1;
+        prev.datagram_tx.ecn_ce = 0;
+        let mut cur = stats_with(200, 0, 0, 180, 160, 190, 20);
+        cur.datagram_tx.ecn_not_ect = 130;
+        cur.datagram_tx.ecn_ect0 = 12;
+        cur.datagram_tx.ecn_ect1 = 4;
+        cur.datagram_tx.ecn_ce = 2;
+        let d = PathProbeDelta::between(&prev, &cur);
+        assert_eq!(d.ecn_not_ect, 80);
+        assert_eq!(d.ecn_ect0, 7);
+        assert_eq!(d.ecn_ect1, 3);
+        assert_eq!(d.ecn_ce, 2);
     }
 
     #[test]

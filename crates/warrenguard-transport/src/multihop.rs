@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use parking_lot::{Mutex, RwLock};
-use quinn::{Connection, Endpoint, TransportConfig};
+use quinn::{Connection, DatagramClass, Endpoint, TransportConfig};
 use thiserror::Error;
 use warrenguard_backoff::Backoff;
 use warrenguard_config::ALPN_H3;
@@ -1705,9 +1705,14 @@ impl MultiHopClient {
         #[cfg(feature = "pq-hpke")]
         self.maybe_resend_pq_setup_ping();
 
+        // Classify while the plaintext is still readable: the sealed frame
+        // is opaque to quinn, so the inner ECN/flow key must travel with
+        // the datagram (cover dummies classify to the unclassified default).
+        let class = DatagramClass::of_inner_ip_packet(payload);
         let bytes = self.seal_next_forward_frame(payload)?;
         let wire_len = bytes.len() as u64;
-        self.conn.send_datagram(Bytes::from(bytes))?;
+        self.conn
+            .send_datagram_classified(Bytes::from(bytes), class)?;
         self.frames_in_epoch.fetch_add(1, Ordering::AcqRel);
         self.metrics.frames_sent.fetch_add(1, Ordering::Relaxed);
         self.metrics

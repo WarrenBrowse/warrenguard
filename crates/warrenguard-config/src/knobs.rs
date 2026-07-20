@@ -102,6 +102,38 @@ pub const REGISTRY: &[KnobMeta] = &[
         home: "warrenguard-transport-core/src/transport_config.rs",
     },
     KnobMeta {
+        name: "WARREN_DG_FQ_QUEUES",
+        kind: "usize",
+        default: "1024",
+        clamp: "clamped to [1, 65536]; unparsable -> default",
+        effect: "flow-queue count of the datagram send AQM (FQ-CoDel per-flow fairness); 1 = single shared queue (plain CoDel fallback)",
+        home: "warrenguard-transport-core/src/transport_config.rs",
+    },
+    KnobMeta {
+        name: "WARREN_DG_BDP_BUF",
+        kind: "bool",
+        default: "on",
+        clamp: "\"0\"/\"false\"/\"no\"/\"off\" disables, else on",
+        effect: "BDP-adaptive datagram send-buffer sizing (shrinks the fixed 4/16 MiB cap toward the path's measured BDP)",
+        home: "warrenguard-transport-core/src/transport_config.rs",
+    },
+    KnobMeta {
+        name: "WARREN_DG_BDP_MULT",
+        kind: "u64",
+        default: "4",
+        clamp: "clamped to [1, 64]; unparsable -> default",
+        effect: "adaptive send-buffer size as a multiple of the smoothed BDP estimate",
+        home: "warrenguard-transport-core/src/transport_config.rs",
+    },
+    KnobMeta {
+        name: "WARREN_DG_BDP_FLOOR",
+        kind: "usize (bytes)",
+        default: "262144 (256 KiB)",
+        clamp: "clamped to [16384, 64 MiB]; unparsable -> default",
+        effect: "lower bound of the adaptive send buffer (ramp-up and tiny-BDP guard)",
+        home: "warrenguard-transport-core/src/transport_config.rs",
+    },
+    KnobMeta {
         name: "WARREN_UPLINK_BATCH_MAX",
         kind: "usize",
         default: "1",
@@ -510,6 +542,62 @@ pub fn dg_aqm_interval_ms() -> u64 {
             10_000,
             100,
         ) as u64
+    })
+}
+
+/// `WARREN_DG_FQ_QUEUES`: flow-queue count of the datagram send AQM
+/// (FQ-CoDel). Clamped to `[1, 65536]`, default `1024`. `1` collapses to a
+/// single shared queue, byte-identical to the plain CoDel of fork.10 (the
+/// per-flow-fairness A/B lever).
+#[must_use]
+pub fn dg_fq_queues() -> usize {
+    static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        parse_usize_clamped(
+            std::env::var("WARREN_DG_FQ_QUEUES").ok().as_deref(),
+            1,
+            65_536,
+            1024,
+        )
+    })
+}
+
+/// `WARREN_DG_BDP_BUF`: BDP-adaptive datagram send-buffer sizing. Default
+/// on; `"0"`/`"false"`/`"no"`/`"off"` disables (production kill switch,
+/// restoring the fixed 4/16 MiB buffers).
+#[must_use]
+pub fn dg_bdp_buf_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| parse_bool_default_on(std::env::var("WARREN_DG_BDP_BUF").ok().as_deref()))
+}
+
+/// `WARREN_DG_BDP_MULT`: adaptive send-buffer size as a multiple of the
+/// smoothed BDP estimate. Clamped to `[1, 64]`, default `4`.
+#[must_use]
+pub fn dg_bdp_mult() -> u64 {
+    static CACHE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        parse_usize_clamped(
+            std::env::var("WARREN_DG_BDP_MULT").ok().as_deref(),
+            1,
+            64,
+            4,
+        ) as u64
+    })
+}
+
+/// `WARREN_DG_BDP_FLOOR`: lower bound of the adaptive send buffer in bytes.
+/// Clamped to `[16 KiB, 64 MiB]`, default `262144` (256 KiB).
+#[must_use]
+pub fn dg_bdp_floor() -> usize {
+    static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        parse_usize_clamped(
+            std::env::var("WARREN_DG_BDP_FLOOR").ok().as_deref(),
+            16 * 1024,
+            64 * 1024 * 1024,
+            256 * 1024,
+        )
     })
 }
 
