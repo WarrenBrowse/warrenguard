@@ -64,7 +64,7 @@ pub const REGISTRY: &[KnobMeta] = &[
     KnobMeta {
         name: "WARREN_INITIAL_WINDOW",
         kind: "u64",
-        default: "controller default",
+        default: "32 packets (~IW10-class)",
         clamp: "must be > 0, else warn + ignore",
         effect: "congestion-controller initial window (bytes)",
         home: "warrenguard-transport-core/src/transport_config.rs",

@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use quinn::TransportConfig;
-use quinn::congestion::{BbrConfig, CubicConfig, NewRenoConfig};
+use quinn::congestion::{BbrConfig, ControllerFactory, CubicConfig, NewRenoConfig};
 use quinn::{DatagramAqmConfig, IdleTimeout, MtuDiscoveryConfig, VarInt};
 use warrenguard_config::{
     QUIC_DATAGRAM_RECV_BUFFER, QUIC_DATAGRAM_SEND_BUFFER, QUIC_DATAGRAM_SEND_BUFFER_EXIT,
@@ -74,36 +74,69 @@ fn parse_cc_kind(cc: Option<&str>) -> CcKind {
     }
 }
 
-fn apply_congestion_controller(cfg: &mut TransportConfig) {
-    let cc_env = warrenguard_config::knobs::cc_choice();
-    let win = warrenguard_config::knobs::initial_window();
-    let kind = parse_cc_kind(cc_env);
-    if cc_env.is_some() || win.is_some() {
-        tracing::info!(?kind, initial_window = ?win, "transport CC override active");
-    }
+/// Warren default congestion-controller initial window, in QUIC packets.
+///
+/// RFC 9001 recommends IW10 (10 packets). Upstream quinn ships BBR at 200
+/// packets (`K_MAX_INITIAL_CONGESTION_WINDOW`), a ~240 KB first burst that
+/// overruns a lossy last mile before any congestion feedback returns: the exact
+/// shape of the bufferbloat stall. 32 packets keeps a brisk handshake ramp while
+/// staying IW10-class. `WARREN_INITIAL_WINDOW` overrides it (any value > 0).
+const DEFAULT_INITIAL_WINDOW_PACKETS: u64 = 32;
+
+/// The Warren default initial window in bytes: [`DEFAULT_INITIAL_WINDOW_PACKETS`]
+/// packets of the conservative QUIC datagram floor
+/// ([`warrenguard_config::TUNNEL_MIN_MTU`], the same 1200 B unit quinn's
+/// controllers meter their windows in). Derived rather than a literal so the
+/// packet count is the single knob.
+fn default_initial_window_bytes() -> u64 {
+    DEFAULT_INITIAL_WINDOW_PACKETS * u64::from(warrenguard_config::TUNNEL_MIN_MTU)
+}
+
+/// Effective initial window for a fresh controller: the `WARREN_INITIAL_WINDOW`
+/// override when set (already validated `> 0` by the knob registry), else the
+/// Warren default. Every transport profile funnels through here via
+/// [`apply_congestion_controller`], so the default applies uniformly to the
+/// client, exit, relay, and multihop configs.
+fn effective_initial_window(override_win: Option<u64>) -> u64 {
+    override_win.unwrap_or_else(default_initial_window_bytes)
+}
+
+/// Builds the congestion-controller factory for `kind`, seeding its initial
+/// window with `win`. The single construction site: the window is set exactly
+/// once (never double-set against the controller's own default) and cannot skew
+/// between controllers.
+fn congestion_controller_factory(
+    kind: CcKind,
+    win: u64,
+) -> Arc<dyn ControllerFactory + Send + Sync> {
     match kind {
         CcKind::Bbr => {
             let mut bbr = BbrConfig::default();
-            if let Some(w) = win {
-                bbr.initial_window(w);
-            }
-            cfg.congestion_controller_factory(Arc::new(bbr));
+            bbr.initial_window(win);
+            Arc::new(bbr)
         }
         CcKind::Cubic => {
             let mut cubic = CubicConfig::default();
-            if let Some(w) = win {
-                cubic.initial_window(w);
-            }
-            cfg.congestion_controller_factory(Arc::new(cubic));
+            cubic.initial_window(win);
+            Arc::new(cubic)
         }
         CcKind::NewReno => {
             let mut nr = NewRenoConfig::default();
-            if let Some(w) = win {
-                nr.initial_window(w);
-            }
-            cfg.congestion_controller_factory(Arc::new(nr));
+            nr.initial_window(win);
+            Arc::new(nr)
         }
     }
+}
+
+fn apply_congestion_controller(cfg: &mut TransportConfig) {
+    let cc_env = warrenguard_config::knobs::cc_choice();
+    let win_override = warrenguard_config::knobs::initial_window();
+    let kind = parse_cc_kind(cc_env);
+    let win = effective_initial_window(win_override);
+    if cc_env.is_some() || win_override.is_some() {
+        tracing::info!(?kind, initial_window = win, "transport CC override active");
+    }
+    cfg.congestion_controller_factory(congestion_controller_factory(kind, win));
 }
 
 /// Datagram send-buffer size: `WARREN_DG_SEND_BUF` (bytes) overrides the
@@ -676,6 +709,52 @@ mod tests {
         assert!(
             rendered.contains("target: 25ms") && rendered.contains("interval: 200ms"),
             "tuned AQM values must reach the transport config, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn default_initial_window_is_32_packets_not_quinn_200() {
+        // RFC 9001 IW10-class. Upstream quinn inherits BBR's 200-packet
+        // (~240 KB at the 1200 B floor) initial burst; the Warren default caps
+        // it at 32 packets so the very first send cannot overrun a lossy last
+        // mile before any congestion feedback returns.
+        let base = u64::from(warrenguard_config::TUNNEL_MIN_MTU);
+        assert_eq!(default_initial_window_bytes(), 32 * base);
+        assert_ne!(
+            default_initial_window_bytes(),
+            200 * base,
+            "must not inherit quinn's 200-packet BBR default"
+        );
+    }
+
+    #[test]
+    fn client_and_exit_profiles_start_the_controller_at_32_packets() {
+        // Every transport profile (client, exit, relay, multihop) funnels its
+        // congestion controller through `congestion_controller_factory`. Assert
+        // the default window reaching a freshly built controller is 32 packets
+        // for each controller kind, with no override present.
+        use std::time::Instant;
+        let expected = 32 * u64::from(warrenguard_config::TUNNEL_MIN_MTU);
+        let win = effective_initial_window(None);
+        for kind in [CcKind::Bbr, CcKind::Cubic, CcKind::NewReno] {
+            let factory = congestion_controller_factory(kind, win);
+            let controller = factory.build(Instant::now(), warrenguard_config::TUNNEL_MIN_MTU);
+            assert_eq!(
+                controller.initial_window(),
+                expected,
+                "{kind:?} default initial window must be 32 packets, not quinn's 200"
+            );
+        }
+    }
+
+    #[test]
+    fn initial_window_override_wins_over_the_default() {
+        // The WARREN_INITIAL_WINDOW override (validated > 0 by the knob
+        // registry) must take precedence over the Warren default.
+        assert_eq!(effective_initial_window(Some(123_456)), 123_456);
+        assert_eq!(
+            effective_initial_window(None),
+            default_initial_window_bytes()
         );
     }
 

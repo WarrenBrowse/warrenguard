@@ -50,7 +50,7 @@ knob in `REGISTRY` must appear in the table below, or the test fails.
 | Variable | Type | Default | Clamp / validation | Effect | Home |
 |---|---|---|---|---|---|
 | `WARREN_CC` | enum {bbr,cubic,newreno} | bbr | unknown name -> warn + bbr | QUIC congestion controller (A/B bench lever) | warrenguard-transport-core/src/transport_config.rs |
-| `WARREN_INITIAL_WINDOW` | u64 | controller default | must be > 0, else warn + ignore | congestion-controller initial window (bytes) | warrenguard-transport-core/src/transport_config.rs |
+| `WARREN_INITIAL_WINDOW` | u64 | 32 packets (~IW10-class) | must be > 0, else warn + ignore | congestion-controller initial window (bytes) | warrenguard-transport-core/src/transport_config.rs |
 | `WARREN_DG_SEND_BUF` | usize (bytes) | per-side default (client 4 MiB / exit 16 MiB) | must be > 0, capped at 64 MiB | QUIC datagram send-buffer cap per connection | warrenguard-transport-core/src/transport_config.rs |
 | `WARREN_DG_AQM` | bool | on | "0"/"false"/"no"/"off" disables, else on | CoDel AQM on the QUIC datagram send queue (bounds queue latency on slow last miles) | warrenguard-transport-core/src/transport_config.rs |
 | `WARREN_DG_AQM_TARGET_MS` | u64 (ms) | 15 | clamped to [1, 1000]; unparsable -> default | AQM sojourn-time target: queue latency persistently above it starts head-dropping | warrenguard-transport-core/src/transport_config.rs |
