@@ -2331,6 +2331,66 @@ async fn next_downlink<T: PacketDevice>(
     }
 }
 
+/// Process-wide count of downlink packets tail-dropped by the over-read
+/// backpressure gate. Kept observable (rate-limited log) so the early-drop
+/// volume can be A/B-compared against the fork's CoDel `dropped_overflow`
+/// stat when tuning `WARREN_EXIT_OVERREAD_GATE`.
+static OVERREAD_GATE_DROPS: AtomicU64 = AtomicU64::new(0);
+
+/// Fallback MTU when the peer has not yet advertised a datagram frame size
+/// (`max_datagram_size()` is `None`): the Warren tunnel floor.
+const OVERREAD_GATE_FALLBACK_MTU: usize = 1280;
+
+/// Exit downlink over-read backpressure: `true` when this packet must be
+/// tail-dropped because `conn`'s datagram send buffer is within `gate_mtus`
+/// MTUs of full.
+///
+/// With N multi-queue TUN readers feeding one client's single QUIC connection,
+/// the aggregate read rate can far exceed the connection's BBR-limited drain
+/// rate. The excess piles into the datagram send buffer until the fork's CoDel
+/// head-drops (and `send_datagram`'s overflow drops) the OLDEST in-flight
+/// datagrams, which is exactly what the inner TCP is waiting to ACK, spiking
+/// its retransmits. Dropping the NEWEST packet at the reader keeps the standing
+/// queue shallow, so inner-TCP RTT and loss recovery stay fast.
+///
+/// `datagram_send_buffer_space()` is relative to the LIVE (BDP-adaptive) buffer
+/// limit, so a small MTU-multiple low-water stays correct as fork.11 shrinks
+/// the buffer toward the path BDP (no fixed-16-MiB constant). `gate_mtus == 0`
+/// disables the gate; when the buffer has room it is a no-op, so the gate can
+/// only ever reduce occupancy.
+fn overread_gate_should_drop(conn: &Connection, gate_mtus: usize) -> bool {
+    if gate_mtus == 0 {
+        return false;
+    }
+    let mtu = conn
+        .max_datagram_size()
+        .unwrap_or(OVERREAD_GATE_FALLBACK_MTU);
+    if !overread_should_drop(conn.datagram_send_buffer_space(), mtu, gate_mtus) {
+        return false;
+    }
+    let n = OVERREAD_GATE_DROPS.fetch_add(1, Ordering::Relaxed);
+    if n.is_multiple_of(50_000) {
+        tracing::debug!(
+            total_drops = n + 1,
+            "exit downlink over-read gate: tail-drop (rate-limited log)"
+        );
+    }
+    true
+}
+
+/// Pure over-read decision: drop when fewer than `gate_mtus` MTUs of buffer
+/// `space` remain. `gate_mtus == 0` disables the gate. The threshold scales
+/// with `mtu` (the connection's live datagram size), so it stays relative to
+/// the BDP-adaptive buffer rather than a fixed byte constant. Split out from
+/// the connection read so the boundary/relative-keying logic is unit-testable
+/// without a live QUIC connection.
+fn overread_should_drop(space: usize, mtu: usize, gate_mtus: usize) -> bool {
+    if gate_mtus == 0 {
+        return false;
+    }
+    space < gate_mtus.saturating_mul(mtu)
+}
+
 /// Multi-hop termination with TUN bridge.
 ///
 /// Variant of [`serve_multihop_echo`] that forwards opened plaintext
@@ -2921,6 +2981,18 @@ pub struct ExitTerminateCtx<T: PacketDevice + Clone> {
     /// stays v4-only, firewall keeps native v6 blocked - no leak).
     ip_allocator_v6: Option<Arc<Mutex<IpAllocatorV6>>>,
     router: Option<Arc<MultihopTunRouter>>,
+    /// TUN queues connections write their uplink onto. One entry (the primary
+    /// `tun`) in the single-queue default; N entries when the deployer opens an
+    /// `IFF_MULTI_QUEUE` TUN and calls [`Self::with_extra_tun_queues`]. Each
+    /// accepted connection is pinned round-robin to one queue via
+    /// [`Self::pick_uplink_tun`], so N connections write to N distinct kernel
+    /// fds in parallel instead of contending on one. `Arc` so the per-connection
+    /// ctx clone is a refcount bump, not a Vec copy.
+    uplink_queues: Arc<Vec<T>>,
+    /// Round-robin cursor over `uplink_queues`, shared across the per-connection
+    /// ctx clones (hence `Arc`) so connections spread across the queues instead
+    /// of every clone starting at 0 and piling onto queue 0.
+    next_uplink: Arc<std::sync::atomic::AtomicUsize>,
     /// Exit allowlist gate. `Some` in strict mode (warren-api configured):
     /// a client must assert an allowlisted account pubkey before it is
     /// granted a tunnel IP. `None` in permissive/bench mode admits any
@@ -2983,6 +3055,8 @@ impl<T: PacketDevice + Clone> ExitTerminateCtx<T> {
             cache: Arc::new(SessionCache::new()),
             privkey: Arc::new(exit_x25519_privkey),
             exit_id,
+            uplink_queues: Arc::new(vec![tun.clone()]),
+            next_uplink: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             tun,
             daita: Arc::new(match daita_config {
                 Some(config) if config.is_enabled() => {
@@ -3002,6 +3076,56 @@ impl<T: PacketDevice + Clone> ExitTerminateCtx<T> {
             #[cfg(feature = "pq-hpke")]
             xwing_secret: None,
         }
+    }
+
+    /// Attach `extra` `IFF_MULTI_QUEUE` TUN queues (beyond the primary passed to
+    /// [`Self::new`]) so the exit runs one downlink reader task per queue and
+    /// spreads per-connection uplink writes across all queues. Wired by the
+    /// deployer from `warrenguard_config::knobs::exit_tun_queues()`: it opens N
+    /// queues with `RealTun::create_multi_queue_named`, keeps queue 0 as the
+    /// `new` primary, and hands the rest here.
+    ///
+    /// A downlink router reader is spawned for each extra queue ONLY when an IP
+    /// allocator is configured (the router exists), matching `new`'s primary
+    /// reader; the no-allocator legacy path stays single-queue. Passing an empty
+    /// `extra` is a no-op, so the single-queue default is byte-identical.
+    #[must_use]
+    pub fn with_extra_tun_queues(mut self, extra: Vec<T>) -> Self {
+        if extra.is_empty() {
+            return self;
+        }
+        if let Some(router) = self.router.clone() {
+            for q in &extra {
+                tokio::spawn(pump_multihop_tun_router(q.clone(), router.clone()));
+            }
+        }
+        let mut queues = Vec::with_capacity(self.uplink_queues.len() + extra.len());
+        queues.extend(self.uplink_queues.iter().cloned());
+        queues.extend(extra);
+        self.uplink_queues = Arc::new(queues);
+        self
+    }
+
+    /// The TUN queue this connection writes its uplink onto: round-robin across
+    /// the opened queues so N connections spread over N kernel fds. Collapses to
+    /// the single primary `tun` when only one queue is open (the default), so
+    /// the single-queue path picks exactly the historic handle.
+    fn pick_uplink_tun(&self) -> T {
+        let n = self.uplink_queues.len();
+        if n <= 1 {
+            return self.tun.clone();
+        }
+        let i = self
+            .next_uplink
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % n;
+        self.uplink_queues[i].clone()
+    }
+
+    /// Number of TUN queues this ctx fans out over (1 = single-queue default).
+    #[must_use]
+    pub fn tun_queue_count(&self) -> usize {
+        self.uplink_queues.len()
     }
 
     /// Sample the curated DAITA pool independently for every connection this
@@ -3160,7 +3284,10 @@ pub async fn terminate_connection<T>(
         ctx.privkey.clone(),
         ctx.exit_id,
         ctx.cache.clone(),
-        ctx.tun.clone(),
+        // Round-robin the connection onto one of the opened TUN queues so its
+        // uplink writes parallelize across kernel fds (single-queue = the
+        // primary `tun`, byte-identical to before).
+        ctx.pick_uplink_tun(),
         daita_pick,
         ctx.ip_allocator.clone(),
         ctx.ip_allocator_v6.clone(),
@@ -3586,6 +3713,14 @@ async fn serve_one_connection_with_tun<T>(
                 Some(p) => p,
                 None => return,
             };
+            // Over-read backpressure: drop the newest packet BEFORE sealing when
+            // the client's connection buffer is near full (see the gate helper).
+            if overread_gate_should_drop(
+                &conn_tx,
+                warrenguard_config::knobs::exit_overread_gate_mtus(),
+            ) {
+                continue;
+            }
             let (session, epoch) = match current_tx.lock().clone() {
                 Some(v) => v,
                 None => continue,
@@ -3828,6 +3963,14 @@ async fn serve_pq_datagram_pump<T>(
                 Some(p) => p,
                 None => return,
             };
+            // Over-read backpressure: drop the newest packet BEFORE sealing when
+            // the client's connection buffer is near full (see the gate helper).
+            if overread_gate_should_drop(
+                &conn_tx,
+                warrenguard_config::knobs::exit_overread_gate_mtus(),
+            ) {
+                continue;
+            }
             let (session, epoch) = match current_tx.lock().clone() {
                 Some(v) => v,
                 None => continue,
@@ -4307,6 +4450,16 @@ async fn serve_one_connection_with_tun_and_daita<T>(
                 None => return,
             };
             from_tun += 1;
+            // Over-read backpressure: drop the newest packet BEFORE sealing (and
+            // before the DAITA uplink-sent event, which must only fire for a
+            // packet that actually egresses) when the client's connection buffer
+            // is near full. See the gate helper.
+            if overread_gate_should_drop(
+                &conn_tx,
+                warrenguard_config::knobs::exit_overread_gate_mtus(),
+            ) {
+                continue;
+            }
             let (session, epoch) = match current_tx.lock().clone() {
                 Some(v) => v,
                 None => {
@@ -4546,6 +4699,145 @@ pub fn format_x25519_pubkey_hex(pub_key: &WarrenKemPublicKey) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- Downlink over-read backpressure gate ----
+
+    /// The gate is a kill-switchable safety, not a hard-coded behaviour: with
+    /// `gate_mtus == 0` it must NEVER drop, even when the send buffer is empty.
+    #[test]
+    fn overread_gate_disabled_never_drops() {
+        assert!(
+            !overread_should_drop(0, 1280, 0),
+            "disabled gate must pass a full buffer"
+        );
+        assert!(!overread_should_drop(1_000_000, 1280, 0));
+    }
+
+    /// The gate's whole purpose: when the connection's datagram send buffer has
+    /// less than `gate_mtus` MTUs of room, the NEW packet is tail-dropped before
+    /// it can deepen the standing queue into the CoDel oldest-first head-drop.
+    #[test]
+    fn overread_gate_drops_when_buffer_near_full() {
+        // 1 KiB of room left, 4-MTU (5120 B) low-water at a 1280 B MTU: drop.
+        assert!(overread_should_drop(1024, 1280, 4));
+        // No room at all: drop.
+        assert!(overread_should_drop(0, 1280, 4));
+    }
+
+    /// Symmetric to the drop case: with plenty of room the gate is a no-op, so
+    /// the datapath is unchanged whenever the connection is draining normally.
+    #[test]
+    fn overread_gate_passes_when_space_available() {
+        assert!(!overread_should_drop(100_000, 1280, 4));
+        // Exactly at the low-water is enough room (strict `<`): the boundary
+        // packet passes, so the gate never fires one MTU too early.
+        assert!(
+            !overread_should_drop(4 * 1280, 1280, 4),
+            "at the low-water, pass"
+        );
+        // One byte under the low-water fires.
+        assert!(
+            overread_should_drop(4 * 1280 - 1, 1280, 4),
+            "just under the low-water, drop"
+        );
+    }
+
+    /// Relative keying (the property that lets the gate survive fork.11's
+    /// BDP-adaptive buffer without a fixed 16-MiB constant): the SAME `gate_mtus`
+    /// yields a threshold that scales with the connection's live MTU. With the
+    /// same 5000 B of room, a 1000 B MTU (threshold 4000) passes but a 2000 B
+    /// MTU (threshold 8000) drops.
+    #[test]
+    fn overread_gate_threshold_is_relative_to_mtu() {
+        assert!(!overread_should_drop(5000, 1000, 4), "5000 >= 4*1000, pass");
+        assert!(overread_should_drop(5000, 2000, 4), "5000 < 4*2000, drop");
+    }
+
+    // ---- Multi-queue exit TUN wiring ----
+
+    /// The single-queue default (no extra queues) must be exactly today's
+    /// behaviour: one queue, and `pick_uplink_tun` hands out the primary
+    /// without ever spinning the round-robin cursor.
+    #[tokio::test]
+    async fn exit_ctx_defaults_to_a_single_tun_queue() {
+        let (priv_key, _pub) = derive_x25519_keypair(&[3u8; 32]).expect("32-byte ikm");
+        let ctx = ExitTerminateCtx::new(
+            priv_key,
+            ExitId::from_bytes([1u8; 16]),
+            warrenguard_transport_core::FakeTun::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            ctx.tun_queue_count(),
+            1,
+            "default exit opens exactly one TUN queue"
+        );
+        for _ in 0..5 {
+            let _ = ctx.pick_uplink_tun();
+        }
+        assert_eq!(
+            ctx.next_uplink.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "single-queue pick must short-circuit to the primary, never spinning the cursor"
+        );
+    }
+
+    /// Opting into N queues constructs an N-wide fan-out and round-robins the
+    /// per-connection uplink across them (the cursor advances once per pick).
+    #[tokio::test]
+    async fn exit_ctx_multi_queue_constructs_n_queues_and_round_robins() {
+        let (priv_key, _pub) = derive_x25519_keypair(&[4u8; 32]).expect("32-byte ikm");
+        let ctx = ExitTerminateCtx::new(
+            priv_key,
+            ExitId::from_bytes([2u8; 16]),
+            warrenguard_transport_core::FakeTun::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .with_extra_tun_queues(vec![
+            warrenguard_transport_core::FakeTun::new(),
+            warrenguard_transport_core::FakeTun::new(),
+        ]);
+        assert_eq!(ctx.tun_queue_count(), 3, "primary + 2 extra = 3 queues");
+        for _ in 0..3 {
+            let _ = ctx.pick_uplink_tun();
+        }
+        assert_eq!(
+            ctx.next_uplink.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "each multi-queue pick advances the round-robin cursor once"
+        );
+    }
+
+    /// An empty extra-queue list is a no-op: a deployer that resolved
+    /// `queues == 1` leaves the single-queue default untouched.
+    #[tokio::test]
+    async fn exit_ctx_with_empty_extra_queues_stays_single() {
+        let (priv_key, _pub) = derive_x25519_keypair(&[5u8; 32]).expect("32-byte ikm");
+        let ctx = ExitTerminateCtx::new(
+            priv_key,
+            ExitId::from_bytes([3u8; 16]),
+            warrenguard_transport_core::FakeTun::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .with_extra_tun_queues(vec![]);
+        assert_eq!(
+            ctx.tun_queue_count(),
+            1,
+            "empty extra queues keep the single-queue default"
+        );
+    }
 
     // ---- DAITA machine selection (per connection, not per process) ----
 

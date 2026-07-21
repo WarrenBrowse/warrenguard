@@ -134,6 +134,14 @@ pub const REGISTRY: &[KnobMeta] = &[
         home: "warrenguard-transport-core/src/transport_config.rs",
     },
     KnobMeta {
+        name: "WARREN_EXIT_OVERREAD_GATE",
+        kind: "usize (MTUs)",
+        default: "4 (on)",
+        clamp: "0 disables; clamped to [0, 64]; unparsable/absent -> default",
+        effect: "exit downlink over-read backpressure: tail-drop a NEW downlink packet when the destination connection's datagram send buffer has less than N MTUs of space left (relative to the BDP-adaptive limit), so N multi-queue TUN readers cannot over-fill the buffer into the CoDel oldest-first head-drop zone that spikes inner-TCP retransmits",
+        home: "warrenguard-multihop-server/src/multihop.rs (downlink tx_task)",
+    },
+    KnobMeta {
         name: "WARREN_UPLINK_BATCH_MAX",
         kind: "usize",
         default: "1",
@@ -606,6 +614,40 @@ pub fn dg_fq_queues() -> usize {
             1,
             65_536,
             1024,
+        )
+    })
+}
+
+/// Default over-read gate low-water in MTUs (see [`exit_overread_gate_mtus`]).
+const OVERREAD_GATE_DEFAULT_MTUS: usize = 4;
+/// Upper bound on the over-read gate low-water (MTUs). Beyond this the gate
+/// would start tail-dropping into any reasonable BDP-adaptive buffer without
+/// benefit; a small multiple of the MTU is all the headroom the drain needs.
+const OVERREAD_GATE_MAX_MTUS: usize = 64;
+
+/// `WARREN_EXIT_OVERREAD_GATE`: exit downlink over-read backpressure low-water,
+/// in units of the connection's max datagram size (MTUs). Default `4` (on);
+/// `0` disables the gate. When a downlink `tx_task` is about to seal a packet
+/// and the destination connection's [`datagram_send_buffer_space`] is below
+/// `N * max_datagram_size`, the packet is tail-dropped instead of enqueued.
+///
+/// `datagram_send_buffer_space` is measured against the LIVE (BDP-adaptive)
+/// buffer limit, so the threshold stays relative to fork.11's now-shrinking
+/// buffer without a fixed-16-MiB constant: "within N MTUs of full" means the
+/// pipe is at its BDP, where feeding more only builds a standing queue the fork
+/// CoDel then head-drops oldest-first (spiking inner-TCP retransmits). Dropping
+/// the newest packet keeps the queue shallow, so it can only reduce occupancy.
+///
+/// [`datagram_send_buffer_space`]: https://docs.rs/quinn/latest/quinn/struct.Connection.html
+#[must_use]
+pub fn exit_overread_gate_mtus() -> usize {
+    static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        parse_usize_clamped(
+            std::env::var("WARREN_EXIT_OVERREAD_GATE").ok().as_deref(),
+            0,
+            OVERREAD_GATE_MAX_MTUS,
+            OVERREAD_GATE_DEFAULT_MTUS,
         )
     })
 }
@@ -1284,6 +1326,32 @@ mod tests {
         assert_eq!(resolve_client_tun_queues(1, 8, 8), 1, "explicit 1 disables");
         // Clamped to [1, MAX_TUN_QUEUES].
         assert_eq!(resolve_client_tun_queues(999, 8, 8), MAX_TUN_QUEUES);
+    }
+
+    #[test]
+    fn overread_gate_resolves_default_disable_and_clamp() {
+        // Absent or unparsable -> default (on, 4 MTUs).
+        let resolve =
+            |raw| parse_usize_clamped(raw, 0, OVERREAD_GATE_MAX_MTUS, OVERREAD_GATE_DEFAULT_MTUS);
+        assert_eq!(
+            resolve(None),
+            OVERREAD_GATE_DEFAULT_MTUS,
+            "absent -> default on"
+        );
+        assert_eq!(
+            resolve(Some("junk")),
+            OVERREAD_GATE_DEFAULT_MTUS,
+            "garbage -> default"
+        );
+        // Explicit 0 is a valid value (disables the gate), not the default.
+        assert_eq!(resolve(Some("0")), 0, "explicit 0 disables the gate");
+        // An explicit low-water is honoured, and huge values clamp to the max.
+        assert_eq!(resolve(Some("8")), 8);
+        assert_eq!(
+            resolve(Some("9999")),
+            OVERREAD_GATE_MAX_MTUS,
+            "clamped to max"
+        );
     }
 
     #[test]
