@@ -27,11 +27,13 @@ fn main() {
     let (sha_full, sha_short) = resolve_git_sha();
     let build_time = resolve_build_time();
     let release = resolve_release(&sha_short);
+    let engine_release = resolve_engine_release();
 
     println!("cargo:rustc-env=WARREN_BUILD_GIT_SHA={sha_full}");
     println!("cargo:rustc-env=WARREN_BUILD_GIT_SHORT={sha_short}");
     println!("cargo:rustc-env=WARREN_BUILD_TIME={build_time}");
     println!("cargo:rustc-env=WARREN_BUILD_RELEASE={release}");
+    println!("cargo:rustc-env=WARREN_BUILD_ENGINE_RELEASE={engine_release}");
 
     // Re-bake when the injected env vars change so a new deploy from the
     // same source tree but a new commit picks up the value.
@@ -39,6 +41,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=WARREN_BUILD_TIME");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
     println!("cargo:rerun-if-env-changed=WARREN_RELEASE");
+    println!("cargo:rerun-if-env-changed=WARREN_ENGINE_RELEASE");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/build_time.rs");
 
@@ -90,6 +93,24 @@ fn resolve_release(sha_short: &str) -> String {
     } else {
         format!("g{sha_short}")
     }
+}
+
+/// Resolve the ENGINE release: the describe of the repo this crate lives in
+/// (the engine checkout), `--dirty` included. Unlike [`resolve_release`],
+/// whose env override carries the CONSUMING product's release in deploy
+/// builds, the override here exists for gitless builds and for orchestrating
+/// scripts that compute the value fresh on the host: a build-script cache
+/// cannot observe a tree turning dirty, so an injected value is the only
+/// guaranteed-fresh source.
+fn resolve_engine_release() -> String {
+    if let Ok(rel) = std::env::var("WARREN_ENGINE_RELEASE") {
+        let rel = rel.trim().to_owned();
+        if !rel.is_empty() {
+            return rel;
+        }
+    }
+    run("git", &["describe", "--tags", "--always", "--dirty"])
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 fn resolve_build_time() -> String {

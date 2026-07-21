@@ -27,10 +27,35 @@ pub const GIT_SHORT: &str = env!("WARREN_BUILD_GIT_SHORT");
 /// UTC RFC3339 build timestamp, or `"unknown"`.
 pub const BUILD_TIME: &str = env!("WARREN_BUILD_TIME");
 
-/// Human-readable one-line summary, e.g. `v0.3.0-7-g4d607b92 (0.1.0)`.
+/// Engine-repo release identifier: the `git describe` of the checkout this
+/// crate lives in, `-dirty`-suffixed when that tree has uncommitted or
+/// untracked changes. Deploy builds inject the CONSUMING product's release
+/// into [`RELEASE`], which erases the engine's own state from the binary;
+/// this constant keeps it visible, because the engine is a path-dep whose
+/// working-tree state (including stray WIP) is compiled in verbatim. Baked
+/// from `WARREN_ENGINE_RELEASE` (build-arg for gitless or orchestrated
+/// builds) or `git describe` in the engine checkout.
+pub const ENGINE_RELEASE: &str = env!("WARREN_BUILD_ENGINE_RELEASE");
+
+/// Human-readable one-line summary, e.g.
+/// `v0.3.0-7-g4d607b92 (0.1.0) [engine 922c614]`. The engine suffix is
+/// omitted when [`RELEASE`] already IS the engine describe (standalone
+/// engine builds), and kept even when the engine resolves to `unknown`
+/// so broken provenance is loud rather than silent.
 #[must_use]
 pub fn summary() -> String {
-    format!("{RELEASE} ({VERSION})")
+    compose_summary(RELEASE, VERSION, ENGINE_RELEASE)
+}
+
+/// [`summary`] as a pure function of its inputs, split out so the format
+/// (which deploy tooling greps for `-dirty` and parses for a committish)
+/// is pinned by tests independently of this build's baked constants.
+fn compose_summary(release: &str, version: &str, engine: &str) -> String {
+    if engine == release {
+        format!("{release} ({version})")
+    } else {
+        format!("{release} ({version}) [engine {engine}]")
+    }
 }
 
 // The build-timestamp resolution policy lives in `build_time`, shared
@@ -63,5 +88,38 @@ mod tests {
         let s = super::summary();
         assert!(s.starts_with(super::RELEASE));
         assert!(s.contains(super::VERSION));
+    }
+
+    #[test]
+    #[allow(clippy::const_is_empty)]
+    fn engine_release_is_populated() {
+        assert!(!super::ENGINE_RELEASE.is_empty());
+    }
+
+    #[test]
+    fn summary_appends_engine_when_it_differs_from_release() {
+        assert_eq!(
+            super::compose_summary("v0.6.40-1-gabc1234", "0.1.0", "922c614"),
+            "v0.6.40-1-gabc1234 (0.1.0) [engine 922c614]",
+            "a product build must expose which engine tree it embeds"
+        );
+    }
+
+    #[test]
+    fn summary_omits_engine_when_it_equals_release() {
+        assert_eq!(
+            super::compose_summary("922c614", "0.1.0", "922c614"),
+            "922c614 (0.1.0)",
+            "a standalone engine build must not repeat its own describe"
+        );
+    }
+
+    #[test]
+    fn summary_propagates_a_dirty_engine_marker() {
+        let s = super::compose_summary("v0.6.40", "0.1.0", "922c614-dirty");
+        assert!(
+            s.contains("-dirty"),
+            "a dirty engine tree must stay visible so deploy tooling can refuse the build"
+        );
     }
 }
