@@ -44,8 +44,8 @@ use warrenguard_multihop::{
 };
 #[cfg(feature = "pq-hpke")]
 use warrenguard_multihop::{
-    MULTIHOP_FRAME_V2_MAX_OVERHEAD, PqExitSession, WarrenMultihopFrameV2, XWingRecipientSecretKey,
-    decode_frame_v2, encode_frame_v2,
+    MULTIHOP_FRAME_V2_DATA_MAX_OVERHEAD, PqExitSession, WarrenMultihopFrameV2,
+    XWingRecipientSecretKey, decode_frame_v2, encode_frame_v2,
 };
 use warrenguard_pump::{DAITA_DUMMY_FIRST_BYTE, is_daita_dummy};
 use warrenguard_server::tun_dispatch::source_ip_matches;
@@ -3316,9 +3316,9 @@ pub async fn terminate_connection<T>(
 /// This node's live inner-packet budget for one multihop connection: its
 /// current QUIC datagram budget minus the wire overhead of the frame format
 /// this session speaks ([`MULTIHOP_FRAME_MAX_OVERHEAD`] for `/v1` sessions,
-/// `MULTIHOP_FRAME_V2_MAX_OVERHEAD` under `pq-hpke`). Saturates instead of
-/// wrapping when the path MTU cannot even carry the frame overhead, and
-/// falls back to `u16::MAX` (no clamp) before the connection has negotiated
+/// [`pq_inner_budget`]'s data-frame overhead under `pq-hpke`). Saturates
+/// instead of wrapping when the path MTU cannot even carry the frame overhead,
+/// and falls back to `u16::MAX` (no clamp) before the connection has negotiated
 /// a size.
 fn inner_budget(max_datagram_size: Option<usize>, frame_overhead: usize) -> u16 {
     u16::try_from(
@@ -3327,6 +3327,19 @@ fn inner_budget(max_datagram_size: Option<usize>, frame_overhead: usize) -> u16 
             .saturating_sub(frame_overhead),
     )
     .unwrap_or(u16::MAX)
+}
+
+/// The `/v2` (pq-hpke) inner-packet budget for a live datagram size. A `/v2`
+/// DATA frame carries an EMPTY `pq_ct` (the 1088-byte ML-KEM ciphertext rides
+/// only the dedicated bootstrap frame, see [`PqExitSession::seal_response`]), so
+/// the budget subtracts [`MULTIHOP_FRAME_V2_DATA_MAX_OVERHEAD`], matching the
+/// client's `max_inner_payload`. Subtracting the ~1 KB-larger setup bound
+/// starved a 1452-byte path to a ~240-byte budget, so every real downlink packet
+/// exceeded it and was reflected as frag-needed rather than sealed: a silent
+/// data black-hole while the tunnel stayed Connected.
+#[cfg(feature = "pq-hpke")]
+fn pq_inner_budget(max_datagram_size: Option<usize>) -> u16 {
+    inner_budget(max_datagram_size, MULTIHOP_FRAME_V2_DATA_MAX_OVERHEAD)
 }
 
 /// Rewrites the MSS option of a SYN/SYN-ACK down to `budget`, logging the
@@ -3931,7 +3944,11 @@ async fn serve_pq_datagram_pump<T>(
             }
             // Cap the MSS any SYN announces to the exit's own downlink
             // budget before it reaches the TUN: see `clamp_uplink_syn`.
-            clamp_uplink_syn(&mut plaintext, &conn_rx, MULTIHOP_FRAME_V2_MAX_OVERHEAD);
+            clamp_uplink_syn(
+                &mut plaintext,
+                &conn_rx,
+                MULTIHOP_FRAME_V2_DATA_MAX_OVERHEAD,
+            );
             match tun_rx.send(&plaintext).await {
                 Ok(()) => tun_write_errors = 0,
                 Err(e) => {
@@ -3976,7 +3993,7 @@ async fn serve_pq_datagram_pump<T>(
                 None => continue,
             };
             // Reject/clamp before sealing: see `adapt_inner_for_budget`.
-            let budget = inner_budget(conn_tx.max_datagram_size(), MULTIHOP_FRAME_V2_MAX_OVERHEAD);
+            let budget = pq_inner_budget(conn_tx.max_datagram_size());
             if let Some(ptb) = adapt_inner_for_budget(&mut packet, budget) {
                 mtu_reflected += 1;
                 if mtu_reflected == 1 || mtu_reflected.is_multiple_of(64) {
@@ -5828,6 +5845,25 @@ mod tests {
     #[test]
     fn inner_budget_defaults_to_u16_max_before_the_connection_negotiates_a_size() {
         assert_eq!(inner_budget(None, 83), u16::MAX - 83);
+    }
+
+    #[cfg(feature = "pq-hpke")]
+    #[test]
+    fn pq_inner_budget_sizes_from_the_data_frame_not_the_setup_bound() {
+        // A /v2 DATA frame carries an empty pq_ct, so the exit's downlink budget
+        // must subtract the small data-frame overhead, not the ~1174-byte setup
+        // bound (which held the 1088-byte ML-KEM ciphertext). The setup bound
+        // starved a 1452-byte path to a ~240-byte budget, so every real downlink
+        // packet was reflected as frag-needed instead of sealed: a silent data
+        // black-hole while the tunnel stayed Connected.
+        assert_eq!(
+            pq_inner_budget(Some(1452)),
+            inner_budget(Some(1452), MULTIHOP_FRAME_V2_DATA_MAX_OVERHEAD)
+        );
+        assert!(
+            pq_inner_budget(Some(1452)) > 1000,
+            "the /v2 downlink budget must not be starved by the ~1 KB setup bound"
+        );
     }
 
     #[tokio::test]
