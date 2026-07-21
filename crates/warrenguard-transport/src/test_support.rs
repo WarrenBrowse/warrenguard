@@ -174,7 +174,18 @@ async fn bare_rpk_loopback(
 /// `client.recv()` can decrypt, exactly mirroring a real exit's reverse
 /// direction without paying for the setup-stream round-trip.
 pub(crate) async fn spawn_loopback_multihop(exit_id: ExitId) -> LoopbackMultiHop {
-    let (client_ep, client_conn, exit_conn, server_ep) = bare_rpk_loopback(0x77, None).await;
+    spawn_loopback_multihop_with_transport(exit_id, None).await
+}
+
+/// [`spawn_loopback_multihop`] with an explicit QUIC transport config on both
+/// ends, so a test can drive a specific path MTU (e.g. the Warren multi-hop
+/// profile's 1280 initial MTU) rather than quinn's default.
+pub(crate) async fn spawn_loopback_multihop_with_transport(
+    exit_id: ExitId,
+    transport_config: Option<Arc<quinn::TransportConfig>>,
+) -> LoopbackMultiHop {
+    let (client_ep, client_conn, exit_conn, server_ep) =
+        bare_rpk_loopback(0x77, transport_config).await;
 
     let (exit_priv, exit_pub) = derive_exit_keypair(&[0x99; 32]);
     let exit_pub_bytes = warrenguard_multihop::test_support::pubkey_to_bytes(&exit_pub);

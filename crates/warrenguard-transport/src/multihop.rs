@@ -564,6 +564,13 @@ pub struct MultiHopClient {
     // all in-flight datagrams.
     endpoint: Endpoint,
     conn: Connection,
+    /// True when this session's QUIC connection rides the TLS-over-TCP fallback
+    /// carrier rather than a native UDP socket. The carrier disables DPLPMTUD
+    /// (its socket reports `may_fragment`), so `conn.max_datagram_size()`
+    /// over-reports the frame budget; [`Self::max_inner_payload`] caps the inner
+    /// MTU accordingly so the MSS clamp / PTB stop full-size uplink black-holing.
+    /// Set once at construction; never mutated after the client is shared.
+    over_carrier: bool,
     session: ClientSessionKind,
     seq_send: AtomicU64,
     frames_in_epoch: AtomicU64,
@@ -853,7 +860,7 @@ impl MultiHopClient {
         // key fails before any UDP traffic is emitted, matching the relay-PKI
         // check inside `dial_relay`.
         let _ = parse_exit_x25519_pubkey(exit_x25519_multihop_pubkey)?;
-        let (endpoint, conn, relay_auth_pubkey) = Self::dial_relay(
+        let (endpoint, conn, relay_auth_pubkey, over_carrier) = Self::dial_relay(
             relay,
             operational_pubkey,
             bind_addr,
@@ -862,13 +869,15 @@ impl MultiHopClient {
         )
         .await?;
         tracing::info!("multi-hop session established");
-        Self::from_established_connection(
+        let mut client = Self::from_established_connection(
             endpoint,
             conn,
             exit_id,
             exit_x25519_multihop_pubkey,
             relay_auth_pubkey,
-        )
+        )?;
+        client.over_carrier = over_carrier;
+        Ok(client)
     }
 
     /// PQ (`/v2` X-Wing) twin of [`Self::connect_with_transport_config`].
@@ -902,7 +911,7 @@ impl MultiHopClient {
         socket_bypass: Option<SocketBypass>,
     ) -> Result<Self, MultiHopError> {
         let _ = parse_exit_x25519_pubkey(exit_x25519_multihop_pubkey)?;
-        let (endpoint, conn, relay_auth_pubkey) = Self::dial_relay(
+        let (endpoint, conn, relay_auth_pubkey, over_carrier) = Self::dial_relay(
             relay,
             operational_pubkey,
             bind_addr,
@@ -911,7 +920,7 @@ impl MultiHopClient {
         )
         .await?;
         tracing::info!("multi-hop session established");
-        Self::from_established_connection_pq(
+        let mut client = Self::from_established_connection_pq(
             endpoint,
             conn,
             exit_id,
@@ -919,7 +928,9 @@ impl MultiHopClient {
             mlkem768_ek,
             require_pq,
             relay_auth_pubkey,
-        )
+        )?;
+        client.over_carrier = over_carrier;
+        Ok(client)
     }
 
     /// Verify the relay descriptor and dial the relay over QUIC. Shared by
@@ -941,7 +952,7 @@ impl MultiHopClient {
         // physical link before its first send (Port Fail fix). `None` keeps the
         // verbatim client bind (userland proxy, or Android which uses `protect`).
         socket_bypass: Option<SocketBypass>,
-    ) -> Result<(Endpoint, Connection, Option<WarrenPubkey>), MultiHopError> {
+    ) -> Result<(Endpoint, Connection, Option<WarrenPubkey>, bool), MultiHopError> {
         // On Android the socket is protected by `VpnService.protect` (below), not
         // a setsockopt, so any desktop bypass value is irrelevant there.
         #[cfg(target_os = "android")]
@@ -1061,7 +1072,7 @@ impl MultiHopClient {
         // plain UDP dial verbatim (behaviour-neutral for every RPK / non-carrier
         // relay). The winning path's endpoint is carried out and kept alive for
         // the connection.
-        let (endpoint, conn) = match carrier_client_cfg {
+        let (endpoint, conn, over_carrier) = match carrier_client_cfg {
             Some(inner_cfg) => {
                 Self::dial_relay_with_carrier(
                     relay,
@@ -1077,7 +1088,7 @@ impl MultiHopClient {
                     .connect(relay.endpoint, &server_name)?
                     .await
                     .map_err(MultiHopError::Handshake)?;
-                (endpoint, conn)
+                (endpoint, conn, false)
             }
         };
 
@@ -1091,7 +1102,7 @@ impl MultiHopClient {
         // RPK mode pins the identity at the TLS layer and needs no in-band proof.
         let relay_auth_pubkey = relay.cover_domain.is_some().then_some(relay_pubkey);
 
-        Ok((endpoint, conn, relay_auth_pubkey))
+        Ok((endpoint, conn, relay_auth_pubkey, over_carrier))
     }
 
     /// Races the relay's UDP QUIC dial (on the already-bound `endpoint`)
@@ -1119,7 +1130,7 @@ impl MultiHopClient {
         // is pinned to the physical link before connect (system-VPN Port Fail
         // fix); `None` keeps the plain connect (userland proxy).
         socket_bypass: Option<SocketBypass>,
-    ) -> Result<(Endpoint, Connection), MultiHopError> {
+    ) -> Result<(Endpoint, Connection, bool), MultiHopError> {
         // The synthetic quinn peer and both dials target the relay's advertised
         // QUIC endpoint; only the socket beneath differs between the arms.
         let target = relay.endpoint;
@@ -1141,13 +1152,16 @@ impl MultiHopClient {
         // disabled, which cannot happen on this (armed) path, so it is mapped
         // to an opaque io::Error (no address, no-log) purely to satisfy the
         // race's shared Result type.
+        // The trailing `bool` marks which arm won: `false` for the native UDP
+        // dial, `true` for the TLS-over-TCP carrier, so the caller can cap the
+        // carrier session's inner MTU (its DPLPMTUD is off, see `over_carrier`).
         let udp = async {
             let conn = endpoint
                 .connect(target, server_name)
                 .map_err(|_| std::io::Error::other("udp quic connect setup failed"))?
                 .await
                 .map_err(|_| std::io::Error::other("udp quic handshake failed"))?;
-            Ok::<(Endpoint, Connection), std::io::Error>((endpoint, conn))
+            Ok::<(Endpoint, Connection, bool), std::io::Error>((endpoint, conn, false))
         };
         let tcp = || async move {
             // Under a full-tunnel system VPN the carrier's TCP socket must be
@@ -1168,7 +1182,7 @@ impl MultiHopClient {
                 .map_err(|_| std::io::Error::other("carrier quic connect setup failed"))?
                 .await
                 .map_err(|_| std::io::Error::other("carrier quic handshake failed"))?;
-            Ok::<(Endpoint, Connection), std::io::Error>((carrier_ep, conn))
+            Ok::<(Endpoint, Connection, bool), std::io::Error>((carrier_ep, conn, true))
         };
 
         // Armed (this path is only reached when the carrier is armed): race the
@@ -1219,6 +1233,7 @@ impl MultiHopClient {
         Ok(Self {
             endpoint,
             conn,
+            over_carrier: false,
             session: ClientSessionKind::V1(RwLock::new(session)),
             seq_send: AtomicU64::new(0),
             frames_in_epoch: AtomicU64::new(0),
@@ -1317,6 +1332,7 @@ impl MultiHopClient {
         Ok(Self {
             endpoint,
             conn,
+            over_carrier: false,
             session: ClientSessionKind::V2 {
                 session: RwLock::new(pq_session),
                 recipient: Box::new(recipient),
@@ -2199,7 +2215,12 @@ impl MultiHopClient {
     pub fn max_inner_payload(&self) -> usize {
         const BASE_MTU: usize = 1280;
         let path = self.max_datagram_size().unwrap_or(BASE_MTU);
-        path.saturating_sub(self.session.max_frame_overhead())
+        let inner = path.saturating_sub(self.session.max_frame_overhead());
+        // On the TLS-over-TCP carrier, DPLPMTUD is off so `path` over-reports the
+        // real frame budget; cap the inner MTU so the MSS clamp / PTB stop
+        // full-size uplink black-holing. Byte-identical on the native UDP path
+        // (the `false` arm is the identity).
+        warrenguard_transport_core::carrier_capped_inner_mtu(inner, self.over_carrier)
     }
 
     /// The current HPKE epoch (starts at `0`, `+1` per [`Self::rekey`]).
@@ -3356,6 +3377,45 @@ mod tests {
         assert!(
             pair.client.should_rekey(6),
             "past the frame threshold must rekey"
+        );
+    }
+
+    #[tokio::test]
+    async fn carrier_session_caps_inner_mtu_while_native_session_is_unchanged() {
+        // Drive the real multi-hop profile (1280 initial MTU) so the native
+        // datagram budget sits above the carrier ceiling, exactly as it does on
+        // the production carrier path where the cap must engage.
+        let mut pair = crate::test_support::spawn_loopback_multihop_with_transport(
+            ExitId::from_bytes([0x6c; 16]),
+            Some(
+                warrenguard_transport_core::warren_transport_config_client_multihop_with_gso(false),
+            ),
+        )
+        .await;
+
+        // Native UDP session (the default): the inner-MTU budget tracks the live
+        // datagram size and is NOT capped to the carrier ceiling. On loopback the
+        // path budget is well above the carrier ceiling, so a regression that
+        // capped the native path would be visible here.
+        let native = pair.client.max_inner_payload();
+        assert!(
+            native > warrenguard_transport_core::CARRIER_MAX_INNER_MTU,
+            "the native UDP path must not be capped to the carrier ceiling \
+             (got {native}, ceiling {})",
+            warrenguard_transport_core::CARRIER_MAX_INNER_MTU
+        );
+
+        // Flip the same session onto the carrier: DPLPMTUD is off there, so the
+        // budget is capped to the carrier's reduced inner MTU, which is what the
+        // uplink MSS clamp / PTB reflection then use to stop full-size uplink
+        // black-holing.
+        Arc::get_mut(&mut pair.client)
+            .expect("sole owner before any clone")
+            .over_carrier = true;
+        assert_eq!(
+            pair.client.max_inner_payload(),
+            warrenguard_transport_core::CARRIER_MAX_INNER_MTU,
+            "a carrier session must self-report the reduced carrier inner MTU"
         );
     }
 

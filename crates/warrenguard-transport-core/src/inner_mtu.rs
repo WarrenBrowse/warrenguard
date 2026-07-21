@@ -182,6 +182,42 @@ pub fn clamp_downlink_syn(pkt: &mut [u8], budget: u16) -> Option<(u16, u16)> {
     clamp_syn_mss(pkt, budget)
 }
 
+/// Inner-IP MTU ceiling for a session riding the TLS-over-TCP fallback carrier.
+///
+/// The carrier delivers datagrams whole, but quinn's DPLPMTUD is OFF on it (the
+/// carrier socket reports `may_fragment`, so quinn keeps `allow_mtud = false`).
+/// A carrier connection's path MTU therefore stays pinned at the native initial
+/// MTU (~1280) and its `max_datagram_size` over-reports what one sealed frame
+/// can traverse the carrier end to end: a client whose uplink seals a full-size
+/// (1280-MTU) inner packet emits a frame larger than the carrier's real datagram
+/// budget, which is then dropped, black-holing exactly the users the carrier is
+/// meant to help. The native UDP path instead grows its MTU above 1280 via
+/// DPLPMTUD, so it is unaffected.
+///
+/// Feeding this bench-validated inner MTU (inner MTU 1100 traverses the carrier;
+/// 1200+ black-holes) into the existing MSS-clamp / synthetic-PTB machinery
+/// makes the carrier self-report its reduced inner MTU like a nested/low-PMTU
+/// path: inner TCP is clamped (SYN/SYN-ACK) and non-TCP flows converge via PTB,
+/// so full-size uplink segments fit the carrier frame instead of black-holing.
+pub const CARRIER_MAX_INNER_MTU: usize = 1100;
+
+/// Caps an inner-MTU budget at [`CARRIER_MAX_INNER_MTU`] when the session rides
+/// the TLS-over-TCP carrier, else returns it unchanged.
+///
+/// The one home for the carrier inner-MTU policy: budget accessors wrap their
+/// live value in this so a fix lands once. The `over_carrier == false` arm is
+/// the identity function, so wiring this into the native UDP datapath's budget
+/// is byte-identical to not calling it at all: the carrier cap can never regress
+/// the native path.
+#[must_use]
+pub fn carrier_capped_inner_mtu(inner_mtu: usize, over_carrier: bool) -> usize {
+    if over_carrier {
+        inner_mtu.min(CARRIER_MAX_INNER_MTU)
+    } else {
+        inner_mtu
+    }
+}
+
 /// [`build_frag_needed`] preconfigured for the client uplink: the reflected
 /// ICMP error is sourced from the tunnel gateway
 /// ([`warrenguard_config::TUNNEL_GATEWAY_IP`] / `_IPV6`) and carries the
@@ -613,6 +649,56 @@ mod tests {
         let _ = fixed; // payload checksum irrelevant to the builder
         let ptb = build_frag_needed(&big, 1198, GW4, GW6).expect("ptb");
         assert_eq!(ptb.len(), 1280);
+    }
+
+    #[test]
+    fn carrier_cap_reduces_the_budget_only_when_the_carrier_is_active() {
+        // Native UDP path: the live budget passes through unchanged (identity),
+        // so the carrier cap can never regress the native datapath.
+        assert_eq!(carrier_capped_inner_mtu(1197, false), 1197);
+        assert_eq!(carrier_capped_inner_mtu(1360, false), 1360);
+        // Carrier active: a native-sized inner budget is capped to the carrier's
+        // reduced, bench-validated ceiling (strictly below the native 1280-MTU
+        // inner budget), so the MSS clamp / PTB size to the carrier frame.
+        assert!(
+            carrier_capped_inner_mtu(1197, true) < 1197,
+            "a native-sized inner budget must be reduced on the carrier"
+        );
+        assert_eq!(carrier_capped_inner_mtu(1197, true), CARRIER_MAX_INNER_MTU);
+        assert_eq!(carrier_capped_inner_mtu(1360, true), CARRIER_MAX_INNER_MTU);
+        // A budget already under the ceiling is left alone even on the carrier.
+        assert_eq!(carrier_capped_inner_mtu(900, true), 900);
+    }
+
+    #[test]
+    fn full_size_inner_syn_is_clamped_on_the_carrier_but_not_on_the_native_path() {
+        // A full-size inner SYN whose MSS fits a 1280-MTU packet.
+        let native_budget = carrier_capped_inner_mtu(1360, false);
+        let carrier_budget = carrier_capped_inner_mtu(1360, true);
+
+        // Native path: the fitting MSS is left alone (byte-identical behaviour).
+        let mut native = v4_syn(&linux_syn_options(1240), 0x02);
+        assert_eq!(
+            clamp_uplink_syn(&mut native, native_budget as u16),
+            None,
+            "the native UDP path must not clamp an MSS that already fits its grown MTU"
+        );
+
+        // Carrier path: the same SYN is clamped down so its sealed frame fits the
+        // carrier's smaller datagram budget instead of black-holing.
+        let mut carrier = v4_syn(&linux_syn_options(1240), 0x02);
+        let clamped = clamp_uplink_syn(&mut carrier, carrier_budget as u16)
+            .expect("the carrier path must clamp a full-size inner MSS");
+        assert!(
+            clamped.1 < 1240,
+            "the clamped MSS ({}) must fit the carrier's reduced inner MTU",
+            clamped.1
+        );
+        assert_eq!(
+            tcp_v4_checksum_residual(&carrier),
+            0,
+            "the carrier-clamped SYN must stay checksum-valid"
+        );
     }
 
     #[test]
