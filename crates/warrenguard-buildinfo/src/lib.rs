@@ -38,7 +38,7 @@ pub const BUILD_TIME: &str = env!("WARREN_BUILD_TIME");
 pub const ENGINE_RELEASE: &str = env!("WARREN_BUILD_ENGINE_RELEASE");
 
 /// Human-readable one-line summary, e.g.
-/// `v0.3.0-7-g4d607b92 (0.1.0) [engine 922c614]`. The engine suffix is
+/// `v0.3.0-7-g4d607b92 (0.1.0) (engine 922c614)`. The engine suffix is
 /// omitted when [`RELEASE`] already IS the engine describe (standalone
 /// engine builds), and kept even when the engine resolves to `unknown`
 /// so broken provenance is loud rather than silent.
@@ -50,11 +50,14 @@ pub fn summary() -> String {
 /// [`summary`] as a pure function of its inputs, split out so the format
 /// (which deploy tooling greps for `-dirty` and parses for a committish)
 /// is pinned by tests independently of this build's baked constants.
+/// Parentheses, not brackets: every char must clear the Warren API
+/// heartbeat sanitizer whitelist or the deploy becomes invisible to the
+/// rollout controller (see `summary_stays_inside_the_heartbeat_charset`).
 fn compose_summary(release: &str, version: &str, engine: &str) -> String {
     if engine == release {
         format!("{release} ({version})")
     } else {
-        format!("{release} ({version}) [engine {engine}]")
+        format!("{release} ({version}) (engine {engine})")
     }
 }
 
@@ -100,8 +103,23 @@ mod tests {
     fn summary_appends_engine_when_it_differs_from_release() {
         assert_eq!(
             super::compose_summary("v0.6.40-1-gabc1234", "0.1.0", "922c614"),
-            "v0.6.40-1-gabc1234 (0.1.0) [engine 922c614]",
+            "v0.6.40-1-gabc1234 (0.1.0) (engine 922c614)",
             "a product build must expose which engine tree it embeds"
+        );
+    }
+
+    #[test]
+    fn summary_stays_inside_the_heartbeat_charset() {
+        // The Warren API stores a heartbeat version only when every char is
+        // in its defense-in-depth whitelist (alnum . _ + ( ) - space); a
+        // char outside it makes the whole deploy invisible to the rollout
+        // controller (learned the hard way with `[engine ...]`, 2026-07-22).
+        let s = super::compose_summary("v0.6.40-6-g465871a1", "0.1.0", "0b869dc-dirty");
+        assert!(
+            s.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '(' | ')' | '-' | ' ')
+            }),
+            "summary must only use heartbeat-whitelisted characters, got: {s}"
         );
     }
 
