@@ -72,7 +72,25 @@ pub async fn forward_session(
     exit_conn: Arc<Connection>,
 ) -> Result<ForwardSummary, ForwardError> {
     let started = std::time::Instant::now();
-    let mut summary = ForwardSummary::default();
+
+    // Client-leg path telemetry (rtt/loss/cwnd/datagram-queue of the
+    // relay->client connection). This leg is where a client's last-mile
+    // pathology manifests server-side, and it had ZERO visibility during
+    // the 2026-07-22 brownout forensics; the probe self-terminates when
+    // the connection closes.
+    drop(warrenguard_transport_core::spawn_path_probe(
+        "relay-client-leg",
+        vec![client_conn.clone()],
+        None,
+    ));
+
+    // Live shared counters, incremented by the pumps as they forward.
+    // The teardown below ABORTS whichever pump is still parked on its
+    // recv when the first one finishes; counters accumulated inside the
+    // task would be lost with it (every real session used to end with
+    // `exit_to_client=0` this way, reading as a phantom half-dead
+    // session), so the pumps write here instead of returning totals.
+    let live = Arc::new(LiveCounters::default());
 
     // Spawn two unidirectional pumps. JoinSet lets us cancel the
     // twin task when one direction stops, mirroring the lifetime
@@ -80,44 +98,64 @@ pub async fn forward_session(
     let mut set = JoinSet::new();
     let client_for_c1 = client_conn.clone();
     let exit_for_c1 = exit_conn.clone();
-    set.spawn(async move { pump_c1_to_c2(client_for_c1, exit_for_c1).await });
+    let live_for_c1 = live.clone();
+    set.spawn(async move { pump_c1_to_c2(client_for_c1, exit_for_c1, live_for_c1).await });
     let client_for_c2 = client_conn.clone();
     let exit_for_c2 = exit_conn.clone();
-    set.spawn(async move { pump_c2_to_c1(exit_for_c2, client_for_c2).await });
+    let live_for_c2 = live.clone();
+    set.spawn(async move { pump_c2_to_c1(exit_for_c2, client_for_c2, live_for_c2).await });
 
+    let mut teardown_started = false;
     while let Some(joined) = set.join_next().await {
-        match joined {
-            Ok(result) => match result.direction {
-                Direction::ClientToExit => {
-                    summary.client_to_exit += result.forwarded;
-                    summary.dropped_client_to_exit_too_large += result.dropped_too_large;
-                }
-                Direction::ExitToClient => {
-                    summary.exit_to_client += result.forwarded;
-                    summary.dropped_exit_to_client_too_large += result.dropped_too_large;
-                }
-            },
-            Err(join_err) => {
-                // A pump task panicked or was aborted. We cannot reliably
-                // tell which direction it carried from a JoinError, so we
-                // record nothing into the summary rather than blindly
-                // attributing it to ClientToExit (which would corrupt the
-                // counters). Log it without any identifying data.
+        if let Err(join_err) = joined {
+            if join_err.is_panic() {
+                tracing::warn!("relay forward pump task panicked");
+            } else if !(teardown_started && join_err.is_cancelled()) {
+                // A cancellation we did not initiate is still abnormal.
                 tracing::warn!(
-                    panicked = join_err.is_panic(),
                     cancelled = join_err.is_cancelled(),
                     "relay forward pump task ended abnormally"
                 );
             }
         }
-        // First task to finish triggers session shutdown.
+        // First task to finish triggers session shutdown; the twin's
+        // cancellation right after is the NORMAL end of every session.
         client_conn.close(quinn::VarInt::from_u32(0), b"forward complete");
         exit_conn.close(quinn::VarInt::from_u32(0), b"forward complete");
+        teardown_started = true;
         set.abort_all();
     }
 
+    let mut summary = live.snapshot();
     summary.duration_secs = started.elapsed().as_secs();
     Ok(summary)
+}
+
+/// Pump counters shared between the two direction tasks and the
+/// session teardown (cf. the abort note in [`forward_session`]).
+#[derive(Debug, Default)]
+struct LiveCounters {
+    client_to_exit: std::sync::atomic::AtomicU64,
+    exit_to_client: std::sync::atomic::AtomicU64,
+    dropped_client_to_exit_too_large: std::sync::atomic::AtomicU64,
+    dropped_exit_to_client_too_large: std::sync::atomic::AtomicU64,
+}
+
+impl LiveCounters {
+    fn snapshot(&self) -> ForwardSummary {
+        use std::sync::atomic::Ordering;
+        ForwardSummary {
+            client_to_exit: self.client_to_exit.load(Ordering::Relaxed),
+            exit_to_client: self.exit_to_client.load(Ordering::Relaxed),
+            dropped_client_to_exit_too_large: self
+                .dropped_client_to_exit_too_large
+                .load(Ordering::Relaxed),
+            dropped_exit_to_client_too_large: self
+                .dropped_exit_to_client_too_large
+                .load(Ordering::Relaxed),
+            duration_secs: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,48 +164,38 @@ enum Direction {
     ExitToClient,
 }
 
-struct PumpResult {
-    forwarded: u64,
-    dropped_too_large: u64,
-    direction: Direction,
+async fn pump_c1_to_c2(client: Connection, exit: Arc<Connection>, live: Arc<LiveCounters>) {
+    pump_one_direction(&client, exit.as_ref(), Direction::ClientToExit, &live).await;
 }
 
-async fn pump_c1_to_c2(client: Connection, exit: Arc<Connection>) -> PumpResult {
-    pump_one_direction(&client, exit.as_ref(), Direction::ClientToExit).await
-}
-
-async fn pump_c2_to_c1(exit: Arc<Connection>, client: Connection) -> PumpResult {
-    pump_one_direction(exit.as_ref(), &client, Direction::ExitToClient).await
+async fn pump_c2_to_c1(exit: Arc<Connection>, client: Connection, live: Arc<LiveCounters>) {
+    pump_one_direction(exit.as_ref(), &client, Direction::ExitToClient, &live).await;
 }
 
 async fn pump_one_direction(
     source: &Connection,
     sink: &Connection,
     direction: Direction,
-) -> PumpResult {
-    let mut forwarded: u64 = 0;
-    let mut dropped_too_large: u64 = 0;
+    live: &LiveCounters,
+) {
+    use std::sync::atomic::Ordering;
+    let (forwarded, dropped_too_large) = match direction {
+        Direction::ClientToExit => (&live.client_to_exit, &live.dropped_client_to_exit_too_large),
+        Direction::ExitToClient => (&live.exit_to_client, &live.dropped_exit_to_client_too_large),
+    };
     loop {
         let bytes = match source.read_datagram().await {
             Ok(b) => b,
-            Err(_) => {
-                return PumpResult {
-                    forwarded,
-                    dropped_too_large,
-                    direction,
-                };
-            }
+            Err(_) => return,
         };
         match sink.send_datagram(bytes) {
-            Ok(()) => forwarded += 1,
-            Err(SendDatagramError::TooLarge) => dropped_too_large += 1,
-            Err(_other) => {
-                return PumpResult {
-                    forwarded,
-                    dropped_too_large,
-                    direction,
-                };
+            Ok(()) => {
+                forwarded.fetch_add(1, Ordering::Relaxed);
             }
+            Err(SendDatagramError::TooLarge) => {
+                dropped_too_large.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_other) => return,
         }
     }
 }

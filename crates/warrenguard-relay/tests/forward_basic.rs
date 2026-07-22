@@ -260,6 +260,58 @@ async fn survives_one_thousand_concurrent_datagrams_both_directions() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exit_to_client_counter_survives_client_close() {
+    let relay_server_key = det_signing_key(0x11);
+    let exit_server_key = det_signing_key(0x22);
+
+    let (fake_client_conn, relay_client_side) = build_handshaken_pair(&relay_server_key).await;
+    let (relay_exit_side, fake_exit_conn) = build_handshaken_pair(&exit_server_key).await;
+    let exit_arc = Arc::new(relay_exit_side);
+
+    let echo_handle = spawn_echo_loop(fake_exit_conn);
+
+    let forward_handle = tokio::spawn({
+        let exit_arc = exit_arc.clone();
+        async move { forward_session(relay_client_side, exit_arc).await }
+    });
+
+    // Two round-trips, both echoes DRAINED on the client: two downlink
+    // datagrams provably crossed the exit_to_client pump.
+    for payload in [&b"ping-one"[..], &b"ping-two"[..]] {
+        fake_client_conn
+            .send_datagram(Bytes::copy_from_slice(payload))
+            .expect("send data datagram");
+        let echo = tokio::time::timeout(Duration::from_secs(3), fake_client_conn.read_datagram())
+            .await
+            .expect("read echo")
+            .expect("echo bytes");
+        assert_eq!(echo.as_ref(), payload);
+    }
+
+    // The client leaves; the still-parked exit_to_client pump gets
+    // cancelled by the session teardown. Its counters must survive the
+    // cancellation: on a real relay EVERY session ends this way, and a
+    // summary reading exit_to_client=0 turns a healthy session into a
+    // phantom "half-dead" diagnosis.
+    fake_client_conn.close(VarInt::from_u32(0), b"client leaves");
+
+    let summary: ForwardSummary = tokio::time::timeout(Duration::from_secs(3), forward_handle)
+        .await
+        .expect("forward_session completes")
+        .expect("forward task did not panic")
+        .expect("forward_session returns Ok");
+    assert!(
+        summary.exit_to_client >= 2,
+        "the two drained echoes crossed the downlink pump, got summary={summary:?}"
+    );
+    assert!(
+        summary.client_to_exit >= 2,
+        "sender-side counter sanity, got summary={summary:?}"
+    );
+    echo_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn closes_session_cleanly_on_client_close() {
     let relay_server_key = det_signing_key(0x11);
     let exit_server_key = det_signing_key(0x22);
