@@ -1059,6 +1059,12 @@ async fn run_setup(
 /// does not grow unboundedly across thousands of rekeys on a long
 /// connection. Cf. `docs/19-WARREN-MULTIHOP-DESIGN.md` § 11.6 and
 /// `warren_multihop_doctrine_v1` memory.
+///
+/// For `/v2`, this bound is no longer wall-clock blind: `serve_pq_datagram_pump`
+/// runs a per-connection keepalive that refreshes the live session's entry
+/// (see [`PqSessionCache::refresh`]) at roughly half the TTL, so a still-connected
+/// client survives an idle gap longer than the TTL. Only a session whose
+/// connection has actually gone away ages out.
 const SESSION_CACHE_TTL: Duration = Duration::from_secs(5);
 
 /// HKDF info string binding the X25519 multihop IKM derivation to the
@@ -1259,6 +1265,14 @@ struct SessionCacheEntry {
     /// get a fresh window and could re-accept an ancient replay. The TTL
     /// bounds that residue to the doctrine rekey-overlap window; a frame
     /// older than that is harmless (the client has long moved on).
+    ///
+    /// The `/v2` equivalent entry does not rely on frame traffic alone: a
+    /// live connection's `serve_pq_datagram_pump` keepalive refreshes it
+    /// within the TTL (see [`PqSessionCache::refresh`]), so this residual
+    /// case never arises while the connection is up. Memory stays bounded
+    /// because only entries backed by a live connection get refreshed, and
+    /// keeping the window alive for a live connection is strictly safer
+    /// than letting it die and re-derive.
     replay_windows: Arc<Mutex<EpochReplayWindows>>,
     last_seen_at: Instant,
 }
@@ -1467,6 +1481,29 @@ impl PqSessionCache {
             session: existing.session.clone(),
             replay_windows: existing.replay_windows.clone(),
         })
+    }
+
+    /// Bump `last_seen_at` for an already-established entry so the lazy TTL
+    /// sweep does not reclaim it, without creating a new entry and without
+    /// touching the create-rate budget. Used by the per-connection keepalive
+    /// in `serve_pq_datagram_pump` to keep a live `/v2` connection's session
+    /// warm through an idle gap: unlike `get`, this is not driven by frame
+    /// traffic, so it does not depend on the client sending anything.
+    ///
+    /// Returns whether `encapsulated_key` had a live entry to refresh.
+    fn refresh(&self, encapsulated_key: &EncapsulatedKeyBytes) -> bool {
+        let mut guard = self.inner.lock();
+        let now = Instant::now();
+        let ttl = self.ttl;
+        guard
+            .map
+            .retain(|_, entry| now.duration_since(entry.last_seen_at) < ttl);
+        if let Some(existing) = guard.map.get_mut(encapsulated_key) {
+            existing.last_seen_at = now;
+            true
+        } else {
+            false
+        }
     }
 
     #[cfg(test)]
@@ -3835,6 +3872,10 @@ async fn serve_pq_datagram_pump<T>(
     let reverse_seq = Arc::new(AtomicU64::new(0));
     let spoof_gate_v4 = setup.assigned_ip;
     let spoof_gate_v6 = setup.assigned_ip_v6;
+    // Encapsulated key of the session currently in use on this connection, so
+    // the keepalive task below can tell the cache which entry to refresh.
+    // Identity material: never logged, not even a prefix.
+    let current_key: Arc<Mutex<Option<EncapsulatedKeyBytes>>> = Arc::new(Mutex::new(None));
 
     // Inbound-activity counter for the sticky-IP takeover re-check (see the
     // classical pump). Registration already happened in `run_setup`; here we
@@ -3861,6 +3902,7 @@ async fn serve_pq_datagram_pump<T>(
     let down_tx_rx = down_tx.clone();
     let pq_rx = pq.clone();
     let rx_activity_rx = rx_activity.clone();
+    let current_key_rx = current_key.clone();
     let rx_task = tokio::spawn(async move {
         let mut tun_write_errors: u32 = 0;
         let mut spoofed_drops: u64 = 0;
@@ -3898,6 +3940,11 @@ async fn serve_pq_datagram_pump<T>(
                     Err(_) => continue,
                 }
             };
+            // Record the key of the session actually in use so the keepalive
+            // task can refresh it: an idle gap over the cache TTL would
+            // otherwise silently evict a still-connected session (see
+            // `PqSessionCache::refresh`).
+            *current_key_rx.lock() = Some(frame.encapsulated_key);
             let session = handle.session;
             let (frame_seq, frame_epoch) = (frame.seq, frame.epoch);
             let mut plaintext = match session.open(&frame) {
@@ -4027,9 +4074,35 @@ async fn serve_pq_datagram_pump<T>(
         }
     });
 
+    // Keep the connection's PQ session warm for as long as the connection is
+    // alive, instead of relying on frame traffic: a steady-state DATA frame's
+    // empty `pq_ct` cannot rebuild an evicted session, so an idle gap longer
+    // than `SESSION_CACHE_TTL` would otherwise silently black-hole every
+    // packet on resume (`PqSessionCache::get` misses forever, since the
+    // client only re-sends `pq_ct` while an epoch is unacked). Refreshing at
+    // half the TTL leaves a safety margin against scheduling jitter.
+    let conn_ka = conn.clone();
+    let cache_ka = pq.cache.clone();
+    let current_key_ka = current_key.clone();
+    let keepalive_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = conn_ka.closed() => break,
+                () = tokio::time::sleep(SESSION_CACHE_TTL / 2) => {
+                    let key = *current_key_ka.lock();
+                    if let Some(k) = key {
+                        cache_ka.refresh(&k);
+                    }
+                }
+            }
+        }
+    });
+
     let _ = rx_task.await;
     tx_task.abort();
     let _ = tx_task.await;
+    keepalive_task.abort();
+    let _ = keepalive_task.await;
     if let (Some(router), Some(ip), Some(own_tx)) = (&router, setup.assigned_ip, &down_tx) {
         router.unregister_if_owner(ip, own_tx);
         if let Some(ip6) = setup.assigned_ip_v6 {
@@ -5339,6 +5412,106 @@ mod tests {
         // The established exit session opens a frame the client sealed to it.
         let frame = client.seal(b"pq data", 0, 1).expect("client seals data");
         assert_eq!(h2.session.open(&frame).expect("exit opens"), b"pq data");
+    }
+
+    #[cfg(feature = "pq-hpke")]
+    fn establish_pq_session_for_cache_test(
+        exit_id: ExitId,
+    ) -> (
+        EncapsulatedKeyBytes,
+        warrenguard_multihop::XWingRecipientSecretKey,
+        warrenguard_multihop::PqClientSession,
+    ) {
+        let (secret, public) = warrenguard_multihop::XWingRecipientSecretKey::derive_deterministic(
+            &[7u8; 32],
+            &[9u8; 32],
+            &[11u8; 32],
+        );
+        let mut rng = rand_core::UnwrapErr(rand_core::OsRng);
+        let client = warrenguard_multihop::PqClientSession::new(&public, exit_id, &mut rng)
+            .expect("client session setup");
+        let ek = client.encapsulated_key();
+        (ek, secret, client)
+    }
+
+    #[cfg(feature = "pq-hpke")]
+    #[test]
+    fn refresh_keeps_a_pq_session_past_the_ttl() {
+        // Same TTL/sleep shape as `session_cache_hit_refreshes_last_seen_at`
+        // below: 20 ms touches against a 40 ms TTL.
+        let ttl = Duration::from_millis(40);
+        let exit_id = ExitId::from_bytes([0x3d; 16]);
+
+        // WITH refresh: touched inside every TTL window, must survive past
+        // a total elapsed time greater than the TTL. This is the fix: the
+        // pump keepalive calls `refresh` so a live `/v2` connection's
+        // session cannot be evicted by an idle gap over the TTL.
+        let (ek, secret, client) = establish_pq_session_for_cache_test(exit_id);
+        let refreshed_cache = PqSessionCache::with_ttl(ttl);
+        refreshed_cache
+            .establish_or_get(&ek, client.pq_ct(), exit_id, &secret)
+            .expect("establish");
+        for _ in 0..4 {
+            std::thread::sleep(Duration::from_millis(20));
+            assert!(
+                refreshed_cache.refresh(&ek),
+                "refresh must find the just-established entry"
+            );
+        }
+        assert!(
+            refreshed_cache.get(&ek).is_some(),
+            "a session refreshed inside every TTL window must survive past the TTL"
+        );
+
+        // WITHOUT refresh, same TTL and total idle time: the entry must
+        // still be evicted. This is the regression the fix prevents for a
+        // live connection, and proves it does not weaken the TTL for a
+        // genuinely idle/disconnected one.
+        let idle_cache = PqSessionCache::with_ttl(ttl);
+        idle_cache
+            .establish_or_get(&ek, client.pq_ct(), exit_id, &secret)
+            .expect("establish");
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(
+            idle_cache.get(&ek).is_none(),
+            "an un-refreshed session must still be evicted after the TTL"
+        );
+    }
+
+    #[cfg(feature = "pq-hpke")]
+    #[test]
+    fn refresh_returns_false_for_an_absent_key() {
+        let cache = PqSessionCache::new();
+        let ek: EncapsulatedKeyBytes = [0x44; 32];
+        assert!(
+            !cache.refresh(&ek),
+            "refresh on a never-established key must report absent"
+        );
+        assert_eq!(cache.entry_count(), 0, "refresh must not create an entry");
+    }
+
+    #[cfg(feature = "pq-hpke")]
+    #[test]
+    fn refresh_does_not_consume_the_create_budget() {
+        let cache = PqSessionCache::new();
+        let absent: EncapsulatedKeyBytes = [0x55; 32];
+        for _ in 0..10 {
+            assert!(!cache.refresh(&absent));
+        }
+        assert_eq!(
+            cache.entry_count(),
+            0,
+            "repeated refreshes on an absent key must never insert an entry"
+        );
+
+        let exit_id = ExitId::from_bytes([0x3e; 16]);
+        let (ek, secret, client) = establish_pq_session_for_cache_test(exit_id);
+        assert!(
+            cache
+                .establish_or_get(&ek, client.pq_ct(), exit_id, &secret)
+                .is_ok(),
+            "establish must still succeed: refresh on an absent key must not drain the create budget"
+        );
     }
 
     #[test]
