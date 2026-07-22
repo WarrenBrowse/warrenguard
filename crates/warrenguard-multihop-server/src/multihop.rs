@@ -3586,8 +3586,18 @@ async fn serve_one_connection_with_tun<T>(
         #[cfg(feature = "pq-hpke")]
         SetupOutcome::V2(pq_setup) => {
             if let Some(pq) = pq {
-                serve_pq_datagram_pump(conn, exit_id, tun, pq_setup, router, down_tx, down_rx, pq)
-                    .await;
+                serve_pq_datagram_pump(
+                    conn,
+                    exit_id,
+                    tun,
+                    pq_setup,
+                    router,
+                    down_tx,
+                    down_rx,
+                    pq,
+                    reverse_seq,
+                )
+                .await;
             }
             return;
         }
@@ -3864,12 +3874,19 @@ async fn serve_pq_datagram_pump<T>(
     down_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
     down_rx: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
     pq: PqSetup,
+    // MUST be the same counter `run_setup` sealed the stream reply from,
+    // never a fresh one: the client feeds stream replies and datagram
+    // downlinks through ONE anti-replay window, so restarting the pump's
+    // seqs at 0 re-issues the seq the IpAssign reply already consumed and
+    // the session's first downlink datagram is discarded as a replay
+    // (surfaced by the strict egress probe as "anti-replay rejection
+    // (epoch 0, seq 0)"; ordinary clients just lose one datagram).
+    reverse_seq: Arc<AtomicU64>,
 ) where
     T: PacketDevice + Clone,
 {
     let current: SharedPqCurrentSession =
         Arc::new(Mutex::new(Some((setup.session.clone(), setup.epoch))));
-    let reverse_seq = Arc::new(AtomicU64::new(0));
     let spoof_gate_v4 = setup.assigned_ip;
     let spoof_gate_v6 = setup.assigned_ip_v6;
     // Encapsulated key of the session currently in use on this connection, so
@@ -4257,8 +4274,18 @@ async fn serve_one_connection_with_tun_and_daita<T>(
         #[cfg(feature = "pq-hpke")]
         SetupOutcome::V2(pq_setup) => {
             if let Some(pq) = pq {
-                serve_pq_datagram_pump(conn, exit_id, tun, pq_setup, router, down_tx, down_rx, pq)
-                    .await;
+                serve_pq_datagram_pump(
+                    conn,
+                    exit_id,
+                    tun,
+                    pq_setup,
+                    router,
+                    down_tx,
+                    down_rx,
+                    pq,
+                    reverse_seq,
+                )
+                .await;
             }
             return;
         }
