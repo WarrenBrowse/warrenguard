@@ -1241,7 +1241,7 @@ fn take_active_for_port_returns_and_removes_the_mapping() {
         .expect("alice");
     let port = a.external_port;
     let removed = alloc.take_active_for_port(port);
-    assert_eq!(removed.as_ref(), Some(&a));
+    assert_eq!(removed, vec![a]);
     assert_eq!(alloc.active_count(), 0);
     assert_eq!(
         alloc.cooldown_count(),
@@ -1259,7 +1259,7 @@ fn take_active_for_port_returns_and_removes_the_mapping() {
 #[test]
 fn take_active_for_port_returns_none_for_unknown_port() {
     let alloc = Allocator::new();
-    assert!(alloc.take_active_for_port(49999).is_none());
+    assert!(alloc.take_active_for_port(49999).is_empty());
     assert_eq!(alloc.metrics().releases_total, 0);
     assert_eq!(alloc.metrics().evictions_total, 0);
 }
@@ -1722,4 +1722,209 @@ fn restore_skips_expired_and_conflicting_entries() {
         "conflicting + expired entries must both be skipped, got {reinstated:?}"
     );
     assert_eq!(fresh.active_count(), 1, "only bob's mapping remains");
+}
+
+// ---------------------------------------------------------------------------
+// Dual-proto: TCP + UDP simultaneously on the same external port
+// ---------------------------------------------------------------------------
+
+#[test]
+fn owner_maps_both_protos_on_the_same_port() {
+    let alloc = Allocator::new();
+    let now = Instant::now();
+    let udp = alloc
+        .allocate_at(ALICE, Proto::Udp, 4242, 50000, 600, now)
+        .expect("udp leg");
+    assert_eq!(udp.external_port, 50000);
+    let tcp = alloc
+        .allocate_at(ALICE, Proto::Tcp, 4242, 50000, 600, now)
+        .expect("tcp companion on the port this client already owns");
+    assert_eq!(tcp.external_port, 50000);
+    assert_eq!(alloc.active_count(), 2, "one entry per proto");
+}
+
+#[test]
+fn other_client_cannot_take_the_free_proto_of_an_owned_port() {
+    // Port ownership is client-level: a port live-mapped by Alice in UDP
+    // must never be grantable to Bob in TCP, or two tenants would share
+    // one public port number across protocols.
+    let alloc = Allocator::new();
+    let now = Instant::now();
+    alloc
+        .allocate_at(ALICE, Proto::Udp, 4242, 50000, 600, now)
+        .expect("alice udp");
+    let err = alloc
+        .allocate_at(BOB, Proto::Tcp, 4242, 50000, 600, now)
+        .expect_err("bob must not obtain the tcp slot of alice's port");
+    assert!(matches!(err, NatPmpError::SuggestedPortInUse(50000)));
+}
+
+#[test]
+fn random_pick_never_lands_on_the_free_proto_of_an_owned_port() {
+    // Single-port pool: alice owns the only port in UDP. Bob's
+    // no-preference TCP request must exhaust rather than share it.
+    let alloc = Allocator::with_config(
+        (50000, 50000),
+        Duration::from_secs(300),
+        100,
+        Duration::from_secs(60),
+    );
+    let now = Instant::now();
+    alloc
+        .allocate_at(ALICE, Proto::Udp, 0, 0, 600, now)
+        .expect("alice udp");
+    let err = alloc
+        .allocate_at(BOB, Proto::Tcp, 0, 0, 600, now)
+        .expect_err("the only port is owned by alice");
+    assert!(matches!(err, NatPmpError::Exhausted));
+}
+
+#[test]
+fn companion_proto_does_not_consume_quota() {
+    use warrenguard_natpmp_server::allocator::AllocatorConfig;
+    let alloc = Allocator::from_config(AllocatorConfig {
+        range: (49152, 65535),
+        cooldown: Duration::from_secs(300),
+        rate_limit_max: 100,
+        rate_limit_window: Duration::from_secs(60),
+        quota_per_client: 1,
+    });
+    let now = Instant::now();
+    let udp = alloc
+        .allocate_at(ALICE, Proto::Udp, 4242, 50000, 600, now)
+        .expect("first port");
+    // Same port number, other proto: not a new port, must pass the
+    // 1-port quota.
+    alloc
+        .allocate_at(ALICE, Proto::Tcp, 4242, udp.external_port, 600, now)
+        .expect("companion proto is quota-free");
+    // A second port number is over quota.
+    let err = alloc
+        .allocate_at(ALICE, Proto::Udp, 5353, 0, 600, now)
+        .expect_err("second port number exceeds the quota");
+    assert!(matches!(err, NatPmpError::QuotaExceeded(ip) if ip == ALICE));
+}
+
+#[test]
+fn quota_counts_port_numbers_not_entries() {
+    use warrenguard_natpmp_server::allocator::AllocatorConfig;
+    let alloc = Allocator::from_config(AllocatorConfig {
+        range: (49152, 65535),
+        cooldown: Duration::from_secs(300),
+        rate_limit_max: 100,
+        rate_limit_window: Duration::from_secs(60),
+        quota_per_client: 2,
+    });
+    let now = Instant::now();
+    for port in [50000u16, 50001] {
+        alloc
+            .allocate_at(ALICE, Proto::Udp, port, port, 600, now)
+            .expect("udp leg");
+        alloc
+            .allocate_at(ALICE, Proto::Tcp, port, port, 600, now)
+            .expect("tcp leg");
+    }
+    assert_eq!(alloc.active_count(), 4, "2 ports x 2 protos");
+    let err = alloc
+        .allocate_at(ALICE, Proto::Udp, 6000, 0, 600, now)
+        .expect_err("third port number exceeds the 2-port quota");
+    assert!(matches!(err, NatPmpError::QuotaExceeded(_)));
+}
+
+#[test]
+fn companion_proto_is_exempt_from_rate_limit() {
+    // The rate limit throttles NEW port acquisition; adding the other
+    // proto on a port the client already owns acquires nothing.
+    let alloc = Allocator::with_config(
+        (49152, 65535),
+        Duration::from_secs(300),
+        1,
+        Duration::from_secs(60),
+    );
+    let now = Instant::now();
+    let udp = alloc
+        .allocate_at(ALICE, Proto::Udp, 4242, 0, 600, now)
+        .expect("consumes the only rate-limit slot");
+    alloc
+        .allocate_at(ALICE, Proto::Tcp, 4242, udp.external_port, 600, now)
+        .expect("companion proto must not be rate limited");
+    let err = alloc
+        .allocate_at(ALICE, Proto::Udp, 5353, 0, 600, now)
+        .expect_err("a new port acquisition is rate limited");
+    assert!(matches!(err, NatPmpError::RateLimited { .. }));
+}
+
+#[test]
+fn releasing_one_proto_keeps_the_other_live_and_the_port_owned() {
+    let alloc = Allocator::new();
+    let now = Instant::now();
+    alloc
+        .allocate_at(ALICE, Proto::Udp, 4242, 50000, 600, now)
+        .expect("udp");
+    alloc
+        .allocate_at(ALICE, Proto::Tcp, 4242, 50000, 600, now)
+        .expect("tcp");
+    let released = alloc.release_by_client_at(ALICE, 4242, Proto::Udp, now);
+    assert!(released.is_some(), "udp leg found and released");
+    assert_eq!(alloc.active_count(), 1, "tcp leg survives");
+    // The port stays alice's: bob cannot grab the freed udp slot.
+    let err = alloc
+        .allocate_at(BOB, Proto::Udp, 4242, 50000, 600, now)
+        .expect_err("port still owned by alice through the live tcp leg");
+    assert!(matches!(err, NatPmpError::SuggestedPortInUse(50000)));
+    // Alice may re-add the udp leg immediately.
+    alloc
+        .allocate_at(ALICE, Proto::Udp, 4242, 50000, 600, now)
+        .expect("owner re-adds the released proto");
+}
+
+#[test]
+fn take_active_for_port_removes_both_protos() {
+    // Admin revoke-by-port kills the whole port, both legs at once.
+    let alloc = Allocator::new();
+    let now = Instant::now();
+    alloc
+        .allocate_at(ALICE, Proto::Udp, 4242, 50000, 600, now)
+        .expect("udp");
+    alloc
+        .allocate_at(ALICE, Proto::Tcp, 4242, 50000, 600, now)
+        .expect("tcp");
+    let taken = alloc.take_active_for_port_at(50000, now);
+    assert_eq!(taken.len(), 2, "both legs drained: {taken:?}");
+    assert_eq!(alloc.active_count(), 0);
+}
+
+#[test]
+fn restore_reinstates_a_dual_proto_pair() {
+    // Hot-swap persistence: a pair saved before the restart must come
+    // back whole, not first-wins-by-port.
+    let alloc = Allocator::new();
+    let now = Instant::now();
+    let udp = alloc
+        .allocate_at(ALICE, Proto::Udp, 4242, 50000, 600, now)
+        .expect("udp");
+    let tcp = alloc
+        .allocate_at(ALICE, Proto::Tcp, 4242, 50000, 600, now)
+        .expect("tcp");
+    let fresh = Allocator::new();
+    let reinstated = fresh.restore_at(vec![udp, tcp], now);
+    assert_eq!(reinstated.len(), 2, "both legs reinstated: {reinstated:?}");
+    assert_eq!(fresh.active_count(), 2);
+}
+
+#[test]
+fn lazily_expired_port_rejects_foreign_suggestion_during_cooldown() {
+    // The random-pick path already honours the expiry cooldown; the
+    // explicit-suggestion path must too, or a different client could
+    // inherit residual inbound traffic the instant a lease lapses.
+    let alloc = Allocator::new();
+    let t0 = Instant::now();
+    let a = alloc
+        .allocate_at(ALICE, Proto::Tcp, 0, 50000, 60, t0)
+        .expect("alice lease");
+    assert_eq!(a.external_port, 50000);
+    let err = alloc
+        .allocate_at(BOB, Proto::Tcp, 0, 50000, 600, t0 + Duration::from_secs(61))
+        .expect_err("bob must not inherit the just-expired port by suggestion");
+    assert!(matches!(err, NatPmpError::SuggestedPortInUse(50000)));
 }

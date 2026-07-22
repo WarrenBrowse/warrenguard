@@ -671,10 +671,12 @@ impl<E: NftExecutor + 'static> PortForwardingBackend for NftablesBackend<E> {
                     dnat_port,
                 );
                 if let Err(stderr) = runner.run_script(&script).await {
-                    // Drop WITHOUT arming a cooldown (take, not release):
-                    // nothing routes to this port, so the owner's fresh
-                    // re-request must be able to grab it back at once.
-                    allocator.take_active_for_port(alloc.external_port);
+                    // Drop only this slot, WITHOUT arming a cooldown:
+                    // nothing routes to it, so the owner's fresh
+                    // re-request must be able to grab it back at once,
+                    // and the pair's other leg (restored separately)
+                    // must not be collaterally evicted.
+                    allocator.take_active_for_slot(alloc.external_port, alloc.proto);
                     tracing::warn!(
                         error = %stderr,
                         external_port = alloc.external_port,

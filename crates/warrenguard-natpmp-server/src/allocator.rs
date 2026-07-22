@@ -3,7 +3,7 @@
 //!
 //! **No disk persistence**: reboot = full reset, by design no-log.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -34,7 +34,8 @@ pub struct AllocatorConfig {
     pub rate_limit_max: usize,
     /// Sliding window for the per-source rate limit.
     pub rate_limit_window: Duration,
-    /// Max simultaneous active allocations per source IP. With the
+    /// Max simultaneous distinct external PORT NUMBERS per source IP.
+    /// A TCP + UDP pair on one port counts once. With the
     /// one-IP-per-pubkey tunnel model, this caps the per-pubkey
     /// port-forward budget at the same value.
     pub quota_per_client: usize,
@@ -94,7 +95,10 @@ pub struct AllocateOutcome {
 /// External port allocator for `warrenguard-natpmp-server`.
 ///
 /// Internal state (RAM only):
-/// - `active`: `external_port → Allocation`. Current source of truth.
+/// - `active`: `(external_port, proto) → Allocation`. Current source of
+///   truth. Port ownership is CLIENT-level: at most one client holds a
+///   given port number, but that client may hold both the TCP and the
+///   UDP slot of it (dual-proto forwarding on one port).
 /// - `cooldown`: recently released ports (FIFO ordered by release
 ///   instant + cooldown). A port in cooldown cannot be reallocated.
 /// - `last_user_per_port`: `external_port → (last_client, expiry)`.
@@ -164,7 +168,7 @@ pub struct AllocatorMetrics {
 }
 
 struct Inner {
-    active: HashMap<u16, Allocation>,
+    active: HashMap<(u16, Proto), Allocation>,
     cooldown_until: HashMap<u16, Instant>,
     last_user_per_port: HashMap<u16, (Ipv4Addr, Instant)>,
     rate_limit_log: HashMap<Ipv4Addr, VecDeque<Instant>>,
@@ -361,9 +365,75 @@ impl Allocator {
         // Entries this call removes from `active` (expiry sweep +
         // refresh-reclaim), collected up-front so EVERY return path -
         // including the error returns below - hands them back for
-        // backend teardown. The strict pre-check returns before any
-        // mutation, so `evicted` is simply empty there.
+        // backend teardown.
         let mut evicted: Vec<Allocation> = Vec::new();
+
+        // Lazy sweep of expired allocations FIRST, so every check below
+        // (the strict suggested-port pre-check included) sees only live
+        // entries and the expiry cooldown armed here is consulted
+        // uniformly by the suggestion and random-pick paths. Sweeping on
+        // a path that later rejects is harmless: the entries were dead
+        // either way and the caller tears down `evicted` on every path.
+        // Without the sweep, ports stay RAM-occupied past their lifetime
+        // and the pool ends in guaranteed exhaustion (clients that crash
+        // without sending a delete-mapping).
+        // Collect lazily-expired `(port, owner_ip, expires_at)` so their
+        // anti-inheritance cooldown can be armed after the retain (the other
+        // side maps cannot be touched while `active` is mutably borrowed here).
+        let mut expired_ports: Vec<(u16, Ipv4Addr, Instant)> = Vec::new();
+        g.active.retain(|&(ext, _), alloc| {
+            let keep = alloc.expires_at > now;
+            if !keep {
+                expired_ports.push((ext, alloc.internal_ip, alloc.expires_at));
+                evicted.push(alloc.clone());
+            }
+            keep
+        });
+        // A lazily-expired lease (client crashed without sending delete) must
+        // arm the SAME cooldown as an explicit release, or a DIFFERENT client
+        // could grab the exact port the instant it lapses and inherit residual
+        // inbound traffic. The cooldown is measured from the lease's EXPIRY,
+        // not from `now` (the sweep time) - otherwise a client that simply
+        // asks long after the lease lapsed would restart the cooldown clock and
+        // be wrongly blocked. A long-dead entry whose cooldown already elapsed
+        // adds nothing, so skip it. The owner can still reclaim its own port
+        // via an explicit suggestion (`port_eligible(allow_owner_reclaim=true)`),
+        // which is exactly the case the cooldown is NOT meant to block. A
+        // dual-proto pair expiring together arms once per leg; keep the later
+        // deadline.
+        for (ext, ip, expires_at) in expired_ports {
+            let deadline = expires_at + self.cooldown;
+            if deadline > now {
+                let slot = g.cooldown_until.entry(ext).or_insert(deadline);
+                if deadline > *slot {
+                    *slot = deadline;
+                }
+                let last = g.last_user_per_port.entry(ext).or_insert((ip, deadline));
+                if deadline > last.1 {
+                    *last = (ip, deadline);
+                }
+            }
+        }
+
+        // The three side maps used to grow without bound
+        // (cooldown_until, last_user_per_port, rate_limit_log). In
+        // particular `rate_limit_log` kept empty entries forever for
+        // any client that made a request then disappeared - unbounded
+        // leak under ephemeral-client churn. The two port maps are
+        // bounded by `range_size` but their entries used to remain
+        // permanent past expiry.
+        g.cooldown_until.retain(|_, expiry| *expiry > now);
+        g.last_user_per_port.retain(|_, (_, expiry)| *expiry > now);
+        let rate_window = self.rate_limit_window;
+        g.rate_limit_log.retain(|_, log| {
+            while log
+                .front()
+                .is_some_and(|t| now.duration_since(*t) > rate_window)
+            {
+                log.pop_front();
+            }
+            !log.is_empty()
+        });
 
         // Strict honouring of an explicit suggestion. RFC 6886 §3.3
         // permits the server to grant a different port, but Warren's UX
@@ -374,31 +444,31 @@ impl Allocator {
         // confused users who pinned a port (it appeared to "work" on a
         // different port, then "fix itself" on the next renewal).
         //
-        // Checked up-front, BEFORE the lazy sweep / refresh-reclaim
-        // mutate `active`, so a rejection leaves the client's current
-        // mapping (and its backend DNAT rule) untouched: a live
-        // port-change to an unavailable port fails cleanly and the
-        // existing mapping keeps working. The rejection path mutates only
-        // the probing client's rate-limit log, never `active`, so
-        // there is still no `evicted` teardown to leak.
+        // Checked BEFORE the refresh-reclaim mutates `active`, so a
+        // rejection leaves the client's current mapping (and its backend
+        // DNAT rule) untouched: a live port-change to an unavailable
+        // port fails cleanly and the existing mapping keeps working.
+        // Port ownership is client-level: a port live-held by another
+        // client is never grantable, whatever the proto; a port
+        // live-held by THIS client grants its free proto slot (the
+        // dual-proto companion) or the same-tuple refresh.
         if suggested != 0 {
             let grantable = port_in_range(suggested, self.range)
-                && match g.active.get(&suggested) {
-                    // Occupied - but a self-owned same-tuple entry (a
-                    // refresh of the very same port) or an already
-                    // expired entry (which the sweep below would free)
-                    // does not block this client.
-                    Some(a) => {
-                        (a.internal_ip == client_ip
-                            && a.internal_port == internal_port
-                            && a.proto == proto)
-                            || a.expires_at <= now
+                && port_owner(&g, suggested).is_none_or(|owner| owner == client_ip)
+                && match g.active.get(&(suggested, proto)) {
+                    // Live entry in this exact slot: only the owner's
+                    // same-tuple refresh may re-grant it.
+                    Some(a) => a.internal_ip == client_ip && a.internal_port == internal_port,
+                    // Slot free: fine when the client already owns the
+                    // port through the other proto, else the port must
+                    // be fully eligible, allowing the owner to reclaim
+                    // its OWN pinned port (the cooldown only guards
+                    // against a *different* client inheriting residual
+                    // traffic).
+                    None => {
+                        port_owner(&g, suggested).is_some()
+                            || port_eligible(&g, suggested, client_ip, now, true)
                     }
-                    // Free in `active`: grantable iff eligible for this
-                    // client, allowing the owner to reclaim its OWN
-                    // pinned port (the cooldown only guards against a
-                    // *different* client inheriting residual traffic).
-                    None => port_eligible(&g, suggested, client_ip, now, true),
                 };
             if !grantable {
                 // Throttle the suggested-port occupancy oracle: a rejected
@@ -439,60 +509,6 @@ impl Allocator {
             }
         }
 
-        // Lazy sweep of expired allocations before allocating. Without
-        // this, ports stay RAM-occupied past their lifetime and the
-        // pool ends in guaranteed exhaustion (clients that crash
-        // without sending a delete-mapping).
-        // Collect lazily-expired `(port, owner_ip, expires_at)` so their
-        // anti-inheritance cooldown can be armed after the retain (the other
-        // side maps cannot be touched while `active` is mutably borrowed here).
-        let mut expired_ports: Vec<(u16, Ipv4Addr, Instant)> = Vec::new();
-        g.active.retain(|ext, alloc| {
-            let keep = alloc.expires_at > now;
-            if !keep {
-                expired_ports.push((*ext, alloc.internal_ip, alloc.expires_at));
-                evicted.push(alloc.clone());
-            }
-            keep
-        });
-        // A lazily-expired lease (client crashed without sending delete) must
-        // arm the SAME cooldown as an explicit release, or a DIFFERENT client
-        // could grab the exact port the instant it lapses and inherit residual
-        // inbound traffic. The cooldown is measured from the lease's EXPIRY,
-        // not from `now` (the sweep time) - otherwise a client that simply
-        // asks long after the lease lapsed would restart the cooldown clock and
-        // be wrongly blocked. A long-dead entry whose cooldown already elapsed
-        // adds nothing, so skip it. The owner can still reclaim its own port
-        // via an explicit suggestion (`port_eligible(allow_owner_reclaim=true)`),
-        // which is exactly the case the cooldown is NOT meant to block.
-        for (ext, ip, expires_at) in expired_ports {
-            let deadline = expires_at + self.cooldown;
-            if deadline > now {
-                g.cooldown_until.insert(ext, deadline);
-                g.last_user_per_port.insert(ext, (ip, deadline));
-            }
-        }
-
-        // The three side maps used to grow without bound
-        // (cooldown_until, last_user_per_port, rate_limit_log). In
-        // particular `rate_limit_log` kept empty entries forever for
-        // any client that made a request then disappeared - unbounded
-        // leak under ephemeral-client churn. The two port maps are
-        // bounded by `range_size` but their entries used to remain
-        // permanent past expiry.
-        g.cooldown_until.retain(|_, expiry| *expiry > now);
-        g.last_user_per_port.retain(|_, (_, expiry)| *expiry > now);
-        let rate_window = self.rate_limit_window;
-        g.rate_limit_log.retain(|_, log| {
-            while log
-                .front()
-                .is_some_and(|t| now.duration_since(*t) > rate_window)
-            {
-                log.pop_front();
-            }
-            !log.is_empty()
-        });
-
         // A refresh = a still-live mapping for the SAME
         // (client_ip, internal_port, proto) tuple (the expiry sweep above
         // already dropped dead ones). Renewals and re-applying an
@@ -502,16 +518,24 @@ impl Allocator {
         // rate-limit budget just keeping them alive - the limit is meant
         // to throttle NEW allocations / port changes, not steady-state
         // renewals.
-        let is_refresh = g.active.values().any(|a| {
-            a.internal_ip == client_ip && a.internal_port == internal_port && a.proto == proto
+        let is_refresh = g.active.iter().any(|(key, a)| {
+            key.1 == proto && a.internal_ip == client_ip && a.internal_port == internal_port
         });
+        // The rate limit throttles NEW port acquisition. An explicit
+        // suggestion for a port this client already live-owns (the
+        // dual-proto companion, or a re-add after a single-leg release)
+        // acquires no new port number, so it is exempt like a refresh -
+        // otherwise mapping TCP+UDP pairs would cost double budget.
+        let owns_suggested_port =
+            suggested != 0 && port_owner(&g, suggested).is_some_and(|owner| owner == client_ip);
+        let acquires_new_port = !is_refresh && !owns_suggested_port;
 
-        // Rate limit (NEW allocations only): trim the window then check
-        // (do not increment yet). Incrementing before `pick_port` would
-        // consume a slot on `Exhausted` failure, and a client racing
-        // against a full pool would end up permanently `RateLimited`
-        // (self-reinforcing DoS).
-        if !is_refresh {
+        // Rate limit (NEW port acquisitions only): trim the window then
+        // check (do not increment yet). Incrementing before `pick_port`
+        // would consume a slot on `Exhausted` failure, and a client
+        // racing against a full pool would end up permanently
+        // `RateLimited` (self-reinforcing DoS).
+        if acquires_new_port {
             let log = g.rate_limit_log.entry(client_ip).or_default();
             while log
                 .front()
@@ -560,21 +584,21 @@ impl Allocator {
         // We deliberately do NOT register a cooldown / anti-rotation
         // entry for the reclaimed port: the same client is the one
         // re-requesting, so penalising it would defeat the refresh.
-        let stale_same_tuple: Vec<u16> = g
+        let stale_same_tuple: Vec<(u16, Proto)> = g
             .active
             .iter()
-            .filter(|(_, a)| {
-                a.internal_ip == client_ip && a.internal_port == internal_port && a.proto == proto
+            .filter(|(key, a)| {
+                key.1 == proto && a.internal_ip == client_ip && a.internal_port == internal_port
             })
-            .map(|(ext, _)| *ext)
+            .map(|(key, _)| *key)
             .collect();
         // Remember the port this client most recently held for the
         // tuple, so a refresh that carries no explicit suggestion can
         // reuse it (port stability across renewals - see below).
         let mut previously_held: Option<u16> = None;
-        for ext in stale_same_tuple {
-            if let Some(removed) = g.active.remove(&ext) {
-                previously_held = Some(ext);
+        for key in stale_same_tuple {
+            if let Some(removed) = g.active.remove(&key) {
+                previously_held = Some(key.0);
                 // Refresh that moves to a different external port: the
                 // old port's DNAT element must be deleted by the
                 // backend, or it lingers forwarding to the client
@@ -585,19 +609,28 @@ impl Allocator {
             }
         }
 
-        // Per-client quota. Counted on *active* allocations only
-        // (after the refresh-reclaim above). Releasing a port restores
-        // a slot immediately so a legitimate client can rotate ports
-        // without waiting on the global cooldown. Once a source IP holds
-        // `NATPMP_QUOTA_PER_CLIENT_IP` (currently 5) simultaneous mappings,
-        // a further mapping on a different internal_port is refused here
-        // before we touch the port pool.
-        let already_held = g
+        // Per-client quota, counted on distinct live PORT NUMBERS (after
+        // the refresh-reclaim above), not entries: a TCP+UDP pair on one
+        // port consumes one quota slot. Releasing a port restores a slot
+        // immediately so a legitimate client can rotate ports without
+        // waiting on the global cooldown. A request that lands on a port
+        // the client already holds (explicit companion suggestion, or a
+        // dual-proto leg refreshing onto its own port) adds no port and
+        // is quota-free; only a genuinely new port number is refused
+        // once the client holds `NATPMP_QUOTA_PER_CLIENT_IP` (currently
+        // 5) of them.
+        let held_ports: HashSet<u16> = g
             .active
-            .values()
-            .filter(|alloc| alloc.internal_ip == client_ip)
-            .count();
-        if already_held >= self.quota_per_client {
+            .iter()
+            .filter(|(_, a)| a.internal_ip == client_ip)
+            .map(|(key, _)| key.0)
+            .collect();
+        let reuses_held_port = if suggested != 0 {
+            held_ports.contains(&suggested)
+        } else {
+            previously_held.is_some_and(|p| held_ports.contains(&p))
+        };
+        if !reuses_held_port && held_ports.len() >= self.quota_per_client {
             self.counters.quota_exceeded.fetch_add(1, Ordering::Relaxed);
             return AllocateOutcome {
                 result: Err(NatPmpError::QuotaExceeded(client_ip)),
@@ -608,9 +641,9 @@ impl Allocator {
         // Port choice.
         // - An explicit suggestion was already validated as grantable
         //   by the strict pre-check at the top of this function, and the
-        //   sweep / refresh-reclaim since then only ever FREED ports
-        //   (never made it ineligible), so we grant it verbatim. No
-        //   random fallback: strict honour-or-error.
+        //   refresh-reclaim since then only ever FREED slots (never made
+        //   it ineligible), so we grant it verbatim. No random fallback:
+        //   strict honour-or-error.
         // - With no suggestion, reuse the port the client just held on a
         //   refresh so the public mapping stays stable across the
         //   ~30 min renewal cycle (RFC 6886 refresh semantics), else
@@ -618,7 +651,14 @@ impl Allocator {
         let port = if suggested != 0 {
             suggested
         } else {
-            match pick_port(&g, self.range, previously_held.unwrap_or(0), client_ip, now) {
+            match pick_port(
+                &g,
+                self.range,
+                proto,
+                previously_held.unwrap_or(0),
+                client_ip,
+                now,
+            ) {
                 Some(p) => p,
                 None => {
                     self.counters.exhausted.fetch_add(1, Ordering::Relaxed);
@@ -631,10 +671,11 @@ impl Allocator {
         };
 
         // Allocation succeeded: register a rate-limit slot ONLY for a
-        // genuinely-new allocation (a refresh of an existing mapping is
-        // exempt - see `is_refresh` above - so steady-state renewals of
-        // many held ports never erode the budget).
-        if !is_refresh {
+        // genuinely-new port acquisition (refreshes and same-port
+        // companion protos are exempt - see `acquires_new_port` above -
+        // so steady-state renewals of many held ports never erode the
+        // budget).
+        if acquires_new_port {
             g.rate_limit_log
                 .entry(client_ip)
                 .or_default()
@@ -648,7 +689,7 @@ impl Allocator {
             proto,
             expires_at: now + lifetime,
         };
-        g.active.insert(port, alloc.clone());
+        g.active.insert((port, proto), alloc.clone());
         self.counters.allocations.fetch_add(1, Ordering::Relaxed);
         AllocateOutcome {
             result: Ok(alloc),
@@ -667,11 +708,12 @@ impl Allocator {
     ///
     /// # Warning
     ///
-    /// Releases whatever currently holds `alloc.external_port` with NO
-    /// `internal_ip` owner check. This is safe today only because the single
-    /// client-reachable release path is `release_by_client` (owner-scoped, RFC
-    /// `lifetime=0`). NEVER call this with an attacker-influenced port, or one
-    /// client could tear down another client's mapping (cross-tenant).
+    /// Releases whatever currently holds the `(external_port, proto)` slot
+    /// with NO `internal_ip` owner check. This is safe today only because the
+    /// single client-reachable release path is `release_by_client`
+    /// (owner-scoped, RFC `lifetime=0`). NEVER call this with an
+    /// attacker-influenced port, or one client could tear down another
+    /// client's mapping (cross-tenant).
     pub fn release(&self, alloc: &Allocation) {
         self.release_at(alloc, Instant::now());
     }
@@ -679,7 +721,10 @@ impl Allocator {
     /// Variant with an injectable `now`.
     pub fn release_at(&self, alloc: &Allocation, now: Instant) {
         let mut g = self.inner.lock();
-        if g.active.remove(&alloc.external_port).is_some() {
+        if g.active
+            .remove(&(alloc.external_port, alloc.proto))
+            .is_some()
+        {
             g.cooldown_until
                 .insert(alloc.external_port, now + self.cooldown);
             // Anti-rotation expires with the cooldown: past that, the
@@ -733,14 +778,14 @@ impl Allocator {
         // Find the external_port for (client_ip, internal_port,
         // proto). Linear in N=active mappings; OK for N < a few
         // thousand, otherwise add a reverse index later.
-        let external_port = g.active.iter().find_map(|(ext, a)| {
-            (a.internal_ip == client_ip && a.internal_port == internal_port && a.proto == proto)
-                .then_some(*ext)
+        let key = g.active.iter().find_map(|(key, a)| {
+            (key.1 == proto && a.internal_ip == client_ip && a.internal_port == internal_port)
+                .then_some(*key)
         })?;
-        let alloc = g.active.remove(&external_port).expect("checked above");
-        g.cooldown_until.insert(external_port, now + self.cooldown);
+        let alloc = g.active.remove(&key).expect("checked above");
+        g.cooldown_until.insert(key.0, now + self.cooldown);
         g.last_user_per_port
-            .insert(external_port, (alloc.internal_ip, now + self.cooldown));
+            .insert(key.0, (alloc.internal_ip, now + self.cooldown));
         self.counters.releases.fetch_add(1, Ordering::Relaxed);
         Some(alloc)
     }
@@ -772,12 +817,21 @@ impl Allocator {
         let mut g = self.inner.lock();
         let mut kept = Vec::new();
         for entry in entries {
-            if entry.expires_at <= now || g.active.contains_key(&entry.external_port) {
+            let key = (entry.external_port, entry.proto);
+            // Skip expired entries, an already-taken slot (first-wins),
+            // and a port whose owner is another client: port ownership
+            // is client-level, so a pre-restore third-party grant wins
+            // the whole port, both protos of a saved pair included.
+            if entry.expires_at <= now
+                || g.active.contains_key(&key)
+                || port_owner(&g, entry.external_port)
+                    .is_some_and(|owner| owner != entry.internal_ip)
+            {
                 continue;
             }
             g.last_user_per_port
                 .insert(entry.external_port, (entry.internal_ip, now));
-            g.active.insert(entry.external_port, entry.clone());
+            g.active.insert(key, entry.clone());
             kept.push(entry);
         }
         kept
@@ -808,14 +862,15 @@ impl Allocator {
         self.take_active_for_ip_at(client_ip, Instant::now())
     }
 
-    /// Remove the single active mapping at `external_port` and
-    /// return it so the caller can tear down the matching backend
-    /// rule. Used by the admin revoke path: the control plane pushes the
-    /// pending port list back to the exit through the sync
-    /// response, and the exit drains each entry through this
-    /// method before feeding the cleanup worker.
+    /// Remove every active mapping at `external_port` (both protos of a
+    /// dual-proto pair) and return them so the caller can tear down the
+    /// matching backend rules. Used by the admin revoke path: the
+    /// control plane pushes the pending port list back to the exit
+    /// through the sync response, and the exit drains each entry
+    /// through this method before feeding the cleanup worker. Revoking
+    /// a port means the whole port number, so both legs go at once.
     ///
-    /// Returns `None` if no allocation currently holds that port
+    /// Returns an empty vec if no allocation currently holds that port
     /// (already expired, never allocated, or freed by a concurrent
     /// path). The cooldown bookkeeping mirrors the regular release
     /// path so an admin revoke does not let the same port come
@@ -827,21 +882,38 @@ impl Allocator {
     /// the admin-revoke-by-port primitive). NEVER expose it on a
     /// client-reachable path with a client-supplied port, or one client could
     /// evict another's mapping. Client releases go through `release_by_client`.
-    pub fn take_active_for_port(&self, port: u16) -> Option<Allocation> {
+    pub fn take_active_for_port(&self, port: u16) -> Vec<Allocation> {
         self.take_active_for_port_at(port, Instant::now())
     }
 
     /// Variant of [`Self::take_active_for_port`] with an injectable
     /// `now` for tests.
-    pub fn take_active_for_port_at(&self, port: u16, now: Instant) -> Option<Allocation> {
+    pub fn take_active_for_port_at(&self, port: u16, now: Instant) -> Vec<Allocation> {
         let mut g = self.inner.lock();
-        let alloc = g.active.remove(&port)?;
-        g.cooldown_until.insert(port, now + self.cooldown);
-        g.last_user_per_port
-            .insert(port, (alloc.internal_ip, now + self.cooldown));
-        self.counters.releases.fetch_add(1, Ordering::Relaxed);
-        self.counters.evictions.fetch_add(1, Ordering::Relaxed);
-        Some(alloc)
+        let mut removed = Vec::new();
+        for proto in [Proto::Tcp, Proto::Udp] {
+            if let Some(alloc) = g.active.remove(&(port, proto)) {
+                g.cooldown_until.insert(port, now + self.cooldown);
+                g.last_user_per_port
+                    .insert(port, (alloc.internal_ip, now + self.cooldown));
+                removed.push(alloc);
+            }
+        }
+        if !removed.is_empty() {
+            let n = removed.len() as u64;
+            self.counters.releases.fetch_add(n, Ordering::Relaxed);
+            self.counters.evictions.fetch_add(n, Ordering::Relaxed);
+        }
+        removed
+    }
+
+    /// Remove exactly one `(external_port, proto)` slot WITHOUT arming a
+    /// cooldown or the anti-rotation entry. For the restore-failure path
+    /// only: the backend could not install the rule, so nothing routes
+    /// to the slot and the owner's fresh re-request must be able to
+    /// grab it back at once. Never expose it on a client-reachable path.
+    pub fn take_active_for_slot(&self, port: u16, proto: Proto) -> Option<Allocation> {
+        self.inner.lock().active.remove(&(port, proto))
     }
 
     /// Variant of [`Self::take_active_for_ip`] with an injectable
@@ -849,17 +921,17 @@ impl Allocator {
     /// bookkeeping deterministically.
     pub fn take_active_for_ip_at(&self, client_ip: Ipv4Addr, now: Instant) -> Vec<Allocation> {
         let mut g = self.inner.lock();
-        let ports: Vec<u16> = g
+        let keys: Vec<(u16, Proto)> = g
             .active
             .iter()
-            .filter_map(|(port, alloc)| (alloc.internal_ip == client_ip).then_some(*port))
+            .filter_map(|(key, alloc)| (alloc.internal_ip == client_ip).then_some(*key))
             .collect();
-        let mut removed = Vec::with_capacity(ports.len());
-        for port in ports {
-            if let Some(alloc) = g.active.remove(&port) {
-                g.cooldown_until.insert(port, now + self.cooldown);
+        let mut removed = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(alloc) = g.active.remove(&key) {
+                g.cooldown_until.insert(key.0, now + self.cooldown);
                 g.last_user_per_port
-                    .insert(port, (alloc.internal_ip, now + self.cooldown));
+                    .insert(key.0, (alloc.internal_ip, now + self.cooldown));
                 removed.push(alloc);
             }
         }
@@ -961,12 +1033,25 @@ fn port_in_range(p: u16, range: (u16, u16)) -> bool {
     p >= range.0 && p <= range.1
 }
 
+/// The client holding external port `p` through either proto slot, if
+/// any. Callers run after the lazy expiry sweep, so a returned owner is
+/// live. Port ownership is client-level: the allocation paths guarantee
+/// both slots of one port always belong to the same `internal_ip`.
+fn port_owner(g: &Inner, p: u16) -> Option<Ipv4Addr> {
+    g.active
+        .get(&(p, Proto::Tcp))
+        .or_else(|| g.active.get(&(p, Proto::Udp)))
+        .map(|a| a.internal_ip)
+}
+
 /// Whether external port `p` may be granted to `client_ip`.
 ///
-/// A port is eligible when it is not actively mapped and not within the
-/// post-release cooldown. The cooldown exists to stop a *different*
-/// client from inheriting a port whose previous tenant may still receive
-/// residual inbound traffic.
+/// A port is eligible when NEITHER proto slot is actively mapped and it
+/// is not within the post-release cooldown. The cooldown exists to stop
+/// a *different* client from inheriting a port whose previous tenant may
+/// still receive residual inbound traffic. (Granting the free proto slot
+/// of a port the SAME client already owns is handled by the callers via
+/// [`port_owner`], not here.)
 ///
 /// `allow_owner_reclaim` distinguishes the two call paths:
 /// - `false` (no-preference random pick / refresh reuse): the port's own
@@ -984,7 +1069,7 @@ fn port_eligible(
     now: Instant,
     allow_owner_reclaim: bool,
 ) -> bool {
-    if g.active.contains_key(&p) {
+    if g.active.contains_key(&(p, Proto::Tcp)) || g.active.contains_key(&(p, Proto::Udp)) {
         return false;
     }
     // Owner reclaiming its own recently-released port (explicit
@@ -1011,8 +1096,10 @@ fn port_eligible(
 const PICK_PORT_RANDOM_TRIES: usize = 256;
 
 /// Picks a free port in `range`:
-/// 1. if `suggested != 0` and it is free + not in cooldown + not the
-///    same user as `last_user_per_port`, return it.
+/// 1. if `reuse != 0` (the port the client's refresh just reclaimed) and
+///    its `proto` slot is grantable to this client, return it - port
+///    stability across renewals, including the dual-proto case where the
+///    client still owns the port through the other proto's live leg.
 /// 2. otherwise, draw randomly up to [`PICK_PORT_RANDOM_TRIES`]
 ///    indices from the range. Hot case: lightly loaded pool → finds
 ///    one in O(1).
@@ -1028,19 +1115,23 @@ const PICK_PORT_RANDOM_TRIES: usize = 256;
 fn pick_port(
     g: &Inner,
     range: (u16, u16),
-    suggested: u16,
+    proto: Proto,
+    reuse: u16,
     client_ip: Ipv4Addr,
     now: Instant,
 ) -> Option<u16> {
     // `allow_owner_reclaim = false`: this is the no-preference path
     // (random pick / refresh reuse), where anti-rotation steers a client
     // away from its own recently-released port. Explicit suggestions are
-    // handled by the strict pre-check, not here.
-    if suggested != 0
-        && port_in_range(suggested, range)
-        && port_eligible(g, suggested, client_ip, now, false)
-    {
-        return Some(suggested);
+    // handled by the strict pre-check, not here. A port the client still
+    // owns through the other proto's live leg bypasses `port_eligible`
+    // (which requires a fully free port): the renewing leg must not hop
+    // ports just because its sibling is mapped.
+    if reuse != 0 && port_in_range(reuse, range) && !g.active.contains_key(&(reuse, proto)) {
+        let owned_by_client = port_owner(g, reuse).is_some_and(|owner| owner == client_ip);
+        if owned_by_client || port_eligible(g, reuse, client_ip, now, false) {
+            return Some(reuse);
+        }
     }
 
     let range_size = u32::from(range.1 - range.0) + 1;
