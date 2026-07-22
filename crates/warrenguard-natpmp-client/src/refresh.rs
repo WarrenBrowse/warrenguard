@@ -86,6 +86,38 @@ pub enum SuggestionKind {
     Sticky,
 }
 
+/// Protocol scope of one forward rule: a single transport, or the
+/// atomic TCP+UDP pair on ONE external port.
+///
+/// `Both` drives both legs from a single refresh loop: the UDP leg maps
+/// first (with the configured suggestion), then the TCP leg pins the
+/// exact port the UDP leg was granted. The pair is atomic: a permanent
+/// refusal of either leg releases the already-granted leg and fails the
+/// whole rule, so the user never ends up with a half-forwarded port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ForwardProtos {
+    /// UDP only (RFC 6886 opcode 1).
+    Udp,
+    /// TCP only (RFC 6886 opcode 2).
+    Tcp,
+    /// TCP + UDP together on the same external port.
+    Both,
+}
+
+impl ForwardProtos {
+    /// The wire protocols this scope maps, in request order. The UDP
+    /// leg leads for `Both` so the server-picked port exists before the
+    /// TCP leg pins it.
+    #[must_use]
+    pub fn legs(self) -> &'static [MapProto] {
+        match self {
+            Self::Udp => &[MapProto::Udp],
+            Self::Tcp => &[MapProto::Tcp],
+            Self::Both => &[MapProto::Udp, MapProto::Tcp],
+        }
+    }
+}
+
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use warrenguard_natpmp_protocol::{MapProto, ResultCode};
@@ -242,12 +274,12 @@ pub struct RefreshLoopHandle {
     cancel_tx: Option<oneshot::Sender<()>>,
     join_handle: JoinHandle<()>,
     /// Request shape captured at spawn time. Reused by [`release`] to
-    /// issue a final `lifetime = 0` Map directed at the same
+    /// issue a final `lifetime = 0` Map per leg directed at the same
     /// `(client_ip, internal_port, proto)` tuple - the exit allocator
     /// keys its lookup on those three values, so a fresh socket with
     /// the same `bind_addr` finds and frees the mapping.
     server: SocketAddr,
-    proto: MapProto,
+    protos: ForwardProtos,
     internal_port: u16,
     bind_addr: Option<std::net::IpAddr>,
 }
@@ -291,44 +323,10 @@ impl RefreshLoopHandle {
         // because the cancel channel races against the request future
         // inside the loop (see `tokio::select! { biased; ... }`).
         self.cancel();
-        // Step 2: issue the lifetime=0 Map. Single attempt: a stuck
-        // server is not worth holding the caller for the full RFC
-        // §3.1 exponential backoff (~7.75 s). On the happy path the
-        // exit replies within a single RTT (< 50 ms intra-EU).
-        let outcome = tokio::time::timeout(
-            Duration::from_millis(750),
-            crate::request_map_with_retries_from_addr(
-                self.server,
-                self.proto,
-                self.internal_port,
-                0, // suggested_external_port irrelevant for a release
-                0, // lifetime = 0 = delete this mapping
-                1, // single attempt, no retry
-                self.bind_addr,
-            ),
-        )
-        .await;
-        match outcome {
-            Ok(Ok(_)) => {
-                // Server confirmed the release.
-            }
-            Ok(Err(e)) => {
-                // Server responded with an error or a parse failure.
-                // Anything other than Success is acceptable here: a
-                // release for a mapping we don't own (mid-rotation
-                // race, server already GC'd it, …) still does its
-                // job. We log so an operator can correlate if needed.
-                tracing::debug!("NAT-PMP release: server reply {e}; ignoring");
-            }
-            Err(_elapsed) => {
-                // Timeout. The mapping will GC on its own at lease
-                // expiry. Not strictly safe (the slot is held until
-                // then), but the caller's reconfig path is
-                // best-effort by design.
-                tracing::debug!(
-                    "NAT-PMP release: timed out after 750 ms; mapping will GC at lease expiry"
-                );
-            }
+        // Step 2: issue the lifetime=0 Map, once per leg (a dual-proto
+        // pair frees both its slots).
+        for &proto in self.protos.legs() {
+            send_release(self.server, proto, self.internal_port, self.bind_addr).await;
         }
     }
 
@@ -348,6 +346,53 @@ impl RefreshLoopHandle {
     #[must_use]
     pub fn is_finished(&self) -> bool {
         self.join_handle.is_finished()
+    }
+}
+
+/// Best-effort `lifetime = 0` Map (RFC 6886 §3.3.2) for one leg. Single
+/// attempt, ~750 ms bound: a stuck server is not worth holding the
+/// caller for the full RFC §3.1 exponential backoff (~7.75 s), and the
+/// exit GCs the mapping at its lease expiry anyway if the packet is
+/// lost. Shared by [`RefreshLoopHandle::release`] and the dual-pair
+/// atomic-abort path inside the refresh loop.
+async fn send_release(
+    server: SocketAddr,
+    proto: MapProto,
+    internal_port: u16,
+    bind_addr: Option<std::net::IpAddr>,
+) {
+    let outcome = tokio::time::timeout(
+        Duration::from_millis(750),
+        crate::request_map_with_retries_from_addr(
+            server,
+            proto,
+            internal_port,
+            0, // suggested_external_port irrelevant for a release
+            0, // lifetime = 0 = delete this mapping
+            1, // single attempt, no retry
+            bind_addr,
+        ),
+    )
+    .await;
+    match outcome {
+        Ok(Ok(_)) => {
+            // Server confirmed the release.
+        }
+        Ok(Err(e)) => {
+            // Anything other than Success is acceptable here: a
+            // release for a mapping we don't own (mid-rotation race,
+            // server already GC'd it, …) still does its job. We log so
+            // an operator can correlate if needed.
+            tracing::debug!("NAT-PMP release: server reply {e}; ignoring");
+        }
+        Err(_elapsed) => {
+            // The mapping will GC on its own at lease expiry. Not
+            // strictly safe (the slot is held until then), but the
+            // caller's reconfig path is best-effort by design.
+            tracing::debug!(
+                "NAT-PMP release: timed out after 750 ms; mapping will GC at lease expiry"
+            );
+        }
     }
 }
 
@@ -424,10 +469,51 @@ pub fn spawn_refresh_loop_from_addr(
     event_tx: mpsc::UnboundedSender<NatPmpEvent>,
     bind_addr: Option<std::net::IpAddr>,
 ) -> RefreshLoopHandle {
+    let protos = match proto {
+        MapProto::Udp => ForwardProtos::Udp,
+        MapProto::Tcp => ForwardProtos::Tcp,
+    };
+    spawn_refresh_loop_protos_from_addr(
+        server,
+        protos,
+        internal_port,
+        suggested_external_port,
+        lifetime_secs,
+        suggestion,
+        event_tx,
+        bind_addr,
+    )
+}
+
+/// Generalisation of [`spawn_refresh_loop_from_addr`] over a
+/// [`ForwardProtos`] scope. With a single-proto scope the behaviour is
+/// identical to the historical loop. With [`ForwardProtos::Both`], each
+/// cycle maps the UDP leg first (with the configured suggestion), then
+/// the TCP leg pinned to the exact port the UDP leg was granted, and
+/// emits ONE `Mapped`/`Renewed` event for the pair (lifetime = the
+/// smaller grant). The pair is atomic: a permanent refusal of either
+/// leg releases the leg(s) already granted in that cycle and emits a
+/// single `Failed`. Recoverable situations (rate limit, transient
+/// network errors) retry the whole cycle; a leg already granted stays
+/// alive through its lease meanwhile, which also keeps the pair's port
+/// reserved for the retry.
+#[must_use = "the returned handle owns the spawned task; drop discards control"]
+#[expect(clippy::too_many_arguments)]
+pub fn spawn_refresh_loop_protos_from_addr(
+    server: SocketAddr,
+    protos: ForwardProtos,
+    internal_port: u16,
+    suggested_external_port: u16,
+    lifetime_secs: u32,
+    suggestion: SuggestionKind,
+    event_tx: mpsc::UnboundedSender<NatPmpEvent>,
+    bind_addr: Option<std::net::IpAddr>,
+) -> RefreshLoopHandle {
     let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
 
     let join_handle = tokio::spawn(async move {
         let mut suggested_external_port = suggested_external_port;
+        let legs = protos.legs();
         let mut is_first = true;
         // Counts consecutive transient failures while no mapping has ever
         // succeeded. Bounds the initial attempt (see
@@ -438,143 +524,183 @@ pub fn spawn_refresh_loop_from_addr(
         // the initial value after every successful (re)mapping.
         let mut backoff_secs = INITIAL_BACKOFF_SECS;
         let mut last_epoch_secs: Option<u32> = None;
-        loop {
-            // Race the request_map call against cancellation so a
-            // cancel during a slow / unreachable server does not wait
-            // for the RFC §3.1 retry exhaustion (~7.75s).
-            let req_fut = crate::request_map_with_retries_from_addr(
-                server,
-                proto,
-                internal_port,
-                suggested_external_port,
-                lifetime_secs,
-                crate::DEFAULT_MAX_ATTEMPTS,
-                bind_addr,
-            );
-            let result = tokio::select! {
-                biased;
-                _ = &mut cancel_rx => {
-                    let _ = event_tx.send(NatPmpEvent::Cancelled);
-                    return;
-                }
-                r = req_fut => r,
-            };
-
-            let mapping = match result {
-                Ok(m) => {
-                    backoff_secs = INITIAL_BACKOFF_SECS; // recovered
-                    m
-                }
-                Err(NatPmpClientError::RateLimited { retry_after_secs }) => {
-                    // Recoverable-after-delay: the exit's per-source rate
-                    // limit fired (typically the user changed ports too
-                    // many times in a row). Surface it so the UI can block
-                    // the port control and show a countdown, then wait the
-                    // retry-after and retry - the loop self-heals once the
-                    // sliding window clears, without tearing the feature
-                    // down. We do NOT reset the transient backoff here.
-                    let _ = event_tx.send(NatPmpEvent::RateLimited { retry_after_secs });
-                    // Clamp: never busy-spin (>= 1s), and never sleep
-                    // longer than ~2 min even if the server reports a
-                    // larger window, so a stale value cannot wedge the
-                    // loop.
-                    let wait = Duration::from_secs(u64::from(retry_after_secs.clamp(1, 120)));
-                    tokio::select! {
-                        biased;
-                        _ = &mut cancel_rx => {
-                            let _ = event_tx.send(NatPmpEvent::Cancelled);
-                            return;
-                        }
-                        () = tokio::time::sleep(wait) => {}
-                    }
-                    continue;
-                }
-                Err(NatPmpClientError::Server(ResultCode::SuggestedPortUnavailable))
-                    if suggestion == SuggestionKind::Sticky && suggested_external_port != 0 =>
-                {
-                    // A sticky preference lost its port to another client
-                    // (typically on the destination exit of a maintenance
-                    // migration). Downgrade to a server pick and re-request
-                    // immediately: keeping the rule alive on a new port
-                    // beats failing it over a port the user never chose.
-                    tracing::debug!("sticky suggested port taken; retrying with a server pick");
-                    suggested_external_port = 0;
-                    continue;
-                }
-                Err(err) => {
-                    let reason = NatPmpFailureReason::from_client_error(&err);
-                    if reason != NatPmpFailureReason::Other {
-                        // Permanent / not-self-recoverable: the exit
-                        // refused for a reason retrying the same request
-                        // cannot fix (port taken by another client,
-                        // not authorised, out of resources/quota/rate
-                        // limit). Surface it and stop - the daemon/UI
-                        // decides (the user picks another port, etc.).
-                        let _ = event_tx.send(NatPmpEvent::Failed {
-                            reason,
-                            error: err.to_string(),
-                        });
+        'cycle: loop {
+            // One cycle = one Map per leg. `granted_this_cycle` tracks
+            // the legs granted so far so a permanent refusal of a later
+            // leg can release them (atomic pair). `pair_port` is the
+            // port granted to the first leg; later legs pin it.
+            let mut granted_this_cycle: Vec<MapProto> = Vec::new();
+            let mut pair_port = suggested_external_port;
+            let mut min_lifetime = u32::MAX;
+            let mut external_port = 0u16;
+            let mut rate_limit = None;
+            let mut epoch_secs = 0u32;
+            for (leg_index, &proto) in legs.iter().enumerate() {
+                let leg_suggested = if leg_index == 0 {
+                    suggested_external_port
+                } else {
+                    pair_port
+                };
+                // Race the request_map call against cancellation so a
+                // cancel during a slow / unreachable server does not wait
+                // for the RFC §3.1 retry exhaustion (~7.75s).
+                let req_fut = crate::request_map_with_retries_from_addr(
+                    server,
+                    proto,
+                    internal_port,
+                    leg_suggested,
+                    lifetime_secs,
+                    crate::DEFAULT_MAX_ATTEMPTS,
+                    bind_addr,
+                );
+                let result = tokio::select! {
+                    biased;
+                    _ = &mut cancel_rx => {
+                        let _ = event_tx.send(NatPmpEvent::Cancelled);
                         return;
                     }
-                    // Transient (timeout / I/O / parse). Two regimes:
-                    //
-                    // - Before the first successful mapping: bound the
-                    //   retries. An exit that never answers must not strand
-                    //   the UI in "requesting…" forever - after
-                    //   `MAX_INITIAL_MAP_ATTEMPTS` we surface `Failed` so
-                    //   the user gets actionable feedback and can retry.
-                    // - After at least one `Mapped`: keep the mapping alive
-                    //   by retrying with capped exponential backoff instead
-                    //   of tearing it down. The exit-side mapping survives
-                    //   until its lease expires, so we do NOT emit `Failed`
-                    //   (which would flap the UI from Mapped to error and
-                    //   back); we retry until success or cancellation. The
-                    //   tunnel going down cancels the loop, bounding the
-                    //   retries.
-                    if is_first {
-                        initial_transient_failures += 1;
-                        if initial_transient_failures >= MAX_INITIAL_MAP_ATTEMPTS {
+                    r = req_fut => r,
+                };
+
+                match result {
+                    Ok(m) => {
+                        backoff_secs = INITIAL_BACKOFF_SECS; // recovered
+                        pair_port = m.external_port;
+                        external_port = m.external_port;
+                        min_lifetime = min_lifetime.min(m.lifetime_secs);
+                        if m.rate_limit.is_some() {
+                            rate_limit = m.rate_limit;
+                        }
+                        epoch_secs = m.epoch_secs;
+                        granted_this_cycle.push(proto);
+                    }
+                    Err(NatPmpClientError::RateLimited { retry_after_secs }) => {
+                        // Recoverable-after-delay: the exit's per-source rate
+                        // limit fired (typically the user changed ports too
+                        // many times in a row). Surface it so the UI can block
+                        // the port control and show a countdown, then wait the
+                        // retry-after and retry the whole cycle - the loop
+                        // self-heals once the sliding window clears, without
+                        // tearing the feature down. A leg already granted
+                        // this cycle stays alive (its lease reserves the
+                        // pair's port for the retry). We do NOT reset the
+                        // transient backoff here.
+                        let _ = event_tx.send(NatPmpEvent::RateLimited { retry_after_secs });
+                        // Clamp: never busy-spin (>= 1s), and never sleep
+                        // longer than ~2 min even if the server reports a
+                        // larger window, so a stale value cannot wedge the
+                        // loop.
+                        let wait = Duration::from_secs(u64::from(retry_after_secs.clamp(1, 120)));
+                        tokio::select! {
+                            biased;
+                            _ = &mut cancel_rx => {
+                                let _ = event_tx.send(NatPmpEvent::Cancelled);
+                                return;
+                            }
+                            () = tokio::time::sleep(wait) => {}
+                        }
+                        continue 'cycle;
+                    }
+                    Err(NatPmpClientError::Server(ResultCode::SuggestedPortUnavailable))
+                        if leg_index == 0
+                            && suggestion == SuggestionKind::Sticky
+                            && suggested_external_port != 0 =>
+                    {
+                        // A sticky preference lost its port to another client
+                        // (typically on the destination exit of a maintenance
+                        // migration). Downgrade to a server pick and re-request
+                        // immediately: keeping the rule alive on a new port
+                        // beats failing it over a port the user never chose.
+                        // First leg only: a later leg's suggestion is the
+                        // pair port, a contract rather than a preference.
+                        tracing::debug!("sticky suggested port taken; retrying with a server pick");
+                        suggested_external_port = 0;
+                        continue 'cycle;
+                    }
+                    Err(err) => {
+                        let reason = NatPmpFailureReason::from_client_error(&err);
+                        if reason != NatPmpFailureReason::Other {
+                            // Permanent / not-self-recoverable: the exit
+                            // refused for a reason retrying the same request
+                            // cannot fix (port taken by another client,
+                            // not authorised, out of resources/quota/rate
+                            // limit). Atomic pair: free the leg(s) granted
+                            // this cycle so the rule never survives
+                            // half-mapped, then surface and stop - the
+                            // daemon/UI decides (the user picks another
+                            // port, etc.).
+                            for &granted in &granted_this_cycle {
+                                send_release(server, granted, internal_port, bind_addr).await;
+                            }
                             let _ = event_tx.send(NatPmpEvent::Failed {
-                                reason: NatPmpFailureReason::Other,
+                                reason,
                                 error: err.to_string(),
                             });
                             return;
                         }
-                    }
-                    let wait = Duration::from_secs(u64::from(backoff_secs));
-                    backoff_secs = backoff_secs.saturating_mul(2).min(MAX_BACKOFF_SECS);
-                    tokio::select! {
-                        biased;
-                        _ = &mut cancel_rx => {
-                            let _ = event_tx.send(NatPmpEvent::Cancelled);
-                            return;
+                        // Transient (timeout / I/O / parse). Two regimes:
+                        //
+                        // - Before the first successful cycle: bound the
+                        //   retries. An exit that never answers must not strand
+                        //   the UI in "requesting…" forever - after
+                        //   `MAX_INITIAL_MAP_ATTEMPTS` we surface `Failed` so
+                        //   the user gets actionable feedback and can retry.
+                        // - After at least one `Mapped`: keep the mapping alive
+                        //   by retrying with capped exponential backoff instead
+                        //   of tearing it down. The exit-side mapping survives
+                        //   until its lease expires, so we do NOT emit `Failed`
+                        //   (which would flap the UI from Mapped to error and
+                        //   back); we retry until success or cancellation. The
+                        //   tunnel going down cancels the loop, bounding the
+                        //   retries.
+                        if is_first {
+                            initial_transient_failures += 1;
+                            if initial_transient_failures >= MAX_INITIAL_MAP_ATTEMPTS {
+                                for &granted in &granted_this_cycle {
+                                    send_release(server, granted, internal_port, bind_addr).await;
+                                }
+                                let _ = event_tx.send(NatPmpEvent::Failed {
+                                    reason: NatPmpFailureReason::Other,
+                                    error: err.to_string(),
+                                });
+                                return;
+                            }
                         }
-                        () = tokio::time::sleep(wait) => {}
+                        let wait = Duration::from_secs(u64::from(backoff_secs));
+                        backoff_secs = backoff_secs.saturating_mul(2).min(MAX_BACKOFF_SECS);
+                        tokio::select! {
+                            biased;
+                            _ = &mut cancel_rx => {
+                                let _ = event_tx.send(NatPmpEvent::Cancelled);
+                                return;
+                            }
+                            () = tokio::time::sleep(wait) => {}
+                        }
+                        continue 'cycle;
                     }
-                    continue;
                 }
-            };
+            }
 
-            let attempts_remaining = mapping.rate_limit.map(|r| r.attempts_remaining);
-            let window_reset_secs = mapping.rate_limit.map_or(0, |r| r.window_reset_secs);
+            let attempts_remaining = rate_limit.map(|r| r.attempts_remaining);
+            let window_reset_secs = rate_limit.map_or(0, |r| r.window_reset_secs);
             // RFC 6886 §3.6 gateway-restart detection: a backwards epoch jump
             // means the gateway rebooted and dropped our mapping. The Map above
             // already re-created it, so surface it as a fresh Mapped (not
             // Renewed) so the daemon re-applies its side (DNAT, etc.).
-            let restart = last_epoch_secs
-                .is_some_and(|prev| epoch_indicates_restart(prev, mapping.epoch_secs));
-            last_epoch_secs = Some(mapping.epoch_secs);
+            let restart =
+                last_epoch_secs.is_some_and(|prev| epoch_indicates_restart(prev, epoch_secs));
+            last_epoch_secs = Some(epoch_secs);
             let event = if is_first || restart {
                 NatPmpEvent::Mapped {
-                    external_port: mapping.external_port,
-                    lifetime_secs: mapping.lifetime_secs,
+                    external_port,
+                    lifetime_secs: min_lifetime,
                     attempts_remaining,
                     window_reset_secs,
                 }
             } else {
                 NatPmpEvent::Renewed {
-                    external_port: mapping.external_port,
-                    lifetime_secs: mapping.lifetime_secs,
+                    external_port,
+                    lifetime_secs: min_lifetime,
                     attempts_remaining,
                     window_reset_secs,
                 }
@@ -589,8 +715,9 @@ pub fn spawn_refresh_loop_from_addr(
             is_first = false;
 
             // RFC 6886 §3.7: refresh at half the granted lifetime to
-            // tolerate clock skew and packet loss.
-            let granted = mapping.lifetime_secs.max(MIN_LIFETIME_FOR_REFRESH);
+            // tolerate clock skew and packet loss. The pair follows the
+            // SMALLER grant so neither leg ever lapses.
+            let granted = min_lifetime.max(MIN_LIFETIME_FOR_REFRESH);
             let refresh_in = Duration::from_secs(u64::from(granted) / 2);
 
             tokio::select! {
@@ -608,7 +735,7 @@ pub fn spawn_refresh_loop_from_addr(
         cancel_tx: Some(cancel_tx),
         join_handle,
         server,
-        proto,
+        protos,
         internal_port,
         bind_addr,
     }
@@ -1232,6 +1359,246 @@ mod tests {
         assert!(
             counter.load(Ordering::SeqCst) >= 3,
             "stub should have served at least 3 requests"
+        );
+
+        handle.cancel();
+        let _ = handle.join().await;
+    }
+
+    /// Records every Map request `(proto, suggested_external_port,
+    /// lifetime_secs)` and replies per proto: UDP always succeeds with
+    /// external port 58000; TCP replies `tcp_result` (Success echoes the
+    /// suggested port, mirroring the exit's strict honour-or-error
+    /// grant). Releases (lifetime=0) are recorded and acked.
+    async fn spawn_pair_recording_stub(
+        tcp_result: ResultCode,
+    ) -> (SocketAddr, Arc<std::sync::Mutex<Vec<(MapProto, u16, u32)>>>) {
+        use std::sync::Mutex;
+        let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind stub");
+        let addr = sock.local_addr().expect("local_addr");
+        let log: Arc<Mutex<Vec<(MapProto, u16, u32)>>> = Arc::new(Mutex::new(Vec::new()));
+        let log_for_stub = log.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            loop {
+                let (n, peer) = match sock.recv_from(&mut buf).await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let (proto, suggested, lifetime) =
+                    match warrenguard_natpmp_protocol::parse_request(&buf[..n]) {
+                        Ok(warrenguard_natpmp_protocol::Request::Map {
+                            proto,
+                            suggested_external_port,
+                            lifetime_secs,
+                            ..
+                        }) => (proto, suggested_external_port, lifetime_secs),
+                        _ => continue,
+                    };
+                log_for_stub
+                    .lock()
+                    .expect("stub lock poisoned")
+                    .push((proto, suggested, lifetime));
+                let (result_code, external_port) = if lifetime == 0 {
+                    (ResultCode::Success, 0)
+                } else {
+                    match proto {
+                        MapProto::Udp => (ResultCode::Success, 58000),
+                        MapProto::Tcp => match tcp_result {
+                            ResultCode::Success => (ResultCode::Success, suggested),
+                            other => (other, 0),
+                        },
+                    }
+                };
+                let resp = serialize_response(&ServerResponse::Map {
+                    proto,
+                    result_code,
+                    epoch_secs: 0,
+                    internal_port: 22,
+                    external_port,
+                    lifetime_secs: if result_code == ResultCode::Success {
+                        lifetime
+                    } else {
+                        0
+                    },
+                    rate_limit: None,
+                });
+                let _ = sock.send_to(&resp, peer).await;
+            }
+        });
+        (addr, log)
+    }
+
+    #[tokio::test]
+    async fn dual_refresh_loop_maps_both_protos_on_the_same_port() {
+        let (stub, log) = spawn_pair_recording_stub(ResultCode::Success).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut handle = spawn_refresh_loop_protos_from_addr(
+            stub,
+            ForwardProtos::Both,
+            22,
+            0,
+            60,
+            SuggestionKind::Pinned,
+            tx,
+            None,
+        );
+
+        let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("event within timeout")
+            .expect("channel open");
+        assert!(
+            matches!(
+                ev,
+                NatPmpEvent::Mapped {
+                    external_port: 58000,
+                    ..
+                }
+            ),
+            "one Mapped for the whole pair with the UDP-granted port, got {ev:?}"
+        );
+
+        let reqs = log.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 2, "one Map per leg: {reqs:?}");
+        assert_eq!(reqs[0].0, MapProto::Udp, "UDP leg goes first");
+        assert_eq!(
+            reqs[1],
+            (MapProto::Tcp, 58000, 60),
+            "TCP leg must pin the port granted to the UDP leg"
+        );
+
+        handle.cancel();
+        let _ = handle.join().await;
+    }
+
+    #[tokio::test]
+    async fn dual_refresh_loop_atomic_failure_releases_first_leg() {
+        // The exit refuses the TCP leg permanently: the whole rule must
+        // fail AND the already-granted UDP leg must be released, never
+        // left half-mapped.
+        let (stub, log) = spawn_pair_recording_stub(ResultCode::OutOfResources).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handle = spawn_refresh_loop_protos_from_addr(
+            stub,
+            ForwardProtos::Both,
+            22,
+            0,
+            60,
+            SuggestionKind::Pinned,
+            tx,
+            None,
+        );
+
+        let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("event within timeout")
+            .expect("channel open");
+        assert!(
+            matches!(
+                ev,
+                NatPmpEvent::Failed {
+                    reason: NatPmpFailureReason::OutOfResources,
+                    ..
+                }
+            ),
+            "the pair must fail as a unit, got {ev:?}"
+        );
+
+        // Give the in-task release a moment to hit the stub.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let reqs = log.lock().unwrap().clone();
+        assert!(
+            reqs.contains(&(MapProto::Udp, 0, 0)),
+            "the granted UDP leg must be released (lifetime=0): {reqs:?}"
+        );
+        assert!(
+            !matches!(
+                tokio::time::timeout(Duration::from_millis(100), rx.recv()).await,
+                Ok(Some(NatPmpEvent::Mapped { .. }))
+            ),
+            "no Mapped may be emitted for a half-granted pair"
+        );
+
+        let _ = handle.join().await;
+    }
+
+    #[tokio::test]
+    async fn dual_release_sends_lifetime_zero_for_both_protos() {
+        let (stub, log) = spawn_pair_recording_stub(ResultCode::Success).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut handle = spawn_refresh_loop_protos_from_addr(
+            stub,
+            ForwardProtos::Both,
+            22,
+            0,
+            60,
+            SuggestionKind::Pinned,
+            tx,
+            None,
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("Mapped");
+
+        handle.release().await;
+
+        let reqs = log.lock().unwrap().clone();
+        assert!(
+            reqs.contains(&(MapProto::Udp, 0, 0)),
+            "release must free the UDP leg: {reqs:?}"
+        );
+        assert!(
+            reqs.contains(&(MapProto::Tcp, 0, 0)),
+            "release must free the TCP leg: {reqs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dual_refresh_loop_renews_both_legs() {
+        // Granted lifetime 2 -> renewal after ~1s re-Maps BOTH legs,
+        // the TCP leg still pinned to the pair port.
+        let (stub, log) = spawn_pair_recording_stub(ResultCode::Success).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut handle = spawn_refresh_loop_protos_from_addr(
+            stub,
+            ForwardProtos::Both,
+            22,
+            0,
+            2,
+            SuggestionKind::Pinned,
+            tx,
+            None,
+        );
+
+        let first = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("first event")
+            .expect("open");
+        assert!(matches!(first, NatPmpEvent::Mapped { .. }));
+        let second = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("second event")
+            .expect("open");
+        assert!(
+            matches!(
+                second,
+                NatPmpEvent::Renewed {
+                    external_port: 58000,
+                    ..
+                }
+            ),
+            "renewal covers the pair as one event, got {second:?}"
+        );
+
+        let reqs = log.lock().unwrap().clone();
+        let tcp_maps: Vec<_> = reqs
+            .iter()
+            .filter(|(p, _, l)| *p == MapProto::Tcp && *l > 0)
+            .collect();
+        assert!(
+            tcp_maps.len() >= 2 && tcp_maps.iter().all(|(_, s, _)| *s == 58000),
+            "every TCP renewal must stay pinned to the pair port: {reqs:?}"
         );
 
         handle.cancel();
