@@ -14,12 +14,14 @@
 //! sent from the session's assigned tunnel IP to the tunnel gateway,
 //! whose kernel echoes them back through the full downlink datapath.
 //! Large probe dead while the small one survives = size-selective
-//! blackhole; both dead while transport ACKs still flow = wedged
-//! datapath. Either way the prober requests ONE make-before-break
-//! overlap migration per episode (it fixes session-state wedges and is
-//! gap-free), then publishes the degraded verdict on a watch channel so
-//! an embedder can tell the user the PATH is sick instead of looking
-//! healthy-but-dead.
+//! blackhole (last-mile shrink / brownout); both dead while transport
+//! ACKs still flow = wedged datapath. Only the wedge (`DegradedBoth`)
+//! requests ONE overlap migration per episode: a fresh session can cure
+//! a session-state wedge, whereas a same-exit re-dial cannot fix a
+//! last-mile shrink and (with sticky-IP preservation unmerged) would
+//! force an IP-change tunnel rebuild. Both verdicts publish on a watch
+//! channel so an embedder can tell the user the PATH is sick instead of
+//! looking healthy-but-dead.
 //!
 //! Complementary to [`crate::egress_probe`], which asks the gateway
 //! resolver a SMALL DNS question and therefore keeps reporting a
@@ -62,9 +64,18 @@ pub enum HealthEvent {
     Entered(PathHealth),
     /// The tracker returned to [`PathHealth::Healthy`].
     Recovered,
-    /// First degradation of an episode: the caller should request ONE
-    /// gap-free overlap migration (it cures session-state wedges; it is
-    /// harmless when the underlay itself is sick).
+    /// The episode reached a state a fresh session can plausibly cure (a
+    /// [`PathHealth::DegradedBoth`] datapath wedge): request ONE overlap
+    /// migration for the episode.
+    ///
+    /// NOT emitted for [`PathHealth::DegradedLarge`]: that is the
+    /// large-frame-selective signature of a last-mile brownout / shrunk
+    /// path MTU, which a same-exit re-dial over the SAME first hop cannot
+    /// fix, and which (while the sticky-IP-preservation fix is unmerged)
+    /// a re-dial actively harms by forcing an inner-IP change and a full
+    /// tunnel rebuild, converting a self-healing degradation into a
+    /// guaranteed gap. A DegradedLarge episode is surfaced and left to
+    /// the MSS-clamp / PMTU machinery and last-mile recovery.
     RequestMigration,
 }
 
@@ -168,7 +179,13 @@ impl HealthTracker {
             self.state = verdict;
             self.recover_streak = 0;
             events.push(HealthEvent::Entered(verdict));
-            if !self.migration_requested {
+            // Only a DegradedBoth wedge is worth a re-dial: a fresh
+            // session can cure a session-state datapath wedge, but a
+            // same-exit re-dial cannot fix the last-mile shrink that
+            // DegradedLarge signals (and, with sticky-IP preservation
+            // unmerged, would force an IP-change tunnel rebuild). One
+            // request per episode.
+            if verdict == PathHealth::DegradedBoth && !self.migration_requested {
                 self.migration_requested = true;
                 events.push(HealthEvent::RequestMigration);
             }
@@ -416,7 +433,7 @@ async fn probe_round(
                 }
                 HealthEvent::RequestMigration => {
                     tracing::info!(
-                        "path health: requesting one gap-free overlap migration for this episode"
+                        "path health: datapath wedge (both probe sizes dead), requesting one overlap migration for this episode"
                     );
                     overlap.notify_one();
                 }
@@ -467,28 +484,26 @@ mod tests {
     }
 
     #[test]
-    fn large_blackhole_enters_degraded_large_with_one_migration() {
+    fn large_blackhole_enters_degraded_large_without_migration() {
         let mut t = HealthTracker::default();
         for _ in 0..4 {
             assert!(t.record_pair(true, false).is_empty(), "window not full yet");
         }
+        // DegradedLarge is the last-mile signature: surface it, but do
+        // NOT request a migration (a same-exit re-dial cannot fix the
+        // radio and would force an IP-change rebuild).
         let events = t.record_pair(true, false);
         assert_eq!(
             events,
-            vec![
-                HealthEvent::Entered(PathHealth::DegradedLarge),
-                HealthEvent::RequestMigration
-            ]
+            vec![HealthEvent::Entered(PathHealth::DegradedLarge)]
         );
         assert_eq!(t.state(), PathHealth::DegradedLarge);
         assert!(t.wants_fast());
-        // Staying degraded emits nothing new, and never a second
-        // migration for the same episode.
         assert!(t.record_pair(true, false).is_empty());
     }
 
     #[test]
-    fn total_blackhole_enters_degraded_both() {
+    fn total_blackhole_enters_degraded_both_with_one_migration() {
         let mut t = HealthTracker::default();
         for _ in 0..4 {
             assert!(t.record_pair(false, false).is_empty());
@@ -501,52 +516,77 @@ mod tests {
                 HealthEvent::RequestMigration
             ]
         );
+        // Never a second migration for the same episode.
+        assert!(t.record_pair(false, false).is_empty());
     }
 
     #[test]
-    fn large_degradation_reclassifies_to_both_without_second_migration() {
+    fn large_reclassifies_to_both_and_migrates_once_then_not_again() {
         let mut t = HealthTracker::default();
         for _ in 0..5 {
             t.record_pair(true, false);
         }
         assert_eq!(t.state(), PathHealth::DegradedLarge);
-        // Small probes start dying too.
+        // Small probes start dying too: NOW a fresh session can help, so
+        // the reclassification to Both is the first migration of the
+        // episode.
+        let mut migrations = 0;
         let mut saw_both = false;
         for _ in 0..5 {
             for e in t.record_pair(false, false) {
-                assert_ne!(
-                    e,
-                    HealthEvent::RequestMigration,
-                    "one migration per episode"
-                );
+                if e == HealthEvent::RequestMigration {
+                    migrations += 1;
+                }
                 if e == HealthEvent::Entered(PathHealth::DegradedBoth) {
                     saw_both = true;
                 }
             }
         }
         assert!(saw_both);
+        assert_eq!(
+            migrations, 1,
+            "exactly one migration when Large escalates to Both"
+        );
         assert_eq!(t.state(), PathHealth::DegradedBoth);
     }
 
     #[test]
-    fn recovery_needs_three_clean_pairs_then_new_episode_can_migrate_again() {
+    fn recovery_needs_three_clean_pairs_then_a_both_episode_can_migrate_again() {
         let mut t = HealthTracker::default();
         for _ in 0..5 {
-            t.record_pair(true, false);
+            t.record_pair(false, false);
         }
-        assert_eq!(t.state(), PathHealth::DegradedLarge);
+        assert_eq!(t.state(), PathHealth::DegradedBoth);
         assert!(t.record_pair(true, true).is_empty());
         assert!(t.record_pair(true, true).is_empty());
         assert_eq!(t.record_pair(true, true), vec![HealthEvent::Recovered]);
         assert_eq!(t.state(), PathHealth::Healthy);
         assert!(!t.wants_fast());
-        // A relapse is a NEW episode: it may request migration again.
+        // A relapse into a Both wedge is a NEW episode: it may migrate again.
         for _ in 0..4 {
-            assert!(t.record_pair(true, false).is_empty());
+            assert!(t.record_pair(false, false).is_empty());
         }
         assert!(
-            t.record_pair(true, false)
+            t.record_pair(false, false)
                 .contains(&HealthEvent::RequestMigration)
+        );
+    }
+
+    #[test]
+    fn degraded_large_never_requests_migration_across_a_long_episode() {
+        let mut t = HealthTracker::default();
+        let mut sent = 0;
+        for _ in 0..20 {
+            for e in t.record_pair(true, false) {
+                if e == HealthEvent::RequestMigration {
+                    sent += 1;
+                }
+            }
+        }
+        assert_eq!(t.state(), PathHealth::DegradedLarge);
+        assert_eq!(
+            sent, 0,
+            "a pure last-mile episode must never force a re-dial"
         );
     }
 
