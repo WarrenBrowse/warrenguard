@@ -519,6 +519,11 @@ pub struct MultiHopSupervisor {
     /// stops two independent same-wallet sessions from sharing one inner
     /// IP and stealing each other's downlink.
     last_assigned_v4: Mutex<Option<std::net::Ipv4Addr>>,
+    /// Shared state of the goodput prober ([`crate::path_health`]):
+    /// tracker episode memory, reply stream and probe tap. The tap is
+    /// installed on every published bundle; one prober task runs per
+    /// published bundle and exits with it.
+    prober: Arc<crate::path_health::ProberShared>,
 }
 
 /// Consecutive watchdog-forced redials, each of a session whose ENTIRE life
@@ -592,6 +597,7 @@ impl MultiHopSupervisor {
             overlap: Arc::new(Notify::new()),
             target,
             last_assigned_v4: Mutex::new(None),
+            prober: crate::path_health::ProberShared::new(rand::random()),
         };
         (supervisor, rx)
     }
@@ -629,6 +635,17 @@ impl MultiHopSupervisor {
     #[must_use]
     pub fn metrics(&self) -> Arc<SupervisorMetrics> {
         self.metrics.clone()
+    }
+
+    /// Subscribe to the goodput-prober's verdict
+    /// ([`crate::path_health::PathHealth`]). Observes the degraded
+    /// states the dead-path watches cannot see (bulk traffic dead
+    /// behind a live trickle) so an embedder can surface "the PATH is
+    /// degraded" instead of a healthy-looking dead tunnel. Call BEFORE
+    /// [`Self::run`] consumes `self`.
+    #[must_use]
+    pub fn path_health_rx(&self) -> watch::Receiver<crate::path_health::PathHealth> {
+        self.prober.health_watch()
     }
 
     /// Build a [`SupervisorHandle`] for external reconnect control.
@@ -745,6 +762,7 @@ impl MultiHopSupervisor {
                 }
             };
             let mut bundle = MultiHopBundle::new_unsealed(vec![primary.clone()]);
+            bundle.set_probe_tap(self.prober.tap());
 
             // Publish the live session. If the receiver side dropped,
             // shut down cleanly (sealing first so the unsealed bundle's
@@ -762,6 +780,11 @@ impl MultiHopSupervisor {
                 "client-mh",
                 bundle.clone_connections(),
                 None,
+            ));
+            drop(crate::path_health::spawn_path_health(
+                Arc::downgrade(&bundle),
+                self.prober.clone(),
+                self.overlap.clone(),
             ));
             self.spawn_background_bond(&bundle, assign, session_tokens);
             self.notify_on_reconnect(first_session);
@@ -867,6 +890,7 @@ impl MultiHopSupervisor {
                                     );
                                     continue;
                                 }
+                                new_bundle.set_probe_tap(self.prober.tap());
                                 if self.tx.send(Some(new_bundle.clone())).is_err() {
                                     return Ok(());
                                 }
@@ -877,6 +901,11 @@ impl MultiHopSupervisor {
                                     "client-mh",
                                     new_bundle.clone_connections(),
                                     None,
+                                ));
+                                drop(crate::path_health::spawn_path_health(
+                                    Arc::downgrade(&new_bundle),
+                                    self.prober.clone(),
+                                    self.overlap.clone(),
                                 ));
                                 self.notify_on_reconnect(false);
                                 self.metrics.reconnect_count.fetch_add(1, Ordering::Relaxed);
@@ -1420,6 +1449,11 @@ impl MultiHopSupervisor {
                  (surfaced, NOT a silent fallback)"
             );
         }
+        // The goodput prober sources its echoes from the CURRENT
+        // assignment (a stale source is dropped by the exit's spoof
+        // guard), so the endpoints follow every assignment, channel or
+        // not.
+        self.prober.set_endpoints(spec.assigned, spec.gateway);
         let Some(channel) = self.config.ip_assign_channel.as_ref() else {
             return;
         };

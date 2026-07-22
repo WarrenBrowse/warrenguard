@@ -9,6 +9,7 @@ pub mod client_metrics;
 pub mod constants;
 pub mod error;
 pub mod flow_hash;
+pub mod icmp_probe;
 pub mod inner_mtu;
 pub mod ip_parse;
 pub mod packet_device;

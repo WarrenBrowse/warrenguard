@@ -182,6 +182,14 @@ pub const REGISTRY: &[KnobMeta] = &[
         home: "warrenguard-transport/src/supervisor.rs",
     },
     KnobMeta {
+        name: "WARREN_PATH_HEALTH_SECS",
+        kind: "u64 (seconds)",
+        default: "15",
+        clamp: "0 disables the prober; unparsable -> default",
+        effect: "steady cadence of the paired small/large in-tunnel goodput probes",
+        home: "warrenguard-transport/src/path_health.rs",
+    },
+    KnobMeta {
         name: "WARREN_WORKER_THREADS",
         kind: "usize",
         default: "2",
@@ -745,6 +753,23 @@ pub fn app_downlink_dead_secs() -> u64 {
             std::env::var("WARREN_APP_DOWNLINK_DEAD_SECS")
                 .ok()
                 .as_deref(),
+            15,
+        )
+    })
+}
+
+/// `WARREN_PATH_HEALTH_SECS`: steady cadence in seconds of the paired
+/// small/large in-tunnel goodput probes (the path-health detector). The
+/// prober self-escalates to a burst cadence while a degradation is
+/// suspected or confirmed, so this knob only paces the healthy steady
+/// state. Default `15`; `0` disables the prober entirely.
+#[must_use]
+pub fn path_health_secs() -> u64 {
+    static CACHE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        parse_u64_or_default(
+            "WARREN_PATH_HEALTH_SECS",
+            std::env::var("WARREN_PATH_HEALTH_SECS").ok().as_deref(),
             15,
         )
     })

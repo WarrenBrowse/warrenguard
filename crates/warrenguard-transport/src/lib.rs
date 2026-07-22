@@ -23,6 +23,7 @@ pub mod ip_assign;
 mod ios_tun;
 pub mod multi_hop_pump;
 pub mod multihop;
+pub mod path_health;
 // Single home of the "host moved to another network" detection (route/source
 // change watcher); consumers react through their own redial machinery.
 pub mod network_monitor;

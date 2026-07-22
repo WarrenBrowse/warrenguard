@@ -48,7 +48,7 @@ fn incremental_checksum_update(ck: u16, old: u16, new: u16) -> u16 {
 
 /// Ones-complement internet checksum over `data` (padded with a zero byte
 /// when the length is odd).
-fn internet_checksum(seed: u32, data: &[u8]) -> u16 {
+pub(crate) fn internet_checksum(seed: u32, data: &[u8]) -> u16 {
     let mut sum = seed;
     let mut chunks = data.chunks_exact(2);
     for w in &mut chunks {

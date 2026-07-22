@@ -73,6 +73,11 @@ pub struct MultiHopBundle {
     /// [`Self::real_traffic_totals`].
     real_tx: AtomicU64,
     real_rx: AtomicU64,
+    /// Path-health reply intercept, installed by the supervisor on every
+    /// bundle it publishes. `recv()` consumes matching echo replies so
+    /// probe traffic never reaches the TUN nor the real-traffic
+    /// counters.
+    probe_tap: RwLock<Option<Arc<crate::path_health::ProbeTap>>>,
 }
 
 impl MultiHopBundle {
@@ -118,6 +123,7 @@ impl MultiHopBundle {
             reader_tasks: PlMutex::new(reader_tasks),
             real_tx: AtomicU64::new(0),
             real_rx: AtomicU64::new(0),
+            probe_tap: RwLock::new(None),
         })
     }
 
@@ -254,6 +260,25 @@ impl MultiHopBundle {
         sent
     }
 
+    /// Seals and sends one path-health probe packet on its flow-pinned
+    /// session, WITHOUT feeding the real-traffic liveness counters:
+    /// engine-generated probes must never satisfy (or trip) the
+    /// app-traffic dead-path watches.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`MultiHopClient::send`] errors of the picked session.
+    pub async fn send_probe(&self, payload: &[u8]) -> Result<(), MultiHopError> {
+        self.pick(payload).send(payload).await
+    }
+
+    /// Installs the path-health reply intercept consulted by
+    /// [`Self::recv`]. The supervisor installs the SAME tap on every
+    /// bundle it publishes so probe sequencing survives overlap swaps.
+    pub fn set_probe_tap(&self, tap: Arc<crate::path_health::ProbeTap>) {
+        *self.probe_tap.write() = Some(tap);
+    }
+
     /// Sends one DAITA padding frame on the next round-robin session,
     /// so cover traffic spreads across every bonded connection.
     ///
@@ -288,6 +313,9 @@ impl MultiHopBundle {
     }
 
     /// Receives the next decoded inner packet from any bonded session.
+    /// Path-health echo replies are consumed here (handed to the prober
+    /// through the installed tap) so probe traffic never reaches the
+    /// consumer or the TUN.
     ///
     /// # Errors
     ///
@@ -295,9 +323,24 @@ impl MultiHopBundle {
     /// bundle is dead and the supervisor is about to redial).
     pub async fn recv(&self) -> Result<Vec<u8>, MultiHopError> {
         let mut rx = self.merged_rx.lock().await;
-        match rx.recv().await {
-            Some(payload) => Ok(payload),
-            None => Err(MultiHopError::Recv(self.closed().await)),
+        loop {
+            match rx.recv().await {
+                Some(payload) => {
+                    // Cheap shape pre-check before touching the tap
+                    // lock: IPv4 + protocol ICMP is the only thing a
+                    // probe reply can be.
+                    if payload.len() >= 28
+                        && payload[0] >> 4 == 4
+                        && payload[9] == 1
+                        && let Some(tap) = self.probe_tap.read().as_ref()
+                        && tap.try_intercept(&payload)
+                    {
+                        continue;
+                    }
+                    return Ok(payload);
+                }
+                None => return Err(MultiHopError::Recv(self.closed().await)),
+            }
         }
     }
 
