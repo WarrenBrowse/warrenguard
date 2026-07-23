@@ -15,8 +15,8 @@
 //! 4. Process the recovered IP packet: [`serve_multihop_echo`] seals the
 //!    plaintext straight back to the client through the
 //!    reverse-direction HPKE export info (end-to-end loopback tests
-//!    without a TUN), while [`serve_multihop_with_tun`] bridges it onto
-//!    the exit TUN device (the production path).
+//!    without a TUN), while [`serve_multihop_with_tun_and_daita`] bridges it
+//!    onto the exit TUN device (the production path).
 //!
 //! Privacy contract: no per-client identifier is logged from this
 //! module. The only structured fields emitted are session counters and
@@ -917,10 +917,13 @@ async fn process_setup_frame(
                 }
             }
         }
-        None if ip_allocator.is_some() => {
-            // Pool exhausted: sealed IpExhausted detail, then the same
-            // opaque close every policy rejection uses (anti-oracle).
-            tracing::warn!("ip-nego: pool exhausted at setup; sealed detail + opaque close");
+        None => {
+            // No address to hand out (pool exhausted, or no allocator wired).
+            // The rx pump gates every inner packet against the address
+            // assigned here, so serving a session without one would leave that
+            // anti-spoof gate with nothing to compare against. Refuse, using
+            // the same opaque close every policy rejection uses (anti-oracle).
+            tracing::warn!("ip-nego: no tunnel address at setup; sealed detail + opaque close");
             reply_sealed_detail_then_close(
                 &mut send,
                 &term,
@@ -932,25 +935,6 @@ async fn process_setup_frame(
             .await;
             return None;
         }
-        // No allocator (legacy single client): reply with an empty
-        // IpExhausted-free path is not applicable. Send a benign reply so
-        // the client's reliable setup round-trip still completes: re-seal
-        // the client's own setup plaintext as the reply. The client's
-        // setup_over_stream then decodes a non-IpAssign reply and keeps
-        // its bootstrap IP.
-        None => match encode_control(&WarrenControlMessage::IpRequest {
-            prefer_ipv4: None,
-            client_pubkey: None,
-            wants_ipv6: false,
-            pop_sig: None,
-            wants_daita: false,
-        }) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(error = %e, "multihop: encode no-alloc setup reply failed");
-                return None;
-            }
-        },
     };
 
     let seq = reverse_seq.fetch_add(1, Ordering::AcqRel);
@@ -1520,7 +1504,7 @@ impl PqSessionCache {
 /// traffic. It exists so the multihop pipeline can be exercised
 /// end-to-end with iperf3 over the QUIC tunnel without requiring root
 /// or a Linux kernel TUN device. The production TUN-bridged variant is
-/// [`serve_multihop_with_tun`].
+/// [`serve_multihop_with_tun_and_daita`].
 ///
 /// The function returns when `endpoint.accept()` yields `None` (i.e. the
 /// endpoint has been closed) or when an unrecoverable error is raised
@@ -2441,8 +2425,11 @@ fn overread_should_drop(space: usize, mtu: usize, gate_mtus: usize) -> bool {
 ///   connection by destination IPv4, which then seals it with its
 ///   latest [`ExitSession::seal_response`] (a rekey replaces the sealing
 ///   context atomically) -> `encode_frame` -> `Quinn::send_datagram`.
-///   When ip-nego is off (no allocator) the single client reads the TUN
-///   directly.
+///
+/// `ip_allocator` is required in practice: a connection the exit cannot
+/// assign a tunnel address to is refused at setup, because the rx pump's
+/// inner-source anti-spoof gate compares against that address and has
+/// nothing to enforce without one.
 ///
 /// The reverse-direction seq counter is connection-local and resets
 /// to zero per connection. The client-side anti-replay window
@@ -2450,44 +2437,14 @@ fn overread_should_drop(space: usize, mtu: usize, gate_mtus: usize) -> bool {
 /// (cf. the client `multi_hop::MultiHopClient` doctrine overlap
 /// state).
 ///
-/// # Errors
-///
-/// - [`MultihopExitError::EndpointClosed`] when the underlying
-///   `endpoint.accept()` returns `None`.
-pub async fn serve_multihop_with_tun<T>(
-    endpoint: Endpoint,
-    exit_x25519_privkey: WarrenKemPrivateKey,
-    exit_id: ExitId,
-    tun: T,
-) -> Result<(), MultihopExitError>
-where
-    T: PacketDevice + Clone,
-{
-    serve_multihop_with_tun_and_daita(
-        endpoint,
-        exit_x25519_privkey,
-        exit_id,
-        tun,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await
-}
-
-/// DAITA-aware variant of [`serve_multihop_with_tun`].
-///
 /// When `daita_config` is `Some(cfg)` and the config is enabled,
 /// every accepted multi-hop connection builds a fresh
 /// [`DaitaState`] from that config and runs a third "padding timer"
 /// task alongside the standard rx + tx pumps. The timer drives the
 /// maybenot framework over the per-conn [`DaitaState`] and emits
 /// DAITA dummies on the reverse direction when the per-machine
-/// action timer expires.
-///
-/// `None` / disabled config = strict alias of
-/// [`serve_multihop_with_tun`] (zero overhead, no extra tasks).
+/// action timer expires. A `None` or disabled config adds no task and no
+/// overhead.
 ///
 /// This entry point runs one FIXED config for every connection (each conn
 /// still gets an independent [`DaitaState`] instance: separate maybenot
@@ -2499,7 +2456,8 @@ where
 ///
 /// # Errors
 ///
-/// See [`serve_multihop_with_tun`].
+/// - [`MultihopExitError::EndpointClosed`] when the underlying
+///   `endpoint.accept()` returns `None`.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_multihop_with_tun_and_daita<T>(
     endpoint: Endpoint,
@@ -7054,6 +7012,32 @@ mod tests {
         assert!(
             matches!(detail, Some(WarrenControlMessage::Rejected)),
             "a denied v7 token must yield a sealed Rejected, got {detail:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_session_without_an_assigned_address_is_refused_not_served() {
+        // Every terminated connection is bridged to a packet device, and the
+        // rx pump's inner-source anti-spoof gate compares against the address
+        // assigned at setup. A session that never got one leaves that gate
+        // with nothing to compare, so it must be refused rather than served.
+        let exit = spawn_terminating_exit(None, None);
+        let (detail, close) = client_setup_roundtrip(&exit, |_| WarrenControlMessage::IpRequest {
+            prefer_ipv4: None,
+            client_pubkey: None,
+            wants_ipv6: false,
+            pop_sig: None,
+            wants_daita: false,
+        })
+        .await;
+        assert!(
+            close.is_some(),
+            "a session with no assigned address must be closed, not served with a disarmed \
+             anti-spoof gate (reply was {detail:?})"
+        );
+        assert!(
+            !matches!(detail, Some(WarrenControlMessage::IpAssign { .. })),
+            "no address can be granted without an allocator, got {detail:?}"
         );
     }
 
