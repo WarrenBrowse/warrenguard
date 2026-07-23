@@ -9,6 +9,10 @@
 
 #![forbid(unsafe_code)]
 
+/// Per-packet datapath helpers shared by the exit's `/v1` and `/v2` pumps
+/// (routing keys, security gates, drop accounting, MTU adaptation).
+pub(crate) mod datapath;
+
 /// Multihop termination: HPKE-aware Quinn datagram loop wired against
 /// the [`warrenguard_multihop`] `/v1` wire format, consumed end-to-end
 /// behind a `warrenguard-relay`.
@@ -19,3 +23,12 @@ pub mod multihop;
 /// host address from a configurable subnet; the pump returns it
 /// on connection close so the pool survives sustained churn.
 pub mod ip_pool;
+
+/// The per-packet datapath helpers, exposed only under the `bench-internals`
+/// feature so `benches/datapath.rs` can measure them without any of it
+/// reaching a deployer's build.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub mod internals {
+    pub use crate::datapath::*;
+}

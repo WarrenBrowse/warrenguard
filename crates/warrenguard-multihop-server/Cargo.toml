@@ -49,6 +49,10 @@ rand_core = { version = "0.9", default-features = false, features = ["os_rng"] }
 # an ML-KEM key plus terminate `/v2` frames. Additive over the classical `/v1`
 # datapath, which stays byte-identical when the feature is off.
 pq-hpke = ["warrenguard-multihop/pq-hpke"]
+# Re-exports the per-packet datapath helpers so `benches/` can measure them
+# directly. OFF by default, so a deployer never sees this surface; the bench
+# target enables it via `required-features`.
+bench-internals = []
 
 [dev-dependencies]
 # Build the rustls server/client configs the loopback termination tests drive.
@@ -64,6 +68,14 @@ quinn = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 # Loopback integration tests drive `ClientSession::new` from `OsRng`.
 rand_core = { version = "0.9", default-features = false, features = ["os_rng"] }
+criterion = { workspace = true }
+# The bench reaches for the frame overhead constant and the DAITA event enum.
+warrenguard-daita = { path = "../warrenguard-daita" }
+
+[[bench]]
+name = "datapath"
+harness = false
+required-features = ["bench-internals"]
 
 [lints]
 workspace = true

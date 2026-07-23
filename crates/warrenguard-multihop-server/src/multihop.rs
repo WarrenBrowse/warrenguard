@@ -22,8 +22,9 @@
 //! module. The only structured fields emitted are session counters and
 //! the local bind address.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -48,12 +49,15 @@ use warrenguard_multihop::{
     XWingRecipientSecretKey, decode_frame_v2, encode_frame_v2,
 };
 use warrenguard_pump::{DAITA_DUMMY_FIRST_BYTE, is_daita_dummy};
-use warrenguard_server::tun_dispatch::source_ip_matches;
 use warrenguard_server::{AllowlistHandle, SessionTokenAdmitter};
 use warrenguard_transport_core::PacketDevice;
-use warrenguard_transport_core::{build_frag_needed, clamp_syn_mss, is_tcp_syn};
 use warrenguard_wire::WarrenPubkey;
 
+use crate::datapath::{
+    DOWNLINK_CHANNEL_BOUND, DaitaSink, FLOW_TABLE_CAP_PER_IP, FlowNoter, RateLimited, RxReport,
+    SpoofGate, TunWrite, TunWriter, TxReport, canonical_flow_key, clamp_uplink_syn, dst_ipv4,
+    next_sealable, send_sealed, src_ipv4,
+};
 use crate::ip_pool::{ConnId, IpAllocator, IpAllocatorV6, SessionIntent, SessionIntentV6};
 
 /// Retain anti-replay windows for at most this many recent epochs. Rekeys are
@@ -101,10 +105,6 @@ impl EpochReplayWindows {
 /// connection. Holds the host IP that was popped off the
 /// [`crate::ip_pool::IpAllocator`] for this connection plus the subnet
 /// parameters that the [`WarrenControlMessage::IpAssign`] needs.
-///
-/// `None` ⇒ no allocator wired, so the exit can assign nothing and refuses
-/// the session. `Some` ⇒ the rx loop emits exactly one `IpAssign` after the
-/// session is open, then forwards regular traffic.
 #[derive(Debug, Clone, Copy)]
 struct IpAssignSpec {
     assigned: Ipv4Addr,
@@ -156,17 +156,16 @@ impl IpAssignSpec {
 /// could be reused. The caller then emits an
 /// [`WarrenControlMessage::IpExhausted`] and closes the connection.
 fn allocate_on_first_frame(
-    ip_allocator: &Option<Arc<Mutex<IpAllocator>>>,
-    ip_allocator_v6: &Option<Arc<Mutex<IpAllocatorV6>>>,
+    ip_allocator: &Mutex<IpAllocator>,
+    ip_allocator_v6: Option<&Arc<Mutex<IpAllocatorV6>>>,
     conn_id: ConnId,
     sticky_pubkey: Option<[u8; 32]>,
     wants_ipv6: bool,
     prefer_ipv4: Option<[u8; 4]>,
 ) -> Option<IpAssignSpec> {
-    let alloc = ip_allocator.as_ref()?;
     let pubkey = sticky_pubkey;
     let intent = SessionIntent::from_prefer_ipv4(prefer_ipv4);
-    let mut guard = alloc.lock();
+    let mut guard = ip_allocator.lock();
     let assigned = match pubkey {
         Some(pk) => guard.allocate_for_pubkey_with_intent(conn_id, pk, intent)?,
         None => guard.allocate(conn_id)?,
@@ -189,7 +188,7 @@ fn allocate_on_first_frame(
     // client's firewall keeps native v6 blocked, so this is leak-safe, and
     // the `None` reply surfaces the gap on the client.
     let (assigned_v6, gateway_v6, prefix_len_v6) = if wants_ipv6 {
-        match ip_allocator_v6.as_ref() {
+        match ip_allocator_v6 {
             Some(alloc6) => {
                 let mut guard6 = alloc6.lock();
                 let v6 = match pubkey {
@@ -348,9 +347,10 @@ struct ConnSetup {
     /// into the shared `current` slot before pumping).
     epoch: u32,
     /// IP allocated for this connection, already announced to the client
-    /// over the setup stream as an `IpAssign`. Always `Some` on a served
-    /// session: setup refuses any connection it could not assign and route.
-    assigned_ip: Option<Ipv4Addr>,
+    /// over the setup stream as an `IpAssign` and registered as its downlink
+    /// route. Setup refuses any connection it could not assign one to, so the
+    /// rx pump's anti-spoof gate always has an address to enforce.
+    assigned_ip: Ipv4Addr,
     /// Multi-hop `/v2` dual-stack: the IPv6 allocated for this conn,
     /// announced in the same setup-stream `IpAssign`. `None` when the
     /// client is v4-only or the exit has no v6 allocator. Read by the
@@ -379,7 +379,7 @@ struct ConnSetup {
 struct ConnSetupPq {
     session: Arc<PqExitSession>,
     epoch: u32,
-    assigned_ip: Option<Ipv4Addr>,
+    assigned_ip: Ipv4Addr,
     assigned_ip_v6: Option<Ipv6Addr>,
     #[allow(dead_code)]
     revocation_guard: Option<SessionGuard>,
@@ -482,7 +482,7 @@ impl SetupTermination {
 
     fn into_outcome(
         self,
-        assigned_ip: Option<Ipv4Addr>,
+        assigned_ip: Ipv4Addr,
         assigned_ip_v6: Option<Ipv6Addr>,
         revocation_guard: Option<SessionGuard>,
         wants_daita: bool,
@@ -600,11 +600,11 @@ async fn accept_setup_stream(
     privkey: &Arc<WarrenKemPrivateKey>,
     exit_id: ExitId,
     cache: &Arc<SessionCache>,
-    ip_allocator: &Option<Arc<Mutex<IpAllocator>>>,
-    ip_allocator_v6: &Option<Arc<Mutex<IpAllocatorV6>>>,
+    ip_allocator: &Mutex<IpAllocator>,
+    ip_allocator_v6: Option<&Arc<Mutex<IpAllocatorV6>>>,
     conn_id: ConnId,
-    router: &Option<Arc<MultihopTunRouter>>,
-    down_tx: &Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    router: &MultihopTunRouter,
+    down_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
     reverse_seq: &AtomicU64,
     allowlist: Option<&AllowlistHandle>,
     session_registry: Option<&Arc<MultihopSessionRegistry>>,
@@ -671,11 +671,11 @@ async fn process_setup_frame(
     privkey: &Arc<WarrenKemPrivateKey>,
     exit_id: ExitId,
     cache: &Arc<SessionCache>,
-    ip_allocator: &Option<Arc<Mutex<IpAllocator>>>,
-    ip_allocator_v6: &Option<Arc<Mutex<IpAllocatorV6>>>,
+    ip_allocator: &Mutex<IpAllocator>,
+    ip_allocator_v6: Option<&Arc<Mutex<IpAllocatorV6>>>,
     conn_id: ConnId,
-    router: &Option<Arc<MultihopTunRouter>>,
-    down_tx: &Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    router: &MultihopTunRouter,
+    down_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
     reverse_seq: &AtomicU64,
     allowlist: Option<&AllowlistHandle>,
     session_registry: Option<&Arc<MultihopSessionRegistry>>,
@@ -872,9 +872,9 @@ async fn process_setup_frame(
     // The setup reply is sealed and written on the same bidi stream the
     // relay shuttles back to the client, instead of a reverse datagram.
     // A served session must always end up with an address the rx pump can gate
-    // its inner packets against, so both ways of failing to get one refuse the
-    // connection with the same opaque close every policy rejection uses
-    // (anti-oracle), rather than serving it with a disarmed anti-spoof gate.
+    // its inner packets against, so an exhausted pool refuses the connection
+    // with the same opaque close every policy rejection uses (anti-oracle),
+    // rather than serving it with a disarmed anti-spoof gate.
     let Some(spec) = allocate_on_first_frame(
         ip_allocator,
         ip_allocator_v6,
@@ -897,31 +897,15 @@ async fn process_setup_frame(
     };
     // Registering the downlink route is what makes an allocated address real:
     // the rx pump gates inner packets against it and the tx task fans out by
-    // it, so a half-wired session is refused like an unassigned one.
-    let (Some(router), Some(tx)) = (router, down_tx) else {
-        tracing::warn!("ip-nego: no downlink router for the allocated address; refusing");
-        reply_sealed_detail_then_close(
-            &mut send,
-            &term,
-            epoch,
-            reverse_seq,
-            conn,
-            &WarrenControlMessage::IpExhausted,
-        )
-        .await;
-        return None;
-    };
-    router.register(spec.assigned, tx.clone());
-    let assigned_ip = Some(spec.assigned);
+    // it.
+    router.register(spec.assigned, down_tx.clone());
     if let (Some(registry), Some(guard)) = (session_registry, revocation_guard.as_ref()) {
         registry.record_assigned_ipv4(spec.assigned, guard.pubkey);
     }
     // Dual-stack `/v2`: also register the v6 downlink route so the single TUN
     // reader fans out v6 reply packets to this conn by destination address.
-    let mut assigned_ip_v6 = None;
     if let Some(v6) = spec.assigned_v6 {
-        router.register_v6(v6, tx.clone());
-        assigned_ip_v6 = Some(v6);
+        router.register_v6(v6, down_tx.clone());
     }
     // DAITA capability echo: grant the machine THIS connection runs only when
     // the client asked for it. A client that did not ask is never pushed a
@@ -956,18 +940,21 @@ async fn process_setup_frame(
         tracing::debug!(error = %e, "multihop: finish setup reply stream failed");
         return None;
     }
-    if let Some(ip) = assigned_ip {
-        // `ip` is the ephemeral exit-internal pool address (10.66.0.x),
-        // not a client identifier, so it is benign to log. The v6 address
-        // is omitted; the `dual_stack` flag is enough for ops.
-        tracing::info!(
-            assigned = %ip,
-            dual_stack = assigned_ip_v6.is_some(),
-            "ip-nego: IpAssign sent over setup stream"
-        );
-    }
+    // The assigned address is the ephemeral exit-internal pool address
+    // (10.66.0.x), not a client identifier, so it is benign to log. The v6
+    // address is omitted; the `dual_stack` flag is enough for ops.
+    tracing::info!(
+        assigned = %spec.assigned,
+        dual_stack = spec.assigned_v6.is_some(),
+        "ip-nego: IpAssign sent over setup stream"
+    );
 
-    Some(term.into_outcome(assigned_ip, assigned_ip_v6, revocation_guard, wants_daita))
+    Some(term.into_outcome(
+        spec.assigned,
+        spec.assigned_v6,
+        revocation_guard,
+        wants_daita,
+    ))
 }
 
 /// Run the setup-stream phase from either source: accept the bidi
@@ -980,11 +967,11 @@ async fn run_setup(
     privkey: &Arc<WarrenKemPrivateKey>,
     exit_id: ExitId,
     cache: &Arc<SessionCache>,
-    ip_allocator: &Option<Arc<Mutex<IpAllocator>>>,
-    ip_allocator_v6: &Option<Arc<Mutex<IpAllocatorV6>>>,
+    ip_allocator: &Mutex<IpAllocator>,
+    ip_allocator_v6: Option<&Arc<Mutex<IpAllocatorV6>>>,
     conn_id: ConnId,
-    router: &Option<Arc<MultihopTunRouter>>,
-    down_tx: &Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    router: &MultihopTunRouter,
+    down_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
     reverse_seq: &AtomicU64,
     allowlist: Option<&AllowlistHandle>,
     session_registry: Option<&Arc<MultihopSessionRegistry>>,
@@ -1047,11 +1034,11 @@ async fn run_setup(
 /// connection. Cf. `docs/19-WARREN-MULTIHOP-DESIGN.md` § 11.6 and
 /// `warren_multihop_doctrine_v1` memory.
 ///
-/// For `/v2`, this bound is no longer wall-clock blind: `serve_pq_datagram_pump`
+/// For `/v2` the bound is not wall-clock blind: [`serve_pq_datagram_pump`]
 /// runs a per-connection keepalive that refreshes the live session's entry
-/// (see [`PqSessionCache::refresh`]) at roughly half the TTL, so a still-connected
-/// client survives an idle gap longer than the TTL. Only a session whose
-/// connection has actually gone away ages out.
+/// (see [`PqSessionCache::refresh`]) at roughly half the TTL, so a
+/// still-connected client survives an idle gap longer than the TTL. Only a
+/// session whose connection has actually gone away ages out.
 const SESSION_CACHE_TTL: Duration = Duration::from_secs(5);
 
 /// HKDF info string binding the X25519 multihop IKM derivation to the
@@ -1591,13 +1578,13 @@ async fn serve_one_connection_echo(
 }
 
 /// Shared slot holding the latest installed `(ExitSession, epoch)` for
-/// a connection. Mutated by the RX pump on each accepted frame, read
-/// by the TX pump before each reverse seal.
-type SharedCurrentSession = Arc<Mutex<Option<(Arc<ExitSession>, u32)>>>;
+/// a connection. Seeded from the completed setup, mutated by the RX pump on
+/// each accepted frame (rekey), read by the TX pump before each reverse seal.
+type SharedCurrentSession = Arc<Mutex<(Arc<ExitSession>, u32)>>;
 
 /// Post-quantum counterpart of [`SharedCurrentSession`] (`/v2` X-Wing session).
 #[cfg(feature = "pq-hpke")]
-type SharedPqCurrentSession = Arc<Mutex<Option<(Arc<PqExitSession>, u32)>>>;
+type SharedPqCurrentSession = Arc<Mutex<(Arc<PqExitSession>, u32)>>;
 
 /// A drain advisory broadcast to every live multi-hop connection on this
 /// exit when the backend marks the exit for maintenance (the heartbeat
@@ -1682,24 +1669,23 @@ fn spawn_drain_emitter(
         };
         loop {
             // Seal with the connection's latest session (rotates on rekey).
-            if let Some((session, epoch)) = current.lock().clone() {
-                let seq = reverse_seq.fetch_add(1, Ordering::AcqRel);
-                match session.seal_response(&plaintext, epoch, seq) {
-                    Ok(frame) => match encode_frame(&frame) {
-                        Ok(bytes) => {
-                            // Best-effort: a transient PMTU dip can make even
-                            // a tiny control frame momentarily TooLarge; the
-                            // next re-emit retries. A hard send error means
-                            // the conn is gone, so stop.
-                            match conn.send_datagram(bytes.into()) {
-                                Ok(()) | Err(SendDatagramError::TooLarge) => {}
-                                Err(_) => return,
-                            }
+            let (session, epoch) = current.lock().clone();
+            let seq = reverse_seq.fetch_add(1, Ordering::AcqRel);
+            match session.seal_response(&plaintext, epoch, seq) {
+                Ok(frame) => match encode_frame(&frame) {
+                    Ok(bytes) => {
+                        // Best-effort: a transient PMTU dip can make even a
+                        // tiny control frame momentarily TooLarge; the next
+                        // re-emit retries. A hard send error means the conn is
+                        // gone, so stop.
+                        match conn.send_datagram(bytes.into()) {
+                            Ok(()) | Err(SendDatagramError::TooLarge) => {}
+                            Err(_) => return,
                         }
-                        Err(e) => tracing::trace!(error = %e, "drain: encode_frame failed"),
-                    },
-                    Err(e) => tracing::trace!(error = %e, "drain: seal_response failed"),
-                }
+                    }
+                    Err(e) => tracing::trace!(error = %e, "drain: encode_frame failed"),
+                },
+                Err(e) => tracing::trace!(error = %e, "drain: seal_response failed"),
             }
             let now = unix_now_secs();
             if now >= advisory.deadline_unix_secs {
@@ -1744,42 +1730,10 @@ fn spawn_drain_emitter(
     }))
 }
 
-/// Routes exit-TUN downlink packets to the owning multi-hop connection
-/// by inner destination IPv4.
-///
-/// Replaces the broken model where every connection's TX task competed
-/// on a shared `tun.recv()`: the kernel hands each TUN packet to exactly
-/// one reader, so with more than one connection a downlink packet went
-/// to a random TX task and was sealed for the wrong client's HPKE
-/// session - only the first connection ever worked. A single reader
-/// task ([`pump_multihop_tun_router`]) instead parses each packet's
-/// destination IPv4 and forwards it to that connection's bounded
-/// channel; the per-connection TX task then seals and sends as before.
-///
-/// Only used when the exit allocates inner IPs (ip-nego on). The legacy
-/// no-allocator path keeps reading the TUN directly (single client).
-/// Bound on each connection's downlink channel. Full ⇒ the router drops
-/// (TCP retransmits); sized for a burst without unbounded memory growth.
-const DOWNLINK_CHANNEL_BOUND: usize = 1024;
-
 /// Upper bound on bonded downlink channels per assigned IP. Generous
 /// vs the client-side bonding cap (8): the overlap window of a sticky
 /// reconnect can briefly hold both the dying and the fresh generation.
 const MAX_SENDERS_PER_IP: usize = 16;
-
-/// Cap on the per-IP learned-flow table (canonical 5-tuple -> owning
-/// downlink sender). Bounds memory when many short flows churn under one
-/// sticky IP; at the cap one existing entry is evicted and that flow falls
-/// back to the 5-tuple hash until its next uplink packet re-learns the
-/// owner. A normal client holds far fewer than this.
-const FLOW_TABLE_CAP_PER_IP: usize = 8192;
-
-/// Give up on a connection's RX pump only after this many consecutive
-/// TUN write failures. A single transient write error (kernel queue
-/// pressure under a burst) used to kill the RX task, which cascaded
-/// into a zombie connection: pumps dead, QUIC alive, every flow pinned
-/// to it blackholed both ways (2026-06-11 incident, 8-flow collapse).
-const MAX_CONSECUTIVE_TUN_WRITE_ERRORS: u32 = 10_000;
 
 /// Delay after a sticky-IP takeover before the stale-predecessor re-check
 /// runs. Long enough that a predecessor still serving traffic has advanced
@@ -2051,8 +2005,19 @@ impl<A: std::hash::Hash + Eq + Copy> RouteTable<A> {
     }
 }
 
+/// Routes exit-TUN downlink packets to the owning multi-hop connection
+/// by inner destination IPv4.
+///
+/// Replaces the broken model where every connection's TX task competed
+/// on a shared `tun.recv()`: the kernel hands each TUN packet to exactly
+/// one reader, so with more than one connection a downlink packet went
+/// to a random TX task and was sealed for the wrong client's HPKE
+/// session - only the first connection ever worked. A single reader
+/// task ([`pump_multihop_tun_router`]) instead parses each packet's
+/// destination IPv4 and forwards it to that connection's bounded
+/// channel; the per-connection TX task then seals and sends as before.
 #[derive(Default)]
-struct MultihopTunRouter {
+pub(crate) struct MultihopTunRouter {
     routes: RouteTable<Ipv4Addr>,
     /// Multi-hop `/v2` dual-stack: per-connection downlink channels keyed
     /// on the assigned IPv6. Same one-reader-fans-out model as `routes`;
@@ -2187,15 +2152,6 @@ impl MultihopTunRouter {
     }
 }
 
-/// Extracts the destination IPv4 from a raw inner IP packet, or `None`
-/// when the packet is too short or not IPv4.
-fn dst_ipv4(pkt: &[u8]) -> Option<Ipv4Addr> {
-    if pkt.len() < 20 || (pkt[0] >> 4) != 4 {
-        return None;
-    }
-    Some(Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]))
-}
-
 /// Extracts the destination IPv6 from a raw inner IP packet, or `None`
 /// when the packet is too short or not IPv6. The IPv6 header is fixed at
 /// 40 bytes with the destination address in the last 16 (offset 24..40).
@@ -2208,17 +2164,6 @@ fn dst_ipv6(pkt: &[u8]) -> Option<Ipv6Addr> {
     Some(Ipv6Addr::from(octets))
 }
 
-/// Extracts the source IPv4 from a raw inner IP packet (offset 12..16), or
-/// `None` when too short or not IPv4. On the uplink the source is the
-/// client's own allocated address (the anti-spoof gate has already proven
-/// it), which is the slot key the downlink uses as destination.
-fn src_ipv4(pkt: &[u8]) -> Option<Ipv4Addr> {
-    if pkt.len() < 20 || (pkt[0] >> 4) != 4 {
-        return None;
-    }
-    Some(Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]))
-}
-
 /// Extracts the source IPv6 from a raw inner IP packet (offset 8..24), or
 /// `None` when too short or not IPv6.
 fn src_ipv6(pkt: &[u8]) -> Option<Ipv6Addr> {
@@ -2228,77 +2173,6 @@ fn src_ipv6(pkt: &[u8]) -> Option<Ipv6Addr> {
     let mut octets = [0u8; 16];
     octets.copy_from_slice(&pkt[8..24]);
     Some(Ipv6Addr::from(octets))
-}
-
-/// Direction-agnostic hash of an inner packet's flow, so an uplink packet
-/// (src=client, dst=peer) and its downlink reply (src=peer, dst=client)
-/// map to the SAME key. It hashes `(proto, min(endpoint), max(endpoint))`
-/// where an endpoint is `(ip, port)`, ordering the two endpoints so the
-/// direction drops out. Returns `None` for non-TCP/UDP or malformed
-/// packets (the caller then falls back to the plain 5-tuple hash).
-///
-/// This is the key under which the exit learns, from the uplink, which
-/// bonded connection owns a flow, so the downlink returns to the same
-/// session instead of being split by a blind hash across every session
-/// that happens to share one sticky IP.
-fn canonical_flow_key(pkt: &[u8]) -> Option<u64> {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x100_0000_01b3;
-    let first = *pkt.first()?;
-    let mut h: u64 = FNV_OFFSET;
-    let mut feed = |bytes: &[u8]| {
-        for &b in bytes {
-            h ^= u64::from(b);
-            h = h.wrapping_mul(FNV_PRIME);
-        }
-    };
-    match first >> 4 {
-        4 => {
-            if pkt.len() < 24 {
-                return None;
-            }
-            let ihl = (first & 0x0f) as usize * 4;
-            if ihl < 20 || pkt.len() < ihl + 4 {
-                return None;
-            }
-            let proto = pkt[9];
-            if proto != 6 && proto != 17 {
-                return None;
-            }
-            let mut a = [0u8; 6];
-            a[..4].copy_from_slice(&pkt[12..16]);
-            a[4..].copy_from_slice(&pkt[ihl..ihl + 2]);
-            let mut b = [0u8; 6];
-            b[..4].copy_from_slice(&pkt[16..20]);
-            b[4..].copy_from_slice(&pkt[ihl + 2..ihl + 4]);
-            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-            feed(&[proto]);
-            feed(&lo);
-            feed(&hi);
-            Some(h)
-        }
-        6 => {
-            if pkt.len() < 44 {
-                return None;
-            }
-            let next = pkt[6];
-            if next != 6 && next != 17 {
-                return None;
-            }
-            let mut a = [0u8; 18];
-            a[..16].copy_from_slice(&pkt[8..24]);
-            a[16..].copy_from_slice(&pkt[40..42]);
-            let mut b = [0u8; 18];
-            b[..16].copy_from_slice(&pkt[24..40]);
-            b[16..].copy_from_slice(&pkt[42..44]);
-            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-            feed(&[next]);
-            feed(&lo);
-            feed(&hi);
-            Some(h)
-        }
-        _ => None,
-    }
 }
 
 /// Single TUN reader: forwards each downlink packet to the owning
@@ -2340,81 +2214,6 @@ async fn pump_multihop_tun_router<T: PacketDevice>(tun: T, router: Arc<MultihopT
     }
 }
 
-/// Reads the next downlink packet for a connection's TX task, from the
-/// router channel fed per-IP by the single TUN reader. The direct-TUN arm
-/// only serves callers with no router, which no served session has.
-/// Returns `None` when the source is exhausted (channel senders all
-/// dropped, or TUN error) so the caller's TX loop exits.
-async fn next_downlink<T: PacketDevice>(
-    down_rx: &mut Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
-    tun: &T,
-) -> Option<Vec<u8>> {
-    match down_rx {
-        Some(rx) => rx.recv().await,
-        None => tun.recv().await.ok(),
-    }
-}
-
-/// Process-wide count of downlink packets tail-dropped by the over-read
-/// backpressure gate. Kept observable (rate-limited log) so the early-drop
-/// volume can be A/B-compared against the fork's CoDel `dropped_overflow`
-/// stat when tuning `WARREN_EXIT_OVERREAD_GATE`.
-static OVERREAD_GATE_DROPS: AtomicU64 = AtomicU64::new(0);
-
-/// Fallback MTU when the peer has not yet advertised a datagram frame size
-/// (`max_datagram_size()` is `None`): the Warren tunnel floor.
-const OVERREAD_GATE_FALLBACK_MTU: usize = 1280;
-
-/// Exit downlink over-read backpressure: `true` when this packet must be
-/// tail-dropped because `conn`'s datagram send buffer is within `gate_mtus`
-/// MTUs of full.
-///
-/// With N multi-queue TUN readers feeding one client's single QUIC connection,
-/// the aggregate read rate can far exceed the connection's BBR-limited drain
-/// rate. The excess piles into the datagram send buffer until the fork's CoDel
-/// head-drops (and `send_datagram`'s overflow drops) the OLDEST in-flight
-/// datagrams, which is exactly what the inner TCP is waiting to ACK, spiking
-/// its retransmits. Dropping the NEWEST packet at the reader keeps the standing
-/// queue shallow, so inner-TCP RTT and loss recovery stay fast.
-///
-/// `datagram_send_buffer_space()` is relative to the LIVE (BDP-adaptive) buffer
-/// limit, so a small MTU-multiple low-water stays correct as fork.11 shrinks
-/// the buffer toward the path BDP (no fixed-16-MiB constant). `gate_mtus == 0`
-/// disables the gate; when the buffer has room it is a no-op, so the gate can
-/// only ever reduce occupancy.
-fn overread_gate_should_drop(conn: &Connection, gate_mtus: usize) -> bool {
-    if gate_mtus == 0 {
-        return false;
-    }
-    let mtu = conn
-        .max_datagram_size()
-        .unwrap_or(OVERREAD_GATE_FALLBACK_MTU);
-    if !overread_should_drop(conn.datagram_send_buffer_space(), mtu, gate_mtus) {
-        return false;
-    }
-    let n = OVERREAD_GATE_DROPS.fetch_add(1, Ordering::Relaxed);
-    if n.is_multiple_of(50_000) {
-        tracing::debug!(
-            total_drops = n + 1,
-            "exit downlink over-read gate: tail-drop (rate-limited log)"
-        );
-    }
-    true
-}
-
-/// Pure over-read decision: drop when fewer than `gate_mtus` MTUs of buffer
-/// `space` remain. `gate_mtus == 0` disables the gate. The threshold scales
-/// with `mtu` (the connection's live datagram size), so it stays relative to
-/// the BDP-adaptive buffer rather than a fixed byte constant. Split out from
-/// the connection read so the boundary/relative-keying logic is unit-testable
-/// without a live QUIC connection.
-fn overread_should_drop(space: usize, mtu: usize, gate_mtus: usize) -> bool {
-    if gate_mtus == 0 {
-        return false;
-    }
-    space < gate_mtus.saturating_mul(mtu)
-}
-
 /// Multi-hop termination with TUN bridge.
 ///
 /// Variant of [`serve_multihop_echo`] that forwards opened plaintext
@@ -2429,10 +2228,9 @@ fn overread_should_drop(space: usize, mtu: usize, gate_mtus: usize) -> bool {
 ///   latest [`ExitSession::seal_response`] (a rekey replaces the sealing
 ///   context atomically) -> `encode_frame` -> `Quinn::send_datagram`.
 ///
-/// `ip_allocator` is required in practice: a connection the exit cannot
-/// assign a tunnel address to is refused at setup, because the rx pump's
-/// inner-source anti-spoof gate compares against that address and has
-/// nothing to enforce without one.
+/// A connection the exit cannot assign a tunnel address to is refused at
+/// setup: the rx pump's inner-source anti-spoof gate compares against that
+/// address and would have nothing to enforce without one.
 ///
 /// The reverse-direction seq counter is connection-local and resets
 /// to zero per connection. The client-side anti-replay window
@@ -2469,7 +2267,7 @@ pub async fn serve_multihop_with_tun_and_daita<T>(
     tun: T,
     daita_config: Option<warrenguard_wire::DaitaConfig>,
     daita_machine_name: Option<String>,
-    ip_allocator: Option<Arc<Mutex<IpAllocator>>>,
+    ip_allocator: Arc<Mutex<IpAllocator>>,
     ip_allocator_v6: Option<Arc<Mutex<IpAllocatorV6>>>,
 ) -> Result<(), MultihopExitError>
 where
@@ -2483,10 +2281,10 @@ where
         daita_machine_name,
         ip_allocator,
         ip_allocator_v6,
-        // Standalone-listener entry point (tests / legacy single-tenant):
-        // no allowlist, every client admitted. The production unified
-        // dispatcher passes a real allowlist via `ExitTerminateCtx::new`
-        // in `run_multihop_mode`.
+        // Standalone-listener entry point (tests, self-hosted single
+        // tenant): no allowlist, every client admitted. The production
+        // unified dispatcher passes a real allowlist via
+        // `ExitTerminateCtx::new`.
         None,
     );
     while let Some(incoming) = endpoint.accept().await {
@@ -2973,12 +2771,12 @@ pub struct ExitTerminateCtx<T: PacketDevice + Clone> {
     exit_id: ExitId,
     tun: T,
     daita: Arc<DaitaSource>,
-    ip_allocator: Option<Arc<Mutex<IpAllocator>>>,
+    ip_allocator: Arc<Mutex<IpAllocator>>,
     /// Multi-hop `/v2` dual-stack: the IPv6 pool allocator. `None` keeps
     /// the exit IPv4-only (a v2 client then gets `ipv6: None` back and
     /// stays v4-only, firewall keeps native v6 blocked - no leak).
     ip_allocator_v6: Option<Arc<Mutex<IpAllocatorV6>>>,
-    router: Option<Arc<MultihopTunRouter>>,
+    router: Arc<MultihopTunRouter>,
     /// TUN queues connections write their uplink onto. One entry (the primary
     /// `tun`) in the single-queue default; N entries when the deployer opens an
     /// `IFF_MULTI_QUEUE` TUN and calls [`Self::with_extra_tun_queues`]. Each
@@ -3029,9 +2827,9 @@ pub struct ExitTerminateCtx<T: PacketDevice + Clone> {
 }
 
 impl<T: PacketDevice + Clone> ExitTerminateCtx<T> {
-    /// Build the shared termination state. When an allocator is present,
-    /// spawns the single TUN -> per-IP downlink router pump (the same
-    /// one-reader-fans-out model the standalone listener used).
+    /// Build the shared termination state, spawning the single TUN -> per-IP
+    /// downlink router pump (the one-reader-fans-out model every terminating
+    /// entry point uses).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         exit_x25519_privkey: WarrenKemPrivateKey,
@@ -3039,16 +2837,12 @@ impl<T: PacketDevice + Clone> ExitTerminateCtx<T> {
         tun: T,
         daita_config: Option<warrenguard_wire::DaitaConfig>,
         daita_machine_name: Option<String>,
-        ip_allocator: Option<Arc<Mutex<IpAllocator>>>,
+        ip_allocator: Arc<Mutex<IpAllocator>>,
         ip_allocator_v6: Option<Arc<Mutex<IpAllocatorV6>>>,
         allowlist: Option<AllowlistHandle>,
     ) -> Self {
-        let router = ip_allocator
-            .as_ref()
-            .map(|_| Arc::new(MultihopTunRouter::default()));
-        if let Some(router) = router.clone() {
-            tokio::spawn(pump_multihop_tun_router(tun.clone(), router));
-        }
+        let router = Arc::new(MultihopTunRouter::default());
+        tokio::spawn(pump_multihop_tun_router(tun.clone(), router.clone()));
         Self {
             cache: Arc::new(SessionCache::new()),
             privkey: Arc::new(exit_x25519_privkey),
@@ -3083,19 +2877,16 @@ impl<T: PacketDevice + Clone> ExitTerminateCtx<T> {
     /// queues with `RealTun::create_multi_queue_named`, keeps queue 0 as the
     /// `new` primary, and hands the rest here.
     ///
-    /// A downlink router reader is spawned for each extra queue ONLY when an IP
-    /// allocator is configured (the router exists), matching `new`'s primary
-    /// reader; the no-allocator legacy path stays single-queue. Passing an empty
-    /// `extra` is a no-op, so the single-queue default is byte-identical.
+    /// A downlink router reader is spawned for each extra queue, matching
+    /// `new`'s primary reader. Passing an empty `extra` is a no-op, so the
+    /// single-queue default is byte-identical.
     #[must_use]
     pub fn with_extra_tun_queues(mut self, extra: Vec<T>) -> Self {
         if extra.is_empty() {
             return self;
         }
-        if let Some(router) = self.router.clone() {
-            for q in &extra {
-                tokio::spawn(pump_multihop_tun_router(q.clone(), router.clone()));
-            }
+        for q in &extra {
+            tokio::spawn(pump_multihop_tun_router(q.clone(), self.router.clone()));
         }
         let mut queues = Vec::with_capacity(self.uplink_queues.len() + extra.len());
         queues.extend(self.uplink_queues.iter().cloned());
@@ -3216,13 +3007,12 @@ impl<T: PacketDevice + Clone> ExitTerminateCtx<T> {
     }
 
     /// Read-only handle over this dispatcher's live tunnel IPv4s, for the
-    /// NAT-PMP orphan reaper to diff against the allocator. `None` when no
-    /// per-IP router is wired (no ip-nego / bench echo path). Cheap to clone
+    /// NAT-PMP orphan reaper to diff against the allocator. Cheap to clone
     /// (shares the router `Arc`); call before moving `self` into the serve
     /// loop, which never returns until shutdown.
     #[must_use]
-    pub fn active_tunnel_ipv4s(&self) -> Option<ActiveTunnelIpv4s> {
-        self.router.clone().map(ActiveTunnelIpv4s)
+    pub fn active_tunnel_ipv4s(&self) -> ActiveTunnelIpv4s {
+        ActiveTunnelIpv4s(self.router.clone())
     }
 }
 
@@ -3277,14 +3067,14 @@ pub async fn terminate_connection<T>(
     let conn_id: ConnId = conn.stable_id() as ConnId;
     // Two clients of the same exit must not share one maybenot machine.
     let daita_pick = ctx.daita_for_connection();
-    serve_one_connection_with_tun_and_daita(
+    serve_terminating_connection(
         conn,
         ctx.privkey.clone(),
         ctx.exit_id,
         ctx.cache.clone(),
         // Round-robin the connection onto one of the opened TUN queues so its
-        // uplink writes parallelize across kernel fds (single-queue = the
-        // primary `tun`, byte-identical to before).
+        // uplink writes parallelize across kernel fds (single-queue hands out
+        // the primary `tun`).
         ctx.pick_uplink_tun(),
         daita_pick,
         ctx.ip_allocator.clone(),
@@ -3300,103 +3090,13 @@ pub async fn terminate_connection<T>(
         ctx.pq_setup(),
     )
     .await;
-    if let Some(alloc) = ctx.ip_allocator.as_ref() {
-        alloc.lock().release(conn_id);
-    }
+    ctx.ip_allocator.lock().release(conn_id);
     // `/v2` dual-stack: release the v6 lease too so its interface ID
     // returns to the recycle queue (and the sticky binding survives for
     // a reconnect of the same pubkey).
     if let Some(alloc6) = ctx.ip_allocator_v6.as_ref() {
         alloc6.lock().release(conn_id);
     }
-}
-
-/// This node's live inner-packet budget for one multihop connection: its
-/// current QUIC datagram budget minus the wire overhead of the frame format
-/// this session speaks ([`MULTIHOP_FRAME_MAX_OVERHEAD`] for `/v1` sessions,
-/// [`pq_inner_budget`]'s data-frame overhead under `pq-hpke`). Saturates
-/// instead of wrapping when the path MTU cannot even carry the frame overhead,
-/// and falls back to `u16::MAX` (no clamp) before the connection has negotiated
-/// a size.
-fn inner_budget(max_datagram_size: Option<usize>, frame_overhead: usize) -> u16 {
-    u16::try_from(
-        max_datagram_size
-            .unwrap_or(usize::from(u16::MAX))
-            .saturating_sub(frame_overhead),
-    )
-    .unwrap_or(u16::MAX)
-}
-
-/// The `/v2` (pq-hpke) inner-packet budget for a live datagram size. A `/v2`
-/// DATA frame carries an EMPTY `pq_ct` (the 1088-byte ML-KEM ciphertext rides
-/// only the dedicated bootstrap frame, see [`PqExitSession::seal_response`]), so
-/// the budget subtracts [`MULTIHOP_FRAME_V2_DATA_MAX_OVERHEAD`], matching the
-/// client's `max_inner_payload`. Subtracting the ~1 KB-larger setup bound
-/// starved a 1452-byte path to a ~240-byte budget, so every real downlink packet
-/// exceeded it and was reflected as frag-needed rather than sealed: a silent
-/// data black-hole while the tunnel stayed Connected.
-#[cfg(feature = "pq-hpke")]
-fn pq_inner_budget(max_datagram_size: Option<usize>) -> u16 {
-    inner_budget(max_datagram_size, MULTIHOP_FRAME_V2_DATA_MAX_OVERHEAD)
-}
-
-/// Rewrites the MSS option of a SYN/SYN-ACK down to `budget`, logging the
-/// change. A no-op, silently, when [`clamp_syn_mss`] finds the packet
-/// already fits or carries no MSS option.
-fn clamp_mss_logged(packet: &mut [u8], budget: u16) {
-    if let Some((old, new)) = clamp_syn_mss(packet, budget) {
-        tracing::debug!(
-            old,
-            new,
-            budget,
-            "exit clamped inner TCP MSS to node budget"
-        );
-    }
-}
-
-/// Uplink SYN clamp (client -> exit -> TUN). The [`is_tcp_syn`] pre-filter
-/// means the live-budget lookup (a `Connection` state read) is only paid on
-/// the rare packets that could actually be rewritten, not on every uplink
-/// packet. The MSS a peer announces governs the segments the OTHER side
-/// will emit back through this node, so clamping it here caps what any
-/// origin server ever sends down through this exit's own transmit budget,
-/// healing pre-existing clients with no app update since the clamp lives
-/// entirely on the exit (2026-07-15 SNCF incident: a reduced-MTU underlay
-/// silently blackholed full-MSS downlink segments while the tunnel stayed
-/// Connected).
-fn clamp_uplink_syn(packet: &mut [u8], conn: &Connection, frame_overhead: usize) {
-    if !is_tcp_syn(packet) {
-        return;
-    }
-    clamp_mss_logged(
-        packet,
-        inner_budget(conn.max_datagram_size(), frame_overhead),
-    );
-}
-
-/// Downlink adaptation (TUN -> exit -> client) of a packet about to be
-/// sealed, given the live `budget` ([`inner_budget`]). Clamps an outgoing
-/// SYN-ACK's MSS the same way as [`clamp_uplink_syn`] (always small enough
-/// afterward on its own: a SYN carries no payload). Any other packet that
-/// still exceeds `budget` cannot be sealed/sent as-is: `Some` is the RFC
-/// 1191/4443 fragmentation-needed reply to reflect into the TUN so the
-/// origin server's own PMTUD shrinks its segments within one RTT instead of
-/// the exit dropping them silently forever; `None` means seal and send
-/// unchanged.
-fn adapt_inner_for_budget(packet: &mut [u8], budget: u16) -> Option<Vec<u8>> {
-    if is_tcp_syn(packet) {
-        clamp_mss_logged(packet, budget);
-        return None;
-    }
-    if packet.len() <= usize::from(budget) {
-        return None;
-    }
-    build_frag_needed(
-        packet,
-        budget,
-        warrenguard_config::TUNNEL_GATEWAY_IP,
-        warrenguard_config::TUNNEL_GATEWAY_IPV6,
-    )
 }
 
 /// Attach this connection's inbound-activity counter to its freshly
@@ -3415,24 +3115,18 @@ fn adapt_inner_for_budget(packet: &mut [u8], budget: u16) -> Option<Vec<u8>> {
 /// so black-holes nothing; it is the concurrent same-pubkey-collision case
 /// (decision pending), not the single-user reconnect this fixes.
 fn arm_takeover_recheck(
-    router: &Option<Arc<MultihopTunRouter>>,
-    down_tx: &Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
-    assigned_ip: Option<Ipv4Addr>,
+    router: &Arc<MultihopTunRouter>,
+    down_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    assigned_ip: Ipv4Addr,
     assigned_ip_v6: Option<Ipv6Addr>,
     activity: &Arc<AtomicU64>,
 ) {
-    let (Some(router), Some(tx)) = (router.as_ref(), down_tx.as_ref()) else {
-        return;
-    };
-    let mut predecessors_v4 = Vec::new();
+    router.attach_liveness(assigned_ip, down_tx, activity.clone());
+    let predecessors_v4 = router.snapshot_predecessors(assigned_ip, down_tx);
     let mut predecessors_v6 = Vec::new();
-    if let Some(ip) = assigned_ip {
-        router.attach_liveness(ip, tx, activity.clone());
-        predecessors_v4 = router.snapshot_predecessors(ip, tx);
-    }
     if let Some(ip6) = assigned_ip_v6 {
-        router.attach_liveness_v6(ip6, tx, activity.clone());
-        predecessors_v6 = router.snapshot_predecessors_v6(ip6, tx);
+        router.attach_liveness_v6(ip6, down_tx, activity.clone());
+        predecessors_v6 = router.snapshot_predecessors_v6(ip6, down_tx);
     }
     if predecessors_v4.is_empty() && predecessors_v6.is_empty() {
         return;
@@ -3448,10 +3142,7 @@ fn arm_takeover_recheck(
     let router = router.clone();
     tokio::spawn(async move {
         tokio::time::sleep(TAKEOVER_STALE_RECHECK).await;
-        let mut evicted = 0;
-        if let Some(ip) = assigned_ip {
-            evicted += router.evict_stale_predecessors(ip, &predecessors_v4);
-        }
+        let mut evicted = router.evict_stale_predecessors(assigned_ip, &predecessors_v4);
         if let Some(ip6) = assigned_ip_v6 {
             evicted += router.evict_stale_predecessors_v6(ip6, &predecessors_v6);
         }
@@ -3464,666 +3155,105 @@ fn arm_takeover_recheck(
     });
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn serve_one_connection_with_tun<T>(
-    conn: Connection,
-    privkey: Arc<WarrenKemPrivateKey>,
-    exit_id: ExitId,
-    cache: Arc<SessionCache>,
-    tun: T,
-    ip_allocator: Option<Arc<Mutex<IpAllocator>>>,
-    ip_allocator_v6: Option<Arc<Mutex<IpAllocatorV6>>>,
-    conn_id: ConnId,
-    router: Option<Arc<MultihopTunRouter>>,
-    setup_source: SetupSource,
-    allowlist: Option<AllowlistHandle>,
-    session_registry: Option<Arc<MultihopSessionRegistry>>,
-    drain_rx: Option<watch::Receiver<Option<DrainAdvisory>>>,
-    token_admitter: Option<Arc<dyn SessionTokenAdmitter>>,
-    #[cfg(feature = "pq-hpke")] pq: Option<PqSetup>,
-) where
-    T: PacketDevice + Clone,
-{
-    // Latest installed sealing context shared between the RX task
-    // (which installs it on every accepted frame) and the TX task
-    // (which uses it to seal reverse frames). On a rekey the
-    // exit-side SessionCache returns a fresh entry for the new
-    // encapsulated_key; the slot is then atomically swapped here so
-    // the reverse path picks the new sealing context on the next
-    // outbound TUN packet.
-    let current: SharedCurrentSession = Arc::new(Mutex::new(None));
-    let reverse_seq = Arc::new(AtomicU64::new(0));
-
-    // Downlink routing (see the DAITA variant + `MultihopTunRouter`):
-    // channel-fed per-IP when ip-nego is on, direct `tun.recv()` else.
-    let (down_tx, down_rx) = if router.is_some() {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(DOWNLINK_CHANNEL_BOUND);
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
-
-    // Reliable setup phase: derive HPKE, allocate the IP, register the
-    // route, and reply with the sealed IpAssign over the bidi stream
-    // BEFORE any DATA datagram is pumped. A setup failure abandons the
-    // connection (the datagram pump never starts). The anti-replay window
-    // is session-scoped (held in the SessionCache entry), not local to
-    // this connection, so a frame replayed on a fresh connection sharing
-    // this HPKE session is rejected.
-    let setup = match run_setup(
-        setup_source,
-        &conn,
-        &privkey,
-        exit_id,
-        &cache,
-        &ip_allocator,
-        &ip_allocator_v6,
-        conn_id,
-        &router,
-        &down_tx,
-        &reverse_seq,
-        allowlist.as_ref(),
-        session_registry.as_ref(),
-        token_admitter.as_ref(),
-        // Plain pump: this connection runs no machine, so there is nothing
-        // to offer a wants_daita client (the reply honestly reads None).
-        None,
-        #[cfg(feature = "pq-hpke")]
-        pq.as_ref(),
-    )
-    .await
-    {
-        Some(o) => o,
-        None => return,
-    };
-    // When compiled without `pq-hpke`, `SetupOutcome` has only the `V1` variant,
-    // so this reads as a single-arm destructure; the `V2` arm exists only under
-    // the feature.
-    #[allow(clippy::infallible_destructuring_match)]
-    let setup = match setup {
-        SetupOutcome::V1(s) => s,
-        // A `/v2` connection runs the dedicated post-quantum pump; the classical
-        // pump below is byte-identical to before.
-        #[cfg(feature = "pq-hpke")]
-        SetupOutcome::V2(pq_setup) => {
-            if let Some(pq) = pq {
-                serve_pq_datagram_pump(
-                    conn,
-                    exit_id,
-                    tun,
-                    pq_setup,
-                    router,
-                    down_tx,
-                    down_rx,
-                    pq,
-                    reverse_seq,
-                )
-                .await;
-            }
-            return;
-        }
-    };
-    let assigned_ip: Arc<Mutex<Option<Ipv4Addr>>> = Arc::new(Mutex::new(setup.assigned_ip));
-    let assigned_ip_v6: Arc<Mutex<Option<Ipv6Addr>>> = Arc::new(Mutex::new(setup.assigned_ip_v6));
-    *current.lock() = Some((setup.session.clone(), setup.epoch));
-
-    // Inbound-activity counter bumped by the RX task below; feeds the
-    // sticky-IP takeover re-check so a dead predecessor's re-used flows
-    // re-pin to this live connection in bounded time.
-    let rx_activity = Arc::new(AtomicU64::new(0));
-    arm_takeover_recheck(
-        &router,
-        &down_tx,
-        setup.assigned_ip,
-        setup.assigned_ip_v6,
-        &rx_activity,
-    );
-
-    // ADR 36 soft drain signal: park on the exit-wide drain watch and, when
-    // the exit is marked for maintenance, seal+emit ExitDraining on this
-    // connection, hard-closing at the deadline. Spawned BEFORE the Arcs are
-    // moved into the pump tasks below (this variant has no timer task, so
-    // `current`/`reverse_seq` are moved, not cloned).
-    let drain_task =
-        spawn_drain_emitter(drain_rx, current.clone(), reverse_seq.clone(), conn.clone());
-
-    // Transport path probe (Lever 1a): the unified prod dispatcher
-    // terminates clients HERE, so the multihop path needs its own probe
-    // spawn for observability parity.
-    drop(warrenguard_transport_core::spawn_path_probe(
-        "exit-mh",
-        vec![conn.clone()],
-        None,
-    ));
-
-    let conn_rx = conn.clone();
-    let tun_rx = tun.clone();
-    let cache_rx = cache.clone();
-    let privkey_rx = privkey.clone();
-    let current_rx = current.clone();
-    // For learning per-flow downlink ownership from the uplink (both `None`
-    // on the legacy no-allocator path, where routing is direct `tun.recv`).
-    let router_rx = router.clone();
-    let down_tx_rx = down_tx.clone();
-    // Anti-spoof gate inputs: fixed for the connection's lifetime (the
-    // allocation happens once, during setup). `None` only on the legacy
-    // no-allocator path (single client, bootstrap IP) where no expected
-    // address exists to compare against.
-    let spoof_gate_v4 = setup.assigned_ip;
-    let spoof_gate_v6 = setup.assigned_ip_v6;
-    let rx_activity_rx = rx_activity.clone();
-    let rx_task = tokio::spawn(async move {
-        let mut tun_write_errors: u32 = 0;
-        let mut spoofed_drops: u64 = 0;
-        // See the DAITA variant: lock-free memo so the router lock is taken
-        // only on a flow's first uplink packet, not on its bulk data.
-        let mut noted_flows: HashSet<u64> = HashSet::new();
-        loop {
-            let datagram = match conn_rx.read_datagram().await {
-                Ok(d) => d,
-                Err(_) => return,
-            };
-            // One lock-free bump per inbound datagram: a live peer keeps
-            // this advancing, a dead predecessor freezes it (takeover check).
-            rx_activity_rx.fetch_add(1, Ordering::Relaxed);
-            let frame = match decode_frame(&datagram) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            if frame.exit_id != exit_id {
-                continue;
-            }
-            let handle = match cache_rx.get_or_insert(&frame.encapsulated_key, || {
-                ExitSession::new(&privkey_rx, &frame.encapsulated_key, exit_id)
-            }) {
-                Ok(h) => h,
-                Err(_) => continue,
-            };
-            let session = handle.session;
-            // Capture the Copy scalars used after the open (anti-replay seq/epoch
-            // and the epoch slot) before the zero-copy open consumes the frame.
-            let (frame_seq, frame_epoch) = (frame.seq, frame.epoch);
-            let mut plaintext = match session.open_owned(frame) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            // Anti-replay before the frame can reach the TUN: a
-            // blind/compromised relay must not be able to replay a
-            // captured sealed frame. The window is shared across every
-            // connection driving this HPKE session (cf. SessionCache), so
-            // a replay on a fresh connection is rejected too.
-            if handle
-                .replay_windows
-                .lock()
-                .check_and_record(frame_seq, frame_epoch)
-                .is_err()
-            {
-                continue;
-            }
-            *current_rx.lock() = Some((session.clone(), frame_epoch));
-            // The setup round-trip is reliable, so a DATA datagram is
-            // normally a real IP packet. A stray control frame (e.g. a
-            // client still retrying an IpRequest on the legacy datagram
-            // path) is dropped rather than re-forwarded: the setup
-            // stream already delivered the IpAssign.
-            if warrenguard_multihop::try_decode_control(&plaintext)
-                .ok()
-                .flatten()
-                .is_some()
-            {
-                continue;
-            }
-            // Anti-spoof: the decrypted packet's inner source IP must be
-            // the address allocated to this connection. The counter (not the
-            // address) is logged.
-            if let Some(expected_v4) = spoof_gate_v4
-                && !source_ip_matches(&plaintext, expected_v4, spoof_gate_v6)
-            {
-                spoofed_drops += 1;
-                if spoofed_drops == 1 || spoofed_drops.is_multiple_of(10_000) {
-                    tracing::warn!(
-                        spoofed_drops,
-                        "rx_task: dropped packet with spoofed inner source IP"
-                    );
-                }
-                continue;
-            }
-            // Anti-spoof passed: safe to record this flow's downlink owner
-            // for the reverse path. First packet of each flow only (memoized).
-            if let (Some(router), Some(owner)) = (&router_rx, &down_tx_rx)
-                && let Some(fk) = canonical_flow_key(&plaintext)
-            {
-                if noted_flows.len() >= FLOW_TABLE_CAP_PER_IP {
-                    noted_flows.clear();
-                }
-                if noted_flows.insert(fk) {
-                    router.note_uplink(&plaintext, owner);
-                }
-            }
-            // Cap the MSS any SYN announces to the exit's own downlink
-            // budget before it reaches the TUN: see `clamp_uplink_syn`.
-            clamp_uplink_syn(&mut plaintext, &conn_rx, MULTIHOP_FRAME_MAX_OVERHEAD);
-            match tun_rx.send(&plaintext).await {
-                Ok(()) => tun_write_errors = 0,
-                Err(e) => {
-                    tun_write_errors += 1;
-                    if tun_write_errors == 1 || tun_write_errors.is_multiple_of(1_000) {
-                        tracing::warn!(
-                            error = %e,
-                            consecutive = tun_write_errors,
-                            "rx_task: transient TUN write error, dropping packet"
-                        );
-                    }
-                    if tun_write_errors >= MAX_CONSECUTIVE_TUN_WRITE_ERRORS {
-                        return;
-                    }
-                }
-            }
-        }
-    });
-
-    let conn_tx = conn.clone();
-    let tun_tx = tun;
-    let mut down_rx_tx = down_rx;
-    let current_tx = current;
-    let reverse_seq_tx = reverse_seq;
-    let tx_task = tokio::spawn(async move {
-        let mut mtu_reflected = 0u64;
-        loop {
-            let mut packet = match next_downlink(&mut down_rx_tx, &tun_tx).await {
-                Some(p) => p,
-                None => return,
-            };
-            // Over-read backpressure: drop the newest packet BEFORE sealing when
-            // the client's connection buffer is near full (see the gate helper).
-            if overread_gate_should_drop(
-                &conn_tx,
-                warrenguard_config::knobs::exit_overread_gate_mtus(),
-            ) {
-                continue;
-            }
-            let (session, epoch) = match current_tx.lock().clone() {
-                Some(v) => v,
-                None => continue,
-            };
-            // Reject/clamp before sealing: see `adapt_inner_for_budget`.
-            let budget = inner_budget(conn_tx.max_datagram_size(), MULTIHOP_FRAME_MAX_OVERHEAD);
-            if let Some(ptb) = adapt_inner_for_budget(&mut packet, budget) {
-                mtu_reflected += 1;
-                if mtu_reflected == 1 || mtu_reflected.is_multiple_of(64) {
-                    tracing::warn!(
-                        mtu_reflected,
-                        budget,
-                        "tx_task: packet exceeds downlink budget, reflecting frag-needed instead of sealing"
-                    );
-                }
-                if let Err(e) = tun_tx.send(&ptb).await {
-                    tracing::trace!(error = %e, "tx_task: frag-needed reflection tun write failed");
-                }
-                continue;
-            }
-            let seq = reverse_seq_tx.fetch_add(1, Ordering::AcqRel);
-            // Classify while the plaintext is still readable: the sealed
-            // frame is opaque to quinn, so the inner ECN/flow key must
-            // travel with the datagram.
-            let class = DatagramClass::of_inner_ip_packet(&packet);
-            let frame = match session.seal_response_owned(packet, epoch, seq) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            let bytes = match encode_frame(&frame) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            match conn_tx.send_datagram_classified(bytes.into(), class) {
-                Ok(()) => {}
-                // Transient PMTU dip under loss: drop, never die (see
-                // the DAITA tx_task below for the full rationale).
-                Err(SendDatagramError::TooLarge) => {}
-                Err(_) => return,
-            }
-        }
-    });
-
-    // On conn close, rx_task returns first (Quinn `read_datagram`
-    // errors). Without this abort the tx_task's downlink source would
-    // never return, leaking the spawn forever and blocking the
-    // allocator's `release(conn_id)` in the parent. Abort both
-    // side-tasks once rx exits; this is safe because reverse-direction
-    // packets after conn close cannot land.
-    let _ = rx_task.await;
-    tx_task.abort();
-    let _ = tx_task.await;
-    // The drain emitter may still be parked on the watch (no drain ever
-    // came) or sleeping between re-emits; abort AND join it so a deadline
-    // hard-close in flight settles before the pump's own close, keeping the
-    // client-visible close code deterministic (WARREN_MH_DRAINING wins).
-    if let Some(t) = drain_task {
-        t.abort();
-        let _ = t.await;
-    }
-    // Owner-checked: a same-pubkey takeover may have re-pointed this
-    // address at a successor connection's channel already.
-    if let (Some(router), Some(ip), Some(own_tx)) = (&router, *assigned_ip.lock(), &down_tx) {
-        router.unregister_if_owner(ip, own_tx);
-        if let Some(ip6) = *assigned_ip_v6.lock() {
-            router.unregister_v6_if_owner(ip6, own_tx);
-        }
-    }
-    // Pumps gone: close the QUIC connection so the client's bundle
-    // observes the death and redials. Without this, detached observers
-    // (the path probe holds a `Connection` clone) keep the session
-    // alive and every flow pinned to it blackholes silently.
-    conn.close(quinn::VarInt::from_u32(0), b"exit pumps ended");
-}
-
-/// Post-quantum (`/v2`) datagram pump: the X-Wing counterpart of the RX/TX tasks
-/// in [`serve_one_connection_with_tun`]. The setup phase already ran (over the
-/// reliable stream, in [`process_setup_frame`]), so this only pumps DATA and
-/// rekey datagrams. Anti-spoof, per-flow downlink routing and TUN writes are
-/// identical to the classical path; only the seal/open and the
-/// establish-from-`pq_ct` cache discipline differ. DAITA cover and the
-/// soft-drain emitter are not wired on the PQ path yet.
-#[cfg(feature = "pq-hpke")]
-#[allow(clippy::too_many_arguments)]
-async fn serve_pq_datagram_pump<T>(
-    conn: Connection,
-    exit_id: ExitId,
-    tun: T,
-    setup: ConnSetupPq,
-    router: Option<Arc<MultihopTunRouter>>,
-    down_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
-    down_rx: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
-    pq: PqSetup,
-    // MUST be the same counter `run_setup` sealed the stream reply from,
-    // never a fresh one: the client feeds stream replies and datagram
-    // downlinks through ONE anti-replay window, so restarting the pump's
-    // seqs at 0 re-issues the seq the IpAssign reply already consumed and
-    // the session's first downlink datagram is discarded as a replay
-    // (surfaced by the strict egress probe as "anti-replay rejection
-    // (epoch 0, seq 0)"; ordinary clients just lose one datagram).
+/// Timer task for an armed connection: wake on the next per-machine action
+/// timer, drain the expired ones, seal one dummy per machine with the
+/// connection's current session (rotating transparently on rekey) and emit it
+/// on the reverse direction behind the `0xFF` marker. The receiver's
+/// `is_daita_dummy` drops it before it can reach a TUN.
+fn spawn_daita_timer(
+    daita: &DaitaSink,
+    current: SharedCurrentSession,
     reverse_seq: Arc<AtomicU64>,
-) where
-    T: PacketDevice + Clone,
-{
-    let current: SharedPqCurrentSession =
-        Arc::new(Mutex::new(Some((setup.session.clone(), setup.epoch))));
-    let spoof_gate_v4 = setup.assigned_ip;
-    let spoof_gate_v6 = setup.assigned_ip_v6;
-    // Encapsulated key of the session currently in use on this connection, so
-    // the keepalive task below can tell the cache which entry to refresh.
-    // Identity material: never logged, not even a prefix.
-    let current_key: Arc<Mutex<Option<EncapsulatedKeyBytes>>> = Arc::new(Mutex::new(None));
-
-    // Inbound-activity counter for the sticky-IP takeover re-check (see the
-    // classical pump). Registration already happened in `run_setup`; here we
-    // attach the counter and arm the re-check for the `/v2` path too.
-    let rx_activity = Arc::new(AtomicU64::new(0));
-    arm_takeover_recheck(
-        &router,
-        &down_tx,
-        setup.assigned_ip,
-        setup.assigned_ip_v6,
-        &rx_activity,
-    );
-
-    drop(warrenguard_transport_core::spawn_path_probe(
-        "exit-mh-pq",
-        vec![conn.clone()],
-        None,
-    ));
-
-    let conn_rx = conn.clone();
-    let tun_rx = tun.clone();
-    let current_rx = current.clone();
-    let router_rx = router.clone();
-    let down_tx_rx = down_tx.clone();
-    let pq_rx = pq.clone();
-    let rx_activity_rx = rx_activity.clone();
-    let current_key_rx = current_key.clone();
-    let rx_task = tokio::spawn(async move {
-        let mut tun_write_errors: u32 = 0;
-        let mut spoofed_drops: u64 = 0;
-        let mut noted_flows: HashSet<u64> = HashSet::new();
+    conn: Connection,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let shared = daita.shared()?.clone();
+    Some(tokio::spawn(async move {
         loop {
-            let datagram = match conn_rx.read_datagram().await {
-                Ok(d) => d,
-                Err(_) => return,
-            };
-            rx_activity_rx.fetch_add(1, Ordering::Relaxed);
-            let frame = match decode_frame_v2(&datagram) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            if frame.exit_id != exit_id {
-                continue;
-            }
-            // A rekey/setup datagram carries `pq_ct`: (re)establish the epoch's
-            // session by decapsulating it. A steady-state DATA datagram (empty
-            // `pq_ct`) can only LOOK UP an already-established session; a miss is
-            // dropped, since it cannot be rebuilt without the ML-KEM ciphertext.
-            let handle = if frame.pq_ct.is_empty() {
-                match pq_rx.cache.get(&frame.encapsulated_key) {
-                    Some(h) => h,
-                    None => continue,
-                }
-            } else {
-                match pq_rx.cache.establish_or_get(
-                    &frame.encapsulated_key,
-                    &frame.pq_ct,
-                    exit_id,
-                    &pq_rx.secret,
-                ) {
-                    Ok(h) => h,
-                    Err(_) => continue,
-                }
-            };
-            // Record the key of the session actually in use so the keepalive
-            // task can refresh it: an idle gap over the cache TTL would
-            // otherwise silently evict a still-connected session (see
-            // `PqSessionCache::refresh`).
-            *current_key_rx.lock() = Some(frame.encapsulated_key);
-            let session = handle.session;
-            let (frame_seq, frame_epoch) = (frame.seq, frame.epoch);
-            let mut plaintext = match session.open(&frame) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            if handle
-                .replay_windows
-                .lock()
-                .check_and_record(frame_seq, frame_epoch)
-                .is_err()
-            {
-                continue;
-            }
-            *current_rx.lock() = Some((session.clone(), frame_epoch));
-            if warrenguard_multihop::try_decode_control(&plaintext)
-                .ok()
-                .flatten()
-                .is_some()
-            {
-                continue;
-            }
-            if let Some(expected_v4) = spoof_gate_v4
-                && !source_ip_matches(&plaintext, expected_v4, spoof_gate_v6)
-            {
-                spoofed_drops += 1;
-                if spoofed_drops == 1 || spoofed_drops.is_multiple_of(10_000) {
-                    tracing::warn!(
-                        spoofed_drops,
-                        "pq rx_task: dropped packet with spoofed inner source IP"
-                    );
-                }
-                continue;
-            }
-            if let (Some(router), Some(owner)) = (&router_rx, &down_tx_rx)
-                && let Some(fk) = canonical_flow_key(&plaintext)
-            {
-                if noted_flows.len() >= FLOW_TABLE_CAP_PER_IP {
-                    noted_flows.clear();
-                }
-                if noted_flows.insert(fk) {
-                    router.note_uplink(&plaintext, owner);
-                }
-            }
-            // Cap the MSS any SYN announces to the exit's own downlink
-            // budget before it reaches the TUN: see `clamp_uplink_syn`.
-            clamp_uplink_syn(
-                &mut plaintext,
-                &conn_rx,
-                MULTIHOP_FRAME_V2_DATA_MAX_OVERHEAD,
-            );
-            match tun_rx.send(&plaintext).await {
-                Ok(()) => tun_write_errors = 0,
-                Err(e) => {
-                    tun_write_errors += 1;
-                    if tun_write_errors == 1 || tun_write_errors.is_multiple_of(1_000) {
-                        tracing::warn!(
-                            error = %e,
-                            consecutive = tun_write_errors,
-                            "pq rx_task: transient TUN write error, dropping packet"
-                        );
-                    }
-                    if tun_write_errors >= MAX_CONSECUTIVE_TUN_WRITE_ERRORS {
-                        return;
-                    }
-                }
-            }
-        }
-    });
-
-    let conn_tx = conn.clone();
-    let tun_tx = tun;
-    let mut down_rx_tx = down_rx;
-    let current_tx = current;
-    let reverse_seq_tx = reverse_seq;
-    let tx_task = tokio::spawn(async move {
-        let mut mtu_reflected = 0u64;
-        loop {
-            let mut packet = match next_downlink(&mut down_rx_tx, &tun_tx).await {
-                Some(p) => p,
-                None => return,
-            };
-            // Over-read backpressure: drop the newest packet BEFORE sealing when
-            // the client's connection buffer is near full (see the gate helper).
-            if overread_gate_should_drop(
-                &conn_tx,
-                warrenguard_config::knobs::exit_overread_gate_mtus(),
-            ) {
-                continue;
-            }
-            let (session, epoch) = match current_tx.lock().clone() {
-                Some(v) => v,
-                None => continue,
-            };
-            // Reject/clamp before sealing: see `adapt_inner_for_budget`.
-            let budget = pq_inner_budget(conn_tx.max_datagram_size());
-            if let Some(ptb) = adapt_inner_for_budget(&mut packet, budget) {
-                mtu_reflected += 1;
-                if mtu_reflected == 1 || mtu_reflected.is_multiple_of(64) {
-                    tracing::warn!(
-                        mtu_reflected,
-                        budget,
-                        "pq tx_task: packet exceeds downlink budget, reflecting frag-needed instead of sealing"
-                    );
-                }
-                if let Err(e) = tun_tx.send(&ptb).await {
-                    tracing::trace!(error = %e, "pq tx_task: frag-needed reflection tun write failed");
-                }
-                continue;
-            }
-            let seq = reverse_seq_tx.fetch_add(1, Ordering::AcqRel);
-            // Same plaintext-side classification as the v1 tx_task above.
-            let class = DatagramClass::of_inner_ip_packet(&packet);
-            let frame = match session.seal_response(&packet, epoch, seq) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            let bytes = match encode_frame_v2(&frame) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            match conn_tx.send_datagram_classified(bytes.into(), class) {
-                Ok(()) => {}
-                Err(SendDatagramError::TooLarge) => {}
-                Err(_) => return,
-            }
-        }
-    });
-
-    // Keep the connection's PQ session warm for as long as the connection is
-    // alive, instead of relying on frame traffic: a steady-state DATA frame's
-    // empty `pq_ct` cannot rebuild an evicted session, so an idle gap longer
-    // than `SESSION_CACHE_TTL` would otherwise silently black-hole every
-    // packet on resume (`PqSessionCache::get` misses forever, since the
-    // client only re-sends `pq_ct` while an epoch is unacked). Refreshing at
-    // half the TTL leaves a safety margin against scheduling jitter.
-    let conn_ka = conn.clone();
-    let cache_ka = pq.cache.clone();
-    let current_key_ka = current_key.clone();
-    let keepalive_task = tokio::spawn(async move {
-        loop {
+            let next_timer = shared.state.lock().sleep_deadline(Instant::now());
+            let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(next_timer));
+            tokio::pin!(sleep);
             tokio::select! {
-                _ = conn_ka.closed() => break,
-                () = tokio::time::sleep(SESSION_CACHE_TTL / 2) => {
-                    let key = *current_key_ka.lock();
-                    if let Some(k) = key {
-                        cache_ka.refresh(&k);
+                _ = &mut sleep => {}
+                // State changed: re-read next_timer on the next iteration. Do
+                // NOT drain expired here, the placeholder timer may not have
+                // fired yet.
+                () = shared.changed.notified() => continue,
+            }
+            let fired = shared.state.lock().drain_expired(Instant::now());
+            if fired.is_empty() {
+                continue;
+            }
+            let (session, epoch) = current.lock().clone();
+            // Dummy plaintext size accounting for HPKE + wire format overhead
+            // (~96 B: 12 nonce + 16 AEAD tag + ~68 wire header fields).
+            // Capping plaintext below the negotiated Quinn `max_datagram_size`
+            // prevents `send_datagram` returning `TooLarge` and silently
+            // killing the timer task. On loopback the negotiated max is
+            // ~1200 B; in production cross-DC with TUN MTU 1280 the value
+            // scales with the path MTU.
+            let max_plaintext = conn
+                .max_datagram_size()
+                .unwrap_or(1200)
+                .saturating_sub(96)
+                .min(1184);
+            for machine in fired {
+                let dummy = vec![DAITA_DUMMY_FIRST_BYTE; max_plaintext];
+                let seq = reverse_seq.fetch_add(1, Ordering::AcqRel);
+                let frame = match session.seal_response_owned(dummy, epoch, seq) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::trace!(error = %e, "daita dummy seal failed");
+                        continue;
                     }
+                };
+                let bytes = match encode_frame(&frame) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::trace!(error = %e, "daita dummy encode failed");
+                        continue;
+                    }
+                };
+                match conn.send_datagram(bytes.into()) {
+                    Ok(()) => {}
+                    // Transient PMTU dip: skip this dummy, keep the timer
+                    // alive (a dead timer silently disables the defense for
+                    // the rest of the session).
+                    Err(SendDatagramError::TooLarge) => continue,
+                    Err(_) => return,
                 }
+                shared.state.lock().on_dummy_sent(machine, Instant::now());
             }
         }
-    });
-
-    let _ = rx_task.await;
-    tx_task.abort();
-    let _ = tx_task.await;
-    keepalive_task.abort();
-    let _ = keepalive_task.await;
-    if let (Some(router), Some(ip), Some(own_tx)) = (&router, setup.assigned_ip, &down_tx) {
-        router.unregister_if_owner(ip, own_tx);
-        if let Some(ip6) = setup.assigned_ip_v6 {
-            router.unregister_v6_if_owner(ip6, own_tx);
-        }
-    }
-    conn.close(quinn::VarInt::from_u32(0), b"exit pq pumps ended");
+    }))
 }
 
-/// DAITA-aware variant of [`serve_one_connection_with_tun`].
+/// Terminate one multi-hop connection: run the reliable setup phase, then pump
+/// datagrams both ways until the connection dies.
 ///
-/// When the passed [`DaitaState`] is disabled, this is a strict alias
-/// of [`serve_one_connection_with_tun`] (zero overhead). When enabled,
-/// it runs the same RX + TX pumps **plus** a "padding timer" task that
-/// drives the per-conn maybenot framework over the shared
-/// [`DaitaState`] and emits DAITA dummies on the reverse direction
-/// whenever the action timer expires.
+/// `/v1` (classical HPKE) runs here; a `/v2` setup hands over to
+/// [`serve_pq_datagram_pump`], which speaks the X-Wing seal.
 ///
 /// Maybenot event firing matches the doctrine `DaitaEvent` contract:
-/// - RX (client -> exit -> TUN): `TunnelRecv` always; `PaddingRecv`
-///   if the opened payload is a 0xFF dummy (filtered before TUN); else
-///   `NormalRecv` after a successful `tun.send`.
-/// - TX (TUN -> exit -> client): `NormalSent` + `TunnelSent` BEFORE
-///   the seal so the framework observes the egress packet timing
-///   regardless of QUIC backpressure.
-/// - Timer: `PaddingSent { machine } + TunnelSent` after a dummy is
-///   actually sealed and queued for transmission.
-///
-/// Lock model: `Arc<parking_lot::Mutex<DaitaState>>` shared across the
-/// three tasks (same pattern as
-/// `warrenguard_pump::pump_multi_bidirectional_with_daita`).
+/// - RX (client -> exit -> TUN): `TunnelRecv` always; `PaddingRecv` if the
+///   opened payload is a `0xFF` dummy (filtered before TUN); else `NormalRecv`
+///   after a successful `tun.send`.
+/// - TX (TUN -> exit -> client): `NormalSent` + `TunnelSent` BEFORE the seal
+///   so the framework observes the egress packet timing regardless of QUIC
+///   backpressure.
+/// - Timer: `PaddingSent { machine } + TunnelSent` after a dummy is actually
+///   sealed and queued for transmission.
 #[allow(clippy::too_many_arguments)]
-async fn serve_one_connection_with_tun_and_daita<T>(
+async fn serve_terminating_connection<T>(
     conn: Connection,
     privkey: Arc<WarrenKemPrivateKey>,
     exit_id: ExitId,
     cache: Arc<SessionCache>,
     tun: T,
     daita_pick: DaitaPick,
-    ip_allocator: Option<Arc<Mutex<IpAllocator>>>,
+    ip_allocator: Arc<Mutex<IpAllocator>>,
     ip_allocator_v6: Option<Arc<Mutex<IpAllocatorV6>>>,
     conn_id: ConnId,
-    router: Option<Arc<MultihopTunRouter>>,
+    router: Arc<MultihopTunRouter>,
     setup_source: SetupSource,
     allowlist: Option<AllowlistHandle>,
     session_registry: Option<Arc<MultihopSessionRegistry>>,
@@ -4133,77 +3263,36 @@ async fn serve_one_connection_with_tun_and_daita<T>(
 ) where
     T: PacketDevice + Clone,
 {
+    const LABEL: &str = "v1";
     let DaitaPick {
-        state,
+        state: daita_state,
         name: daita_machine_name,
         config: daita_config,
     } = daita_pick;
-    if !state.is_enabled() {
-        serve_one_connection_with_tun(
-            conn,
-            privkey,
-            exit_id,
-            cache,
-            tun,
-            ip_allocator,
-            ip_allocator_v6,
-            conn_id,
-            router,
-            setup_source,
-            allowlist,
-            session_registry,
-            drain_rx,
-            token_admitter,
-            #[cfg(feature = "pq-hpke")]
-            pq,
-        )
-        .await;
-        return;
-    }
-
-    let daita = Arc::new(Mutex::new(state));
-    // Clone for the end-of-connection metrics snapshot.
-    // Logged after `join!` so ops can compare per-conn DAITA emission
-    // counters against the client-side counterpart.
-    let daita_for_metrics = daita.clone();
+    let daita_offered = daita_state.is_enabled();
     let conn_start = Instant::now();
-    let current: SharedCurrentSession = Arc::new(Mutex::new(None));
     let reverse_seq = Arc::new(AtomicU64::new(0));
-    // Notify the timer task whenever RX or TX fires events into the
-    // shared `DaitaState`. Without this, the timer would park for
-    // hours on the placeholder `next_timer = now + 3600s` it reads
-    // before any event is fired, and never observe the newly-scheduled
-    // action timers. `tokio::sync::Notify` consolidates wake-ups: if
-    // many events fire in quick succession the timer wakes once and
-    // re-reads `next_timer` against the now-up-to-date state.
-    let state_changed = Arc::new(tokio::sync::Notify::new());
 
-    // Downlink routing: when a router is present, the TX task reads its
-    // bounded channel (fed by the single TUN reader keyed on the
-    // client's allocated IPv4) instead of competing on `tun.recv()`.
-    // `assigned_ip` is set by the RX task on allocation and read by the
-    // parent to unregister the route on connection close.
-    let (down_tx, down_rx) = if router.is_some() {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(DOWNLINK_CHANNEL_BOUND);
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
+    // Downlink routing: the single TUN reader keys each packet on its
+    // destination address and hands it to the owning connection's bounded
+    // channel, so the tx tasks never compete on `tun.recv()`.
+    let (down_tx, down_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(DOWNLINK_CHANNEL_BOUND);
 
-    // Reliable setup phase (same as the non-DAITA path): derive HPKE,
-    // allocate the IP, register the route, and reply with the sealed
-    // IpAssign over the bidi stream before any DATA datagram is pumped.
-    // The anti-replay window is session-scoped (held in the SessionCache
-    // entry), so a frame replayed on a fresh connection sharing this HPKE
-    // session is rejected.
-    let setup = match run_setup(
+    // Reliable setup phase: derive HPKE, allocate the IP, register the route,
+    // and reply with the sealed IpAssign over the bidi stream BEFORE any DATA
+    // datagram is pumped. A setup failure abandons the connection (the
+    // datagram pump never starts). The anti-replay window is session-scoped
+    // (held in the SessionCache entry), not local to this connection, so a
+    // frame replayed on a fresh connection sharing this HPKE session is
+    // rejected.
+    let Some(setup) = run_setup(
         setup_source,
         &conn,
         &privkey,
         exit_id,
         &cache,
         &ip_allocator,
-        &ip_allocator_v6,
+        ip_allocator_v6.as_ref(),
         conn_id,
         &router,
         &down_tx,
@@ -4219,19 +3308,18 @@ async fn serve_one_connection_with_tun_and_daita<T>(
         pq.as_ref(),
     )
     .await
-    {
-        Some(o) => o,
-        None => return,
+    else {
+        return;
     };
-    // When compiled without `pq-hpke`, `SetupOutcome` has only the `V1` variant,
-    // so this reads as a single-arm destructure; the `V2` arm exists only under
-    // the feature.
+    // When compiled without `pq-hpke`, `SetupOutcome` has only the `V1`
+    // variant, so this reads as a single-arm destructure; the `V2` arm exists
+    // only under the feature.
     #[allow(clippy::infallible_destructuring_match)]
     let setup = match setup {
         SetupOutcome::V1(s) => s,
-        // A `/v2` connection runs the post-quantum pump (no DAITA padding on the
-        // PQ path yet; a DAITA-enabled exit that also published an ML-KEM key is
-        // out of scope for the first cut and simply terminates PQ without cover).
+        // A `/v2` connection runs the dedicated post-quantum pump (no DAITA
+        // cover there yet: a DAITA-enabled exit that also published an ML-KEM
+        // key terminates PQ without padding).
         #[cfg(feature = "pq-hpke")]
         SetupOutcome::V2(pq_setup) => {
             if let Some(pq) = pq {
@@ -4251,36 +3339,34 @@ async fn serve_one_connection_with_tun_and_daita<T>(
             return;
         }
     };
-    if !setup.wants_daita {
-        // The IpAssign echo already read `daita_spec: None` for this client;
-        // driving the machines anyway would rain 0xFF dummies on a peer that
-        // never negotiated the defense (see `ConnSetup::wants_daita`), so the
-        // connection runs with the shared state disarmed.
-        *daita.lock() = DaitaState::disabled();
-    }
-    let assigned_ip: Arc<Mutex<Option<Ipv4Addr>>> = Arc::new(Mutex::new(setup.assigned_ip));
-    let assigned_ip_v6: Arc<Mutex<Option<Ipv6Addr>>> = Arc::new(Mutex::new(setup.assigned_ip_v6));
-    *current.lock() = Some((setup.session.clone(), setup.epoch));
+    // The exit only drives its machines for a client that negotiated them: an
+    // un-negotiated peer cannot use the 0xFF dummies (legacy pumps pay a
+    // kernel-rejected TUN write per dummy) and unsolicited cover traffic
+    // blinds rx-based liveness watchdogs (2026-07-15 incident).
+    let daita = if daita_offered && setup.wants_daita {
+        DaitaSink::armed(daita_state)
+    } else {
+        DaitaSink::off()
+    };
+    let assigned_ip = setup.assigned_ip;
+    let assigned_ip_v6 = setup.assigned_ip_v6;
+    let current: SharedCurrentSession = Arc::new(Mutex::new((setup.session, setup.epoch)));
 
-    // Inbound-activity counter for the sticky-IP takeover re-check (DAITA
-    // variant); the RX task bumps it via its own `datagrams` counter below.
+    // Inbound-activity counter bumped by the RX task below; feeds the
+    // sticky-IP takeover re-check so a dead predecessor's re-used flows re-pin
+    // to this live connection in bounded time.
     let rx_activity = Arc::new(AtomicU64::new(0));
-    arm_takeover_recheck(
-        &router,
-        &down_tx,
-        setup.assigned_ip,
-        setup.assigned_ip_v6,
-        &rx_activity,
-    );
+    arm_takeover_recheck(&router, &down_tx, assigned_ip, assigned_ip_v6, &rx_activity);
 
-    // ADR 36 soft drain signal (DAITA variant): same emitter as the
-    // non-DAITA path. `current`/`reverse_seq` are Arc-cloned here because
-    // the timer task also keeps a handle, so plain clones are correct.
+    // ADR 36 soft drain signal: park on the exit-wide drain watch and, when
+    // the exit is marked for maintenance, seal+emit ExitDraining on this
+    // connection, hard-closing at the deadline.
     let drain_task =
         spawn_drain_emitter(drain_rx, current.clone(), reverse_seq.clone(), conn.clone());
 
-    // Transport path probe: same observability-parity rationale as the
-    // non-DAITA variant (prod terminates clients on this path).
+    // Transport path probe (Lever 1a): the unified prod dispatcher terminates
+    // clients HERE, so the multihop path needs its own probe spawn for
+    // observability parity.
     drop(warrenguard_transport_core::spawn_path_probe(
         "exit-mh",
         vec![conn.clone()],
@@ -4288,219 +3374,124 @@ async fn serve_one_connection_with_tun_and_daita<T>(
     ));
 
     let conn_rx = conn.clone();
-    let tun_rx = tun.clone();
     let cache_rx = cache.clone();
-    let privkey_rx = privkey.clone();
     let current_rx = current.clone();
-    let daita_rx = daita.clone();
-    let state_changed_rx = state_changed.clone();
-    // For learning per-flow downlink ownership from the uplink (both `None`
-    // on the legacy no-allocator path, where routing is direct `tun.recv`).
     let router_rx = router.clone();
     let down_tx_rx = down_tx.clone();
-    // Anti-spoof gate inputs: fixed for the connection's lifetime (the
-    // allocation happens once, during setup). `None` only on the legacy
-    // no-allocator path (single client, bootstrap IP) where no expected
-    // address exists to compare against.
-    let spoof_gate_v4 = setup.assigned_ip;
-    let spoof_gate_v6 = setup.assigned_ip_v6;
-    let rx_activity_rx = rx_activity.clone();
-    // Counters for periodic observability. Surfaces silent drop paths
-    // (decode/exit_id/session.open) and the dummy-vs-real split so a
-    // "0 real packets reach TUN under DAITA" scenario can be diagnosed
-    // from production logs without per-packet log spam.
+    let daita_rx = daita.clone();
+    let mut tun_writer = TunWriter::new(tun.clone(), LABEL);
+    let mut spoof_gate = SpoofGate::new(assigned_ip, assigned_ip_v6, LABEL);
     let rx_task = tokio::spawn(async move {
-        let mut datagrams = 0u64;
-        let mut decode_errs = 0u64;
-        let mut exit_id_mismatches = 0u64;
-        let mut session_errs = 0u64;
-        let mut open_errs = 0u64;
-        let mut dummies = 0u64;
-        let mut to_tun = 0u64;
-        // Defensive forward-compat dispatch on the `0xC0` marker:
-        // ignores late or unknown control frames on the datagram path
-        // (the IpAssign already travelled over the reliable setup
-        // stream).
-        let mut control_ok = 0u64;
-        let mut control_errs = 0u64;
-        let mut last_report = Instant::now();
-        let mut replays = 0u64;
-        let mut spoofed_drops = 0u64;
-        let mut tun_write_errors: u32 = 0;
-        // Lock-free per-connection memo of flows already announced to the
-        // router: the downlink owner is set once (first-writer-wins), so we
-        // only take the router lock on a flow's FIRST uplink packet, never
-        // on the bulk data that follows. Cleared coarsely at the cap.
-        let mut noted_flows: HashSet<u64> = HashSet::new();
+        let mut report = RxReport::new(LABEL);
+        let mut flows = FlowNoter::new();
         loop {
-            let datagram = match conn_rx.read_datagram().await {
-                Ok(d) => d,
-                Err(_) => return,
+            let Ok(datagram) = conn_rx.read_datagram().await else {
+                return;
             };
-            datagrams += 1;
-            // One lock-free bump per inbound datagram, feeding the sticky-IP
-            // takeover re-check (dead predecessor => this stays frozen).
-            rx_activity_rx.fetch_add(1, Ordering::Relaxed);
+            report.datagrams += 1;
+            // One lock-free bump per inbound datagram: a live peer keeps this
+            // advancing, a dead predecessor freezes it (takeover check).
+            rx_activity.fetch_add(1, Ordering::Relaxed);
             let frame = match decode_frame(&datagram) {
                 Ok(f) => f,
                 Err(_) => {
-                    decode_errs += 1;
+                    report.decode_errs += 1;
                     continue;
                 }
             };
             if frame.exit_id != exit_id {
-                exit_id_mismatches += 1;
+                report.exit_id_mismatches += 1;
                 continue;
             }
             let handle = match cache_rx.get_or_insert(&frame.encapsulated_key, || {
-                ExitSession::new(&privkey_rx, &frame.encapsulated_key, exit_id)
+                ExitSession::new(&privkey, &frame.encapsulated_key, exit_id)
             }) {
                 Ok(h) => h,
                 Err(_) => {
-                    session_errs += 1;
+                    report.session_errs += 1;
                     continue;
                 }
             };
             let session = handle.session;
-            // Capture the Copy scalars used after the open (anti-replay seq/epoch
-            // and the epoch slot) before the zero-copy open consumes the frame.
+            // Capture the Copy scalars used after the open (anti-replay
+            // seq/epoch and the epoch slot) before the zero-copy open consumes
+            // the frame.
             let (frame_seq, frame_epoch) = (frame.seq, frame.epoch);
             let mut plaintext = match session.open_owned(frame) {
                 Ok(p) => p,
                 Err(_) => {
-                    open_errs += 1;
+                    report.open_errs += 1;
                     continue;
                 }
             };
             // Anti-replay: reject a frame whose (epoch, seq) was already
-            // accepted, before it can reach the TUN / the open internet. A blind
-            // or compromised relay can re-send a captured sealed frame; without
-            // this, `ExitSession::open` re-derives the identical per-packet key
-            // and the exit would re-inject the inner IP packet. The window is
-            // shared across every connection driving this HPKE session (cf.
-            // SessionCache), so a replay on a fresh connection is rejected too.
+            // accepted, before it can reach the TUN / the open internet. A
+            // blind or compromised relay can re-send a captured sealed frame;
+            // without this, `ExitSession::open` re-derives the identical
+            // per-packet key and the exit would re-inject the inner IP packet.
+            // The window is shared across every connection driving this HPKE
+            // session (cf. SessionCache), so a replay on a fresh connection is
+            // rejected too.
             if handle
                 .replay_windows
                 .lock()
                 .check_and_record(frame_seq, frame_epoch)
                 .is_err()
             {
-                replays += 1;
+                report.replays += 1;
                 continue;
             }
-            *current_rx.lock() = Some((session.clone(), frame_epoch));
-            // DAITA: TunnelRecv fires for every received frame
-            // (real or dummy), then either PaddingRecv (drop before
-            // TUN) or NormalRecv (after successful tun.send). Each
-            // fire_events potentially schedules a new action timer
-            // so we wake the timer task to re-read `next_timer`.
-            daita_rx
-                .lock()
-                .fire_events(&[DaitaEvent::TunnelRecv], Instant::now());
-            state_changed_rx.notify_one();
-            // Control message dispatch precedes the DAITA dummy filter
-            // and the IP forward path. The IpAssign already travelled
-            // over the reliable setup stream, so a control frame on the
-            // datagram path (a stray legacy IpRequest retry, an unknown
-            // future control message) is simply dropped here.
-            let control_msg = match warrenguard_multihop::try_decode_control(&plaintext) {
-                Ok(Some(msg)) => {
-                    control_ok += 1;
-                    Some(msg)
+            *current_rx.lock() = (session, frame_epoch);
+            // TunnelRecv fires for every received frame, real or dummy, then
+            // either PaddingRecv (dropped before the TUN) or NormalRecv (after
+            // a successful tun.send).
+            daita_rx.fire(&[DaitaEvent::TunnelRecv]);
+            // The setup round-trip is reliable, so a DATA datagram is normally
+            // a real IP packet. A control frame here (a stray legacy IpRequest
+            // retry, an unknown future control message, or a payload whose
+            // 0xC0 marker fails to decode) is dropped rather than forwarded:
+            // the setup stream already delivered the IpAssign, and 0xC0 is not
+            // a valid IP version nibble.
+            match warrenguard_multihop::try_decode_control(&plaintext) {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    report.control_frames += 1;
+                    continue;
                 }
-                Ok(None) => None,
                 Err(e) => {
-                    control_errs += 1;
+                    report.control_frames += 1;
                     tracing::debug!(error = %e, "rx_task control-message decode failed; dropping frame");
                     continue;
                 }
-            };
-            if control_msg.is_some() {
-                tracing::debug!(
-                    "rx_task observed a control message on the datagram path; dropping (setup already done over stream)"
-                );
-                continue;
             }
             if is_daita_dummy(&plaintext) {
-                dummies += 1;
-                daita_rx
-                    .lock()
-                    .fire_events(&[DaitaEvent::PaddingRecv], Instant::now());
-                state_changed_rx.notify_one();
-            } else if let Some(expected_v4) = spoof_gate_v4
-                && !source_ip_matches(&plaintext, expected_v4, spoof_gate_v6)
-            {
-                // Anti-spoof: the decrypted packet's inner source IP must
-                // be the address allocated to this connection. The counter
-                // (not the address) is logged.
-                spoofed_drops += 1;
-                if spoofed_drops == 1 || spoofed_drops.is_multiple_of(10_000) {
-                    tracing::warn!(
-                        spoofed_drops,
-                        "rx_task: dropped packet with spoofed inner source IP"
-                    );
-                }
-            } else {
-                // Anti-spoof passed: the inner source IP is this
-                // connection's allocation, so it is safe to record this
-                // flow's downlink owner for the reverse path. Only the first
-                // packet of each flow takes the router lock (memoized here).
-                if let (Some(router), Some(owner)) = (&router_rx, &down_tx_rx)
-                    && let Some(fk) = canonical_flow_key(&plaintext)
-                {
-                    if noted_flows.len() >= FLOW_TABLE_CAP_PER_IP {
-                        noted_flows.clear();
-                    }
-                    if noted_flows.insert(fk) {
-                        router.note_uplink(&plaintext, owner);
-                    }
-                }
-                // Cap the MSS any SYN announces to the exit's own downlink
-                // budget before it reaches the TUN: see `clamp_uplink_syn`.
-                clamp_uplink_syn(&mut plaintext, &conn_rx, MULTIHOP_FRAME_MAX_OVERHEAD);
-                match tun_rx.send(&plaintext).await {
-                    Ok(()) => {
-                        tun_write_errors = 0;
-                        to_tun += 1;
-                        daita_rx
-                            .lock()
-                            .fire_events(&[DaitaEvent::NormalRecv], Instant::now());
-                        state_changed_rx.notify_one();
-                    }
-                    Err(e) => {
-                        tun_write_errors += 1;
-                        if tun_write_errors == 1 || tun_write_errors.is_multiple_of(1_000) {
-                            tracing::warn!(
-                                error = %e,
-                                consecutive = tun_write_errors,
-                                "rx_task: transient TUN write error, dropping packet"
-                            );
-                        }
-                        if tun_write_errors >= MAX_CONSECUTIVE_TUN_WRITE_ERRORS {
-                            return;
-                        }
-                    }
-                }
+                report.dummies += 1;
+                daita_rx.fire(&[DaitaEvent::PaddingRecv]);
+                report.maybe_emit(spoof_gate.drops());
+                continue;
             }
-            // Periodic structured report every 5 s so the bench harness
-            // can correlate per-conn behaviour against the wire trace.
-            if last_report.elapsed() >= Duration::from_secs(5) {
-                tracing::debug!(
-                    datagrams,
-                    decode_errs,
-                    exit_id_mismatches,
-                    session_errs,
-                    open_errs,
-                    dummies,
-                    control_ok,
-                    control_errs,
-                    to_tun,
-                    replays,
-                    spoofed_drops,
-                    "rx_task report"
-                );
-                last_report = Instant::now();
+            if !spoof_gate.admits(&plaintext) {
+                report.maybe_emit(spoof_gate.drops());
+                continue;
             }
+            // Anti-spoof passed: the inner source IP is this connection's
+            // allocation, so it is safe to record this flow's downlink owner
+            // for the reverse path.
+            if flows.is_first_of_flow(&plaintext) {
+                router_rx.note_uplink(&plaintext, &down_tx_rx);
+            }
+            // Cap the MSS any SYN announces to the exit's own downlink budget
+            // before it reaches the TUN: see `clamp_uplink_syn`.
+            clamp_uplink_syn(&mut plaintext, &conn_rx, MULTIHOP_FRAME_MAX_OVERHEAD);
+            match tun_writer.write(&plaintext).await {
+                TunWrite::Wrote => {
+                    report.to_tun += 1;
+                    daita_rx.fire(&[DaitaEvent::NormalRecv]);
+                }
+                TunWrite::Dropped => {}
+                TunWrite::Fatal => return,
+            }
+            report.maybe_emit(spoof_gate.drops());
         }
     });
 
@@ -4510,259 +3501,357 @@ async fn serve_one_connection_with_tun_and_daita<T>(
     let current_tx = current.clone();
     let reverse_seq_tx = reverse_seq.clone();
     let daita_tx = daita.clone();
-    let state_changed_tx = state_changed.clone();
     let tx_task = tokio::spawn(async move {
-        let mut from_tun = 0u64;
-        let mut no_session = 0u64;
-        let mut seal_errs = 0u64;
-        let mut encode_errs = 0u64;
-        let mut too_large = 0u64;
-        let mut mtu_reflected = 0u64;
-        let mut sent = 0u64;
-        let mut last_report = Instant::now();
+        let mut report = TxReport::new(LABEL);
+        let mut reflected = RateLimited::new(64);
+        let mut too_large = RateLimited::new(5_000);
         loop {
-            // Downlink source: the router channel (per-IP routed) when
-            // ip-nego is on, else the shared TUN directly (single client).
-            let mut packet = match next_downlink(&mut down_rx_tx, &tun_tx).await {
-                Some(p) => p,
-                None => return,
-            };
-            from_tun += 1;
-            // Over-read backpressure: drop the newest packet BEFORE sealing (and
-            // before the DAITA uplink-sent event, which must only fire for a
-            // packet that actually egresses) when the client's connection buffer
-            // is near full. See the gate helper.
-            if overread_gate_should_drop(
+            let packet = match next_sealable(
+                &mut down_rx_tx,
                 &conn_tx,
-                warrenguard_config::knobs::exit_overread_gate_mtus(),
-            ) {
-                continue;
-            }
-            let (session, epoch) = match current_tx.lock().clone() {
-                Some(v) => v,
-                None => {
-                    no_session += 1;
-                    continue;
-                }
+                &tun_tx,
+                MULTIHOP_FRAME_MAX_OVERHEAD,
+                &mut reflected,
+                LABEL,
+            )
+            .await
+            {
+                ControlFlow::Break(()) => return,
+                ControlFlow::Continue(None) => continue,
+                ControlFlow::Continue(Some(p)) => p,
             };
-            // Reject/clamp before sealing: see `adapt_inner_for_budget`. Done
-            // before the DAITA uplink-sent event, which must only fire for a
-            // packet that actually proceeds to seal+send.
-            let budget = inner_budget(conn_tx.max_datagram_size(), MULTIHOP_FRAME_MAX_OVERHEAD);
-            if let Some(ptb) = adapt_inner_for_budget(&mut packet, budget) {
-                mtu_reflected += 1;
-                if mtu_reflected == 1 || mtu_reflected.is_multiple_of(64) {
-                    tracing::warn!(
-                        mtu_reflected,
-                        budget,
-                        "tx_task: packet exceeds downlink budget, reflecting frag-needed instead of sealing"
-                    );
-                }
-                if let Err(e) = tun_tx.send(&ptb).await {
-                    tracing::trace!(error = %e, "tx_task: frag-needed reflection tun write failed");
-                }
-                continue;
-            }
+            report.from_tun += 1;
+            let (session, epoch) = current_tx.lock().clone();
             let seq = reverse_seq_tx.fetch_add(1, Ordering::AcqRel);
-            // DAITA: the uplink event sequence BEFORE the seal so the
-            // framework observes the egress timing independent of any QUIC
-            // backpressure in send_datagram. Notify the timer task because
-            // the new events may have scheduled a SendPadding action timer.
-            daita_tx.lock().on_real_uplink_sent(Instant::now());
-            state_changed_tx.notify_one();
-            // Same plaintext-side classification as the non-DAITA tx_task.
+            daita_tx.on_real_uplink_sent();
+            // Classify while the plaintext is still readable: the sealed frame
+            // is opaque to quinn, so the inner ECN/flow key must travel with
+            // the datagram.
             let class = DatagramClass::of_inner_ip_packet(&packet);
             let frame = match session.seal_response_owned(packet, epoch, seq) {
                 Ok(f) => f,
                 Err(_) => {
-                    seal_errs += 1;
+                    report.seal_errs += 1;
                     continue;
                 }
             };
             let bytes = match encode_frame(&frame) {
                 Ok(b) => b,
                 Err(_) => {
-                    encode_errs += 1;
+                    report.encode_errs += 1;
                     continue;
                 }
             };
-            match conn_tx.send_datagram_classified(bytes.into(), class) {
-                Ok(()) => sent += 1,
-                // Transient: Quinn's black-hole detector can lower the
-                // path-MTU estimate under a loss burst, making an
-                // already-sealed frame "too large" for a moment. Drop
-                // the packet (TCP retransmits); exiting here used to
-                // permanently mute this connection's downlink while
-                // QUIC stayed alive, collapsing every bonded flow onto
-                // the last surviving sender (2026-06-11 incident).
-                Err(SendDatagramError::TooLarge) => {
-                    too_large += 1;
-                    if too_large == 1 || too_large.is_multiple_of(5_000) {
-                        tracing::warn!(
-                            too_large,
-                            "tx_task: datagram too large for current path MTU, dropped"
-                        );
-                    }
-                }
-                // Connection gone (or datagrams disabled by the peer):
-                // nothing further can ever be sent on this conn.
-                Err(_) => return,
+            if send_sealed(&conn_tx, bytes, class, &mut too_large, LABEL).is_break() {
+                return;
             }
-            if last_report.elapsed() >= Duration::from_secs(5) {
-                tracing::debug!(
-                    from_tun,
-                    no_session,
-                    seal_errs,
-                    encode_errs,
-                    too_large,
-                    mtu_reflected,
-                    sent,
-                    "tx_task report"
-                );
-                last_report = Instant::now();
-            }
+            report.sent += 1;
+            report.maybe_emit(too_large.count(), reflected.count());
         }
     });
 
-    // Timer task: wakes on next per-machine action timer, drains
-    // expired ones, seals one dummy per machine via the current
-    // ExitSession (rotates on rekey transparently) and emits it on
-    // the reverse direction with a 0xFF marker. Receiver-side
-    // `is_daita_dummy` then drops it before reaching the TUN.
-    //
-    // Wakes early on `state_changed` (RX/TX fired events that may
-    // have scheduled a closer action timer): without this, the timer
-    // would sleep on the 3600 s placeholder it read before any event
-    // fired and the maybenot machine would never produce dummies in
-    // practice.
-    let current_timer = current;
-    let reverse_seq_timer = reverse_seq;
-    let daita_timer = daita;
-    let conn_timer = conn.clone();
-    let state_changed_timer = state_changed;
-    let timer_task = tokio::spawn(async move {
-        loop {
-            let next_timer = daita_timer.lock().sleep_deadline(Instant::now());
-            let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(next_timer));
-            tokio::pin!(sleep);
-            tokio::select! {
-                _ = &mut sleep => {}
-                _ = state_changed_timer.notified() => {
-                    // State changed: re-read next_timer on the next
-                    // loop iteration. Do NOT drain expired here
-                    // since the placeholder timer may not have
-                    // fired yet.
-                    continue;
-                }
-            }
-            let fired = {
-                let mut st = daita_timer.lock();
-                st.drain_expired(Instant::now())
-            };
-            if fired.is_empty() {
-                continue;
-            }
-            let (session, epoch) = match current_timer.lock().clone() {
-                Some(v) => v,
-                None => continue,
-            };
-            // Dummy plaintext size accounting for HPKE + wire format
-            // overhead (~96 B: 12 nonce + 16 AEAD tag + ~68 wire header
-            // fields). Capping plaintext below the negotiated Quinn
-            // `max_datagram_size` prevents `send_datagram` returning
-            // `TooLarge` and silently killing the timer task. On
-            // loopback the negotiated max is ~1200 B; in production
-            // cross-DC with TUN MTU 1280 the value scales with the
-            // path MTU.
-            let max_plaintext = conn_timer
-                .max_datagram_size()
-                .unwrap_or(1200)
-                .saturating_sub(96)
-                .min(1184);
-            for machine in fired {
-                let dummy = vec![DAITA_DUMMY_FIRST_BYTE; max_plaintext];
-                let seq = reverse_seq_timer.fetch_add(1, Ordering::AcqRel);
-                let frame = match session.seal_response_owned(dummy, epoch, seq) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        tracing::trace!(error = %e, "daita dummy seal failed");
-                        continue;
-                    }
-                };
-                let bytes = match encode_frame(&frame) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::trace!(error = %e, "daita dummy encode failed");
-                        continue;
-                    }
-                };
-                match conn_timer.send_datagram(bytes.into()) {
-                    Ok(()) => {}
-                    // Transient PMTU dip: skip this dummy, keep the
-                    // DAITA timer alive (a dead timer silently disables
-                    // the defense for the rest of the session).
-                    Err(SendDatagramError::TooLarge) => continue,
-                    Err(_) => return,
-                }
-                daita_timer.lock().on_dummy_sent(machine, Instant::now());
-            }
-        }
-    });
+    let timer_task = spawn_daita_timer(&daita, current, reverse_seq, conn.clone());
 
-    // On conn close, rx_task returns first (Quinn `read_datagram`
-    // errors). Without this abort path the tx_task's `tun.recv()` and
-    // the timer_task's `sleep_until + Notify` would both hang forever,
-    // leaking the spawn task and blocking the allocator's
-    // `release(conn_id)` in the parent.
+    // On conn close, rx_task returns first (Quinn `read_datagram` errors).
+    // Without this abort path the tx_task's channel read and the timer_task's
+    // `sleep_until + Notify` would both hang forever, leaking the spawn task
+    // and blocking the allocator's `release(conn_id)` in the parent.
     let _ = rx_task.await;
     tx_task.abort();
-    timer_task.abort();
-    // Abort AND join the drain emitter (see the non-DAITA variant): a
-    // deadline hard-close in flight settles before the pump's own close so
-    // the client-visible code stays deterministic.
-    if let Some(t) = drain_task {
-        t.abort();
-        let _ = t.await;
+    // The drain emitter may still be parked on the watch (no drain ever came)
+    // or sleeping between re-emits; abort AND join it so a deadline
+    // hard-close in flight settles before the pump's own close, keeping the
+    // client-visible close code deterministic (WARREN_MH_DRAINING wins).
+    for task in [Some(tx_task), timer_task, drain_task]
+        .into_iter()
+        .flatten()
+    {
+        task.abort();
+        let _ = task.await;
     }
-    let _ = tx_task.await;
-    let _ = timer_task.await;
-    // Drop this connection's downlink route so the single TUN reader
-    // stops sending its reply packets to a dead channel (and a sticky
-    // reconnect re-registers cleanly). Owner-checked: a same-pubkey
-    // takeover may have re-pointed the address at a successor already.
-    if let (Some(router), Some(ip), Some(own_tx)) = (&router, *assigned_ip.lock(), &down_tx) {
-        router.unregister_if_owner(ip, own_tx);
-        if let Some(ip6) = *assigned_ip_v6.lock() {
-            router.unregister_v6_if_owner(ip6, own_tx);
-        }
+    // Drop this connection's downlink route so the single TUN reader stops
+    // sending its reply packets to a dead channel (and a sticky reconnect
+    // re-registers cleanly). Owner-checked: a same-pubkey takeover may have
+    // re-pointed the address at a successor already.
+    router.unregister_if_owner(assigned_ip, &down_tx);
+    if let Some(ip6) = assigned_ip_v6 {
+        router.unregister_v6_if_owner(ip6, &down_tx);
     }
-    // Pumps gone: close the QUIC connection so the client's bundle
-    // observes the death and redials (see the non-DAITA variant).
+    // Pumps gone: close the QUIC connection so the client's bundle observes
+    // the death and redials. Without this, detached observers (the path probe
+    // holds a `Connection` clone) keep the session alive and every flow pinned
+    // to it blackholes silently.
     conn.close(quinn::VarInt::from_u32(0), b"exit pumps ended");
-    // Per-connection DAITA snapshot. Logged on close so
-    // each multi-hop conn produces one final summary line containing
-    // its emission profile + lifetime; ops can aggregate across conns
-    // off-line without parsing the 5 s in-flight rx/tx reports.
-    // `machine` field threaded from `warren-exit::main`
-    // so the close log mirrors the client-side counterpart (one
-    // grep on the machine label correlates both ends of the path).
+    // Per-connection DAITA snapshot, logged on close so each multi-hop conn
+    // produces one final summary line containing its emission profile +
+    // lifetime; ops can aggregate across conns off-line without parsing the
+    // in-flight rx/tx reports. The `machine` field mirrors the client-side
+    // counterpart (one grep on the label correlates both ends of the path).
     // Read the LIVE state, not the pre-setup pick: a client that never
-    // negotiated DAITA had its machines disarmed after setup and must
-    // close with `machines_count=0`, not the sampled pool's count.
-    let (metrics, machines_count) = {
-        let st = daita_for_metrics.lock();
-        (st.metrics(), st.machines_count())
-    };
-    let conn_secs = conn_start.elapsed().as_secs();
-    tracing::info!(
-        machine = %daita_machine_name.as_deref().unwrap_or("<none>"),
-        machines_count,
-        padding_fired = metrics.padding_fired,
-        blocking_begins = metrics.blocking_begins,
-        blocking_ends = metrics.blocking_ends,
-        conn_secs,
-        "multi-hop connection closed; DAITA per-conn metrics snapshot"
-    );
+    // negotiated DAITA closes with `machines_count=0`, not the sampled pool's
+    // count.
+    if daita_offered {
+        let (metrics, machines_count) = daita.snapshot();
+        tracing::info!(
+            machine = %daita_machine_name.as_deref().unwrap_or("<none>"),
+            machines_count,
+            padding_fired = metrics.padding_fired,
+            blocking_begins = metrics.blocking_begins,
+            blocking_ends = metrics.blocking_ends,
+            conn_secs = conn_start.elapsed().as_secs(),
+            "multi-hop connection closed; DAITA per-conn metrics snapshot"
+        );
+    }
+}
+
+/// Post-quantum (`/v2`) datagram pump: the X-Wing counterpart of the RX/TX
+/// tasks in [`serve_terminating_connection`]. The setup phase already ran (over
+/// the reliable stream, in [`process_setup_frame`]), so this only pumps DATA
+/// and rekey datagrams. Anti-spoof, per-flow downlink routing, MTU adaptation
+/// and TUN writes go through the same helpers as the classical path; only the
+/// seal/open and the establish-from-`pq_ct` cache discipline differ. DAITA
+/// cover and the soft-drain emitter are not wired on the PQ path yet.
+#[cfg(feature = "pq-hpke")]
+#[allow(clippy::too_many_arguments)]
+async fn serve_pq_datagram_pump<T>(
+    conn: Connection,
+    exit_id: ExitId,
+    tun: T,
+    setup: ConnSetupPq,
+    router: Arc<MultihopTunRouter>,
+    down_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    down_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    pq: PqSetup,
+    // MUST be the same counter `run_setup` sealed the stream reply from,
+    // never a fresh one: the client feeds stream replies and datagram
+    // downlinks through ONE anti-replay window, so restarting the pump's
+    // seqs at 0 re-issues the seq the IpAssign reply already consumed and
+    // the session's first downlink datagram is discarded as a replay
+    // (surfaced by the strict egress probe as "anti-replay rejection
+    // (epoch 0, seq 0)"; ordinary clients just lose one datagram).
+    reverse_seq: Arc<AtomicU64>,
+) where
+    T: PacketDevice + Clone,
+{
+    const LABEL: &str = "v2";
+    let assigned_ip = setup.assigned_ip;
+    let assigned_ip_v6 = setup.assigned_ip_v6;
+    let current: SharedPqCurrentSession = Arc::new(Mutex::new((setup.session, setup.epoch)));
+    // Encapsulated key of the session currently in use on this connection, so
+    // the keepalive task below can tell the cache which entry to refresh.
+    // Identity material: never logged, not even a prefix.
+    let current_key: Arc<Mutex<Option<EncapsulatedKeyBytes>>> = Arc::new(Mutex::new(None));
+
+    // Inbound-activity counter for the sticky-IP takeover re-check (see the
+    // classical pump). Registration already happened in `run_setup`; here we
+    // attach the counter and arm the re-check for the `/v2` path too.
+    let rx_activity = Arc::new(AtomicU64::new(0));
+    arm_takeover_recheck(&router, &down_tx, assigned_ip, assigned_ip_v6, &rx_activity);
+
+    drop(warrenguard_transport_core::spawn_path_probe(
+        "exit-mh-pq",
+        vec![conn.clone()],
+        None,
+    ));
+
+    let conn_rx = conn.clone();
+    let current_rx = current.clone();
+    let router_rx = router.clone();
+    let down_tx_rx = down_tx.clone();
+    let pq_rx = pq.clone();
+    let current_key_rx = current_key.clone();
+    let mut tun_writer = TunWriter::new(tun.clone(), LABEL);
+    let mut spoof_gate = SpoofGate::new(assigned_ip, assigned_ip_v6, LABEL);
+    let rx_task = tokio::spawn(async move {
+        let mut report = RxReport::new(LABEL);
+        let mut flows = FlowNoter::new();
+        loop {
+            let Ok(datagram) = conn_rx.read_datagram().await else {
+                return;
+            };
+            report.datagrams += 1;
+            rx_activity.fetch_add(1, Ordering::Relaxed);
+            let frame = match decode_frame_v2(&datagram) {
+                Ok(f) => f,
+                Err(_) => {
+                    report.decode_errs += 1;
+                    continue;
+                }
+            };
+            if frame.exit_id != exit_id {
+                report.exit_id_mismatches += 1;
+                continue;
+            }
+            // A rekey/setup datagram carries `pq_ct`: (re)establish the epoch's
+            // session by decapsulating it. A steady-state DATA datagram (empty
+            // `pq_ct`) can only LOOK UP an already-established session; a miss
+            // is dropped, since it cannot be rebuilt without the ML-KEM
+            // ciphertext.
+            let handle = if frame.pq_ct.is_empty() {
+                match pq_rx.cache.get(&frame.encapsulated_key) {
+                    Some(h) => h,
+                    None => {
+                        report.session_errs += 1;
+                        continue;
+                    }
+                }
+            } else {
+                match pq_rx.cache.establish_or_get(
+                    &frame.encapsulated_key,
+                    &frame.pq_ct,
+                    exit_id,
+                    &pq_rx.secret,
+                ) {
+                    Ok(h) => h,
+                    Err(_) => {
+                        report.session_errs += 1;
+                        continue;
+                    }
+                }
+            };
+            // Record the key of the session actually in use so the keepalive
+            // task can refresh it: an idle gap over the cache TTL would
+            // otherwise silently evict a still-connected session (see
+            // `PqSessionCache::refresh`).
+            *current_key_rx.lock() = Some(frame.encapsulated_key);
+            let session = handle.session;
+            let (frame_seq, frame_epoch) = (frame.seq, frame.epoch);
+            let mut plaintext = match session.open(&frame) {
+                Ok(p) => p,
+                Err(_) => {
+                    report.open_errs += 1;
+                    continue;
+                }
+            };
+            if handle
+                .replay_windows
+                .lock()
+                .check_and_record(frame_seq, frame_epoch)
+                .is_err()
+            {
+                report.replays += 1;
+                continue;
+            }
+            *current_rx.lock() = (session, frame_epoch);
+            match warrenguard_multihop::try_decode_control(&plaintext) {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    report.control_frames += 1;
+                    continue;
+                }
+                Err(e) => {
+                    report.control_frames += 1;
+                    tracing::debug!(error = %e, "pq rx_task control-message decode failed; dropping frame");
+                    continue;
+                }
+            }
+            if !spoof_gate.admits(&plaintext) {
+                report.maybe_emit(spoof_gate.drops());
+                continue;
+            }
+            if flows.is_first_of_flow(&plaintext) {
+                router_rx.note_uplink(&plaintext, &down_tx_rx);
+            }
+            // Cap the MSS any SYN announces to the exit's own downlink
+            // budget before it reaches the TUN: see `clamp_uplink_syn`.
+            clamp_uplink_syn(
+                &mut plaintext,
+                &conn_rx,
+                MULTIHOP_FRAME_V2_DATA_MAX_OVERHEAD,
+            );
+            match tun_writer.write(&plaintext).await {
+                TunWrite::Wrote => report.to_tun += 1,
+                TunWrite::Dropped => {}
+                TunWrite::Fatal => return,
+            }
+            report.maybe_emit(spoof_gate.drops());
+        }
+    });
+
+    let conn_tx = conn.clone();
+    let tun_tx = tun;
+    let mut down_rx_tx = down_rx;
+    let current_tx = current;
+    let reverse_seq_tx = reverse_seq;
+    let tx_task = tokio::spawn(async move {
+        let mut report = TxReport::new(LABEL);
+        let mut reflected = RateLimited::new(64);
+        let mut too_large = RateLimited::new(5_000);
+        loop {
+            let packet = match next_sealable(
+                &mut down_rx_tx,
+                &conn_tx,
+                &tun_tx,
+                MULTIHOP_FRAME_V2_DATA_MAX_OVERHEAD,
+                &mut reflected,
+                LABEL,
+            )
+            .await
+            {
+                ControlFlow::Break(()) => return,
+                ControlFlow::Continue(None) => continue,
+                ControlFlow::Continue(Some(p)) => p,
+            };
+            report.from_tun += 1;
+            let (session, epoch) = current_tx.lock().clone();
+            let seq = reverse_seq_tx.fetch_add(1, Ordering::AcqRel);
+            // Same plaintext-side classification as the v1 tx_task.
+            let class = DatagramClass::of_inner_ip_packet(&packet);
+            let frame = match session.seal_response(&packet, epoch, seq) {
+                Ok(f) => f,
+                Err(_) => {
+                    report.seal_errs += 1;
+                    continue;
+                }
+            };
+            let bytes = match encode_frame_v2(&frame) {
+                Ok(b) => b,
+                Err(_) => {
+                    report.encode_errs += 1;
+                    continue;
+                }
+            };
+            if send_sealed(&conn_tx, bytes, class, &mut too_large, LABEL).is_break() {
+                return;
+            }
+            report.sent += 1;
+            report.maybe_emit(too_large.count(), reflected.count());
+        }
+    });
+
+    // Keep the connection's PQ session warm for as long as the connection is
+    // alive, instead of relying on frame traffic: a steady-state DATA frame's
+    // empty `pq_ct` cannot rebuild an evicted session, so an idle gap longer
+    // than `SESSION_CACHE_TTL` would otherwise silently black-hole every
+    // packet on resume (`PqSessionCache::get` misses forever, since the
+    // client only re-sends `pq_ct` while an epoch is unacked). Refreshing at
+    // half the TTL leaves a safety margin against scheduling jitter.
+    let conn_ka = conn.clone();
+    let cache_ka = pq.cache.clone();
+    let keepalive_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = conn_ka.closed() => break,
+                () = tokio::time::sleep(SESSION_CACHE_TTL / 2) => {
+                    let key = *current_key.lock();
+                    if let Some(k) = key {
+                        cache_ka.refresh(&k);
+                    }
+                }
+            }
+        }
+    });
+
+    let _ = rx_task.await;
+    for task in [tx_task, keepalive_task] {
+        task.abort();
+        let _ = task.await;
+    }
+    router.unregister_if_owner(assigned_ip, &down_tx);
+    if let Some(ip6) = assigned_ip_v6 {
+        router.unregister_v6_if_owner(ip6, &down_tx);
+    }
+    conn.close(quinn::VarInt::from_u32(0), b"exit pq pumps ended");
 }
 
 /// Format the X25519 multihop pubkey as 64 lowercase hex chars on a
@@ -4777,59 +3866,9 @@ pub fn format_x25519_pubkey_hex(pub_key: &WarrenKemPublicKey) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::datapath::tests::ipv4_tcp_full;
 
     // ---- Downlink over-read backpressure gate ----
-
-    /// The gate is a kill-switchable safety, not a hard-coded behaviour: with
-    /// `gate_mtus == 0` it must NEVER drop, even when the send buffer is empty.
-    #[test]
-    fn overread_gate_disabled_never_drops() {
-        assert!(
-            !overread_should_drop(0, 1280, 0),
-            "disabled gate must pass a full buffer"
-        );
-        assert!(!overread_should_drop(1_000_000, 1280, 0));
-    }
-
-    /// The gate's whole purpose: when the connection's datagram send buffer has
-    /// less than `gate_mtus` MTUs of room, the NEW packet is tail-dropped before
-    /// it can deepen the standing queue into the CoDel oldest-first head-drop.
-    #[test]
-    fn overread_gate_drops_when_buffer_near_full() {
-        // 1 KiB of room left, 4-MTU (5120 B) low-water at a 1280 B MTU: drop.
-        assert!(overread_should_drop(1024, 1280, 4));
-        // No room at all: drop.
-        assert!(overread_should_drop(0, 1280, 4));
-    }
-
-    /// Symmetric to the drop case: with plenty of room the gate is a no-op, so
-    /// the datapath is unchanged whenever the connection is draining normally.
-    #[test]
-    fn overread_gate_passes_when_space_available() {
-        assert!(!overread_should_drop(100_000, 1280, 4));
-        // Exactly at the low-water is enough room (strict `<`): the boundary
-        // packet passes, so the gate never fires one MTU too early.
-        assert!(
-            !overread_should_drop(4 * 1280, 1280, 4),
-            "at the low-water, pass"
-        );
-        // One byte under the low-water fires.
-        assert!(
-            overread_should_drop(4 * 1280 - 1, 1280, 4),
-            "just under the low-water, drop"
-        );
-    }
-
-    /// Relative keying (the property that lets the gate survive fork.11's
-    /// BDP-adaptive buffer without a fixed 16-MiB constant): the SAME `gate_mtus`
-    /// yields a threshold that scales with the connection's live MTU. With the
-    /// same 5000 B of room, a 1000 B MTU (threshold 4000) passes but a 2000 B
-    /// MTU (threshold 8000) drops.
-    #[test]
-    fn overread_gate_threshold_is_relative_to_mtu() {
-        assert!(!overread_should_drop(5000, 1000, 4), "5000 >= 4*1000, pass");
-        assert!(overread_should_drop(5000, 2000, 4), "5000 < 4*2000, drop");
-    }
 
     // ---- Multi-queue exit TUN wiring ----
 
@@ -4845,7 +3884,7 @@ mod tests {
             warrenguard_transport_core::FakeTun::new(),
             None,
             None,
-            None,
+            v4_alloc(),
             None,
             None,
         );
@@ -4875,7 +3914,7 @@ mod tests {
             warrenguard_transport_core::FakeTun::new(),
             None,
             None,
-            None,
+            v4_alloc(),
             None,
             None,
         )
@@ -4905,7 +3944,7 @@ mod tests {
             warrenguard_transport_core::FakeTun::new(),
             None,
             None,
-            None,
+            v4_alloc(),
             None,
             None,
         )
@@ -5024,7 +4063,7 @@ mod tests {
             warrenguard_transport_core::FakeTun::new(),
             None,
             None,
-            None,
+            v4_alloc(),
             None,
             None,
         )
@@ -5750,6 +4789,8 @@ mod tests {
         );
     }
 
+    // ---- Shared datapath helpers (used by both the /v1 and /v2 pumps) ----
+
     /// Builds a minimal IPv4 packet (20-byte header) with the given dst.
     fn ipv4_packet_to(dst: Ipv4Addr) -> Vec<u8> {
         let mut p = vec![0u8; 20];
@@ -5879,153 +4920,7 @@ mod tests {
         );
     }
 
-    /// Builds a minimal IPv4 TCP packet with explicit src/dst IP and ports,
-    /// so uplink and its downlink reply can be constructed as mirror images.
-    fn ipv4_tcp_full(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, src_port: u16, dst_port: u16) -> Vec<u8> {
-        let mut p = vec![0u8; 24];
-        p[0] = 0x45;
-        p[9] = 6; // TCP
-        p[12..16].copy_from_slice(&src_ip.octets());
-        p[16..20].copy_from_slice(&dst_ip.octets());
-        p[20..22].copy_from_slice(&src_port.to_be_bytes());
-        p[22..24].copy_from_slice(&dst_port.to_be_bytes());
-        p
-    }
-
-    #[test]
-    fn canonical_flow_key_is_direction_agnostic() {
-        let client = Ipv4Addr::new(10, 66, 0, 7);
-        let peer = Ipv4Addr::new(93, 184, 216, 34);
-        // Uplink (client -> peer) and its downlink reply (peer -> client)
-        // are mirror images; they MUST hash to the same flow key.
-        let up = ipv4_tcp_full(client, peer, 51000, 443);
-        let down = ipv4_tcp_full(peer, client, 443, 51000);
-        assert_eq!(
-            canonical_flow_key(&up),
-            canonical_flow_key(&down),
-            "reverse directions of one flow must share a key"
-        );
-        // A different flow (other client port) must differ.
-        let other = ipv4_tcp_full(client, peer, 51001, 443);
-        assert_ne!(canonical_flow_key(&up), canonical_flow_key(&other));
-        // Non-TCP/UDP yields None (caller falls back to the plain hash).
-        let mut icmp = up.clone();
-        icmp[9] = 1;
-        assert_eq!(canonical_flow_key(&icmp), None);
-    }
-
     // ---- reduced-MTU inner-packet adaptation (2026-07-15 SNCF incident) ----
-
-    /// Minimal IPv4 TCP SYN carrying one MSS option, enough for
-    /// `clamp_syn_mss` to locate and rewrite it. Checksums are irrelevant
-    /// here: `adapt_inner_for_budget` never reads them, and the incremental
-    /// checksum maintenance itself is already vector-tested in
-    /// `warrenguard_transport_core`.
-    fn syn_packet(mss: u16) -> Vec<u8> {
-        let mut p = vec![0u8; 44];
-        p[0] = 0x45; // version 4, IHL 20
-        p[9] = 6; // proto TCP
-        let t = 20;
-        p[t + 12] = 6 << 4; // data offset: 24 bytes (20 base + 4-byte MSS option)
-        p[t + 13] = 0x02; // SYN
-        p[t + 20] = 2; // MSS option kind
-        p[t + 21] = 4; // MSS option length
-        p[t + 22..t + 24].copy_from_slice(&mss.to_be_bytes());
-        p
-    }
-
-    #[test]
-    fn adapt_inner_for_budget_clamps_a_syn_and_sends_it() {
-        let mut pkt = syn_packet(1460);
-        assert_eq!(
-            adapt_inner_for_budget(&mut pkt, 200),
-            None,
-            "a clamped SYN is sent, never reflected"
-        );
-        let mss = u16::from_be_bytes([pkt[20 + 22], pkt[20 + 23]]);
-        assert!(
-            mss < 1460,
-            "MSS option must have been lowered to fit the budget"
-        );
-    }
-
-    #[test]
-    fn adapt_inner_for_budget_leaves_a_fitting_non_syn_packet_untouched() {
-        let mut pkt = ipv4_tcp_full(
-            Ipv4Addr::new(93, 184, 216, 34),
-            Ipv4Addr::new(10, 66, 0, 7),
-            443,
-            51000,
-        );
-        let original = pkt.clone();
-        assert_eq!(adapt_inner_for_budget(&mut pkt, u16::MAX), None);
-        assert_eq!(
-            pkt, original,
-            "a fitting non-SYN packet must stay untouched"
-        );
-    }
-
-    #[test]
-    fn adapt_inner_for_budget_reflects_frag_needed_for_an_oversized_non_syn_packet() {
-        let mut pkt = vec![0u8; 1300];
-        pkt[0] = 0x45;
-        pkt[9] = 17; // UDP: irrelevant to the too-large path
-        pkt[12..16].copy_from_slice(&[93, 184, 216, 34]);
-        let icmp =
-            adapt_inner_for_budget(&mut pkt, 1200).expect("oversized packet must be reflected");
-        assert_eq!(icmp[0] >> 4, 4);
-        assert_eq!(icmp[9], 1, "ICMP");
-        assert_eq!(icmp[20], 3, "destination unreachable");
-        assert_eq!(icmp[21], 4, "fragmentation needed");
-        assert_eq!(
-            u16::from_be_bytes([icmp[26], icmp[27]]),
-            1200,
-            "next-hop MTU echoes the live budget"
-        );
-    }
-
-    #[test]
-    fn adapt_inner_for_budget_returns_none_when_the_packet_already_fits() {
-        let mut pkt = vec![0u8; 100];
-        pkt[0] = 0x45;
-        pkt[9] = 17;
-        pkt[12..16].copy_from_slice(&[93, 184, 216, 34]);
-        assert_eq!(adapt_inner_for_budget(&mut pkt, 100), None);
-    }
-
-    #[test]
-    fn inner_budget_subtracts_the_frame_overhead_from_the_live_datagram_size() {
-        assert_eq!(inner_budget(Some(1300), 83), 1217);
-    }
-
-    #[test]
-    fn inner_budget_saturates_instead_of_underflowing_when_overhead_exceeds_the_datagram() {
-        assert_eq!(inner_budget(Some(50), 83), 0);
-    }
-
-    #[test]
-    fn inner_budget_defaults_to_u16_max_before_the_connection_negotiates_a_size() {
-        assert_eq!(inner_budget(None, 83), u16::MAX - 83);
-    }
-
-    #[cfg(feature = "pq-hpke")]
-    #[test]
-    fn pq_inner_budget_sizes_from_the_data_frame_not_the_setup_bound() {
-        // A /v2 DATA frame carries an empty pq_ct, so the exit's downlink budget
-        // must subtract the small data-frame overhead, not the ~1174-byte setup
-        // bound (which held the 1088-byte ML-KEM ciphertext). The setup bound
-        // starved a 1452-byte path to a ~240-byte budget, so every real downlink
-        // packet was reflected as frag-needed instead of sealed: a silent data
-        // black-hole while the tunnel stayed Connected.
-        assert_eq!(
-            pq_inner_budget(Some(1452)),
-            inner_budget(Some(1452), MULTIHOP_FRAME_V2_DATA_MAX_OVERHEAD)
-        );
-        assert!(
-            pq_inner_budget(Some(1452)) > 1000,
-            "the /v2 downlink budget must not be starved by the ~1 KB setup bound"
-        );
-    }
 
     #[tokio::test]
     async fn downlink_follows_the_uplink_owner_not_the_hash() {
@@ -6279,13 +5174,7 @@ mod tests {
         // Successor registers, then arms the re-check (its own live counter).
         router.register(ip, tx_succ.clone());
         let succ_activity = Arc::new(AtomicU64::new(9));
-        arm_takeover_recheck(
-            &Some(router.clone()),
-            &Some(tx_succ.clone()),
-            Some(ip),
-            None,
-            &succ_activity,
-        );
+        arm_takeover_recheck(&router, &tx_succ, ip, None, &succ_activity);
         // Let the spawned re-check task run up to its sleep so its timer is
         // registered before we advance the (paused) clock.
         tokio::task::yield_now().await;
@@ -6558,11 +5447,22 @@ mod tests {
 
     // ---- Dual-stack negotiation gating ----
 
-    fn v4_alloc() -> Option<Arc<Mutex<IpAllocator>>> {
-        Some(Arc::new(Mutex::new(
-            IpAllocator::new(Ipv4Addr::new(10, 66, 0, 0), 24, Ipv4Addr::new(10, 66, 0, 1))
-                .expect("/24 v4 pool builds"),
-        )))
+    fn v4_alloc() -> Arc<Mutex<IpAllocator>> {
+        v4_pool(24)
+    }
+
+    /// A tunnel address pool with the given prefix length. `/30` leaves the
+    /// pool with a single assignable address, which is how the exhaustion
+    /// path is reached without allocating thousands of leases.
+    fn v4_pool(prefix_len: u8) -> Arc<Mutex<IpAllocator>> {
+        Arc::new(Mutex::new(
+            IpAllocator::new(
+                Ipv4Addr::new(10, 66, 0, 0),
+                prefix_len,
+                Ipv4Addr::new(10, 66, 0, 1),
+            )
+            .expect("v4 pool builds"),
+        ))
     }
 
     fn v6_alloc() -> Option<Arc<Mutex<IpAllocatorV6>>> {
@@ -6573,9 +5473,15 @@ mod tests {
 
     #[test]
     fn wants_ipv6_against_v6_capable_exit_grants_a_dual_stack_ip_assign() {
-        let spec =
-            allocate_on_first_frame(&v4_alloc(), &v6_alloc(), 1, Some([0x11; 32]), true, None)
-                .expect("allocation succeeds");
+        let spec = allocate_on_first_frame(
+            &v4_alloc(),
+            v6_alloc().as_ref(),
+            1,
+            Some([0x11; 32]),
+            true,
+            None,
+        )
+        .expect("allocation succeeds");
         assert!(
             spec.assigned_v6.is_some(),
             "wants_ipv6 against a v6-capable exit must allocate a v6"
@@ -6605,8 +5511,9 @@ mod tests {
         // v6 allocator -> the reply's `ipv6` is `None` (which the client
         // surfaces), the conn stays v4-only, and that is leak-safe.
         let no_v6: Option<Arc<Mutex<IpAllocatorV6>>> = None;
-        let spec = allocate_on_first_frame(&v4_alloc(), &no_v6, 1, Some([0x11; 32]), true, None)
-            .expect("v4 still allocates");
+        let spec =
+            allocate_on_first_frame(&v4_alloc(), no_v6.as_ref(), 1, Some([0x11; 32]), true, None)
+                .expect("v4 still allocates");
         assert!(spec.assigned_v6.is_none(), "no v6 allocator -> no v6");
         match spec.into_control_message(None) {
             WarrenControlMessage::IpAssign { ipv6, .. } => {
@@ -6623,9 +5530,15 @@ mod tests {
     fn no_wants_ipv6_never_triggers_a_v6_allocation() {
         // A v4-only request must NOT get a v6 even on a v6-capable exit: no
         // silent upgrade.
-        let spec =
-            allocate_on_first_frame(&v4_alloc(), &v6_alloc(), 1, Some([0x11; 32]), false, None)
-                .expect("v4 allocates");
+        let spec = allocate_on_first_frame(
+            &v4_alloc(),
+            v6_alloc().as_ref(),
+            1,
+            Some([0x11; 32]),
+            false,
+            None,
+        )
+        .expect("v4 allocates");
         assert!(
             spec.assigned_v6.is_none(),
             "a request with wants_ipv6=false must never allocate a v6"
@@ -6645,10 +5558,17 @@ mod tests {
         // v4 AND v6, so the downlink route keys never span two sessions.
         let v4 = v4_alloc();
         let v6 = v6_alloc();
-        let s1 =
-            allocate_on_first_frame(&v4, &v6, 1, Some([0x11; 32]), true, None).expect("session 1");
-        let s2 = allocate_on_first_frame(&v4, &v6, 2, Some([0x11; 32]), true, Some([0, 0, 0, 0]))
-            .expect("session 2");
+        let s1 = allocate_on_first_frame(&v4, v6.as_ref(), 1, Some([0x11; 32]), true, None)
+            .expect("session 1");
+        let s2 = allocate_on_first_frame(
+            &v4,
+            v6.as_ref(),
+            2,
+            Some([0x11; 32]),
+            true,
+            Some([0, 0, 0, 0]),
+        )
+        .expect("session 2");
         assert_ne!(s2.assigned, s1.assigned, "v4 must be session-fresh");
         assert!(s1.assigned_v6.is_some() && s2.assigned_v6.is_some());
         assert_ne!(s2.assigned_v6, s1.assigned_v6, "v6 must be session-fresh");
@@ -6661,13 +5581,20 @@ mod tests {
         // wallet's sticky binding, which points at session 1.
         let v4 = v4_alloc();
         let v6 = v6_alloc();
-        let s1 =
-            allocate_on_first_frame(&v4, &v6, 1, Some([0x11; 32]), true, None).expect("session 1");
-        let s2 = allocate_on_first_frame(&v4, &v6, 2, Some([0x11; 32]), true, Some([0, 0, 0, 0]))
-            .expect("session 2");
+        let s1 = allocate_on_first_frame(&v4, v6.as_ref(), 1, Some([0x11; 32]), true, None)
+            .expect("session 1");
+        let s2 = allocate_on_first_frame(
+            &v4,
+            v6.as_ref(),
+            2,
+            Some([0x11; 32]),
+            true,
+            Some([0, 0, 0, 0]),
+        )
+        .expect("session 2");
         let joined = allocate_on_first_frame(
             &v4,
-            &v6,
+            v6.as_ref(),
             3,
             Some([0x11; 32]),
             true,
@@ -6762,36 +5689,28 @@ mod tests {
         }
     }
 
-    /// Spawn a real exit-side termination loop (the production
-    /// `terminate_connection` path) with the given allowlist/allocator.
-    fn spawn_terminating_exit(
-        allowlist: Option<AllowlistHandle>,
-        ip_allocator: Option<Arc<Mutex<IpAllocator>>>,
-    ) -> TerminatingExit {
-        let exit_key = SigningKey::from_bytes(&[0x42; 32]);
+    /// Loopback endpoint bound to `exit_key`, running the production accept
+    /// loop (`terminate_connection`) over `ctx`. Every terminating-exit
+    /// fixture below is this plus its own ctx builder chain and whatever
+    /// descriptor material its clients need to seal a setup frame.
+    struct ExitHarness {
+        addr: std::net::SocketAddr,
+        sni: String,
+        endpoint: Endpoint,
+        accept_task: tokio::task::JoinHandle<()>,
+    }
+
+    fn spawn_exit_accept_loop<T>(exit_key: &SigningKey, ctx: ExitTerminateCtx<T>) -> ExitHarness
+    where
+        T: PacketDevice + Clone + Send + Sync + 'static,
+    {
         let provider = warrenguard_tls::default_crypto_provider();
-        let server_cfg = warrenguard_tls::make_server_config(
-            &exit_key,
-            provider,
-            &[warrenguard_config::ALPN_H3],
-        )
-        .expect("server config builds");
+        let server_cfg =
+            warrenguard_tls::make_server_config(exit_key, provider, &[warrenguard_config::ALPN_H3])
+                .expect("server config builds");
         let endpoint = Endpoint::server(server_cfg, (Ipv4Addr::LOCALHOST, 0).into())
             .expect("server endpoint binds");
         let addr = endpoint.local_addr().expect("local addr");
-        let (privkey, exit_pub) =
-            derive_x25519_keypair(&ANTI_ORACLE_EXIT_IKM).expect("x25519 keypair derives");
-        let exit_id = ExitId::from_bytes(ANTI_ORACLE_EXIT_ID);
-        let ctx = ExitTerminateCtx::new(
-            privkey,
-            exit_id,
-            warrenguard_transport_core::FakeTun::new(),
-            None,
-            None,
-            ip_allocator,
-            None,
-            allowlist,
-        );
         let listen = endpoint.clone();
         let accept_task = tokio::spawn(async move {
             while let Some(incoming) = listen.accept().await {
@@ -6803,9 +5722,41 @@ mod tests {
                 });
             }
         });
-        let sni = warrenguard_tls::name::encode(WarrenPubkey::from_bytes(
-            *exit_key.verifying_key().as_bytes(),
-        ));
+        ExitHarness {
+            addr,
+            sni: warrenguard_tls::name::encode(WarrenPubkey::from_bytes(
+                *exit_key.verifying_key().as_bytes(),
+            )),
+            endpoint,
+            accept_task,
+        }
+    }
+
+    /// Spawn a real exit-side termination loop (the production
+    /// `terminate_connection` path) with the given allowlist/allocator.
+    fn spawn_terminating_exit(
+        allowlist: Option<AllowlistHandle>,
+        ip_allocator: Arc<Mutex<IpAllocator>>,
+    ) -> TerminatingExit {
+        let exit_key = SigningKey::from_bytes(&[0x42; 32]);
+        let (privkey, exit_pub) =
+            derive_x25519_keypair(&ANTI_ORACLE_EXIT_IKM).expect("x25519 keypair derives");
+        let ctx = ExitTerminateCtx::new(
+            privkey,
+            ExitId::from_bytes(ANTI_ORACLE_EXIT_ID),
+            warrenguard_transport_core::FakeTun::new(),
+            None,
+            None,
+            ip_allocator,
+            None,
+            allowlist,
+        );
+        let ExitHarness {
+            addr,
+            sni,
+            endpoint,
+            accept_task,
+        } = spawn_exit_accept_loop(&exit_key, ctx);
         TerminatingExit {
             addr,
             sni,
@@ -6855,29 +5806,18 @@ mod tests {
     }
 
     fn spawn_terminating_exit_v7(
-        ip_allocator: Option<Arc<Mutex<IpAllocator>>>,
+        ip_allocator: Arc<Mutex<IpAllocator>>,
         admitter: Arc<dyn SessionTokenAdmitter>,
     ) -> TerminatingExit {
         let exit_key = SigningKey::from_bytes(&[0x42; 32]);
-        let provider = warrenguard_tls::default_crypto_provider();
-        let server_cfg = warrenguard_tls::make_server_config(
-            &exit_key,
-            provider,
-            &[warrenguard_config::ALPN_H3],
-        )
-        .expect("server config builds");
-        let endpoint = Endpoint::server(server_cfg, (Ipv4Addr::LOCALHOST, 0).into())
-            .expect("server endpoint binds");
-        let addr = endpoint.local_addr().expect("local addr");
         let (privkey, exit_pub) =
             derive_x25519_keypair(&ANTI_ORACLE_EXIT_IKM).expect("x25519 keypair derives");
-        let exit_id = ExitId::from_bytes(ANTI_ORACLE_EXIT_ID);
         // Strict allowlist mode (Some) would reject v6, but v7 admission is
         // gated by the token, not the allowlist: pass an allowlist to prove
         // the v7 path bypasses it.
         let ctx = ExitTerminateCtx::new(
             privkey,
-            exit_id,
+            ExitId::from_bytes(ANTI_ORACLE_EXIT_ID),
             warrenguard_transport_core::FakeTun::new(),
             None,
             None,
@@ -6886,20 +5826,12 @@ mod tests {
             Some(allowlist_with(&[[0x99; 32]])),
         )
         .with_token_admitter(Some(admitter));
-        let listen = endpoint.clone();
-        let accept_task = tokio::spawn(async move {
-            while let Some(incoming) = listen.accept().await {
-                let ctx = ctx.clone();
-                tokio::spawn(async move {
-                    if let Ok(conn) = incoming.await {
-                        terminate_connection(conn, SetupSource::AcceptFromConn, ctx).await;
-                    }
-                });
-            }
-        });
-        let sni = warrenguard_tls::name::encode(WarrenPubkey::from_bytes(
-            *exit_key.verifying_key().as_bytes(),
-        ));
+        let ExitHarness {
+            addr,
+            sni,
+            endpoint,
+            accept_task,
+        } = spawn_exit_accept_loop(&exit_key, ctx);
         TerminatingExit {
             addr,
             sni,
@@ -7019,12 +5951,17 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_session_without_an_assigned_address_is_refused_not_served() {
-        // Every terminated connection is bridged to a packet device, and the
-        // rx pump's inner-source anti-spoof gate compares against the address
-        // assigned at setup. A session that never got one leaves that gate
-        // with nothing to compare, so it must be refused rather than served.
-        let exit = spawn_terminating_exit(None, None);
+    async fn a_session_the_pool_cannot_address_is_refused_not_served() {
+        // The rx pump's inner-source anti-spoof gate compares against the
+        // address assigned at setup. A session that never got one would leave
+        // that gate with nothing to compare, so an exhausted pool must refuse
+        // the connection rather than serve it. Every other way of ending up
+        // without an address is ruled out by the types.
+        let pool = v4_pool(30);
+        pool.lock()
+            .allocate(0xDEAD)
+            .expect("the /30 pool has one assignable address");
+        let exit = spawn_terminating_exit(None, pool);
         let (detail, close) = client_setup_roundtrip(&exit, |_| WarrenControlMessage::IpRequest {
             prefer_ipv4: None,
             client_pubkey: None,
@@ -7039,8 +5976,8 @@ mod tests {
              anti-spoof gate (reply was {detail:?})"
         );
         assert!(
-            !matches!(detail, Some(WarrenControlMessage::IpAssign { .. })),
-            "no address can be granted without an allocator, got {detail:?}"
+            matches!(detail, Some(WarrenControlMessage::IpExhausted)),
+            "an exhausted pool must seal the IpExhausted detail, got {detail:?}"
         );
     }
 
@@ -7199,19 +6136,9 @@ mod tests {
     #[cfg(feature = "pq-hpke")]
     fn spawn_terminating_exit_pq(
         allowlist: Option<AllowlistHandle>,
-        ip_allocator: Option<Arc<Mutex<IpAllocator>>>,
+        ip_allocator: Arc<Mutex<IpAllocator>>,
     ) -> TerminatingExitPq {
         let exit_key = SigningKey::from_bytes(&[0x42; 32]);
-        let provider = warrenguard_tls::default_crypto_provider();
-        let server_cfg = warrenguard_tls::make_server_config(
-            &exit_key,
-            provider,
-            &[warrenguard_config::ALPN_H3],
-        )
-        .expect("server config builds");
-        let endpoint = Endpoint::server(server_cfg, (Ipv4Addr::LOCALHOST, 0).into())
-            .expect("server endpoint binds");
-        let addr = endpoint.local_addr().expect("local addr");
         // Identity-bound: the published x25519 pubkey and the X-Wing secret's
         // x25519 half derive from the SAME identity, so the client sealing to the
         // descriptor and the exit decapsulating agree on the hybrid secret.
@@ -7219,10 +6146,9 @@ mod tests {
         let (privkey, exit_pub) = derive_x25519_keypair(&x25519_ikm).expect("x25519 keypair");
         let (xwing_secret, mlkem_ek) =
             derive_exit_xwing_from_identity(&exit_key).expect("xwing derive");
-        let exit_id = ExitId::from_bytes(ANTI_ORACLE_EXIT_ID);
         let ctx = ExitTerminateCtx::new(
             privkey,
-            exit_id,
+            ExitId::from_bytes(ANTI_ORACLE_EXIT_ID),
             warrenguard_transport_core::FakeTun::new(),
             None,
             None,
@@ -7231,20 +6157,12 @@ mod tests {
             allowlist,
         )
         .with_xwing_secret(Arc::new(xwing_secret));
-        let listen = endpoint.clone();
-        let accept_task = tokio::spawn(async move {
-            while let Some(incoming) = listen.accept().await {
-                let ctx = ctx.clone();
-                tokio::spawn(async move {
-                    if let Ok(conn) = incoming.await {
-                        terminate_connection(conn, SetupSource::AcceptFromConn, ctx).await;
-                    }
-                });
-            }
-        });
-        let sni = warrenguard_tls::name::encode(WarrenPubkey::from_bytes(
-            *exit_key.verifying_key().as_bytes(),
-        ));
+        let ExitHarness {
+            addr,
+            sni,
+            endpoint,
+            accept_task,
+        } = spawn_exit_accept_loop(&exit_key, ctx);
         TerminatingExitPq {
             addr,
             sni,
@@ -7359,7 +6277,7 @@ mod tests {
             alloc.lock().allocate(424_242).is_some(),
             "the single /30 host slot must be consumable up-front"
         );
-        let exit_b = spawn_terminating_exit(None, Some(alloc));
+        let exit_b = spawn_terminating_exit(None, alloc);
         let req_b = WarrenControlMessage::IpRequest {
             wants_daita: false,
             prefer_ipv4: None,

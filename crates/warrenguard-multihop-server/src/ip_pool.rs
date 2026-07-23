@@ -441,11 +441,11 @@ impl IpAllocator {
             // several connections: the address is SHARED (a new `used`
             // entry is added, the existing holders are left intact)
             // rather than taken over. The IP only returns to `free` once
-            // the LAST holder releases (refcounted in `release`).
-            // Previously this path EVICTED the prior holder, which broke
-            // bonding: each secondary kicked its sibling out of `used`,
-            // and the first release pushed the still-shared IP back to
-            // `free` where it could be re-handed to a different pubkey.
+            // the LAST holder releases (refcounted in `release`). Never
+            // evict the prior holder here: each secondary would kick its
+            // sibling out of `used`, and the first release would push the
+            // still-shared IP back to `free` where it could be re-handed to
+            // a different pubkey.
             // A Fresh (or degraded Join) intent skips this: an independent
             // session gets its own address so the downlink route key never
             // spans two live sessions.
@@ -714,9 +714,10 @@ impl IpAllocatorV6 {
             // reconnect overlapping its predecessor) of one identity share
             // a single interface ID across several `used` entries. The
             // offset only returns to the recycle queue once the LAST holder
-            // releases. Previously this evicted the prior holder, which
-            // broke bonding. A Fresh (or degraded Join) intent skips this
-            // so an independent session gets its own interface ID.
+            // releases. Never evict the prior holder here, it breaks bonding
+            // exactly as in the v4 allocator. A Fresh (or degraded Join)
+            // intent skips this so an independent session gets its own
+            // interface ID.
             if matches!(intent, SessionIntentV6::Legacy) && self.held_by_pubkey(preferred, &pubkey)
             {
                 self.used.insert(conn, preferred);

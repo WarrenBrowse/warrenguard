@@ -109,12 +109,15 @@ tempfile = "3"
 # Self-signed cert/CA generation for v6 X.509 tests (ring backend only, no
 # aws-lc C toolchain). Used to mint cover-domain leaf + CA fixtures in-test.
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# Datapath benchmarks. `async_tokio` lets the harness drive async targets.
+criterion = { version = "0.8", default-features = false, features = ["async_tokio", "cargo_bench_support"] }
 
 # ---------------------------------------------------------------------------
 # Workspace-level lints. Security-critical engine (VPN data-plane): strict by
 # default. `warrenguard-tun-core` / `-tun-device` opt out and declare their own
 # (the privileged TUN FFI needs `unsafe_code = "deny"` rather than "forbid").
 # ---------------------------------------------------------------------------
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"

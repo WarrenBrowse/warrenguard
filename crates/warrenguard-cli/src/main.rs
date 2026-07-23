@@ -225,7 +225,7 @@ async fn serve_multihop(
         tun,
         None,
         None,
-        Some(ip_allocator),
+        ip_allocator,
         None,
     )
     .await
@@ -541,7 +541,7 @@ mod tests {
             FakeTun::new(),
             None,
             None,
-            Some(ip_allocator),
+            ip_allocator,
             None,
         ));
 
