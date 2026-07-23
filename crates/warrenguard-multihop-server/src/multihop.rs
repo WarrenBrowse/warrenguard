@@ -102,10 +102,9 @@ impl EpochReplayWindows {
 /// [`crate::ip_pool::IpAllocator`] for this connection plus the subnet
 /// parameters that the [`WarrenControlMessage::IpAssign`] needs.
 ///
-/// `None` ⇒ IP negotiation disabled for this binary (legacy behaviour:
-/// the client falls back to the hardcoded `10.66.0.2/24`). `Some` ⇒ the
-/// rx loop emits exactly one `IpAssign` after the session is open, then
-/// forwards regular traffic.
+/// `None` ⇒ no allocator wired, so the exit can assign nothing and refuses
+/// the session. `Some` ⇒ the rx loop emits exactly one `IpAssign` after the
+/// session is open, then forwards regular traffic.
 #[derive(Debug, Clone, Copy)]
 struct IpAssignSpec {
     assigned: Ipv4Addr,
@@ -348,10 +347,9 @@ struct ConnSetup {
     /// Epoch of the setup frame (the pump installs `(session, epoch)`
     /// into the shared `current` slot before pumping).
     epoch: u32,
-    /// IP allocated for this connection (when ip-nego is on), already
-    /// announced to the client over the setup stream as an `IpAssign`.
-    /// `None` when the exit runs without an allocator (legacy single
-    /// client, bootstrap IP).
+    /// IP allocated for this connection, already announced to the client
+    /// over the setup stream as an `IpAssign`. Always `Some` on a served
+    /// session: setup refuses any connection it could not assign and route.
     assigned_ip: Option<Ipv4Addr>,
     /// Multi-hop `/v2` dual-stack: the IPv6 allocated for this conn,
     /// announced in the same setup-stream `IpAssign`. `None` when the
@@ -873,66 +871,71 @@ async fn process_setup_frame(
 
     // The setup reply is sealed and written on the same bidi stream the
     // relay shuttles back to the client, instead of a reverse datagram.
-    let mut assigned_ip = None;
-    let mut assigned_ip_v6 = None;
-    let reply_plaintext = match allocate_on_first_frame(
+    // A served session must always end up with an address the rx pump can gate
+    // its inner packets against, so both ways of failing to get one refuse the
+    // connection with the same opaque close every policy rejection uses
+    // (anti-oracle), rather than serving it with a disarmed anti-spoof gate.
+    let Some(spec) = allocate_on_first_frame(
         ip_allocator,
         ip_allocator_v6,
         conn_id,
         sticky_pubkey,
         wants_ipv6,
         prefer_ipv4,
-    ) {
-        Some(spec) => {
-            if let (Some(router), Some(tx)) = (router, down_tx) {
-                router.register(spec.assigned, tx.clone());
-                assigned_ip = Some(spec.assigned);
-                if let (Some(registry), Some(guard)) = (session_registry, revocation_guard.as_ref())
-                {
-                    registry.record_assigned_ipv4(spec.assigned, guard.pubkey);
-                }
-                // Dual-stack `/v2`: also register the v6 downlink route so
-                // the single TUN reader fans out v6 reply packets to this
-                // conn by destination address.
-                if let Some(v6) = spec.assigned_v6 {
-                    router.register_v6(v6, tx.clone());
-                    assigned_ip_v6 = Some(v6);
-                }
-            }
-            // DAITA capability echo: grant the machine THIS connection runs
-            // only when the client asked for it. A client that did not ask
-            // is never pushed a spec; a client that asked against an unarmed
-            // exit reads the honest `None` ("the defense is not running")
-            // instead of believing itself protected.
-            let granted_daita = if wants_daita {
-                offered_daita.cloned()
-            } else {
-                None
-            };
-            match encode_control(&spec.into_control_message(granted_daita)) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!(error = %e, "ip-nego: encode IpAssign for setup reply failed");
-                    return None;
-                }
-            }
-        }
-        None => {
-            // No address to hand out (pool exhausted, or no allocator wired).
-            // The rx pump gates every inner packet against the address
-            // assigned here, so serving a session without one would leave that
-            // anti-spoof gate with nothing to compare against. Refuse, using
-            // the same opaque close every policy rejection uses (anti-oracle).
-            tracing::warn!("ip-nego: no tunnel address at setup; sealed detail + opaque close");
-            reply_sealed_detail_then_close(
-                &mut send,
-                &term,
-                epoch,
-                reverse_seq,
-                conn,
-                &WarrenControlMessage::IpExhausted,
-            )
-            .await;
+    ) else {
+        tracing::warn!("ip-nego: no tunnel address at setup; sealed detail + opaque close");
+        reply_sealed_detail_then_close(
+            &mut send,
+            &term,
+            epoch,
+            reverse_seq,
+            conn,
+            &WarrenControlMessage::IpExhausted,
+        )
+        .await;
+        return None;
+    };
+    // Registering the downlink route is what makes an allocated address real:
+    // the rx pump gates inner packets against it and the tx task fans out by
+    // it, so a half-wired session is refused like an unassigned one.
+    let (Some(router), Some(tx)) = (router, down_tx) else {
+        tracing::warn!("ip-nego: no downlink router for the allocated address; refusing");
+        reply_sealed_detail_then_close(
+            &mut send,
+            &term,
+            epoch,
+            reverse_seq,
+            conn,
+            &WarrenControlMessage::IpExhausted,
+        )
+        .await;
+        return None;
+    };
+    router.register(spec.assigned, tx.clone());
+    let assigned_ip = Some(spec.assigned);
+    if let (Some(registry), Some(guard)) = (session_registry, revocation_guard.as_ref()) {
+        registry.record_assigned_ipv4(spec.assigned, guard.pubkey);
+    }
+    // Dual-stack `/v2`: also register the v6 downlink route so the single TUN
+    // reader fans out v6 reply packets to this conn by destination address.
+    let mut assigned_ip_v6 = None;
+    if let Some(v6) = spec.assigned_v6 {
+        router.register_v6(v6, tx.clone());
+        assigned_ip_v6 = Some(v6);
+    }
+    // DAITA capability echo: grant the machine THIS connection runs only when
+    // the client asked for it. A client that did not ask is never pushed a
+    // spec; a client that asked against an unarmed exit reads the honest `None`
+    // ("the defense is not running") instead of believing itself protected.
+    let granted_daita = if wants_daita {
+        offered_daita.cloned()
+    } else {
+        None
+    };
+    let reply_plaintext = match encode_control(&spec.into_control_message(granted_daita)) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "ip-nego: encode IpAssign for setup reply failed");
             return None;
         }
     };
@@ -2337,9 +2340,9 @@ async fn pump_multihop_tun_router<T: PacketDevice>(tun: T, router: Arc<MultihopT
     }
 }
 
-/// Reads the next downlink packet for a connection's TX task: from the
-/// router channel when ip-nego is on (per-IP routed by the single TUN
-/// reader), else directly from the shared TUN (legacy single-client).
+/// Reads the next downlink packet for a connection's TX task, from the
+/// router channel fed per-IP by the single TUN reader. The direct-TUN arm
+/// only serves callers with no router, which no served session has.
 /// Returns `None` when the source is exhausted (channel senders all
 /// dropped, or TUN error) so the caller's TX loop exits.
 async fn next_downlink<T: PacketDevice>(
