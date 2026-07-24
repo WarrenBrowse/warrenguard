@@ -48,6 +48,12 @@ pub enum FatalCause {
     NotAuthorized,
     /// The account already holds its maximum number of simultaneous devices.
     DeviceLimit,
+    /// The wallet has been explicitly revoked (banned): it is on the signed
+    /// CRL. Distinct from [`Self::NotAuthorized`] (no active subscription /
+    /// expiry, which the user fixes by renewing) so the app can show a clear
+    /// suspension message. Carries no reason detail here; the localized reason
+    /// is derived from the ban-reason code the client decodes separately.
+    Banned,
     /// The exit closed with the opaque policy-rejection code and the sealed
     /// cause did not arrive: definitive, but the specific reason is unknown.
     PolicyRefused,

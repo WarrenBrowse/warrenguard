@@ -149,6 +149,15 @@ pub enum TunnelError {
     #[error("exit rejected the handshake: identity not authorized (no active subscription)")]
     AuthRejected,
 
+    /// The exit closed with the `WARREN_REVOKED` application code: the wallet is
+    /// on the signed CRL (banned). Surfaces on the **client** side. Unlike
+    /// [`TunnelError::AuthRejected`] (renew the subscription) this is a
+    /// suspension the user cannot fix by paying; the app shows a suspension
+    /// message with a localized reason. Definitive, never retried. No identity
+    /// material is carried (no-log Warren).
+    #[error("exit rejected the handshake: access revoked")]
+    Revoked,
+
     /// The exit closed the handshake with `WARREN_NO_CAPACITY`: its tunnel IP
     /// pool has no free address left. Surfaces on the **client** side. Unlike
     /// [`TunnelError::AuthRejected`] the account is fine, and unlike a transient
@@ -251,6 +260,7 @@ impl TunnelError {
             TunnelError::AuthRejected | TunnelError::AllowlistDenied => {
                 Retryability::Fatal(FatalCause::NotAuthorized)
             }
+            TunnelError::Revoked => Retryability::Fatal(FatalCause::Banned),
             TunnelError::DeviceLimitReached => Retryability::Fatal(FatalCause::DeviceLimit),
             TunnelError::ExitDrainingRefused | TunnelError::PoolExhausted => {
                 Retryability::RetryReselect
@@ -334,6 +344,11 @@ mod tests {
         assert_eq!(
             TunnelError::DeviceLimitReached.retryability(),
             Retryability::Fatal(FatalCause::DeviceLimit)
+        );
+        assert_eq!(
+            TunnelError::Revoked.retryability(),
+            Retryability::Fatal(FatalCause::Banned),
+            "a revoked (banned) wallet is fatal, never retried as a transient loss"
         );
         // Reselect set: not the account's fault, but the same exit re-hits it.
         assert_eq!(

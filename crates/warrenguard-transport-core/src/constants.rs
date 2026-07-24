@@ -27,6 +27,25 @@ use quinn::VarInt;
 /// close-code tell.
 pub const WARREN_AUTH_FAILED: VarInt = VarInt::from_u32(0x5741_5252);
 
+/// Application-level QUIC error code the exit uses to close a connection whose
+/// wallet has been explicitly REVOKED (banned): the pubkey is on the signed
+/// CRL, checked before the allowlist. "WRVK" in ASCII = `0x5752564b`.
+///
+/// Distinct from [`WARREN_AUTH_FAILED`] on purpose: that code means "no active
+/// subscription / not enrolled" (renew), whereas this one means "your access
+/// was suspended". The client maps it to [`crate::TunnelError::Revoked`] so the
+/// app can show a clear suspension message rather than a generic auth failure.
+/// Like the other codes it is only ever sent to an AUTHENTICATED peer (an
+/// unauthenticated prober still sees the decoy / [`H3_GENERAL_PROTOCOL_ERROR`]),
+/// so it leaks no tell. The single opaque multi-hop code stays unchanged; the
+/// revocation reason travels there in the client-sealed control message, never
+/// as a close code the relay could read.
+pub const WARREN_REVOKED: VarInt = VarInt::from_u32(0x5752_564b);
+
+/// Human-readable close reason string paired with [`WARREN_REVOKED`]. Advisory:
+/// the client keys off the code, not these bytes.
+pub const WARREN_REVOKED_REASON: &[u8] = b"access revoked";
+
 /// Application-level QUIC error code the exit uses to close a PRIMARY connection
 /// refused by the global per-account device cap (v2): the account already has
 /// the server-configured maximum of distinct devices live. "WLIM" in
