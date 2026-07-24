@@ -25,9 +25,11 @@ use std::time::Instant;
 use parking_lot::Mutex;
 
 mod connection_limiter;
+mod policy;
 mod registry;
 
 pub use connection_limiter::ConnectionRateLimiter;
+pub use policy::{RateOverride, RatePolicyHandle, RateSpec};
 pub use registry::IdentityLimiter;
 
 /// Pure token bucket. Thread-safe via internal `Mutex`; we assume the
