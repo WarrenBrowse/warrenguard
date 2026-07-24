@@ -454,6 +454,7 @@ pub(crate) struct RxReport {
     pub(crate) control_frames: u64,
     pub(crate) to_tun: u64,
     pub(crate) replays: u64,
+    pub(crate) rate_drops: u64,
     pub(crate) last_report: Instant,
     pub(crate) label: &'static str,
 }
@@ -473,6 +474,7 @@ impl RxReport {
             control_frames: 0,
             to_tun: 0,
             replays: 0,
+            rate_drops: 0,
             last_report: Instant::now(),
             label,
         }
@@ -497,6 +499,7 @@ impl RxReport {
             control_frames = self.control_frames,
             to_tun = self.to_tun,
             replays = self.replays,
+            rate_drops = self.rate_drops,
             spoofed_drops,
             pump = self.label,
             "rx_task report"
@@ -511,6 +514,7 @@ pub(crate) struct TxReport {
     pub(crate) seal_errs: u64,
     pub(crate) encode_errs: u64,
     pub(crate) sent: u64,
+    pub(crate) rate_drops: u64,
     pub(crate) last_report: Instant,
     pub(crate) label: &'static str,
 }
@@ -522,6 +526,7 @@ impl TxReport {
             seal_errs: 0,
             encode_errs: 0,
             sent: 0,
+            rate_drops: 0,
             last_report: Instant::now(),
             label,
         }
@@ -538,6 +543,7 @@ impl TxReport {
             seal_errs = self.seal_errs,
             encode_errs = self.encode_errs,
             sent = self.sent,
+            rate_drops = self.rate_drops,
             too_large,
             mtu_reflected,
             pump = self.label,

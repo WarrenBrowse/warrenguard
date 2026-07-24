@@ -49,6 +49,7 @@ use warrenguard_multihop::{
     XWingRecipientSecretKey, decode_frame_v2, encode_frame_v2,
 };
 use warrenguard_pump::{DAITA_DUMMY_FIRST_BYTE, is_daita_dummy};
+use warrenguard_ratelimit::{RateOverride, RatePolicyHandle, RateSpec};
 use warrenguard_server::{AllowlistHandle, SessionTokenAdmitter};
 use warrenguard_transport_core::PacketDevice;
 use warrenguard_wire::WarrenPubkey;
@@ -369,6 +370,11 @@ struct ConnSetup {
     /// pay a kernel-rejected TUN write per dummy) and unsolicited cover
     /// traffic blinds rx-based liveness watchdogs (2026-07-15 incident).
     wants_daita: bool,
+    /// Bandwidth-budget key for this session (wallet pubkey or v7 token
+    /// serial). `None` only in permissive mode where the client asserted
+    /// no identity at all: there is nothing to key a shared budget on, so
+    /// such a session runs uncapped.
+    session_rate_key: Option<SessionRateKey>,
 }
 
 /// Post-quantum (`/v2`) counterpart of [`ConnSetup`]: the established
@@ -383,6 +389,8 @@ struct ConnSetupPq {
     assigned_ip_v6: Option<Ipv6Addr>,
     #[allow(dead_code)]
     revocation_guard: Option<SessionGuard>,
+    /// See [`ConnSetup::session_rate_key`].
+    session_rate_key: Option<SessionRateKey>,
 }
 
 /// Which datapath a completed setup selected. A `/v1` connection runs the
@@ -486,6 +494,7 @@ impl SetupTermination {
         assigned_ip_v6: Option<Ipv6Addr>,
         revocation_guard: Option<SessionGuard>,
         wants_daita: bool,
+        session_rate_key: Option<SessionRateKey>,
     ) -> SetupOutcome {
         match self {
             Self::V1 { session, frame, .. } => SetupOutcome::V1(ConnSetup {
@@ -495,6 +504,7 @@ impl SetupTermination {
                 assigned_ip_v6,
                 revocation_guard,
                 wants_daita,
+                session_rate_key,
             }),
             #[cfg(feature = "pq-hpke")]
             Self::V2 { session, frame, .. } => SetupOutcome::V2(ConnSetupPq {
@@ -503,6 +513,7 @@ impl SetupTermination {
                 assigned_ip,
                 assigned_ip_v6,
                 revocation_guard,
+                session_rate_key,
             }),
         }
     }
@@ -949,11 +960,20 @@ async fn process_setup_frame(
         "ip-nego: IpAssign sent over setup stream"
     );
 
+    // Budget key: the v7 serial when one was admitted (an anonymous session
+    // always runs the network default), else the asserted wallet pubkey so
+    // every connection/device of one wallet shares one budget.
+    let session_rate_key = match (token_serial, sticky_pubkey) {
+        (Some(serial), _) => Some(SessionRateKey::TokenSerial(serial)),
+        (None, Some(wallet)) => Some(SessionRateKey::Wallet(wallet)),
+        (None, None) => None,
+    };
     Some(term.into_outcome(
         spec.assigned,
         spec.assigned_v6,
         revocation_guard,
         wants_daita,
+        session_rate_key,
     ))
 }
 
@@ -2759,6 +2779,111 @@ impl DaitaPick {
     }
 }
 
+/// Identity a terminated session's bandwidth budget is keyed on. All
+/// connections and devices admitted under one key share ONE budget per
+/// direction: that sharing is the point of per-identity keying (a wallet
+/// cannot multiply its cap by opening more connections).
+///
+/// The two variants never collide even on identical bytes, which is what
+/// makes exemptions wallet-only BY TYPE: a policy override is fed as a
+/// [`SessionRateKey::Wallet`], so an anonymous v7 serial can never match
+/// one and always runs the network default.
+///
+/// No `Debug`: both variants carry identity material (no-log discipline).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SessionRateKey {
+    /// v6 wallet-authenticated session: the account pubkey bytes.
+    Wallet([u8; 32]),
+    /// v7 anonymous session: the admitted token serial.
+    TokenSerial([u8; 32]),
+}
+
+/// Cadence of the idle-bucket sweep spawned by
+/// [`ExitTerminateCtx::with_session_rate_policy`].
+const SESSION_RATE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// A key idle this long has fully refilled its burst budget, so dropping
+/// its buckets changes nothing for it and bounds memory across churn.
+const SESSION_RATE_IDLE_TTL: Duration = Duration::from_secs(600);
+
+/// Runtime-updatable per-session bandwidth policy for the terminating
+/// pumps: a network default plus per-WALLET overrides (raise, lower, or
+/// exempt). `Clone` is a handle clone (shared state), so the deployer keeps
+/// one clone for its refresh loop and hands another to
+/// [`ExitTerminateCtx::with_session_rate_policy`]; every
+/// [`Self::set_policy`] reaches live sessions on their next packet, no
+/// reconnect involved (in-flight burst budgets restart full, see
+/// [`RatePolicyHandle::set_policy`]).
+///
+/// Uplink and downlink are enforced independently, each with a full budget
+/// at the same resolved spec (a "20 Mbps" policy caps each direction at
+/// 20 Mbps, it is not a shared aggregate).
+///
+/// A fresh handle is empty (no default, no overrides) and admits
+/// everything until first fed.
+#[derive(Clone, Default)]
+pub struct SessionRatePolicy {
+    up: RatePolicyHandle<SessionRateKey>,
+    down: RatePolicyHandle<SessionRateKey>,
+}
+
+impl SessionRatePolicy {
+    /// An empty policy: everything unlimited until [`Self::set_policy`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replaces the whole policy: `default` applies to every session
+    /// (wallet or anonymous serial), `wallet_overrides` to wallet sessions
+    /// only. Applied to both directions; each direction's live budgets
+    /// reset on the swap.
+    pub fn set_policy(
+        &self,
+        default: Option<RateSpec>,
+        wallet_overrides: impl IntoIterator<Item = ([u8; 32], RateOverride)>,
+    ) {
+        let overrides: HashMap<SessionRateKey, RateOverride> = wallet_overrides
+            .into_iter()
+            .map(|(wallet, o)| (SessionRateKey::Wallet(wallet), o))
+            .collect();
+        self.up.set_policy(default, overrides.clone());
+        self.down.set_policy(default, overrides);
+    }
+
+    /// The current network default, `None` when uncapped.
+    #[must_use]
+    pub fn default_spec(&self) -> Option<RateSpec> {
+        self.up.default_spec()
+    }
+
+    /// The spec `key` runs under the current policy, `None` when unlimited.
+    #[must_use]
+    pub fn resolve(&self, key: &SessionRateKey) -> Option<RateSpec> {
+        self.up.resolve(key)
+    }
+
+    /// Uplink admission: consume `bytes` from `key`'s uplink budget,
+    /// `false` when the packet must be dropped.
+    pub(crate) fn admits_uplink(&self, key: &SessionRateKey, bytes: usize) -> bool {
+        self.up.try_consume(key, bytes as u64)
+    }
+
+    /// Downlink admission, independent budget from the uplink.
+    pub(crate) fn admits_downlink(&self, key: &SessionRateKey, bytes: usize) -> bool {
+        self.down.try_consume(key, bytes as u64)
+    }
+
+    /// Drops per-key buckets idle for at least `idle` before `now`, both
+    /// directions. Driven by the sweep task
+    /// [`ExitTerminateCtx::with_session_rate_policy`] spawns; public so a
+    /// deployer embedding the handle elsewhere can run its own cadence.
+    pub fn sweep_idle(&self, idle: Duration, now: Instant) {
+        self.up.retain_active(idle, now);
+        self.down.retain_active(idle, now);
+    }
+}
+
 /// Shared per-listener state for exit-side multi-hop termination, cloned
 /// into each accepted connection. Lets the standalone exit listener and
 /// the unified `:443` dispatcher run the identical termination path
@@ -2813,6 +2938,12 @@ pub struct ExitTerminateCtx<T: PacketDevice + Clone> {
     /// is then admitted by verifying + spending a token offline (the exit never
     /// learns the wallet). `None` refuses v7 (the exit stays wallet-authenticated).
     token_admitter: Option<Arc<dyn SessionTokenAdmitter>>,
+    /// Per-session bandwidth policy (doc: [`SessionRatePolicy`]). `Some`
+    /// only when the deployer wires it via
+    /// [`ExitTerminateCtx::with_session_rate_policy`]; `None` (the default,
+    /// every existing entry point) runs the pumps with zero rate-limit
+    /// overhead.
+    session_rate: Option<SessionRatePolicy>,
     /// Post-quantum (`/v2` X-Wing) session cache. Always built when the crate is
     /// compiled with `pq-hpke`; it only ever holds entries once an X-Wing secret
     /// is also attached (see `xwing_secret`).
@@ -2863,6 +2994,7 @@ impl<T: PacketDevice + Clone> ExitTerminateCtx<T> {
             session_registry: None,
             drain_rx: None,
             token_admitter: None,
+            session_rate: None,
             #[cfg(feature = "pq-hpke")]
             pq_cache: Arc::new(PqSessionCache::new()),
             #[cfg(feature = "pq-hpke")]
@@ -2970,6 +3102,28 @@ impl<T: PacketDevice + Clone> ExitTerminateCtx<T> {
     #[must_use]
     pub fn with_token_admitter(mut self, admitter: Option<Arc<dyn SessionTokenAdmitter>>) -> Self {
         self.token_admitter = admitter;
+        self
+    }
+
+    /// Attach a [`SessionRatePolicy`] so every session this ctx terminates
+    /// runs under it (both `/v1` and `/v2` pumps, both directions). The
+    /// deployer keeps a clone of the SAME handle and feeds it from its
+    /// refresh loop; updates reach live sessions without a reconnect.
+    /// Builder (like [`Self::with_session_registry`]) so the existing
+    /// `new(...)` call sites keep the `None` default and pay nothing.
+    ///
+    /// Spawns the periodic idle-bucket sweep for the handle, so a churning
+    /// population of keys cannot grow the bucket maps without end.
+    #[must_use]
+    pub fn with_session_rate_policy(mut self, policy: SessionRatePolicy) -> Self {
+        let sweeper = policy.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(SESSION_RATE_SWEEP_INTERVAL).await;
+                sweeper.sweep_idle(SESSION_RATE_IDLE_TTL, Instant::now());
+            }
+        });
+        self.session_rate = Some(policy);
         self
     }
 
@@ -3086,6 +3240,7 @@ pub async fn terminate_connection<T>(
         ctx.session_registry.clone(),
         ctx.drain_rx.clone(),
         ctx.token_admitter.clone(),
+        ctx.session_rate.clone(),
         #[cfg(feature = "pq-hpke")]
         ctx.pq_setup(),
     )
@@ -3259,6 +3414,7 @@ async fn serve_terminating_connection<T>(
     session_registry: Option<Arc<MultihopSessionRegistry>>,
     drain_rx: Option<watch::Receiver<Option<DrainAdvisory>>>,
     token_admitter: Option<Arc<dyn SessionTokenAdmitter>>,
+    session_rate: Option<SessionRatePolicy>,
     #[cfg(feature = "pq-hpke")] pq: Option<PqSetup>,
 ) where
     T: PacketDevice + Clone,
@@ -3323,6 +3479,7 @@ async fn serve_terminating_connection<T>(
         #[cfg(feature = "pq-hpke")]
         SetupOutcome::V2(pq_setup) => {
             if let Some(pq) = pq {
+                let rate = session_rate.zip(pq_setup.session_rate_key);
                 serve_pq_datagram_pump(
                     conn,
                     exit_id,
@@ -3333,12 +3490,17 @@ async fn serve_terminating_connection<T>(
                     down_rx,
                     pq,
                     reverse_seq,
+                    rate,
                 )
                 .await;
             }
             return;
         }
     };
+    // Both pump directions key the same identity but consume independent
+    // budgets. `None` (no policy wired, or an identity-less permissive
+    // session) keeps the per-packet path a single branch on an empty Option.
+    let rate = session_rate.zip(setup.session_rate_key);
     // The exit only drives its machines for a client that negotiated them: an
     // un-negotiated peer cannot use the 0xFF dummies (legacy pumps pay a
     // kernel-rejected TUN write per dummy) and unsolicited cover traffic
@@ -3379,6 +3541,7 @@ async fn serve_terminating_connection<T>(
     let router_rx = router.clone();
     let down_tx_rx = down_tx.clone();
     let daita_rx = daita.clone();
+    let rate_rx = rate.clone();
     let mut tun_writer = TunWriter::new(tun.clone(), LABEL);
     let mut spoof_gate = SpoofGate::new(assigned_ip, assigned_ip_v6, LABEL);
     let rx_task = tokio::spawn(async move {
@@ -3474,6 +3637,17 @@ async fn serve_terminating_connection<T>(
                 report.maybe_emit(spoof_gate.drops());
                 continue;
             }
+            // Per-session uplink budget, enforced only on authenticated
+            // real traffic (after the anti-spoof gate; dummies and control
+            // frames never reach here). Over budget = drop; the inner
+            // transport retransmits and converges on the cap.
+            if let Some((policy, key)) = &rate_rx
+                && !policy.admits_uplink(key, plaintext.len())
+            {
+                report.rate_drops += 1;
+                report.maybe_emit(spoof_gate.drops());
+                continue;
+            }
             // Anti-spoof passed: the inner source IP is this connection's
             // allocation, so it is safe to record this flow's downlink owner
             // for the reverse path.
@@ -3501,6 +3675,7 @@ async fn serve_terminating_connection<T>(
     let current_tx = current.clone();
     let reverse_seq_tx = reverse_seq.clone();
     let daita_tx = daita.clone();
+    let rate_tx = rate;
     let tx_task = tokio::spawn(async move {
         let mut report = TxReport::new(LABEL);
         let mut reflected = RateLimited::new(64);
@@ -3521,6 +3696,17 @@ async fn serve_terminating_connection<T>(
                 ControlFlow::Continue(Some(p)) => p,
             };
             report.from_tun += 1;
+            // Per-session downlink budget, before the seal (and before any
+            // DAITA uplink-sent event, which must only fire for a packet
+            // that actually egresses). Over budget = drop; the origin's
+            // transport retransmits and converges on the cap.
+            if let Some((policy, key)) = &rate_tx
+                && !policy.admits_downlink(key, packet.len())
+            {
+                report.rate_drops += 1;
+                report.maybe_emit(too_large.count(), reflected.count());
+                continue;
+            }
             let (session, epoch) = current_tx.lock().clone();
             let seq = reverse_seq_tx.fetch_add(1, Ordering::AcqRel);
             daita_tx.on_real_uplink_sent();
@@ -3630,6 +3816,7 @@ async fn serve_pq_datagram_pump<T>(
     // (surfaced by the strict egress probe as "anti-replay rejection
     // (epoch 0, seq 0)"; ordinary clients just lose one datagram).
     reverse_seq: Arc<AtomicU64>,
+    rate: Option<(SessionRatePolicy, SessionRateKey)>,
 ) where
     T: PacketDevice + Clone,
 {
@@ -3660,6 +3847,7 @@ async fn serve_pq_datagram_pump<T>(
     let down_tx_rx = down_tx.clone();
     let pq_rx = pq.clone();
     let current_key_rx = current_key.clone();
+    let rate_rx = rate.clone();
     let mut tun_writer = TunWriter::new(tun.clone(), LABEL);
     let mut spoof_gate = SpoofGate::new(assigned_ip, assigned_ip_v6, LABEL);
     let rx_task = tokio::spawn(async move {
@@ -3749,6 +3937,15 @@ async fn serve_pq_datagram_pump<T>(
                 report.maybe_emit(spoof_gate.drops());
                 continue;
             }
+            // Per-session uplink budget: same gate and placement as the
+            // classical pump (after anti-spoof, before the TUN).
+            if let Some((policy, key)) = &rate_rx
+                && !policy.admits_uplink(key, plaintext.len())
+            {
+                report.rate_drops += 1;
+                report.maybe_emit(spoof_gate.drops());
+                continue;
+            }
             if flows.is_first_of_flow(&plaintext) {
                 router_rx.note_uplink(&plaintext, &down_tx_rx);
             }
@@ -3773,6 +3970,7 @@ async fn serve_pq_datagram_pump<T>(
     let mut down_rx_tx = down_rx;
     let current_tx = current;
     let reverse_seq_tx = reverse_seq;
+    let rate_tx = rate;
     let tx_task = tokio::spawn(async move {
         let mut report = TxReport::new(LABEL);
         let mut reflected = RateLimited::new(64);
@@ -3793,6 +3991,15 @@ async fn serve_pq_datagram_pump<T>(
                 ControlFlow::Continue(Some(p)) => p,
             };
             report.from_tun += 1;
+            // Per-session downlink budget: same gate and placement as the
+            // classical pump (before the seal).
+            if let Some((policy, key)) = &rate_tx
+                && !policy.admits_downlink(key, packet.len())
+            {
+                report.rate_drops += 1;
+                report.maybe_emit(too_large.count(), reflected.count());
+                continue;
+            }
             let (session, epoch) = current_tx.lock().clone();
             let seq = reverse_seq_tx.fetch_add(1, Ordering::AcqRel);
             // Same plaintext-side classification as the v1 tx_task.
@@ -6393,5 +6600,430 @@ mod tests {
             matches!(detail, Some(WarrenControlMessage::IpAssign { .. })),
             "a valid PoP for an allowlisted pubkey must be admitted, got {detail:?}"
         );
+    }
+
+    // ---- Per-session bandwidth policy ----
+
+    #[test]
+    fn session_rate_overrides_are_wallet_only_serials_get_the_default() {
+        let policy = SessionRatePolicy::new();
+        policy.set_policy(
+            RateSpec::new(100, 1),
+            [([0xAA; 32], RateOverride::Unlimited)],
+        );
+        // The exemption reaches the wallet key.
+        assert_eq!(policy.resolve(&SessionRateKey::Wallet([0xAA; 32])), None);
+        // A v7 serial with the SAME bytes still runs the network default:
+        // the two key variants can never collide.
+        assert_eq!(
+            policy.resolve(&SessionRateKey::TokenSerial([0xAA; 32])),
+            RateSpec::new(100, 1)
+        );
+    }
+
+    #[test]
+    fn session_rate_directions_consume_independent_budgets() {
+        let policy = SessionRatePolicy::new();
+        policy.set_policy(RateSpec::new(100, 1), std::iter::empty());
+        let key = SessionRateKey::Wallet([0x01; 32]);
+        assert!(policy.admits_uplink(&key, 100));
+        assert!(!policy.admits_uplink(&key, 1), "uplink budget exhausted");
+        assert!(
+            policy.admits_downlink(&key, 100),
+            "the downlink budget must be independent from the uplink's"
+        );
+        assert!(!policy.admits_downlink(&key, 1));
+    }
+
+    #[test]
+    fn session_rate_sweep_drops_idle_buckets_both_directions() {
+        let policy = SessionRatePolicy::new();
+        policy.set_policy(RateSpec::new(100, 1), std::iter::empty());
+        let key = SessionRateKey::Wallet([0x02; 32]);
+        assert!(policy.admits_uplink(&key, 1));
+        assert!(policy.admits_downlink(&key, 1));
+        policy.sweep_idle(
+            Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(5),
+        );
+        assert_eq!(policy.up.tracked_count(), 0);
+        assert_eq!(policy.down.tracked_count(), 0);
+    }
+
+    /// The far peer of every synthetic rate-limit packet.
+    const RATE_PEER: Ipv4Addr = Ipv4Addr::new(93, 184, 216, 34);
+
+    /// Exit harness sharing `tun` with the test (so uplink deliveries are
+    /// observable) and running `policy` when one is given.
+    fn spawn_rate_limited_exit(
+        policy: Option<SessionRatePolicy>,
+        tun: warrenguard_transport_core::FakeTun,
+        admitter: Option<Arc<dyn SessionTokenAdmitter>>,
+    ) -> TerminatingExit {
+        let exit_key = SigningKey::from_bytes(&[0x42; 32]);
+        let (privkey, exit_pub) =
+            derive_x25519_keypair(&ANTI_ORACLE_EXIT_IKM).expect("x25519 keypair derives");
+        let mut ctx = ExitTerminateCtx::new(
+            privkey,
+            ExitId::from_bytes(ANTI_ORACLE_EXIT_ID),
+            tun,
+            None,
+            None,
+            v4_alloc(),
+            None,
+            None,
+        )
+        .with_token_admitter(admitter);
+        if let Some(policy) = policy {
+            ctx = ctx.with_session_rate_policy(policy);
+        }
+        let ExitHarness {
+            addr,
+            sni,
+            endpoint,
+            accept_task,
+        } = spawn_exit_accept_loop(&exit_key, ctx);
+        TerminatingExit {
+            addr,
+            sni,
+            exit_pub,
+            _endpoint: endpoint,
+            accept_task,
+        }
+    }
+
+    /// Admitted `/v1` client that can pump DATA datagrams at the exit.
+    struct DataClient {
+        _endpoint: Endpoint,
+        conn: quinn::Connection,
+        session: ClientSession,
+        assigned_ip: Ipv4Addr,
+        next_seq: u64,
+    }
+
+    impl DataClient {
+        /// Seal and send one `len`-byte uplink IPv4 packet sourced from this
+        /// session's assigned address (so the anti-spoof gate admits it).
+        fn send_uplink(&mut self, len: usize) {
+            let mut pkt = ipv4_tcp_full(self.assigned_ip, RATE_PEER, 51_000, 443);
+            pkt.resize(len, 0);
+            let seq = self.next_seq;
+            self.next_seq += 1;
+            let frame = self.session.seal(&pkt, 0, seq).expect("seal data frame");
+            let bytes = encode_frame(&frame).expect("encode data frame");
+            self.conn
+                .send_datagram(bytes.into())
+                .expect("send data datagram");
+        }
+    }
+
+    /// Complete the setup round-trip with `build_request` and keep the
+    /// admitted connection + HPKE session alive for DATA pumping.
+    async fn data_client(
+        exit: &TerminatingExit,
+        build_request: impl FnOnce(&ClientSession) -> WarrenControlMessage,
+    ) -> DataClient {
+        let provider = warrenguard_tls::default_crypto_provider();
+        let cfg = warrenguard_tls::make_client_config(provider, &[warrenguard_config::ALPN_H3])
+            .expect("client config builds");
+        let mut endpoint =
+            Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).expect("client endpoint binds");
+        endpoint.set_default_client_config(cfg);
+        let conn = endpoint
+            .connect(exit.addr, &exit.sni)
+            .expect("connect")
+            .await
+            .expect("handshake");
+        let exit_id = ExitId::from_bytes(ANTI_ORACLE_EXIT_ID);
+        let mut rng = rand_core::UnwrapErr(rand_core::OsRng);
+        let session = ClientSession::new(&exit.exit_pub, exit_id, &mut rng).expect("HPKE setup");
+        let request = build_request(&session);
+        let plaintext = encode_control(&request).expect("encode request");
+        let frame = session.seal(&plaintext, 0, 0).expect("seal setup frame");
+        let bytes = encode_frame(&frame).expect("encode setup frame");
+        let (mut send, mut recv) = conn.open_bi().await.expect("open_bi");
+        send.write_all(&bytes).await.expect("write setup");
+        let _ = send.finish();
+        let reply = tokio::time::timeout(
+            Duration::from_secs(5),
+            recv.read_to_end(MAX_MULTIHOP_SETUP_FRAME_BYTES),
+        )
+        .await
+        .expect("setup reply within deadline")
+        .expect("setup reply readable");
+        let detail = decode_frame(&reply)
+            .ok()
+            .and_then(|f| session.open_response(&f).ok())
+            .and_then(|p| try_decode_control(&p).ok().flatten());
+        let Some(WarrenControlMessage::IpAssign { ipv4, .. }) = detail else {
+            panic!("expected an IpAssign, got {detail:?}");
+        };
+        DataClient {
+            _endpoint: endpoint,
+            conn,
+            session,
+            assigned_ip: Ipv4Addr::from(ipv4),
+            next_seq: 1,
+        }
+    }
+
+    /// Accumulate TUN deliveries until `at_least` arrived or `deadline`
+    /// elapsed, then keep draining for one settle beat so a packet that
+    /// SHOULD have been dropped had time to show up before the caller
+    /// asserts the exact count.
+    async fn settled_tun_outbound(
+        tun: &warrenguard_transport_core::FakeTun,
+        at_least: usize,
+        deadline: Duration,
+    ) -> Vec<Vec<u8>> {
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        let start = Instant::now();
+        while got.len() < at_least && start.elapsed() < deadline {
+            got.extend(tun.take_outbound());
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        got.extend(tun.take_outbound());
+        got
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn uplink_over_budget_is_dropped_and_a_live_policy_update_uncaps() {
+        // 250 B of burst at a negligible refill: of five 100 B packets only
+        // the first two fit the budget.
+        let policy = SessionRatePolicy::new();
+        policy.set_policy(RateSpec::new(250, 1), std::iter::empty());
+        let tun = warrenguard_transport_core::FakeTun::new();
+        let exit = spawn_rate_limited_exit(Some(policy.clone()), tun.clone(), None);
+        let mut client = data_client(&exit, |_| WarrenControlMessage::IpRequest {
+            prefer_ipv4: None,
+            client_pubkey: Some([0x3C; 32]),
+            wants_ipv6: false,
+            pop_sig: None,
+            wants_daita: false,
+        })
+        .await;
+        for _ in 0..5 {
+            client.send_uplink(100);
+        }
+        let got = settled_tun_outbound(&tun, 2, Duration::from_secs(5)).await;
+        assert_eq!(
+            got.len(),
+            2,
+            "a 250 B budget must admit exactly two 100 B packets"
+        );
+
+        // Live update on the SAME handle: the capped session must uncap on
+        // its next packets without reconnecting.
+        policy.set_policy(None, std::iter::empty());
+        for _ in 0..3 {
+            client.send_uplink(100);
+        }
+        let got = settled_tun_outbound(&tun, 3, Duration::from_secs(5)).await;
+        assert_eq!(
+            got.len(),
+            3,
+            "after the live uncap every packet must reach the TUN"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn downlink_over_budget_is_dropped_before_sealing() {
+        let policy = SessionRatePolicy::new();
+        policy.set_policy(RateSpec::new(250, 1), std::iter::empty());
+        let tun = warrenguard_transport_core::FakeTun::new();
+        let exit = spawn_rate_limited_exit(Some(policy), tun.clone(), None);
+        let client = data_client(&exit, |_| WarrenControlMessage::IpRequest {
+            prefer_ipv4: None,
+            client_pubkey: Some([0x3D; 32]),
+            wants_ipv6: false,
+            pop_sig: None,
+            wants_daita: false,
+        })
+        .await;
+        for _ in 0..5 {
+            let mut pkt = ipv4_tcp_full(RATE_PEER, client.assigned_ip, 443, 51_000);
+            pkt.resize(100, 0);
+            tun.inject_inbound(pkt);
+        }
+        let mut received = 0usize;
+        while let Ok(Ok(_)) =
+            tokio::time::timeout(Duration::from_millis(700), client.conn.read_datagram()).await
+        {
+            received += 1;
+        }
+        assert_eq!(
+            received, 2,
+            "a 250 B downlink budget must seal exactly two 100 B packets"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_exempt_wallet_runs_uncapped_through_the_pump() {
+        let wallet = [0x3E; 32];
+        let policy = SessionRatePolicy::new();
+        policy.set_policy(RateSpec::new(250, 1), [(wallet, RateOverride::Unlimited)]);
+        let tun = warrenguard_transport_core::FakeTun::new();
+        let exit = spawn_rate_limited_exit(Some(policy), tun.clone(), None);
+        let mut client = data_client(&exit, |_| WarrenControlMessage::IpRequest {
+            prefer_ipv4: None,
+            client_pubkey: Some(wallet),
+            wants_ipv6: false,
+            pop_sig: None,
+            wants_daita: false,
+        })
+        .await;
+        for _ in 0..5 {
+            client.send_uplink(100);
+        }
+        let got = settled_tun_outbound(&tun, 5, Duration::from_secs(5)).await;
+        assert_eq!(
+            got.len(),
+            5,
+            "an exempt wallet must deliver every packet despite the capped default"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_v7_serial_session_runs_the_network_default_cap() {
+        // The exemption below targets a WALLET whose bytes equal the v7
+        // token serial; a serial key must never match it, so the anonymous
+        // session runs the capped default.
+        let admitter = Arc::new(FakeMhAdmitter { deny: false }) as Arc<dyn SessionTokenAdmitter>;
+        let policy = SessionRatePolicy::new();
+        policy.set_policy(
+            RateSpec::new(250, 1),
+            [([0xAB; 32], RateOverride::Unlimited)],
+        );
+        let tun = warrenguard_transport_core::FakeTun::new();
+        let exit = spawn_rate_limited_exit(Some(policy), tun.clone(), Some(admitter));
+        let mut client = data_client(&exit, |s| {
+            s.build_ip_request_v7(vec![a_session_token(0xAB)], None, false, false)
+        })
+        .await;
+        for _ in 0..5 {
+            client.send_uplink(100);
+        }
+        let got = settled_tun_outbound(&tun, 2, Duration::from_secs(5)).await;
+        assert_eq!(
+            got.len(),
+            2,
+            "a v7 serial must run the default cap, never a wallet exemption"
+        );
+    }
+
+    /// The `/v2` pump runs the same uplink gate as the classical one: a
+    /// capped PQ session must drop its over-budget DATA packets before the
+    /// TUN.
+    #[cfg(feature = "pq-hpke")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pq_uplink_over_budget_is_dropped() {
+        let policy = SessionRatePolicy::new();
+        policy.set_policy(RateSpec::new(250, 1), std::iter::empty());
+        let tun = warrenguard_transport_core::FakeTun::new();
+
+        let exit_key = SigningKey::from_bytes(&[0x42; 32]);
+        let x25519_ikm = derive_x25519_ikm_from_ed25519(&exit_key);
+        let (privkey, exit_pub) = derive_x25519_keypair(&x25519_ikm).expect("x25519 keypair");
+        let (xwing_secret, mlkem_ek) =
+            derive_exit_xwing_from_identity(&exit_key).expect("xwing derive");
+        let ctx = ExitTerminateCtx::new(
+            privkey,
+            ExitId::from_bytes(ANTI_ORACLE_EXIT_ID),
+            tun.clone(),
+            None,
+            None,
+            v4_alloc(),
+            None,
+            None,
+        )
+        .with_xwing_secret(Arc::new(xwing_secret))
+        .with_session_rate_policy(policy);
+        let harness = spawn_exit_accept_loop(&exit_key, ctx);
+
+        let provider = warrenguard_tls::default_crypto_provider();
+        let cfg = warrenguard_tls::make_client_config(provider, &[warrenguard_config::ALPN_H3])
+            .expect("client config builds");
+        let mut endpoint =
+            Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).expect("client endpoint binds");
+        endpoint.set_default_client_config(cfg);
+        let conn = endpoint
+            .connect(harness.addr, &harness.sni)
+            .expect("connect")
+            .await
+            .expect("handshake");
+        let exit_id = ExitId::from_bytes(ANTI_ORACLE_EXIT_ID);
+        let recipient = warrenguard_multihop::XWingRecipientPublicKey::from_descriptor_bytes(
+            &mlkem_ek,
+            &pubkey_to_bytes(&exit_pub),
+        )
+        .expect("recipient builds");
+        let mut rng = rand_core::UnwrapErr(rand_core::OsRng);
+        let session = warrenguard_multihop::PqClientSession::new(&recipient, exit_id, &mut rng)
+            .expect("PQ client session");
+        let request = WarrenControlMessage::IpRequest {
+            prefer_ipv4: None,
+            client_pubkey: Some([0x4A; 32]),
+            wants_ipv6: false,
+            pop_sig: None,
+            wants_daita: false,
+        };
+        let plaintext = encode_control(&request).expect("encode request");
+        let frame = session.seal_setup(&plaintext, 0, 0).expect("seal v2 setup");
+        let bytes = encode_frame_v2(&frame).expect("encode v2 setup");
+        let (mut send, mut recv) = conn.open_bi().await.expect("open_bi");
+        send.write_all(&bytes).await.expect("write setup");
+        let _ = send.finish();
+        let reply = tokio::time::timeout(
+            Duration::from_secs(5),
+            recv.read_to_end(MAX_MULTIHOP_SETUP_FRAME_BYTES),
+        )
+        .await
+        .expect("setup reply within deadline")
+        .expect("setup reply readable");
+        let detail = decode_frame_v2(&reply)
+            .ok()
+            .and_then(|f| session.open_response(&f).ok())
+            .and_then(|p| try_decode_control(&p).ok().flatten());
+        let Some(WarrenControlMessage::IpAssign { ipv4, .. }) = detail else {
+            panic!("expected a PQ IpAssign, got {detail:?}");
+        };
+        let assigned = Ipv4Addr::from(ipv4);
+
+        for seq in 1..=5u64 {
+            let mut pkt = ipv4_tcp_full(assigned, RATE_PEER, 51_000, 443);
+            pkt.resize(100, 0);
+            let frame = session.seal(&pkt, 0, seq).expect("seal v2 data frame");
+            let bytes = encode_frame_v2(&frame).expect("encode v2 data frame");
+            conn.send_datagram(bytes.into()).expect("send v2 datagram");
+        }
+        let got = settled_tun_outbound(&tun, 2, Duration::from_secs(5)).await;
+        harness.accept_task.abort();
+        assert_eq!(
+            got.len(),
+            2,
+            "a 250 B budget must admit exactly two 100 B PQ packets"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_exit_without_a_rate_policy_delivers_everything() {
+        // The no-policy default must stay today's behaviour: no cap, no
+        // drop, whatever the traffic shape.
+        let tun = warrenguard_transport_core::FakeTun::new();
+        let exit = spawn_rate_limited_exit(None, tun.clone(), None);
+        let mut client = data_client(&exit, |_| WarrenControlMessage::IpRequest {
+            prefer_ipv4: None,
+            client_pubkey: Some([0x3F; 32]),
+            wants_ipv6: false,
+            pop_sig: None,
+            wants_daita: false,
+        })
+        .await;
+        for _ in 0..5 {
+            client.send_uplink(100);
+        }
+        let got = settled_tun_outbound(&tun, 5, Duration::from_secs(5)).await;
+        assert_eq!(got.len(), 5, "without a policy nothing may be dropped");
     }
 }

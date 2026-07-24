@@ -3662,6 +3662,7 @@ dependencies = [
  "warrenguard-daita",
  "warrenguard-multihop",
  "warrenguard-pump",
+ "warrenguard-ratelimit",
  "warrenguard-server",
  "warrenguard-tls",
  "warrenguard-token",

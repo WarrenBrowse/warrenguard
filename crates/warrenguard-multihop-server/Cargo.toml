@@ -30,6 +30,9 @@ warrenguard-pump = { path = "../warrenguard-pump" }
 warrenguard-daita = { path = "../warrenguard-daita" }
 # Generic engine constants (`unix_now`, tunnel gateway IPs, ALPN).
 warrenguard-config = { path = "../warrenguard-config" }
+# Per-session bandwidth caps on the terminating pumps (runtime-updatable
+# policy handle fed by the deployer's refresh loop).
+warrenguard-ratelimit = { path = "../warrenguard-ratelimit" }
 ed25519-dalek = { workspace = true }
 hex = { workspace = true }
 hkdf = { workspace = true }
