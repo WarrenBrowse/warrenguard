@@ -227,16 +227,32 @@ fn allocate_on_first_frame(
     })
 }
 
-/// H1 exit-side authorization: decide whether a multi-hop client may be
-/// granted a tunnel IP, given the exit allowlist, the account pubkey
-/// asserted in its setup control message, and the Ed25519 proof of
-/// possession (PoP) covering this session's HPKE `encapsulated_key`.
+/// Three-way strict-mode admission verdict, so the rejection site can tell
+/// the client WHY it was refused via the HPKE-sealed control message: an
+/// explicit ban (on the signed CRL) surfaces a suspension, everything else
+/// surfaces "not authorized" (renew). Permissive mode (no allowlist) always
+/// admits. The close code stays opaque either way (anti-oracle); only the
+/// sealed detail differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    /// Authorized: proceed with allocation.
+    Admitted,
+    /// Refused: the asserted pubkey is on the exit's signed CRL (banned).
+    Banned,
+    /// Refused for any other reason: not allowlisted, subscription expired,
+    /// or a missing/invalid proof of possession.
+    NotAuthorized,
+}
+
+/// H1 exit-side authorization: classify a strict-mode client against the
+/// allowlist + CRL, given the account pubkey asserted in its setup control
+/// message and the Ed25519 proof of possession (PoP) covering this session's
+/// HPKE `encapsulated_key`.
 ///
 /// In permissive/bench mode (`allowlist == None`) every client is admitted.
-/// In strict mode the client must assert an
-/// allowlisted account pubkey via the `IpRequest` `client_pubkey` field
-/// AND prove possession of its private key: `pop_sig` must be a valid
-/// signature by `client_pubkey` over
+/// In strict mode the client must assert an allowlisted account pubkey via
+/// the `IpRequest` `client_pubkey` field AND prove possession of its private
+/// key: `pop_sig` must be a valid signature by `client_pubkey` over
 /// `warrenguard_multihop::pop_signing_message(exit_id, encapsulated_key)`.
 ///
 /// SECURITY NOTE: the exit's TLS peer is the relay, not the client, so
@@ -248,15 +264,17 @@ fn allocate_on_first_frame(
 /// The signature is verified BEFORE the allowlist lookup so a forged
 /// assertion never reaches the authorization data. Do NOT relax the
 /// `pop_sig` requirement in strict mode - it is what turns this gate from
-/// a declaration into an authentication.
-fn allowlist_admits(
+/// a declaration into an authentication. The CRL is checked first inside
+/// `is_allowed_at`, so a refused-and-CRL'd pubkey is classified
+/// [`Admission::Banned`].
+fn classify_admission(
     allowlist: Option<&AllowlistHandle>,
     control_msg: Option<&WarrenControlMessage>,
     exit_id: &ExitId,
     encapsulated_key: &EncapsulatedKeyBytes,
-) -> bool {
+) -> Admission {
     let Some(allowlist) = allowlist else {
-        return true;
+        return Admission::Admitted;
     };
     let (asserted, pop_sig) = match control_msg {
         Some(WarrenControlMessage::IpRequest {
@@ -268,14 +286,37 @@ fn allowlist_admits(
     };
     let (Some(pubkey), Some(sig)) = (asserted, pop_sig) else {
         // Strict mode: no pubkey or no possession proof = no egress.
-        return false;
+        return Admission::NotAuthorized;
     };
     if !warrenguard_multihop::verify_pop(&pubkey, exit_id, encapsulated_key, &sig) {
-        return false;
+        return Admission::NotAuthorized;
     }
-    allowlist.is_allowed_at(
-        &WarrenPubkey::from_bytes(pubkey),
-        warrenguard_config::unix_now(),
+    let wpk = WarrenPubkey::from_bytes(pubkey);
+    if allowlist.is_allowed_at(&wpk, warrenguard_config::unix_now()) {
+        return Admission::Admitted;
+    }
+    // Refused: distinguish an explicit ban (on the CRL) from a lapsed/absent
+    // subscription so the client shows a suspension rather than a renew prompt.
+    if allowlist.is_crl_revoked(&wpk) {
+        Admission::Banned
+    } else {
+        Admission::NotAuthorized
+    }
+}
+
+/// Bool view of [`classify_admission`] (admit/refuse), for the unit tests
+/// that only assert the gate decision and not its ban-vs-not-authorized
+/// refinement. The production setup path uses `classify_admission` directly.
+#[cfg(test)]
+fn allowlist_admits(
+    allowlist: Option<&AllowlistHandle>,
+    control_msg: Option<&WarrenControlMessage>,
+    exit_id: &ExitId,
+    encapsulated_key: &EncapsulatedKeyBytes,
+) -> bool {
+    matches!(
+        classify_admission(allowlist, control_msg, exit_id, encapsulated_key),
+        Admission::Admitted
     )
 }
 
@@ -806,20 +847,34 @@ async fn process_setup_frame(
             }
         }
         other => {
-            if !allowlist_admits(allowlist, other, &exit_id, &encapsulated_key) {
-                tracing::warn!(
-                    "multihop: setup rejected - client not authorized; sealed detail + opaque close"
-                );
-                reply_sealed_detail_then_close(
-                    &mut send,
-                    &term,
-                    epoch,
-                    reverse_seq,
-                    conn,
-                    &WarrenControlMessage::Rejected,
-                )
-                .await;
-                return None;
+            match classify_admission(allowlist, other, &exit_id, &encapsulated_key) {
+                Admission::Admitted => {}
+                verdict => {
+                    // Same opaque close for both (anti-oracle); only the
+                    // client-sealed detail distinguishes a ban (suspension)
+                    // from a lapsed/absent subscription (renew).
+                    let detail = if verdict == Admission::Banned {
+                        tracing::warn!(
+                            "multihop: setup rejected - account banned (CRL); sealed detail + opaque close"
+                        );
+                        WarrenControlMessage::RejectedBanned
+                    } else {
+                        tracing::warn!(
+                            "multihop: setup rejected - client not authorized; sealed detail + opaque close"
+                        );
+                        WarrenControlMessage::Rejected
+                    };
+                    reply_sealed_detail_then_close(
+                        &mut send,
+                        &term,
+                        epoch,
+                        reverse_seq,
+                        conn,
+                        &detail,
+                    )
+                    .await;
+                    return None;
+                }
             }
             let pk = match other {
                 Some(WarrenControlMessage::IpRequest {
@@ -5649,6 +5704,53 @@ mod tests {
         assert!(
             !allowlist_admits(Some(&handle), None, &exit_id, &GATE_ENCAP),
             "a client with no control message is rejected in strict mode"
+        );
+    }
+
+    #[test]
+    fn classify_admission_distinguishes_ban_from_not_authorized() {
+        use std::collections::HashSet;
+        // The rejection site needs the ban-vs-renew distinction so the client
+        // shows the right message. A revoked (CRL) pubkey with a valid PoP
+        // classifies Banned; an allowlisted one Admitted; an absent one (valid
+        // PoP, not listed, not on the CRL) NotAuthorized.
+        let exit_id = ExitId::from_bytes(GATE_EXIT_ID);
+        let account = SigningKey::from_bytes(&[0x11; 32]);
+        let account_pubkey = account.verifying_key().to_bytes();
+        let handle = allowlist_with(&[account_pubkey]);
+        let valid_pop = warrenguard_multihop::sign_pop(&account, &exit_id, &GATE_ENCAP);
+        let req = ip_request_pop(Some(account_pubkey), Some(valid_pop));
+
+        assert_eq!(
+            classify_admission(Some(&handle), Some(&req), &exit_id, &GATE_ENCAP),
+            Admission::Admitted,
+            "an allowlisted, non-revoked pubkey is admitted"
+        );
+
+        // Revoke it on the CRL: same request now classifies as a ban.
+        handle.apply_crl_revocations(HashSet::from([WarrenPubkey::from_bytes(account_pubkey)]));
+        assert_eq!(
+            classify_admission(Some(&handle), Some(&req), &exit_id, &GATE_ENCAP),
+            Admission::Banned,
+            "a CRL-revoked pubkey classifies as Banned (suspension), not a generic refusal"
+        );
+
+        // An unlisted pubkey (valid PoP, never on the CRL) is NotAuthorized:
+        // a renew case, never conflated with a ban.
+        let unlisted = SigningKey::from_bytes(&[0x22; 32]);
+        let unlisted_pop = warrenguard_multihop::sign_pop(&unlisted, &exit_id, &GATE_ENCAP);
+        assert_eq!(
+            classify_admission(
+                Some(&handle),
+                Some(&ip_request_pop(
+                    Some(unlisted.verifying_key().to_bytes()),
+                    Some(unlisted_pop)
+                )),
+                &exit_id,
+                &GATE_ENCAP
+            ),
+            Admission::NotAuthorized,
+            "an absent pubkey is NotAuthorized (renew), never a ban"
         );
     }
 

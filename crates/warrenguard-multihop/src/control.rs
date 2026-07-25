@@ -276,6 +276,26 @@ pub enum WarrenControlMessage {
         /// capability-echo contract as [`Self::IpRequest::wants_daita`]).
         wants_daita: bool,
     },
+
+    /// Exit -> client. The setup was refused because the account is
+    /// explicitly REVOKED (banned): its pubkey is on the exit's signed CRL,
+    /// checked before the allowlist. Distinct from [`Self::Rejected`] (no
+    /// active subscription / not enrolled, which the user fixes by renewing)
+    /// so the client can surface a clear suspension message rather than a
+    /// generic "not authorized". Like [`Self::Rejected`] it travels
+    /// HPKE-sealed over the setup stream BEFORE the exit's single opaque
+    /// close, so the relay (hostile by model) cannot tell a ban from any
+    /// other rejection; only the client learns the cause.
+    ///
+    /// Appended as a distinct enum variant (postcard discriminant 6) so the
+    /// existing `/v3` layout and its golden vectors stay byte-for-byte
+    /// untouched: a client that predates this variant fails to decode it and
+    /// safely falls back to the opaque-close `PolicyRefused` verdict (still
+    /// fatal), while an updated client maps it to a suspension state. It
+    /// carries no reason detail: the exit's CRL is membership-only (the
+    /// human-readable reason never leaves the control-plane API), so the
+    /// localized message is derived client-side from the ban state alone.
+    RejectedBanned,
 }
 
 /// Encode a control message into the wire layout (marker + version +
@@ -506,6 +526,7 @@ mod tests {
         for msg in [
             WarrenControlMessage::IpExhausted,
             WarrenControlMessage::Rejected,
+            WarrenControlMessage::RejectedBanned,
         ] {
             let decoded = try_decode_control(&encode_control(&msg).unwrap())
                 .unwrap()
@@ -623,6 +644,27 @@ mod tests {
             encoded,
             vec![0xC0, 0x03, 0x03],
             "Rejected wire layout drifted - bump the version byte + freeze a new vector"
+        );
+    }
+
+    #[test]
+    fn rejected_banned_wire_layout_is_frozen() {
+        // Appended variant: discriminant 6, no payload. Freezing the bytes
+        // proves the ban rejection did not disturb any earlier variant's
+        // layout. A drift here means the wire moved - bump CONTROL_VERSION
+        // and freeze a new vector.
+        let encoded = encode_control(&WarrenControlMessage::RejectedBanned).unwrap();
+        assert_eq!(
+            encoded,
+            vec![0xC0, 0x03, 0x06],
+            "RejectedBanned wire layout drifted - bump the version byte + freeze a new vector"
+        );
+        // The pre-existing Rejected MUST still encode at discriminant 3
+        // (proves appending the ban variant did not renumber the others).
+        assert_eq!(
+            encode_control(&WarrenControlMessage::Rejected).unwrap()[2],
+            0x03,
+            "Rejected must keep enum discriminant 3 after appending RejectedBanned"
         );
     }
 

@@ -131,6 +131,7 @@ fn dispatch_control_message(
             WarrenControlMessage::IpAssign { .. } => "IpAssign",
             WarrenControlMessage::IpExhausted => "IpExhausted",
             WarrenControlMessage::Rejected => "Rejected",
+            WarrenControlMessage::RejectedBanned => "RejectedBanned",
             WarrenControlMessage::ExitDraining { .. } => "ExitDraining",
         };
         tracing::debug!(

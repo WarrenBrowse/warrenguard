@@ -382,6 +382,10 @@ pub(crate) struct FakeMultihopExit {
     /// When set, every subsequent setup reply is a sealed `Rejected`
     /// detail instead of an `IpAssign`.
     pub(crate) reject: Arc<AtomicBool>,
+    /// When set, every subsequent setup reply is a sealed `RejectedBanned`
+    /// detail (takes precedence over `reject`), so a test can drive the
+    /// client's ban-vs-not-authorized decode path.
+    pub(crate) reject_banned: Arc<AtomicBool>,
     _server_ep: Endpoint,
 }
 
@@ -394,6 +398,7 @@ async fn serve_one_fake_exit_connection(
     conn: Connection,
     exit_id: ExitId,
     reject: Arc<AtomicBool>,
+    reject_banned: Arc<AtomicBool>,
 ) {
     let Ok((mut send, mut recv)) = conn.accept_bi().await else {
         return;
@@ -415,7 +420,9 @@ async fn serve_one_fake_exit_connection(
     if exit_session.open(&frame).is_err() {
         return;
     }
-    let reply_msg = if reject.load(Ordering::Relaxed) {
+    let reply_msg = if reject_banned.load(Ordering::Relaxed) {
+        WarrenControlMessage::RejectedBanned
+    } else if reject.load(Ordering::Relaxed) {
         WarrenControlMessage::Rejected
     } else {
         WarrenControlMessage::IpAssign {
@@ -492,10 +499,12 @@ pub(crate) fn spawn_fake_multihop_exit(
 
     let accepted = Arc::new(AtomicUsize::new(0));
     let reject = Arc::new(AtomicBool::new(false));
+    let reject_banned = Arc::new(AtomicBool::new(false));
 
     let accept_loop_ep = server_ep.clone();
     let accept_loop_accepted = accepted.clone();
     let accept_loop_reject = reject.clone();
+    let accept_loop_reject_banned = reject_banned.clone();
     tokio::spawn(async move {
         loop {
             let Some(incoming) = accept_loop_ep.accept().await else {
@@ -505,7 +514,13 @@ pub(crate) fn spawn_fake_multihop_exit(
                 continue;
             };
             accept_loop_accepted.fetch_add(1, Ordering::Relaxed);
-            serve_one_fake_exit_connection(conn, exit_id, accept_loop_reject.clone()).await;
+            serve_one_fake_exit_connection(
+                conn,
+                exit_id,
+                accept_loop_reject.clone(),
+                accept_loop_reject_banned.clone(),
+            )
+            .await;
         }
     });
 
@@ -515,6 +530,7 @@ pub(crate) fn spawn_fake_multihop_exit(
         exit_x25519_pubkey,
         accepted,
         reject,
+        reject_banned,
         _server_ep: server_ep,
     }
 }

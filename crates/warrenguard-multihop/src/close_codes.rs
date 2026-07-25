@@ -69,6 +69,12 @@ pub enum RejectionReason {
     /// HPKE-sealed `Rejected` detail (never from the close code, which
     /// is opaque by design).
     NotAllowlisted,
+    /// Client explicitly REVOKED (banned): its pubkey is on the exit's
+    /// signed CRL. Learned from the HPKE-sealed `RejectedBanned` detail.
+    /// Distinct from [`Self::NotAllowlisted`] (renew) so the client can
+    /// show a suspension message; fatal like it (no other exit helps, the
+    /// CRL is fleet-wide).
+    Banned,
     /// Exit IP pool exhausted. Learned from the HPKE-sealed
     /// `IpExhausted` detail.
     IpExhausted,
@@ -107,6 +113,7 @@ impl RejectionReason {
     pub fn from_sealed_detail(msg: &crate::WarrenControlMessage) -> Option<Self> {
         match msg {
             crate::WarrenControlMessage::Rejected => Some(Self::NotAllowlisted),
+            crate::WarrenControlMessage::RejectedBanned => Some(Self::Banned),
             crate::WarrenControlMessage::IpExhausted => Some(Self::IpExhausted),
             crate::WarrenControlMessage::IpRequest { .. }
             | crate::WarrenControlMessage::IpRequestV7 { .. }
@@ -124,6 +131,7 @@ impl RejectionReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::NotAllowlisted => "not-allowlisted",
+            Self::Banned => "banned",
             Self::IpExhausted => "ip-pool-exhausted",
             Self::PolicyRefused => "policy-refused",
         }
@@ -142,6 +150,7 @@ impl RejectionReason {
         use warrenguard_wire::{FatalCause, Retryability};
         match self {
             Self::NotAllowlisted => Retryability::Fatal(FatalCause::NotAuthorized),
+            Self::Banned => Retryability::Fatal(FatalCause::Banned),
             Self::PolicyRefused => Retryability::Fatal(FatalCause::PolicyRefused),
             Self::IpExhausted => Retryability::RetryReselect,
         }
@@ -166,6 +175,7 @@ mod tests {
         // reintroduced per-cause codes on the relay-facing branch.
         for reason in [
             RejectionReason::NotAllowlisted,
+            RejectionReason::Banned,
             RejectionReason::IpExhausted,
             RejectionReason::PolicyRefused,
         ] {
@@ -244,6 +254,14 @@ mod tests {
             Retryability::Fatal(FatalCause::PolicyRefused),
             "an opaque policy refusal is definitive, so fatal"
         );
+        // A ban is definitive and fleet-wide (signed CRL): fatal, and it maps
+        // to the distinct Banned cause so the app shows a suspension message
+        // instead of a renew prompt.
+        assert_eq!(
+            RejectionReason::Banned.retryability(),
+            Retryability::Fatal(FatalCause::Banned),
+            "a CRL ban must be fatal and carry the distinct Banned cause"
+        );
         // Exhaustion is a capacity issue on THIS exit, not the account: reselect.
         assert_eq!(
             RejectionReason::IpExhausted.retryability(),
@@ -257,6 +275,11 @@ mod tests {
         assert_eq!(
             RejectionReason::from_sealed_detail(&WarrenControlMessage::Rejected),
             Some(RejectionReason::NotAllowlisted)
+        );
+        assert_eq!(
+            RejectionReason::from_sealed_detail(&WarrenControlMessage::RejectedBanned),
+            Some(RejectionReason::Banned),
+            "the sealed RejectedBanned detail refines the opaque close into a ban"
         );
         assert_eq!(
             RejectionReason::from_sealed_detail(&WarrenControlMessage::IpExhausted),

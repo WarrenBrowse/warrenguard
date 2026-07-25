@@ -274,6 +274,19 @@ impl AllowlistHandle {
             .is_some_and(|expires_at| *expires_at > now_unix_secs)
     }
 
+    /// Return `true` if `id` is on the CRL (explicitly revoked / banned),
+    /// independent of allowlist presence or expiry. This is the single bit
+    /// that distinguishes a ban from a lapsed subscription: `is_allowed_at`
+    /// refuses BOTH (the CRL is checked first), so a rejection site consults
+    /// this to tell the client the right cause (suspension vs renew) via the
+    /// sealed control message. Carries no reason detail: the CRL is
+    /// membership-only here (the human-readable reason never leaves the
+    /// control-plane API), preserving no-log.
+    #[must_use]
+    pub fn is_crl_revoked(&self, id: &WarrenPubkey) -> bool {
+        self.inner.crl_revocations.read().contains(id)
+    }
+
     /// Snapshot the current state into a new [`AllowlistSnapshot`].
     /// Used by the refresh loop after `apply_delta` so the on-disk
     /// cache can be re-written without having to re-fetch a full
@@ -907,6 +920,42 @@ mod tests {
             .try_recv()
             .expect("CRL must broadcast on revocation channel");
         assert!(evicted.contains(&pk(2)));
+    }
+
+    #[test]
+    fn is_crl_revoked_distinguishes_ban_from_mere_absence() {
+        // The rejection site needs the single bit that tells a ban (on the
+        // CRL) from a lapsed/absent subscription: both are refused by
+        // is_allowed_at, but only one is a ban. A revoked-but-allowlisted key
+        // reports revoked; an expired/absent key does not (nothing to renew
+        // conflated with a suspension).
+        let (handle, _rx) = AllowlistHandle::new();
+        handle.apply_snapshot(snapshot(1, &[1, 2], 100));
+
+        let mut crl: HashSet<WarrenPubkey> = HashSet::new();
+        crl.insert(pk(1));
+        handle.apply_crl_revocations(crl);
+
+        assert!(handle.is_crl_revoked(&pk(1)), "banned key reports revoked");
+        assert!(
+            !handle.is_allowed(&pk(1)),
+            "banned key is refused at the gate"
+        );
+        assert!(
+            !handle.is_crl_revoked(&pk(2)),
+            "an allowlisted, non-CRL key is not a ban"
+        );
+        assert!(
+            !handle.is_crl_revoked(&pk(99)),
+            "an absent key is not a ban (renew, not suspension)"
+        );
+
+        // Lifting the CRL clears the ban bit.
+        handle.apply_crl_revocations(HashSet::new());
+        assert!(
+            !handle.is_crl_revoked(&pk(1)),
+            "an un-revoked key is no longer a ban"
+        );
     }
 
     #[test]
