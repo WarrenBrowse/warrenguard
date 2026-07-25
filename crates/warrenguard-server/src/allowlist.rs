@@ -138,12 +138,14 @@ struct Inner {
     /// Unbounded on purpose: see the module doc's "Revocation diff"
     /// entry for why a bounded channel would silently fail open.
     revocation_tx: mpsc::UnboundedSender<HashSet<WarrenPubkey>>,
-    /// Pubkeys explicitly revoked by an admin-signed CRL.
-    /// Checked BEFORE the entries lookup in `is_allowed*` so a CRL
-    /// entry blocks even when the allowlist still admits the pubkey
-    /// (e.g. fail-open last-known where the backend has not yet
-    /// pushed the corresponding allowlist removal).
-    crl_revocations: RwLock<HashSet<WarrenPubkey>>,
+    /// Pubkeys explicitly revoked by an admin-signed CRL, each mapped to
+    /// an opaque, product-defined reason code (`0` = unspecified). Checked
+    /// BEFORE the entries lookup in `is_allowed*` so a CRL entry blocks even
+    /// when the allowlist still admits the pubkey (e.g. fail-open last-known
+    /// where the backend has not yet pushed the corresponding allowlist
+    /// removal). Membership decides the ban; the code only refines the
+    /// client-facing suspension message (the engine never interprets it).
+    crl_revocations: RwLock<HashMap<WarrenPubkey, u8>>,
 }
 
 impl AllowlistHandle {
@@ -170,7 +172,7 @@ impl AllowlistHandle {
                 last_generation: AtomicU64::new(0),
                 last_success_unix_secs: AtomicU64::new(0),
                 revocation_tx: tx,
-                crl_revocations: RwLock::new(HashSet::new()),
+                crl_revocations: RwLock::new(HashMap::new()),
             }),
         };
         (handle, rx)
@@ -209,11 +211,30 @@ impl AllowlistHandle {
     /// Returns the count of newly-revoked pubkeys that were also in
     /// the allowlist (= live sessions that the listener should now
     /// tear down).
+    // Not `#[must_use]`: this is a side-effecting mutation (it replaces the
+    // CRL); the count is advisory and several callers legitimately invoke it
+    // only for the effect. The thin delegation trips clippy's purity heuristic
+    // (the interior-mutability write lives in the callee), a false positive here.
+    #[allow(clippy::must_use_candidate)]
     pub fn apply_crl_revocations(&self, revocations: HashSet<WarrenPubkey>) -> usize {
+        // Membership-only convenience for a generic deployer: every pubkey is
+        // banned with the reserved "unspecified" reason code (`0`). A
+        // reason-aware control-plane calls [`Self::apply_crl_revocations_coded`]
+        // instead.
+        self.apply_crl_revocations_coded(revocations.into_iter().map(|pk| (pk, 0)).collect())
+    }
+
+    /// Replace the CRL revocations, each carrying an opaque, product-defined
+    /// reason code. Otherwise identical to [`Self::apply_crl_revocations`]:
+    /// membership decides the ban, the code only refines the client-facing
+    /// suspension message (the engine never interprets it, `0` = unspecified).
+    /// Returns the count of newly-revoked pubkeys that were also in the
+    /// allowlist (= live sessions the listener should now tear down).
+    pub fn apply_crl_revocations_coded(&self, revocations: HashMap<WarrenPubkey, u8>) -> usize {
         let to_tear_down: HashSet<WarrenPubkey> = {
             let entries = self.inner.entries.read();
             revocations
-                .iter()
+                .keys()
                 .filter(|pk| entries.contains_key(pk))
                 .copied()
                 .collect()
@@ -243,7 +264,7 @@ impl AllowlistHandle {
     /// production callers should prefer `is_allowed_at`.
     #[must_use]
     pub fn is_allowed(&self, id: &WarrenPubkey) -> bool {
-        if self.inner.crl_revocations.read().contains(id) {
+        if self.inner.crl_revocations.read().contains_key(id) {
             return false;
         }
         self.inner.entries.read().contains_key(id)
@@ -264,7 +285,7 @@ impl AllowlistHandle {
     /// expiries.
     #[must_use]
     pub fn is_allowed_at(&self, id: &WarrenPubkey, now_unix_secs: u64) -> bool {
-        if self.inner.crl_revocations.read().contains(id) {
+        if self.inner.crl_revocations.read().contains_key(id) {
             return false;
         }
         self.inner
@@ -279,12 +300,24 @@ impl AllowlistHandle {
     /// that distinguishes a ban from a lapsed subscription: `is_allowed_at`
     /// refuses BOTH (the CRL is checked first), so a rejection site consults
     /// this to tell the client the right cause (suspension vs renew) via the
-    /// sealed control message. Carries no reason detail: the CRL is
-    /// membership-only here (the human-readable reason never leaves the
-    /// control-plane API), preserving no-log.
+    /// sealed control message. The reason detail here is only an opaque
+    /// product-defined code (see [`Self::crl_reason_code`]), never the
+    /// human-readable reason (which never leaves the control-plane API),
+    /// preserving no-log.
     #[must_use]
     pub fn is_crl_revoked(&self, id: &WarrenPubkey) -> bool {
-        self.inner.crl_revocations.read().contains(id)
+        self.inner.crl_revocations.read().contains_key(id)
+    }
+
+    /// The opaque, product-defined reason code the CRL carries for `id`, or
+    /// `None` when `id` is not revoked. `Some(0)` is the reserved
+    /// "unspecified" ban. The engine does not interpret the value: the
+    /// rejection site seals it into
+    /// [`warrenguard_multihop::WarrenControlMessage::RejectedBanned`] and the
+    /// client maps it to a localized suspension message.
+    #[must_use]
+    pub fn crl_reason_code(&self, id: &WarrenPubkey) -> Option<u8> {
+        self.inner.crl_revocations.read().get(id).copied()
     }
 
     /// Snapshot the current state into a new [`AllowlistSnapshot`].
@@ -956,6 +989,45 @@ mod tests {
             !handle.is_crl_revoked(&pk(1)),
             "an un-revoked key is no longer a ban"
         );
+    }
+
+    #[test]
+    fn crl_reason_code_carries_the_coded_reason_and_defaults_to_unspecified() {
+        let (handle, _rx) = AllowlistHandle::new();
+        // The reason-aware apply carries a distinct code per pubkey.
+        let mut coded: HashMap<WarrenPubkey, u8> = HashMap::new();
+        coded.insert(pk(1), 7);
+        coded.insert(pk(2), 0);
+        handle.apply_crl_revocations_coded(coded);
+        assert_eq!(
+            handle.crl_reason_code(&pk(1)),
+            Some(7),
+            "the product reason code must be retrievable for a banned key"
+        );
+        assert_eq!(
+            handle.crl_reason_code(&pk(2)),
+            Some(0),
+            "an explicit unspecified code reads back as 0"
+        );
+        assert_eq!(
+            handle.crl_reason_code(&pk(99)),
+            None,
+            "a key that is not revoked has no reason code"
+        );
+        assert!(
+            handle.is_crl_revoked(&pk(1)),
+            "a coded revocation still bans"
+        );
+
+        // The membership-only convenience API defaults every entry to 0.
+        handle.apply_crl_revocations(HashSet::from([pk(3)]));
+        assert_eq!(
+            handle.crl_reason_code(&pk(3)),
+            Some(0),
+            "the set-based convenience API bans with the unspecified code"
+        );
+        // The wholesale swap dropped the earlier coded entries.
+        assert_eq!(handle.crl_reason_code(&pk(1)), None);
     }
 
     #[test]

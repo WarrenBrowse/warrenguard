@@ -238,7 +238,10 @@ enum Admission {
     /// Authorized: proceed with allocation.
     Admitted,
     /// Refused: the asserted pubkey is on the exit's signed CRL (banned).
-    Banned,
+    /// Carries the opaque, product-defined reason code the CRL recorded for
+    /// this pubkey (`0` = unspecified), sealed to the client so it can
+    /// specialize the suspension message. The engine never interprets it.
+    Banned(u8),
     /// Refused for any other reason: not allowlisted, subscription expired,
     /// or a missing/invalid proof of possession.
     NotAuthorized,
@@ -297,10 +300,12 @@ fn classify_admission(
     }
     // Refused: distinguish an explicit ban (on the CRL) from a lapsed/absent
     // subscription so the client shows a suspension rather than a renew prompt.
-    if allowlist.is_crl_revoked(&wpk) {
-        Admission::Banned
-    } else {
-        Admission::NotAuthorized
+    // A banned pubkey carries its opaque reason code through to the sealed
+    // reply so the client can specialize the message (`0` when the CRL
+    // recorded no specific reason).
+    match allowlist.crl_reason_code(&wpk) {
+        Some(reason_code) => Admission::Banned(reason_code),
+        None => Admission::NotAuthorized,
     }
 }
 
@@ -852,17 +857,22 @@ async fn process_setup_frame(
                 verdict => {
                     // Same opaque close for both (anti-oracle); only the
                     // client-sealed detail distinguishes a ban (suspension)
-                    // from a lapsed/absent subscription (renew).
-                    let detail = if verdict == Admission::Banned {
-                        tracing::warn!(
-                            "multihop: setup rejected - account banned (CRL); sealed detail + opaque close"
-                        );
-                        WarrenControlMessage::RejectedBanned
-                    } else {
-                        tracing::warn!(
-                            "multihop: setup rejected - client not authorized; sealed detail + opaque close"
-                        );
-                        WarrenControlMessage::Rejected
+                    // from a lapsed/absent subscription (renew). A ban carries
+                    // its opaque reason code so the client specializes the
+                    // suspension message.
+                    let detail = match verdict {
+                        Admission::Banned(reason_code) => {
+                            tracing::warn!(
+                                "multihop: setup rejected - account banned (CRL); sealed detail + opaque close"
+                            );
+                            WarrenControlMessage::RejectedBanned { reason_code }
+                        }
+                        _ => {
+                            tracing::warn!(
+                                "multihop: setup rejected - client not authorized; sealed detail + opaque close"
+                            );
+                            WarrenControlMessage::Rejected
+                        }
                     };
                     reply_sealed_detail_then_close(
                         &mut send,
@@ -5709,7 +5719,7 @@ mod tests {
 
     #[test]
     fn classify_admission_distinguishes_ban_from_not_authorized() {
-        use std::collections::HashSet;
+        use std::collections::HashMap;
         // The rejection site needs the ban-vs-renew distinction so the client
         // shows the right message. A revoked (CRL) pubkey with a valid PoP
         // classifies Banned; an allowlisted one Admitted; an absent one (valid
@@ -5727,12 +5737,16 @@ mod tests {
             "an allowlisted, non-revoked pubkey is admitted"
         );
 
-        // Revoke it on the CRL: same request now classifies as a ban.
-        handle.apply_crl_revocations(HashSet::from([WarrenPubkey::from_bytes(account_pubkey)]));
+        // Revoke it on the CRL with a specific product reason code: the same
+        // request now classifies as a ban carrying that code, so the client
+        // can specialize the suspension message.
+        let mut coded: HashMap<WarrenPubkey, u8> = HashMap::new();
+        coded.insert(WarrenPubkey::from_bytes(account_pubkey), 1);
+        handle.apply_crl_revocations_coded(coded);
         assert_eq!(
             classify_admission(Some(&handle), Some(&req), &exit_id, &GATE_ENCAP),
-            Admission::Banned,
-            "a CRL-revoked pubkey classifies as Banned (suspension), not a generic refusal"
+            Admission::Banned(1),
+            "a CRL-revoked pubkey classifies as Banned with its reason code, not a generic refusal"
         );
 
         // An unlisted pubkey (valid PoP, never on the CRL) is NotAuthorized:

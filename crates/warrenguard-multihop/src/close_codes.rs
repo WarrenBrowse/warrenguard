@@ -73,8 +73,12 @@ pub enum RejectionReason {
     /// signed CRL. Learned from the HPKE-sealed `RejectedBanned` detail.
     /// Distinct from [`Self::NotAllowlisted`] (renew) so the client can
     /// show a suspension message; fatal like it (no other exit helps, the
-    /// CRL is fleet-wide).
-    Banned,
+    /// CRL is fleet-wide). Carries the opaque, product-defined ban-reason
+    /// code the exit sealed (see
+    /// [`crate::WarrenControlMessage::RejectedBanned`]): the engine does not
+    /// interpret it, the client maps it to a specific localized message and
+    /// treats `0` (and any unrecognized code) as a generic suspension.
+    Banned(u8),
     /// Exit IP pool exhausted. Learned from the HPKE-sealed
     /// `IpExhausted` detail.
     IpExhausted,
@@ -113,7 +117,9 @@ impl RejectionReason {
     pub fn from_sealed_detail(msg: &crate::WarrenControlMessage) -> Option<Self> {
         match msg {
             crate::WarrenControlMessage::Rejected => Some(Self::NotAllowlisted),
-            crate::WarrenControlMessage::RejectedBanned => Some(Self::Banned),
+            crate::WarrenControlMessage::RejectedBanned { reason_code } => {
+                Some(Self::Banned(*reason_code))
+            }
             crate::WarrenControlMessage::IpExhausted => Some(Self::IpExhausted),
             crate::WarrenControlMessage::IpRequest { .. }
             | crate::WarrenControlMessage::IpRequestV7 { .. }
@@ -131,7 +137,7 @@ impl RejectionReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::NotAllowlisted => "not-allowlisted",
-            Self::Banned => "banned",
+            Self::Banned(_) => "banned",
             Self::IpExhausted => "ip-pool-exhausted",
             Self::PolicyRefused => "policy-refused",
         }
@@ -150,7 +156,11 @@ impl RejectionReason {
         use warrenguard_wire::{FatalCause, Retryability};
         match self {
             Self::NotAllowlisted => Retryability::Fatal(FatalCause::NotAuthorized),
-            Self::Banned => Retryability::Fatal(FatalCause::Banned),
+            // The reason code carries no retry semantics: every ban is fatal
+            // and fleet-wide. It only refines the user-facing message
+            // (surfaced separately by the client), so FatalCause stays a plain
+            // marker and does not carry the code.
+            Self::Banned(_) => Retryability::Fatal(FatalCause::Banned),
             Self::PolicyRefused => Retryability::Fatal(FatalCause::PolicyRefused),
             Self::IpExhausted => Retryability::RetryReselect,
         }
@@ -175,7 +185,7 @@ mod tests {
         // reintroduced per-cause codes on the relay-facing branch.
         for reason in [
             RejectionReason::NotAllowlisted,
-            RejectionReason::Banned,
+            RejectionReason::Banned(0),
             RejectionReason::IpExhausted,
             RejectionReason::PolicyRefused,
         ] {
@@ -258,9 +268,16 @@ mod tests {
         // to the distinct Banned cause so the app shows a suspension message
         // instead of a renew prompt.
         assert_eq!(
-            RejectionReason::Banned.retryability(),
+            RejectionReason::Banned(0).retryability(),
             Retryability::Fatal(FatalCause::Banned),
             "a CRL ban must be fatal and carry the distinct Banned cause"
+        );
+        // The verdict is independent of the (message-only) reason code: a
+        // specialized ban is exactly as fatal as an unspecified one.
+        assert_eq!(
+            RejectionReason::Banned(1).retryability(),
+            Retryability::Fatal(FatalCause::Banned),
+            "the reason code must not change the fatal verdict"
         );
         // Exhaustion is a capacity issue on THIS exit, not the account: reselect.
         assert_eq!(
@@ -277,9 +294,18 @@ mod tests {
             Some(RejectionReason::NotAllowlisted)
         );
         assert_eq!(
-            RejectionReason::from_sealed_detail(&WarrenControlMessage::RejectedBanned),
-            Some(RejectionReason::Banned),
+            RejectionReason::from_sealed_detail(&WarrenControlMessage::RejectedBanned {
+                reason_code: 0
+            }),
+            Some(RejectionReason::Banned(0)),
             "the sealed RejectedBanned detail refines the opaque close into a ban"
+        );
+        assert_eq!(
+            RejectionReason::from_sealed_detail(&WarrenControlMessage::RejectedBanned {
+                reason_code: 7
+            }),
+            Some(RejectionReason::Banned(7)),
+            "the sealed ban-reason code must reach the client-side RejectionReason intact"
         );
         assert_eq!(
             RejectionReason::from_sealed_detail(&WarrenControlMessage::IpExhausted),

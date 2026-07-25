@@ -13,7 +13,7 @@
 //! declaration in `lib.rs`.)
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 use ed25519_dalek::{Signer, SigningKey};
 use quinn::{Connection, Endpoint};
@@ -386,6 +386,10 @@ pub(crate) struct FakeMultihopExit {
     /// detail (takes precedence over `reject`), so a test can drive the
     /// client's ban-vs-not-authorized decode path.
     pub(crate) reject_banned: Arc<AtomicBool>,
+    /// Product reason code sealed into the `RejectedBanned` reply when
+    /// `reject_banned` is set, so a test can assert the code reaches the
+    /// client's `RejectionReason::Banned` intact.
+    pub(crate) ban_reason_code: Arc<AtomicU8>,
     _server_ep: Endpoint,
 }
 
@@ -399,6 +403,7 @@ async fn serve_one_fake_exit_connection(
     exit_id: ExitId,
     reject: Arc<AtomicBool>,
     reject_banned: Arc<AtomicBool>,
+    ban_reason_code: Arc<AtomicU8>,
 ) {
     let Ok((mut send, mut recv)) = conn.accept_bi().await else {
         return;
@@ -421,7 +426,9 @@ async fn serve_one_fake_exit_connection(
         return;
     }
     let reply_msg = if reject_banned.load(Ordering::Relaxed) {
-        WarrenControlMessage::RejectedBanned
+        WarrenControlMessage::RejectedBanned {
+            reason_code: ban_reason_code.load(Ordering::Relaxed),
+        }
     } else if reject.load(Ordering::Relaxed) {
         WarrenControlMessage::Rejected
     } else {
@@ -500,11 +507,13 @@ pub(crate) fn spawn_fake_multihop_exit(
     let accepted = Arc::new(AtomicUsize::new(0));
     let reject = Arc::new(AtomicBool::new(false));
     let reject_banned = Arc::new(AtomicBool::new(false));
+    let ban_reason_code = Arc::new(AtomicU8::new(0));
 
     let accept_loop_ep = server_ep.clone();
     let accept_loop_accepted = accepted.clone();
     let accept_loop_reject = reject.clone();
     let accept_loop_reject_banned = reject_banned.clone();
+    let accept_loop_ban_reason_code = ban_reason_code.clone();
     tokio::spawn(async move {
         loop {
             let Some(incoming) = accept_loop_ep.accept().await else {
@@ -519,6 +528,7 @@ pub(crate) fn spawn_fake_multihop_exit(
                 exit_id,
                 accept_loop_reject.clone(),
                 accept_loop_reject_banned.clone(),
+                accept_loop_ban_reason_code.clone(),
             )
             .await;
         }
@@ -531,6 +541,7 @@ pub(crate) fn spawn_fake_multihop_exit(
         accepted,
         reject,
         reject_banned,
+        ban_reason_code,
         _server_ep: server_ep,
     }
 }

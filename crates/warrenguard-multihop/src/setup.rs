@@ -85,9 +85,12 @@ pub enum SetupError {
     Rejected,
     /// The exit refused the setup because the account is explicitly REVOKED
     /// (banned): its pubkey is on the exit's signed CRL. Distinct from
-    /// [`Self::Rejected`] (renew) so the client surfaces a suspension.
+    /// [`Self::Rejected`] (renew) so the client surfaces a suspension. Carries
+    /// the opaque, product-defined ban-reason code from the sealed
+    /// [`WarrenControlMessage::RejectedBanned`] (the engine does not interpret
+    /// it; the client maps it to a specific message, `0` = unspecified).
     #[error("multihop setup rejected: account suspended")]
-    Banned,
+    Banned(u8),
     /// The exit's address pool is exhausted.
     #[error("multihop exit ip pool exhausted")]
     IpExhausted,
@@ -122,7 +125,7 @@ impl SetupError {
         use warrenguard_wire::{FatalCause, Retryability};
         match self {
             SetupError::Rejected => Retryability::Fatal(FatalCause::NotAuthorized),
-            SetupError::Banned => Retryability::Fatal(FatalCause::Banned),
+            SetupError::Banned(_) => Retryability::Fatal(FatalCause::Banned),
             SetupError::IpExhausted => Retryability::RetryReselect,
             SetupError::Session(_) | SetupError::Control(_) | SetupError::UnexpectedReply => {
                 Retryability::RetrySameTarget
@@ -167,7 +170,9 @@ pub fn ip_assignment_from_setup_plaintext(plaintext: &[u8]) -> Result<IpAssignme
             daita_spec,
         }),
         Some(WarrenControlMessage::Rejected) => Err(SetupError::Rejected),
-        Some(WarrenControlMessage::RejectedBanned) => Err(SetupError::Banned),
+        Some(WarrenControlMessage::RejectedBanned { reason_code }) => {
+            Err(SetupError::Banned(reason_code))
+        }
         Some(WarrenControlMessage::IpExhausted) => Err(SetupError::IpExhausted),
         // An IpRequest (client->exit direction), a mid-session ExitDraining
         // advisory (data-plane only, never a setup reply), or a non-control

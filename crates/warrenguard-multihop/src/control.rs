@@ -291,11 +291,23 @@ pub enum WarrenControlMessage {
     /// existing `/v3` layout and its golden vectors stay byte-for-byte
     /// untouched: a client that predates this variant fails to decode it and
     /// safely falls back to the opaque-close `PolicyRefused` verdict (still
-    /// fatal), while an updated client maps it to a suspension state. It
-    /// carries no reason detail: the exit's CRL is membership-only (the
-    /// human-readable reason never leaves the control-plane API), so the
-    /// localized message is derived client-side from the ban state alone.
-    RejectedBanned,
+    /// fatal), while an updated client maps it to a suspension state.
+    RejectedBanned {
+        /// Opaque, product-defined ban-reason code. The engine never
+        /// interprets it (same contract as [`Self::ExitDraining::reason_code`]):
+        /// the deployer's control-plane assigns the meaning and the client
+        /// maps the code to a localized message. `0` is the reserved
+        /// "unspecified" default, so an exit with no reason data, or a client
+        /// that does not recognize a newer code, degrades to a generic
+        /// suspension message rather than failing. A plain `u8` (not a Rust
+        /// enum) keeps the wire forward-compatible: a code the client has never
+        /// seen still decodes cleanly and falls back to the generic message,
+        /// instead of failing the whole control-message decode. It carries a
+        /// coarse category only, never free text: the human-readable reason
+        /// never leaves the control-plane API (no-log), and the sealed code is
+        /// invisible to the hostile relay (anti-oracle).
+        reason_code: u8,
+    },
 }
 
 /// Encode a control message into the wire layout (marker + version +
@@ -526,7 +538,10 @@ mod tests {
         for msg in [
             WarrenControlMessage::IpExhausted,
             WarrenControlMessage::Rejected,
-            WarrenControlMessage::RejectedBanned,
+            WarrenControlMessage::RejectedBanned { reason_code: 0 },
+            // A distinct, non-zero reason code must survive the round-trip:
+            // the exit's product-defined category reaches the client intact.
+            WarrenControlMessage::RejectedBanned { reason_code: 1 },
         ] {
             let decoded = try_decode_control(&encode_control(&msg).unwrap())
                 .unwrap()
@@ -649,15 +664,25 @@ mod tests {
 
     #[test]
     fn rejected_banned_wire_layout_is_frozen() {
-        // Appended variant: discriminant 6, no payload. Freezing the bytes
-        // proves the ban rejection did not disturb any earlier variant's
-        // layout. A drift here means the wire moved - bump CONTROL_VERSION
-        // and freeze a new vector.
-        let encoded = encode_control(&WarrenControlMessage::RejectedBanned).unwrap();
+        // Appended variant: discriminant 6, then a single u8 reason code.
+        // Freezing the bytes proves the ban rejection did not disturb any
+        // earlier variant's layout and that the reason code trails the
+        // discriminant. A drift here means the wire moved - bump
+        // CONTROL_VERSION and freeze a new vector.
+        let unspecified =
+            encode_control(&WarrenControlMessage::RejectedBanned { reason_code: 0 }).unwrap();
         assert_eq!(
-            encoded,
-            vec![0xC0, 0x03, 0x06],
-            "RejectedBanned wire layout drifted - bump the version byte + freeze a new vector"
+            unspecified,
+            vec![0xC0, 0x03, 0x06, 0x00],
+            "RejectedBanned(0) wire layout drifted - bump the version byte + freeze a new vector"
+        );
+        // A non-zero product code trails the discriminant as one raw byte.
+        let coded =
+            encode_control(&WarrenControlMessage::RejectedBanned { reason_code: 1 }).unwrap();
+        assert_eq!(
+            coded,
+            vec![0xC0, 0x03, 0x06, 0x01],
+            "RejectedBanned reason code must be the 4th byte"
         );
         // The pre-existing Rejected MUST still encode at discriminant 3
         // (proves appending the ban variant did not renumber the others).

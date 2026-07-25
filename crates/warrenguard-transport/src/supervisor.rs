@@ -1644,7 +1644,7 @@ fn control_message_variant_name(msg: &WarrenControlMessage) -> &'static str {
         WarrenControlMessage::IpAssign { .. } => "IpAssign",
         WarrenControlMessage::IpExhausted => "IpExhausted",
         WarrenControlMessage::Rejected => "Rejected",
-        WarrenControlMessage::RejectedBanned => "RejectedBanned",
+        WarrenControlMessage::RejectedBanned { .. } => "RejectedBanned",
         WarrenControlMessage::ExitDraining { .. } => "ExitDraining",
     }
 }
@@ -2610,12 +2610,16 @@ mod run_tests {
     async fn run_surfaces_a_banned_rejection_distinctly_and_fatally() {
         // A sealed RejectedBanned detail must surface as the distinct Banned
         // reason (not the generic NotAllowlisted), so the app can show a
-        // suspension message; it is fatal like any rejection.
+        // suspension message; it is fatal like any rejection. The sealed
+        // product reason code must reach the client-side reason intact so the
+        // message can be specialized (here a non-zero code end-to-end).
         let operational_key = SigningKey::from_bytes(&[0x47; 32]);
         let exit_id = ExitId::from_bytes([0x56; 16]);
         let exit = spawn_fake_multihop_exit(&operational_key, exit_id);
         exit.reject_banned
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        exit.ban_reason_code
+            .store(1, std::sync::atomic::Ordering::Relaxed);
         let config = config_with_fake_exit(&exit, &operational_key);
         let (supervisor, _rx) = MultiHopSupervisor::new(config);
         let mut fatal_rx = supervisor.fatal_rx();
@@ -2628,8 +2632,9 @@ mod run_tests {
             Err(MultiHopError::Rejected(reason)) => {
                 assert_eq!(
                     reason,
-                    RejectionReason::Banned,
-                    "a sealed RejectedBanned must decode to the distinct Banned reason"
+                    RejectionReason::Banned(1),
+                    "a sealed RejectedBanned must decode to the distinct Banned reason carrying \
+                     the exit's product reason code"
                 );
                 assert_eq!(
                     reason.retryability(),
@@ -2643,8 +2648,8 @@ mod run_tests {
         let published = *fatal_rx.borrow_and_update();
         assert_eq!(
             published,
-            Some(RejectionReason::Banned),
-            "fatal_rx must observe the ban reason run() returned"
+            Some(RejectionReason::Banned(1)),
+            "fatal_rx must observe the ban reason (and code) run() returned"
         );
     }
 
