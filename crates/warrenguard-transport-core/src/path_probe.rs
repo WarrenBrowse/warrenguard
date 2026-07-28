@@ -1,8 +1,17 @@
 //! Per-connection QUIC path probe: rate-limited (5 s) transport
 //! counters for diagnosing throughput limits on real WAN paths.
 //!
-//! One INFO line per connection per interval, only while traffic
-//! flows. Surfaces the signals that discriminate between the possible
+//! A healthy path logs a heartbeat every
+//! [`PATH_PROBE_HEARTBEAT_TICKS`] intervals; an interval that carries
+//! a pathology (loss, congestion, a send-queue drop, ECN CE) logs
+//! immediately. The old every-tick INFO line was 8 lines every 5 s on
+//! a multihop session, about 1.4 MB per hour, and it crowded out
+//! everything else: a real beta problem report was 98.9% path-probe
+//! bytes and covered only 7 minutes of history. Set
+//! `WARREN_PATH_PROBE_EVERY=1` to restore the every-tick stream for a
+//! throughput bench.
+//!
+//! Surfaces the signals that discriminate between the possible
 //! datagram-path bottlenecks:
 //!
 //! - `cwnd`, `rtt_ms`, `lost`, `congestion`: is the OUTER congestion
@@ -28,9 +37,37 @@ use quinn::{Connection, ConnectionStats};
 
 use crate::client_metrics::ClientMetrics;
 
-/// Interval between probe log lines. 5 s is frequent enough to catch
-/// ramp-up behavior, cheap enough to stay on in production.
+/// Interval between probe samples. 5 s is frequent enough to catch
+/// ramp-up behavior; what used to be expensive was logging every one
+/// of them, not taking them.
 pub const PATH_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Samples between two heartbeat lines for a path with nothing to
+/// report. 60 x 5 s is one line per connection per 5 minutes, which
+/// keeps a problem report readable for days instead of minutes while
+/// still proving the path was alive and what its steady state was.
+pub const PATH_PROBE_HEARTBEAT_TICKS: u32 = 60;
+
+/// Env override for [`PATH_PROBE_HEARTBEAT_TICKS`]. `1` logs every
+/// sample, which is what a throughput bench wants and what production
+/// no longer pays for by default.
+pub const PATH_PROBE_EVERY_ENV: &str = "WARREN_PATH_PROBE_EVERY";
+
+/// Resolves the heartbeat cadence, clamped to at least one sample so a
+/// hostile or fat-fingered value can never divide by zero or silence
+/// the probe entirely.
+#[must_use]
+pub fn heartbeat_ticks() -> u32 {
+    heartbeat_ticks_from(std::env::var(PATH_PROBE_EVERY_ENV).ok().as_deref())
+}
+
+/// The parsing half, split out because mutating the process environment
+/// in a test needs `unsafe` under edition 2024 and this crate forbids it.
+#[must_use]
+fn heartbeat_ticks_from(raw: Option<&str>) -> u32 {
+    raw.and_then(|v| v.trim().parse::<u32>().ok())
+        .map_or(PATH_PROBE_HEARTBEAT_TICKS, |v| v.max(1))
+}
 
 /// Counter deltas between two consecutive [`ConnectionStats`]
 /// snapshots. All fields saturate at 0 so a stats reset (path
@@ -114,6 +151,21 @@ impl PathProbeDelta {
         self.sent_packets == 0 && self.dg_frames_tx == 0 && self.dg_frames_rx == 0
     }
 
+    /// Whether this interval is worth a line on its own, without
+    /// waiting for the next heartbeat.
+    ///
+    /// Exactly the counters the probe exists to catch: anything else is
+    /// a healthy path restating itself, which is what made these lines
+    /// crowd every other event out of a problem report.
+    #[must_use]
+    pub fn is_noteworthy(&self) -> bool {
+        self.lost_packets > 0
+            || self.congestion_events > 0
+            || self.dg_dropped_aqm > 0
+            || self.dg_dropped_overflow > 0
+            || self.ecn_ce > 0
+    }
+
     /// Average UDP datagrams per I/O operation (GSO/sendmmsg batching
     /// efficiency). 1.0 = no batching. 0.0 when no I/O happened.
     #[must_use]
@@ -152,6 +204,8 @@ pub fn spawn_path_probe(
     tokio::spawn(async move {
         let mut prev: Vec<ConnectionStats> = conns.iter().map(quinn::Connection::stats).collect();
         let mut prev_app = app.as_ref().map(|m| m.snapshot());
+        let every = heartbeat_ticks();
+        let mut tick: u32 = 0;
         let mut interval = tokio::time::interval(PATH_PROBE_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // The first tick of `tokio::time::interval` fires immediately;
@@ -159,6 +213,11 @@ pub fn spawn_path_probe(
         interval.tick().await;
         loop {
             interval.tick().await;
+            // Counted per sample, not per connection, so the healthy
+            // lines of a multihop session land together and stay
+            // comparable side by side.
+            let heartbeat = tick % every == 0;
+            tick = tick.wrapping_add(1);
             // App-level deltas are session-wide (the exit counts per
             // client, not per conn): compute once per tick.
             let app_deltas = match (&app, &mut prev_app) {
@@ -183,6 +242,10 @@ pub fn spawn_path_probe(
                 let delta = PathProbeDelta::between(&prev[idx], &cur);
                 prev[idx] = cur;
                 if delta.is_idle() {
+                    continue;
+                }
+                // A healthy path between heartbeats has nothing to add.
+                if !heartbeat && !delta.is_noteworthy() {
                     continue;
                 }
                 let rtt_ms = cur.path.rtt.as_secs_f64() * 1000.0;
@@ -333,6 +396,112 @@ mod tests {
         assert_eq!(d.udp_tx_ios, 0);
         assert_eq!(d.dg_dropped_aqm, 0);
         assert_eq!(d.dg_dropped_overflow, 0);
+    }
+
+    #[test]
+    fn only_a_pathology_earns_a_line_of_its_own() {
+        // A busy but healthy path is what used to flood the logs: 456 of the
+        // 480 lines in a real problem report, 98.9% of its bytes, leaving a
+        // 7 minute window to debug from.
+        let healthy = PathProbeDelta {
+            sent_packets: 41,
+            dg_frames_tx: 28,
+            dg_frames_rx: 26,
+            udp_tx_datagrams: 28,
+            udp_tx_ios: 28,
+            ecn_not_ect: 28,
+            ..Default::default()
+        };
+        assert!(
+            !healthy.is_noteworthy(),
+            "healthy traffic waits for the heartbeat"
+        );
+        assert!(!healthy.is_idle(), "and it is still traffic");
+
+        for (name, delta) in [
+            (
+                "loss",
+                PathProbeDelta {
+                    lost_packets: 1,
+                    ..healthy
+                },
+            ),
+            (
+                "congestion",
+                PathProbeDelta {
+                    congestion_events: 1,
+                    ..healthy
+                },
+            ),
+            (
+                "aqm drop",
+                PathProbeDelta {
+                    dg_dropped_aqm: 1,
+                    ..healthy
+                },
+            ),
+            (
+                "overflow drop",
+                PathProbeDelta {
+                    dg_dropped_overflow: 1,
+                    ..healthy
+                },
+            ),
+            (
+                "ecn ce",
+                PathProbeDelta {
+                    ecn_ce: 1,
+                    ..healthy
+                },
+            ),
+        ] {
+            assert!(
+                delta.is_noteworthy(),
+                "{name} is exactly what this probe exists to catch"
+            );
+        }
+    }
+
+    #[test]
+    fn an_idle_interval_is_never_noteworthy() {
+        // Nothing happened: no pathology can be inferred, and the loop skips
+        // it before the heartbeat is even considered.
+        let idle = PathProbeDelta::default();
+        assert!(idle.is_idle());
+        assert!(!idle.is_noteworthy());
+    }
+
+    #[test]
+    fn the_heartbeat_cadence_is_overridable_but_never_zero() {
+        // Default keeps production quiet; a bench sets 1 to get every sample
+        // back. A zero or garbage value must neither divide by zero in the
+        // loop nor silence the probe.
+        assert_eq!(heartbeat_ticks_from(None), PATH_PROBE_HEARTBEAT_TICKS);
+        assert_eq!(
+            heartbeat_ticks_from(Some("1")),
+            1,
+            "a bench gets every sample"
+        );
+        assert_eq!(
+            heartbeat_ticks_from(Some(" 12 ")),
+            12,
+            "surrounding space is fine"
+        );
+        assert_eq!(
+            heartbeat_ticks_from(Some("0")),
+            1,
+            "zero would divide by zero"
+        );
+        assert_eq!(
+            heartbeat_ticks_from(Some("not a number")),
+            PATH_PROBE_HEARTBEAT_TICKS,
+            "garbage falls back to the default"
+        );
+        assert_eq!(
+            heartbeat_ticks_from(Some("")),
+            PATH_PROBE_HEARTBEAT_TICKS,
+            "an empty override is not an override"
+        );
     }
 
     #[test]
