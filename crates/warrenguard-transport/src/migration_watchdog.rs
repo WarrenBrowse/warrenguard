@@ -24,6 +24,13 @@
 //!    [`MigrationIo::escalate`] hands the failure to the consumer's
 //!    fail-closed reconnect machinery.
 //!
+//! A change that leaves no IPv4 default route parks the cycle instead of
+//! verifying: there is nothing to migrate onto yet. The park owns the
+//! window until the route comes back (it then runs the verification above,
+//! because the return event is consumed here and nothing else would wake
+//! the watchdog), until the source closes, or until the backstop of point 3
+//! expires.
+//!
 //! The decision loop is pure over [`MigrationIo`] so every branch is
 //! unit-testable with paused time; each consumer supplies its own
 //! platform bindings (route-event source, session watch, escape and
@@ -77,6 +84,10 @@ pub trait MigrationIo {
     /// Resolves on the next default-route change event. Returns
     /// `false` when the event source is gone (teardown): the watchdog
     /// loop exits.
+    ///
+    /// Must be cancel-safe: the burst coalescer and the park both drop a
+    /// pending call and issue a fresh one, and an implementation that
+    /// consumed an event on drop would lose the very change it watches for.
     fn next_route_event(&mut self) -> impl Future<Output = bool> + Send;
 
     /// `true` when a usable IPv4 default route is currently present
@@ -143,9 +154,9 @@ pub enum CycleOutcome {
     Reconnected,
     /// Nothing recovered within [`ESCALATE_TIMEOUT`]; escalated.
     Escalated,
-    /// No usable v4 default route: parked until the next event, with
-    /// the escalation backstop armed for online-but-broken networks.
-    Parked,
+    /// The route-event source closed (teardown): nothing will ever wake
+    /// the watchdog again, so [`run_watchdog`] stops on it.
+    SourceClosed,
 }
 
 /// `true` when `cur` proves the tunnel is receiving again relative to
@@ -183,38 +194,83 @@ async fn probe_until<I: MigrationIo>(io: &mut I, window: Duration) -> bool {
     }
 }
 
+/// How a park window ended.
+enum ParkExit {
+    /// A v4 default route is present again: the cycle owes the path a
+    /// verification, whichever wake observed the return.
+    RouteBack,
+    /// The escalation backstop expired with the network still v4-less.
+    StillV4Less,
+    /// The route-event source is gone (teardown).
+    SourceClosed,
+}
+
+/// Wait out a v4-less window: for the route to come back, for the event
+/// source to close, or for the escalation backstop to expire.
+async fn park_for_route_return<I: MigrationIo>(io: &mut I) -> ParkExit {
+    tracing::info!(
+        "Warren migration watchdog: no IPv4 default route; parked with the {ESCALATE_TIMEOUT:?} \
+         escalation backstop armed"
+    );
+    // Armed ONCE for the whole park: an event that leaves the network v4-less
+    // re-parks against the SAME deadline, so route churn cannot defer the
+    // escalation forever on a network that never fires an offline edge.
+    let backstop = tokio::time::sleep(ESCALATE_TIMEOUT);
+    tokio::pin!(backstop);
+    loop {
+        let alive = tokio::select! {
+            () = &mut backstop => break,
+            alive = io.next_route_event() => alive,
+        };
+        if !alive {
+            // A closed source resolves instantly and forever: without this the
+            // park would spin on it once the route manager is gone.
+            return ParkExit::SourceClosed;
+        }
+        if io.has_v4_default_route().await {
+            return ParkExit::RouteBack;
+        }
+    }
+    // The route can also come back with no event reaching us (a coalesced or
+    // dropped notification): verify on the backstop rather than park again.
+    if io.has_v4_default_route().await {
+        return ParkExit::RouteBack;
+    }
+    ParkExit::StillV4Less
+}
+
 /// One full verification cycle following a (coalesced) route event.
 pub async fn run_cycle<I: MigrationIo>(io: &mut I) -> CycleOutcome {
     if !io.has_v4_default_route().await {
         // Truly offline windows are owned by the consumer's state machine
-        // (offline grace then a fail-closed block). The backstop below
-        // only matters on networks that count as online without a v4
-        // route (IPv6-only): no offline edge ever fires there, so
-        // without it the consumer would sit "Connected" on a dead tunnel
-        // forever.
-        let woke_by_event = {
-            let parked = tokio::time::sleep(ESCALATE_TIMEOUT);
-            tokio::pin!(parked);
-            tokio::select! {
-                () = &mut parked => false,
-                _alive = io.next_route_event() => true,
+        // (offline grace then a fail-closed block). The backstop only
+        // matters on networks that count as online without a v4 route
+        // (IPv6-only): no offline edge ever fires there, so without it the
+        // consumer would sit "Connected" on a dead tunnel forever.
+        let parked_at = tokio::time::Instant::now();
+        match park_for_route_return(io).await {
+            ParkExit::SourceClosed => return CycleOutcome::SourceClosed,
+            ParkExit::StillV4Less => {
+                if probe_until(io, MIGRATION_TIMEOUT).await {
+                    return CycleOutcome::Migrated;
+                }
+                io.escalate(
+                    "no IPv4 default route and tunnel unresponsive after network change"
+                        .to_string(),
+                );
+                return CycleOutcome::Escalated;
             }
-        };
-        if woke_by_event {
-            // New event (or source closed): restart from the top; a
-            // closed source makes the caller's next recv exit the loop.
-            return CycleOutcome::Parked;
+            // The route the session used is gone and another one is up: this
+            // wake is the migration signal, so fall through to the same
+            // verification a route change gets. Ending the cycle here would
+            // leave the session on a dead 4-tuple with nothing left to wake
+            // the watchdog.
+            ParkExit::RouteBack => tracing::info!(
+                "Warren migration watchdog: IPv4 default route back after {} ms parked; verifying \
+                 the path",
+                parked_at.elapsed().as_millis()
+            ),
         }
-        if io.has_v4_default_route().await {
-            return CycleOutcome::Parked;
-        }
-        if probe_until(io, MIGRATION_TIMEOUT).await {
-            return CycleOutcome::Migrated;
-        }
-        io.escalate(
-            "no IPv4 default route and tunnel unresponsive after network change".to_string(),
-        );
-        return CycleOutcome::Escalated;
     }
 
     io.nudge_bypass().await;
@@ -324,7 +380,10 @@ pub async fn run_watchdog<I: MigrationIo>(io: &mut I) {
         if source_closed {
             return;
         }
-        if run_cycle(io).await == CycleOutcome::Escalated {
+        if matches!(
+            run_cycle(io).await,
+            CycleOutcome::Escalated | CycleOutcome::SourceClosed
+        ) {
             return;
         }
     }
@@ -334,11 +393,19 @@ pub async fn run_watchdog<I: MigrationIo>(io: &mut I) {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Scripted mock: every IO answer is pre-loaded; calls are recorded.
     struct MockIo {
         route_events: tokio::sync::mpsc::UnboundedReceiver<()>,
-        has_route: bool,
+        /// Shared so a test can flip the route back on (or off) mid-cycle,
+        /// which is what a real interface hand-off does.
+        has_route: Arc<AtomicBool>,
+        /// How many times a CLOSED event source was polled. A closed source
+        /// resolves instantly and forever, so anything but a single
+        /// observation is the watchdog spinning on a torn-down route manager.
+        closed_polls: u32,
         /// Successive samples returned by `rx_sample`, then the last
         /// one repeats forever.
         samples: VecDeque<Option<RxSample>>,
@@ -366,7 +433,8 @@ mod tests {
             (
                 Self {
                     route_events: rx,
-                    has_route,
+                    has_route: Arc::new(AtomicBool::new(has_route)),
+                    closed_polls: 0,
                     samples,
                     last_sample: last,
                     can_migrate: true,
@@ -381,14 +449,29 @@ mod tests {
                 tx,
             )
         }
+
+        /// Handle on the route-presence flag, for tests that restore the
+        /// default route while the cycle is parked on it.
+        fn route_flag(&self) -> Arc<AtomicBool> {
+            Arc::clone(&self.has_route)
+        }
     }
 
     impl MigrationIo for MockIo {
         async fn next_route_event(&mut self) -> bool {
-            self.route_events.recv().await.is_some()
+            let alive = self.route_events.recv().await.is_some();
+            if !alive {
+                self.closed_polls += 1;
+                assert!(
+                    self.closed_polls <= 8,
+                    "a closed route-event source was polled {} times: the watchdog is spinning",
+                    self.closed_polls
+                );
+            }
+            alive
         }
         async fn has_v4_default_route(&mut self) -> bool {
-            self.has_route
+            self.has_route.load(Ordering::SeqCst)
         }
         async fn nudge_bypass(&mut self) {
             self.nudges += 1;
@@ -548,16 +631,104 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cycle_parks_without_v4_route_until_next_event() {
-        // No v4 route: no probes, no forced reconnect. A new route
-        // event within the backstop window re-parks (fresh cycle).
+    async fn park_wake_verifies_the_path_instead_of_waiting_for_another_event() {
+        // The link drops (no v4 route), then the host lands on another
+        // interface. The route-return event is consumed by the park's own
+        // select, so nothing else will ever wake this cycle: the wake IS the
+        // migration signal and must run the verification path, or the session
+        // is left on a 4-tuple that no longer exists.
+        let (mut io, tx) = MockIo::new(false, vec![sample(7, 10), sample(7, 11)]);
+        let route = io.route_flag();
+        let restore = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            route.store(true, Ordering::SeqCst);
+            tx.send(()).expect("inject the route-return event");
+        });
+        let outcome = run_cycle(&mut io).await;
+        restore.await.expect("route-restore task");
+        assert_eq!(outcome, CycleOutcome::Migrated);
+        assert_eq!(io.nudges, 1, "the park wake must run the verification path");
+        assert_eq!(io.rebinds, 1, "the returned route must be rebound onto");
+        assert_eq!(
+            io.calls,
+            vec!["ensure_route_escape", "rebind_endpoint"],
+            "escape then rebind, exactly as on a route change with a live path"
+        );
+        assert!(io.probes_sent >= 1);
+        assert_eq!(io.force_reconnects, 0);
+        assert!(io.escalations.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn park_timeout_verifies_a_route_that_came_back_without_an_event() {
+        // Same defect at the other wake: the backstop expires with a v4 route
+        // present again, its event having been coalesced away or never
+        // delivered. That wake must verify the path too, not end the cycle.
+        let (mut io, _tx) = MockIo::new(false, vec![sample(7, 10), sample(7, 11)]);
+        let route = io.route_flag();
+        let restore = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            route.store(true, Ordering::SeqCst);
+        });
+        let outcome = run_cycle(&mut io).await;
+        restore.await.expect("route-restore task");
+        assert_eq!(outcome, CycleOutcome::Migrated);
+        assert_eq!(io.rebinds, 1, "the returned route must be rebound onto");
+        assert_eq!(io.force_reconnects, 0);
+        assert!(io.escalations.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_stops_when_the_route_source_closes_while_parked() {
+        // Teardown while parked: the route manager is gone, so the source
+        // resolves `false` instantly and forever. The cycle must recognize it
+        // and stop the watchdog; treating it as a wake spins the park loop.
         let (mut io, tx) = MockIo::new(false, vec![sample(7, 10)]);
         tx.send(()).expect("inject route event");
-        let outcome = run_cycle(&mut io).await;
-        assert_eq!(outcome, CycleOutcome::Parked);
-        assert_eq!(io.force_reconnects, 0);
+        let closer = tokio::spawn(async move {
+            // After the settle window, so the cycle is really parked, and well
+            // before the backstop, so stopping is the only honest exit.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            drop(tx);
+        });
+        run_watchdog(&mut io).await;
+        closer.await.expect("closer task");
+        assert_eq!(
+            io.closed_polls, 1,
+            "a closed source must be observed once and stop the watchdog"
+        );
         assert_eq!(io.probes_sent, 0);
-        assert!(io.escalations.is_empty());
+        assert_eq!(io.force_reconnects, 0);
+        assert_eq!(io.nudges, 0);
+        assert!(io.escalations.is_empty(), "a teardown is not an escalation");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cycle_stays_parked_when_a_route_event_does_not_restore_v4() {
+        // An event that leaves the network v4-less is no migration signal: no
+        // nudge, no rebind, no redial. It must not re-arm the escalation
+        // backstop either, otherwise route churn on a v6-only network defers
+        // the only honest exit forever (no offline edge ever fires there).
+        let (mut io, tx) = MockIo::new(false, vec![sample(7, 10)]);
+        tx.send(()).expect("inject route event");
+        let started = tokio::time::Instant::now();
+        let outcome = run_cycle(&mut io).await;
+        assert_eq!(outcome, CycleOutcome::Escalated);
+        assert_eq!(
+            io.force_reconnects, 0,
+            "the park path never force-reconnects"
+        );
+        assert_eq!(
+            io.rebinds, 0,
+            "never rebind onto a network with no v4 route"
+        );
+        assert_eq!(io.nudges, 0);
+        assert_eq!(io.escalations.len(), 1);
+        assert!(
+            started.elapsed() < ESCALATE_TIMEOUT + MIGRATION_TIMEOUT + PROBE_INTERVAL,
+            "the route event re-armed the backstop, escalation took {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test(start_paused = true)]
