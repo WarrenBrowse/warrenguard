@@ -781,21 +781,32 @@ fn resolve_physical_gateway(
     scutil_router.map(str::to_owned)
 }
 
-/// One-shot discovery of the *physical* default route as
-/// `(interface, optional gateway)`, for the exit host-route exception.
+/// One-shot discovery of the host's *physical* default route as
+/// `(interface, optional gateway)`.
 ///
-/// Invokes `route -n get default` once and parses both the interface
-/// and gateway from that single output. Only when that result is
-/// missing or tunnel-shadowed does it fall back to a single `scutil`
-/// query (parsed for both `PrimaryInterface` and `Router`). Resolution
-/// is delegated to the pure cores [`resolve_physical_default_iface`] /
-/// [`resolve_physical_gateway`], both of which refuse a tunnel source.
+/// The interface is the NIC the host currently reaches the Internet through,
+/// and is never a tunnel. The gateway is the LAN router to send a host route
+/// through; it is `None` on a point-to-point link that has no next hop (a
+/// cellular or PPP interface), in which case a caller pins by interface
+/// instead.
+///
+/// Safe to call again once [`DefaultRouteSplitGuard`] is installed, which is
+/// the point of it: the split makes `route get default` name the tunnel, and
+/// this refuses a tunnel source rather than guessing, falling back to the
+/// `scutil` primary service (which still names the physical NIC). A consumer
+/// following a genuine interface hand-off therefore re-resolves here instead
+/// of freezing the value it read before connecting.
+///
+/// Invokes `route -n get default` once and parses both the interface and
+/// gateway from that single output; `scutil` is queried only when that result
+/// is missing or tunnel-shadowed. Resolution is delegated to the pure cores
+/// [`resolve_physical_default_iface`] / [`resolve_physical_gateway`].
 ///
 /// # Errors
 ///
 /// - No physical default route can be determined (offline / link down /
 ///   only tunnels present) - surfaced by [`resolve_physical_default_iface`].
-async fn discover_physical_default() -> Result<(String, Option<String>)> {
+pub async fn discover_physical_default() -> Result<(String, Option<String>)> {
     let route_out = route_get_default_raw().await;
     let route_iface = route_out.as_deref().and_then(parse_default_iface);
     let route_gateway = route_out.as_deref().and_then(parse_default_gateway);
