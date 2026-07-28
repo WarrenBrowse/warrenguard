@@ -21,6 +21,11 @@ pub mod ip_assign;
 // `ios_tun` is portable (pure tokio + mpsc) so it compiles on every target for
 // host-side unit tests; public exposure is gated to iOS below.
 mod ios_tun;
+// Single home of the QUIC path-migration watchdog: the pure decision loop
+// (coalesce route events, verify the migrated path, layered redial/escalate
+// fallback) every client surface drives through its own `MigrationIo`
+// platform bindings.
+pub mod migration_watchdog;
 pub mod multi_hop_pump;
 pub mod multihop;
 pub mod path_health;

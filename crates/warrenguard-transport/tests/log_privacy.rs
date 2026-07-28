@@ -42,6 +42,7 @@ const SCANNED_MODULES: &[&str] = &[
     "supervised_pump.rs",
     "multi_hop_pump.rs",
     "multihop.rs",
+    "migration_watchdog.rs",
 ];
 
 fn read_module(file: &str) -> String {

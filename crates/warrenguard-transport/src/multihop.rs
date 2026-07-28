@@ -563,6 +563,27 @@ pub enum RebindError {
     Io(#[from] std::io::Error),
 }
 
+/// How the fresh migration socket of [`MultiHopClient::rebind_wildcard`] must
+/// be escaped from the tunnel it carries.
+///
+/// The dial already knows how to build a correctly escaped socket
+/// (`VpnService.protect` on Android, a per-socket bypass under a desktop
+/// system VPN, the plain wildcard bind for the userland proxy);
+/// `rebind_wildcard` reuses that knowledge so a migration caller cannot
+/// forget the escape contract.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum RebindPolicy {
+    /// No per-socket escape: the host carries it by route or fwmark.
+    Plain,
+    /// Apply this bypass before quinn sends anything; the rebind is refused if
+    /// it cannot be applied (an unbypassed carrier self-nests the tunnel).
+    Bypass(SocketBypass),
+    /// Android: `VpnService.protect` the fd before handing it to quinn.
+    /// Refused (fail-closed) on every other platform.
+    Protect,
+}
+
 /// Multi-hop client tunnel.
 ///
 /// Owns the Quinn `Endpoint` + `Connection` to the relay and an
@@ -1579,7 +1600,7 @@ impl MultiHopClient {
         self.conn.max_datagram_size()
     }
 
-    /// Rebind the underlying QUIC endpoint onto a fresh UDP socket.
+    /// Rebind the underlying QUIC endpoint onto a caller-supplied UDP socket.
     ///
     /// The relay observes the new source 4-tuple on the next outgoing
     /// packet and (with `migration(true)` on its server config)
@@ -1589,17 +1610,78 @@ impl MultiHopClient {
     /// change; an explicit rebind covers the cases where the old
     /// socket is wedged (e.g. bound port black-holed by a NAT reset).
     ///
+    /// Hidden raw seam: the caller owns the whole escape contract of the
+    /// socket it injects (nothing is applied here), which integration tests
+    /// need to pin a specific loopback socket. Production migration goes
+    /// through [`Self::rebind_wildcard`], which builds the socket the same
+    /// way the dial does.
+    ///
     /// # Errors
     ///
     /// [`RebindError::OverCarrier`] when the session rides the TLS-over-TCP
     /// carrier, or [`RebindError::Io`] from `quinn::Endpoint::rebind` (socket
     /// registration with the runtime failed; the old socket is retained).
+    #[doc(hidden)]
     pub fn rebind(&self, socket: std::net::UdpSocket) -> Result<(), RebindError> {
         // The carrier's endpoint sits on a synthetic TCP socket: handing quinn
         // a raw UDP socket would tear the TLS stream out from under a working
         // session, which a route change alone must never do.
         if self.over_carrier {
             return Err(RebindError::OverCarrier);
+        }
+        self.endpoint.rebind(socket)?;
+        Ok(())
+    }
+
+    /// Rebinds onto a fresh wildcard socket built the same way the dial builds
+    /// its own, so the escape contract cannot be forgotten by the caller: the
+    /// family follows the live local address (a v6-dialed relay keeps a v6
+    /// source) and `policy` is applied BEFORE quinn can send anything on the
+    /// fresh socket.
+    ///
+    /// # Errors
+    ///
+    /// [`RebindError::OverCarrier`] when the session rides the TLS-over-TCP
+    /// carrier (no UDP socket to swap; the recovery path is a redial), or
+    /// [`RebindError::Io`] when the wildcard bind, the policy application
+    /// (bypass / protect), or `quinn::Endpoint::rebind` failed. On any error
+    /// the session keeps its current socket.
+    pub fn rebind_wildcard(&self, policy: RebindPolicy) -> Result<(), RebindError> {
+        if self.over_carrier {
+            return Err(RebindError::OverCarrier);
+        }
+        // Wildcard so the OS picks the source per packet from the current
+        // routing table (following the route change that motivated the rebind).
+        let bind: SocketAddr = match self.local_addr() {
+            Ok(SocketAddr::V6(_)) => (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
+            _ => (std::net::Ipv4Addr::UNSPECIFIED, 0).into(),
+        };
+        let socket = std::net::UdpSocket::bind(bind)?;
+        // Fail closed on any policy failure: quinn must never receive a socket
+        // whose escape is not installed, or the migrated carrier egresses
+        // through the very tunnel it carries (the carrier-blackhole failure
+        // mode). The fresh socket is simply dropped; the session keeps sending
+        // on the old one.
+        match policy {
+            RebindPolicy::Plain => {}
+            RebindPolicy::Bypass(bypass) => {
+                warrenguard_socket_bypass::apply(&socket, bypass)?;
+            }
+            #[cfg(target_os = "android")]
+            RebindPolicy::Protect => {
+                use std::os::fd::AsRawFd;
+                if !crate::socket_protect::protect(socket.as_raw_fd()) {
+                    return Err(RebindError::Io(std::io::Error::other(
+                        "VpnService.protect rejected the migration socket",
+                    )));
+                }
+            }
+            #[cfg(not(target_os = "android"))]
+            RebindPolicy::Protect => {
+                return Err(RebindError::Io(std::io::Error::other(
+                    "RebindPolicy::Protect needs the Android VpnService.protect hook",
+                )));
+            }
         }
         self.endpoint.rebind(socket)?;
         Ok(())
@@ -3490,6 +3572,85 @@ mod tests {
         assert!(
             !pair.client.is_over_carrier(),
             "a natively dialed UDP session must report itself as migratable"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebind_wildcard_refuses_without_a_usable_policy() {
+        let pair =
+            crate::test_support::spawn_loopback_multihop(ExitId::from_bytes([0x8a; 16])).await;
+        let before = pair
+            .client
+            .local_addr()
+            .expect("a live endpoint has a local addr");
+        // A bypass variant this OS cannot honour: applying it must fail, and a
+        // failed policy must fail the whole rebind (an unbypassed carrier
+        // self-nests the tunnel it carries), leaving the old socket in place.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let bypass = SocketBypass::UnicastIf(1);
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let bypass = SocketBypass::Fwmark(1);
+        let err = pair
+            .client
+            .rebind_wildcard(RebindPolicy::Bypass(bypass))
+            .expect_err("an inapplicable bypass policy must refuse the rebind");
+        assert!(
+            matches!(err, RebindError::Io(_)),
+            "a failed policy surfaces as RebindError::Io, got {err:?}"
+        );
+        assert_eq!(
+            pair.client
+                .local_addr()
+                .expect("the endpoint must still hold a socket"),
+            before,
+            "a refused rebind must leave the old socket untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebind_wildcard_refuses_a_carrier_session() {
+        let mut pair =
+            crate::test_support::spawn_loopback_multihop(ExitId::from_bytes([0x8b; 16])).await;
+        // Same contract as `rebind`: the carrier's endpoint sits on a synthetic
+        // TCP socket, and a route change alone must never kill the TLS stream.
+        Arc::get_mut(&mut pair.client)
+            .expect("sole owner before any clone")
+            .over_carrier = true;
+        let err = pair
+            .client
+            .rebind_wildcard(RebindPolicy::Plain)
+            .expect_err("a carrier session has no UDP socket to swap, the rebind must refuse");
+        assert!(
+            matches!(err, RebindError::OverCarrier),
+            "expected RebindError::OverCarrier, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebind_wildcard_plain_rebinds_onto_a_fresh_wildcard_socket() {
+        let pair =
+            crate::test_support::spawn_loopback_multihop(ExitId::from_bytes([0x8c; 16])).await;
+        let before = pair
+            .client
+            .local_addr()
+            .expect("a live endpoint has a local addr");
+        pair.client
+            .rebind_wildcard(RebindPolicy::Plain)
+            .expect("a plain wildcard rebind of a native UDP session must succeed");
+        let after = pair
+            .client
+            .local_addr()
+            .expect("the endpoint must hold the fresh socket");
+        assert!(
+            after.ip().is_unspecified(),
+            "the fresh socket must be wildcard-bound so the OS picks the source \
+             per packet, got {}",
+            after.ip()
+        );
+        assert_ne!(
+            after.port(),
+            before.port(),
+            "the endpoint must actually sit on the fresh socket"
         );
     }
 

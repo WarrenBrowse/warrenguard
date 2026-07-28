@@ -29,7 +29,7 @@ use quinn::Connection;
 use tokio::sync::{mpsc, watch};
 use warrenguard_multihop::{MULTIHOP_FRAME_MAX_OVERHEAD, RejectionReason};
 
-use crate::multihop::{MultiHopClient, MultiHopError, RebindError};
+use crate::multihop::{MultiHopClient, MultiHopError, RebindError, RebindPolicy};
 
 /// Hard cap on bonded connections per session, matching the `n_connections`
 /// operating range; the exit-side router slot cap (16)
@@ -484,12 +484,30 @@ impl MultiHopBundle {
     /// wedged, the nudge fixes the probe path without churning the
     /// healthy siblings.
     ///
+    /// Hidden raw seam, like [`MultiHopClient::rebind`]: the caller owns the
+    /// escape contract of the socket it injects. Production migration goes
+    /// through [`Self::rebind_wildcard`].
+    ///
     /// # Errors
     ///
     /// Propagates [`MultiHopClient::rebind`]: the primary rides the
     /// TLS-over-TCP carrier, or `Endpoint::rebind` refused the socket.
+    #[doc(hidden)]
     pub fn rebind(&self, socket: std::net::UdpSocket) -> Result<(), RebindError> {
         self.primary().rebind(socket)
+    }
+
+    /// Rebinds the PRIMARY session onto a fresh wildcard socket built under
+    /// `policy`, exactly as [`MultiHopClient::rebind_wildcard`] does at dial
+    /// time. Secondaries are left alone on purpose, matching [`Self::rebind`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`MultiHopClient::rebind_wildcard`]: the primary rides the
+    /// TLS-over-TCP carrier, or the bind / escape policy / `Endpoint::rebind`
+    /// failed (the primary then keeps its current socket).
+    pub fn rebind_wildcard(&self, policy: RebindPolicy) -> Result<(), RebindError> {
+        self.primary().rebind_wildcard(policy)
     }
 
     /// `true` when the primary session rides the TLS-over-TCP carrier, so the
@@ -609,6 +627,23 @@ mod live_tests {
         assert!(
             matches!(carried.rebind(fresh), Err(RebindError::OverCarrier)),
             "the bundle must propagate the primary's carrier refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn carrier_primary_makes_the_bundle_refuse_a_wildcard_rebind() {
+        let mut pair = spawn_loopback_multihop(ExitId::from_bytes([0x7b; 16])).await;
+        Arc::get_mut(&mut pair.client)
+            .expect("sole owner before the bundle clones it")
+            .set_over_carrier_for_test();
+        let bundle = MultiHopBundle::new(vec![pair.client.clone()]);
+        assert!(
+            matches!(
+                bundle.rebind_wildcard(RebindPolicy::Plain),
+                Err(RebindError::OverCarrier)
+            ),
+            "the bundle must propagate the primary's carrier refusal on the \
+             policy-built rebind too"
         );
     }
 
