@@ -33,6 +33,16 @@ uses `VpnService.protect`), and the userland proxy datapath is unaffected (it is
 loopback-mediated, with no OS tunnel installed). Only the desktop TUN datapaths
 were exposed.
 
+> **Correction 2026-07-28.** The Android claim above held for the QUIC endpoint
+> socket only. The TLS-over-TCP carrier socket honoured `SocketBypass` and
+> nothing else, and Android passes no bypass (its escape is the protect hook),
+> so that socket dialled straight into the TUN and the anti-censorship carrier
+> could never establish on the platform. `connect_tcp_carrier` now takes the
+> pre-connect `socket2` path whenever a bypass OR a registered protector
+> applies, and fails closed when protection is refused. The lesson generalises:
+> a platform escape has to be applied on EVERY socket the datapath opens, and a
+> new dial path is a new place to forget it.
+
 ## The fix: key the escape on the SOCKET, not the destination
 
 This is the WireGuard fwmark model and exactly TunnelCrack's recommendation:
@@ -55,6 +65,19 @@ endpoint bind fails and nothing egresses, mirroring the Android `protect` path):
 
 `WARREN_TUNNEL_FWMARK = 0x77617272` is the single source of truth, shared by the
 routing rule, the killswitch accept and the socket mark on Linux.
+
+### The escape has to survive a rebind
+
+A socket-keyed escape dies with its socket, and the migration watchdog swaps the
+socket on every network change (see `85-MIGRATION-WATCHDOG.md`). A rebind that
+forgets to reinstall the escape reopens exactly the leak this document closes,
+on the fresh socket, silently. `MultiHopClient::rebind_wildcard(RebindPolicy)`
+is the answer: it applies the policy before quinn can send anything on the new
+socket and fails closed if it cannot, so the contract cannot be forgotten by a
+caller. macOS is the exception that proves the rule: its bind cannot be carried
+across the swap (an `IP_BOUND_IF` socket loses all egress once the default is on
+the TUN), so that surface degrades to the destination-keyed route first and
+takes the bind back only once the new network has proven it egresses.
 
 ### Routing changes
 
