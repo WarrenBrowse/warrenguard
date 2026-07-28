@@ -125,6 +125,15 @@ pub trait MigrationIo {
     /// not just a same-interface flap).
     fn rebind_endpoint(&mut self) -> impl Future<Output = ()> + Send;
 
+    /// Called once a migration is confirmed, so a consumer that degraded a
+    /// leak-free per-socket escape into a destination-keyed route can try to
+    /// take the leak-free one back on the network it just moved onto. Doing
+    /// nothing is always correct: the escape installed before the rebind is
+    /// already live and proven by the revalidated path.
+    fn reclaim_escape(&mut self) -> impl Future<Output = ()> + Send {
+        async {}
+    }
+
     /// Send one in-tunnel liveness probe (DAITA padding datagram) on
     /// the current session, if any. Any answer bumps the rx counters
     /// observed by [`Self::rx_sample`].
@@ -310,6 +319,12 @@ pub async fn run_cycle<I: MigrationIo>(io: &mut I) -> CycleOutcome {
                      default-route change",
                     started.elapsed().as_millis()
                 );
+                // Only here: the new path is proven, so a consumer that traded a
+                // leak-free per-socket escape for a destination-keyed route to
+                // survive the rebind can try to close that exception again. On
+                // every other exit the escape is still the one the redial will
+                // rebuild, and taking it back would race that rebuild.
+                io.reclaim_escape().await;
                 return CycleOutcome::Migrated;
             }
 
@@ -415,6 +430,7 @@ mod tests {
         probes_sent: u32,
         nudges: u32,
         rebinds: u32,
+        reclaims: u32,
         force_reconnects: u32,
         escalations: Vec<String>,
         /// Ordered trace of the escape/rebind pair, so a test can pin that the
@@ -442,6 +458,7 @@ mod tests {
                     probes_sent: 0,
                     nudges: 0,
                     rebinds: 0,
+                    reclaims: 0,
                     force_reconnects: 0,
                     escalations: Vec::new(),
                     calls: Vec::new(),
@@ -486,6 +503,9 @@ mod tests {
         async fn rebind_endpoint(&mut self) {
             self.calls.push("rebind_endpoint");
             self.rebinds += 1;
+        }
+        async fn reclaim_escape(&mut self) {
+            self.reclaims += 1;
         }
         async fn send_probe(&mut self) {
             self.probes_sent += 1;
@@ -601,6 +621,49 @@ mod tests {
                 other => panic!("unexpected recorded call {other}"),
             }
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reclaim_is_called_after_a_confirmed_migration() {
+        // The escape that survived the rebind is the destination-keyed one a
+        // consumer degraded to; once the new path is proven, it gets exactly one
+        // chance to take the leak-free per-socket escape back.
+        let (mut io, _tx) = MockIo::new(true, vec![sample(7, 10), sample(7, 11)]);
+        let outcome = run_cycle(&mut io).await;
+        assert_eq!(outcome, CycleOutcome::Migrated);
+        assert_eq!(
+            io.reclaims, 1,
+            "a confirmed migration must offer the reclaim"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reclaim_is_not_called_when_the_migration_fails() {
+        // The rebind never revalidated, so the redial rebuilds the escape from
+        // the connect path; reclaiming here would race that rebuild on a path
+        // nothing has proven.
+        let stuck: Vec<Option<RxSample>> = std::iter::repeat_n(sample(7, 10), 16).collect();
+        let mut script = stuck;
+        script.push(sample(8, 1));
+        script.push(sample(8, 2));
+        let (mut io, _tx) = MockIo::new(true, script);
+        let outcome = run_cycle(&mut io).await;
+        assert_eq!(outcome, CycleOutcome::Reconnected);
+        assert_eq!(io.reclaims, 0, "a redial is not a confirmed migration");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reclaim_is_not_called_when_the_session_cannot_migrate() {
+        // The carrier branch never rebinds, so no escape was ever degraded and
+        // there is nothing to take back.
+        let (mut io, _tx) = MockIo::new(true, vec![sample(7, 10), sample(8, 1)]);
+        io.can_migrate = false;
+        let outcome = run_cycle(&mut io).await;
+        assert_eq!(outcome, CycleOutcome::Reconnected);
+        assert_eq!(
+            io.reclaims, 0,
+            "no rebind happened, so no escape to reclaim"
+        );
     }
 
     #[tokio::test(start_paused = true)]
