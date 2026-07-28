@@ -549,6 +549,20 @@ impl ClientSessionKind {
     }
 }
 
+/// Errors emitted by [`MultiHopClient::rebind`].
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum RebindError {
+    /// The session rides the TLS-over-TCP fallback carrier, whose synthetic
+    /// socket cannot be swapped for a UDP one: the recovery path is a redial.
+    #[error("the session is carried over TCP and cannot migrate")]
+    OverCarrier,
+    /// `quinn::Endpoint::rebind` refused the socket (registration with the
+    /// runtime failed); the old socket is retained.
+    #[error("socket registration with the runtime failed")]
+    Io(#[from] std::io::Error),
+}
+
 /// Multi-hop client tunnel.
 ///
 /// Owns the Quinn `Endpoint` + `Connection` to the relay and an
@@ -1577,10 +1591,33 @@ impl MultiHopClient {
     ///
     /// # Errors
     ///
-    /// Propagates `quinn::Endpoint::rebind` (socket registration with
-    /// the runtime failed; the old socket is retained on error).
-    pub fn rebind(&self, socket: std::net::UdpSocket) -> std::io::Result<()> {
-        self.endpoint.rebind(socket)
+    /// [`RebindError::OverCarrier`] when the session rides the TLS-over-TCP
+    /// carrier, or [`RebindError::Io`] from `quinn::Endpoint::rebind` (socket
+    /// registration with the runtime failed; the old socket is retained).
+    pub fn rebind(&self, socket: std::net::UdpSocket) -> Result<(), RebindError> {
+        // The carrier's endpoint sits on a synthetic TCP socket: handing quinn
+        // a raw UDP socket would tear the TLS stream out from under a working
+        // session, which a route change alone must never do.
+        if self.over_carrier {
+            return Err(RebindError::OverCarrier);
+        }
+        self.endpoint.rebind(socket)?;
+        Ok(())
+    }
+
+    /// `true` when this session is carried by the TLS-over-TCP fallback
+    /// instead of native UDP. A carrier session has no UDP socket to swap, so
+    /// it can never migrate: its recovery path is a full redial.
+    #[must_use]
+    pub fn is_over_carrier(&self) -> bool {
+        self.over_carrier
+    }
+
+    /// Puts a loopback session in the carrier state so a sibling module's
+    /// tests can exercise the carrier branch without a UDP-hostile network.
+    #[cfg(test)]
+    pub(crate) fn set_over_carrier_for_test(&mut self) {
+        self.over_carrier = true;
     }
 
     /// Closes the relay connection with the dedicated
@@ -3416,6 +3453,43 @@ mod tests {
             pair.client.max_inner_payload(),
             warrenguard_transport_core::CARRIER_MAX_INNER_MTU,
             "a carrier session must self-report the reduced carrier inner MTU"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebind_refuses_a_carrier_session() {
+        let mut pair =
+            crate::test_support::spawn_loopback_multihop(ExitId::from_bytes([0x6d; 16])).await;
+        // A carrier session's quinn endpoint sits on the synthetic TCP socket;
+        // handing it a raw UDP socket would tear the TLS stream out from under
+        // the connection, killing a session that was working.
+        Arc::get_mut(&mut pair.client)
+            .expect("sole owner before any clone")
+            .over_carrier = true;
+        assert!(
+            pair.client.is_over_carrier(),
+            "the accessor must report the carrier state the session was put in"
+        );
+
+        let fresh = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("bind a fresh loopback socket");
+        let err = pair
+            .client
+            .rebind(fresh)
+            .expect_err("a carrier session has no UDP socket to swap, the rebind must refuse");
+        assert!(
+            matches!(err, RebindError::OverCarrier),
+            "expected RebindError::OverCarrier, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_session_reports_not_over_carrier() {
+        let pair =
+            crate::test_support::spawn_loopback_multihop(ExitId::from_bytes([0x6e; 16])).await;
+        assert!(
+            !pair.client.is_over_carrier(),
+            "a natively dialed UDP session must report itself as migratable"
         );
     }
 

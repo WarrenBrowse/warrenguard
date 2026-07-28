@@ -29,7 +29,7 @@ use quinn::Connection;
 use tokio::sync::{mpsc, watch};
 use warrenguard_multihop::{MULTIHOP_FRAME_MAX_OVERHEAD, RejectionReason};
 
-use crate::multihop::{MultiHopClient, MultiHopError};
+use crate::multihop::{MultiHopClient, MultiHopError, RebindError};
 
 /// Hard cap on bonded connections per session, matching the `n_connections`
 /// operating range; the exit-side router slot cap (16)
@@ -486,9 +486,17 @@ impl MultiHopBundle {
     ///
     /// # Errors
     ///
-    /// Propagates the underlying `Endpoint::rebind` I/O error.
-    pub fn rebind(&self, socket: std::net::UdpSocket) -> std::io::Result<()> {
+    /// Propagates [`MultiHopClient::rebind`]: the primary rides the
+    /// TLS-over-TCP carrier, or `Endpoint::rebind` refused the socket.
+    pub fn rebind(&self, socket: std::net::UdpSocket) -> Result<(), RebindError> {
         self.primary().rebind(socket)
+    }
+
+    /// `true` when the primary session rides the TLS-over-TCP carrier, so the
+    /// bundle cannot migrate and must redial instead.
+    #[must_use]
+    pub fn is_over_carrier(&self) -> bool {
+        self.primary().is_over_carrier()
     }
 }
 
@@ -578,6 +586,29 @@ mod live_tests {
         assert!(
             !matches!(close_err, quinn::ConnectionError::LocallyClosed),
             "a peer-initiated close must never be reported as LocallyClosed, got {close_err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn carrier_primary_makes_the_bundle_refuse_a_rebind() {
+        let native_pair = spawn_loopback_multihop(ExitId::from_bytes([0x78; 16])).await;
+        let native = MultiHopBundle::new(vec![native_pair.client.clone()]);
+        assert!(
+            !native.is_over_carrier(),
+            "a natively dialed bundle must report itself as migratable"
+        );
+
+        let mut carried_pair = spawn_loopback_multihop(ExitId::from_bytes([0x79; 16])).await;
+        Arc::get_mut(&mut carried_pair.client)
+            .expect("sole owner before the bundle clones it")
+            .set_over_carrier_for_test();
+        let carried = MultiHopBundle::new(vec![carried_pair.client.clone()]);
+        assert!(carried.is_over_carrier());
+        let fresh = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("bind a fresh loopback socket");
+        assert!(
+            matches!(carried.rebind(fresh), Err(RebindError::OverCarrier)),
+            "the bundle must propagate the primary's carrier refusal"
         );
     }
 
