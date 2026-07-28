@@ -12,8 +12,11 @@
 //! deployer's JNI bridge registers a protector here once per process; the
 //! client invokes [`protect`] on every freshly bound endpoint socket before
 //! any packet egresses.
-
-#![cfg(target_os = "android")]
+//!
+//! The hook compiles on every unix host, not just Android: only Android
+//! registers a protector, so it is inert elsewhere, and that lets each dial
+//! path keep ONE uncfg'd protect call whose fail-closed behaviour is provable
+//! on a developer machine and in CI instead of only on a device.
 
 use std::os::fd::RawFd;
 use std::sync::{Arc, RwLock};
@@ -32,6 +35,17 @@ static PROTECTOR: RwLock<Option<SocketProtector>> = RwLock::new(None);
 /// process, so a global is the right scope.
 pub fn set_protector(protector: SocketProtector) {
     *PROTECTOR.write().unwrap_or_else(|p| p.into_inner()) = Some(protector);
+}
+
+/// `true` once a protector is registered, i.e. this process is a VpnService
+/// whose own sockets need the hook. A dial path consults it to decide whether
+/// it must build the socket itself (to hold the fd before connect) or can keep
+/// its plain, un-hooked fast path.
+pub(crate) fn is_armed() -> bool {
+    PROTECTOR
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .is_some()
 }
 
 /// Protects `fd` via the registered protector. Returns `true` when no

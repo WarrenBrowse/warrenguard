@@ -33,7 +33,7 @@ pub mod path_health;
 // change watcher); consumers react through their own redial machinery.
 pub mod network_monitor;
 pub mod redial_policy;
-#[cfg(target_os = "android")]
+#[cfg(unix)]
 pub mod socket_protect;
 // `real_tun` drives `tun-rs::AsyncDevice`, which has no Android nor iOS backend.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
