@@ -31,6 +31,12 @@
 //!   16-byte RFC `Map` response, carrying the per-source rate-limit
 //!   budget. Length-gated on parse so an RFC-only peer, or a server
 //!   that never emits it, degrades to `rate_limit: None` cleanly.
+//! - The credential trailer ([`append_credential_trailer`],
+//!   [`credential_trailer`]): an optional opaque blob appended after the
+//!   12-byte RFC `Map` request, for a deployer that gates its port budget
+//!   on a credential the client presents. Magic-gated and length-gated on
+//!   parse, and the RFC frame in front is untouched, so a server that
+//!   ignores it reads exactly the request the client sent.
 
 use std::net::Ipv4Addr;
 
@@ -156,6 +162,87 @@ pub enum ParseError {
     /// Unknown opcode (not 0/1/2).
     #[error("unsupported opcode: {0}")]
     UnsupportedOpcode(u8),
+}
+
+/// Wire size of an RFC 6886 Map request, and the offset any Warren trailer
+/// starts at.
+pub const MAP_REQUEST_LEN: usize = 12;
+
+/// Opens the Warren credential trailer on a Map request, so trailing bytes
+/// that are padding, a probe or a future extension are never read as a
+/// credential.
+pub const CREDENTIAL_TRAILER_MAGIC: u16 = 0x5747;
+
+/// Largest credential the trailer carries, in bytes. Bounds what a peer can
+/// make a server hold from one datagram, and keeps the request well inside
+/// any path MTU. The engine treats the bytes as opaque; a deployer decides
+/// what they mean.
+pub const MAX_CREDENTIAL_LEN: usize = 512;
+
+/// Header of the credential trailer: magic (2 B) + length (2 B, big endian).
+const CREDENTIAL_TRAILER_HEADER_LEN: usize = 4;
+
+/// Refusals from [`append_credential_trailer`].
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TrailerError {
+    /// Credential longer than [`MAX_CREDENTIAL_LEN`].
+    #[error("credential too long: {len} bytes, max {max}")]
+    CredentialTooLong {
+        /// Length offered by the caller.
+        len: usize,
+        /// Accepted maximum.
+        max: usize,
+    },
+}
+
+/// Appends an opaque credential to a serialized Map request.
+///
+/// The RFC 6886 frame in front is left untouched, and a server that predates
+/// this trailer ignores the extra bytes (its parser bounds the frame by a
+/// minimum length, not an exact one), so presenting a credential never
+/// changes how an older exit reads the request.
+///
+/// # Errors
+///
+/// [`TrailerError::CredentialTooLong`] past [`MAX_CREDENTIAL_LEN`]; `frame`
+/// is then left as it was.
+pub fn append_credential_trailer(
+    frame: &mut Vec<u8>,
+    credential: &[u8],
+) -> Result<(), TrailerError> {
+    let len = credential.len();
+    if len > MAX_CREDENTIAL_LEN {
+        return Err(TrailerError::CredentialTooLong {
+            len,
+            max: MAX_CREDENTIAL_LEN,
+        });
+    }
+    frame.reserve(CREDENTIAL_TRAILER_HEADER_LEN + len);
+    frame.extend_from_slice(&CREDENTIAL_TRAILER_MAGIC.to_be_bytes());
+    // Truncation-safe: `len` was just bounded by MAX_CREDENTIAL_LEN.
+    frame.extend_from_slice(&(len as u16).to_be_bytes());
+    frame.extend_from_slice(credential);
+    Ok(())
+}
+
+/// Borrows the credential a request carries, or `None` when it carries none.
+///
+/// Anything malformed reads as `None`: a wrong magic, a truncated body, or a
+/// length past [`MAX_CREDENTIAL_LEN`]. A credential is an optional extra, so
+/// a peer must never be able to turn a bad trailer into a refused request.
+#[must_use]
+pub fn credential_trailer(buf: &[u8]) -> Option<&[u8]> {
+    let trailer = buf.get(MAP_REQUEST_LEN..)?;
+    let (header, body) = trailer.split_at_checked(CREDENTIAL_TRAILER_HEADER_LEN)?;
+    if u16::from_be_bytes([header[0], header[1]]) != CREDENTIAL_TRAILER_MAGIC {
+        return None;
+    }
+    let len = usize::from(u16::from_be_bytes([header[2], header[3]]));
+    if len > MAX_CREDENTIAL_LEN {
+        return None;
+    }
+    body.get(..len)
 }
 
 /// Parses a server-side incoming Request frame.
@@ -432,6 +519,118 @@ pub fn serialize_response(resp: &Response) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- credential trailer -------------------------------------------------
+
+    #[test]
+    fn a_plain_request_carries_no_credential() {
+        let frame = serialize_request(&Request::Map {
+            proto: MapProto::Udp,
+            internal_port: 8080,
+            suggested_external_port: 0,
+            lifetime_secs: 600,
+        });
+        assert_eq!(credential_trailer(&frame), None);
+    }
+
+    #[test]
+    fn a_credential_survives_the_trailer_round_trip() {
+        let credential = vec![0xA5; 354];
+        let mut frame = serialize_request(&Request::Map {
+            proto: MapProto::Tcp,
+            internal_port: 8080,
+            suggested_external_port: 50000,
+            lifetime_secs: 600,
+        });
+        append_credential_trailer(&mut frame, &credential).expect("credential fits");
+
+        assert_eq!(credential_trailer(&frame), Some(credential.as_slice()));
+        // The RFC frame in front of it must be untouched, or an exit that
+        // ignores the trailer would read a different request than the one the
+        // client sent.
+        assert!(matches!(
+            parse_request(&frame),
+            Ok(Request::Map {
+                proto: MapProto::Tcp,
+                internal_port: 8080,
+                suggested_external_port: 50000,
+                lifetime_secs: 600,
+            })
+        ));
+    }
+
+    #[test]
+    fn trailing_bytes_that_are_not_a_credential_are_ignored() {
+        // Padding, a probe, or a future extension must degrade to "no
+        // credential" rather than be read as one or refuse the request.
+        let mut frame = serialize_request(&Request::Map {
+            proto: MapProto::Udp,
+            internal_port: 8080,
+            suggested_external_port: 0,
+            lifetime_secs: 600,
+        });
+        frame.extend_from_slice(&[0xDE, 0xAD, 0x00, 0x02, 0x01, 0x02]);
+
+        assert_eq!(credential_trailer(&frame), None);
+        assert!(parse_request(&frame).is_ok());
+    }
+
+    #[test]
+    fn a_truncated_credential_is_ignored_rather_than_half_read() {
+        let mut frame = serialize_request(&Request::Map {
+            proto: MapProto::Udp,
+            internal_port: 8080,
+            suggested_external_port: 0,
+            lifetime_secs: 600,
+        });
+        frame.extend_from_slice(&CREDENTIAL_TRAILER_MAGIC.to_be_bytes());
+        frame.extend_from_slice(&8u16.to_be_bytes());
+        frame.extend_from_slice(&[0x01, 0x02, 0x03]); // 3 bytes, not 8
+
+        assert_eq!(credential_trailer(&frame), None);
+    }
+
+    #[test]
+    fn a_credential_past_the_cap_is_refused_at_append_time() {
+        let mut frame = serialize_request(&Request::Map {
+            proto: MapProto::Udp,
+            internal_port: 8080,
+            suggested_external_port: 0,
+            lifetime_secs: 600,
+        });
+        let oversized = vec![0u8; MAX_CREDENTIAL_LEN + 1];
+
+        let refused = append_credential_trailer(&mut frame, &oversized);
+
+        assert!(matches!(
+            refused,
+            Err(TrailerError::CredentialTooLong { len, max })
+                if len == MAX_CREDENTIAL_LEN + 1 && max == MAX_CREDENTIAL_LEN
+        ));
+        assert_eq!(frame.len(), 12, "a refused append must not touch the frame");
+    }
+
+    #[test]
+    fn a_credential_announcing_more_than_the_cap_is_ignored_on_parse() {
+        // The cap is a receive-side bound too: a peer that ignores it must not
+        // be able to make the parser hand out an oversized slice.
+        let mut frame = serialize_request(&Request::Map {
+            proto: MapProto::Udp,
+            internal_port: 8080,
+            suggested_external_port: 0,
+            lifetime_secs: 600,
+        });
+        let oversized = vec![0u8; MAX_CREDENTIAL_LEN + 1];
+        frame.extend_from_slice(&CREDENTIAL_TRAILER_MAGIC.to_be_bytes());
+        frame.extend_from_slice(
+            &u16::try_from(oversized.len())
+                .expect("fits in u16")
+                .to_be_bytes(),
+        );
+        frame.extend_from_slice(&oversized);
+
+        assert_eq!(credential_trailer(&frame), None);
+    }
 
     // --- serialize_request --------------------------------------------------
 
