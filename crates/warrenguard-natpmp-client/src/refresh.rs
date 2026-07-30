@@ -50,12 +50,14 @@
 //!   or the pool/quota is exhausted). The loop emits
 //!   `NatPmpEvent::Failed { reason, .. }` and terminates so the daemon
 //!   can surface an actionable message and the user can react (pick
-//!   another port, disable, retry later). Exception: a
-//!   [`SuggestionKind::Sticky`] suggestion downgrades to a server pick
-//!   (`suggested = 0`) on `SuggestedPortUnavailable` instead of failing,
-//!   because a carried-over port is a best-effort preference, not a
-//!   contract (the pinned honour-or-error contract is
-//!   [`SuggestionKind::Pinned`]).
+//!   another port, disable, retry later). Two exceptions on
+//!   `SuggestedPortUnavailable`, both about a suggested port a rival
+//!   holds: a [`SuggestionKind::Sticky`] suggestion downgrades to a server
+//!   pick (`suggested = 0`), because a carried-over port is a best-effort
+//!   preference; a [`SuggestionKind::Pinned`] one keeps asking for the
+//!   exact port for [`PINNED_CONFLICT_RETRY_WINDOW_SECS`], because the
+//!   holder is usually the client's own predecessor session and the port
+//!   comes back on its own.
 //! - **Rate-limited** (`RateLimited { retry_after_secs }`): the exit's
 //!   per-source rate limit fired (usually too many port changes in a
 //!   row). This is recoverable once the sliding window clears, so the
@@ -70,8 +72,10 @@ use std::time::Duration;
 /// loop's reaction to the exit's strict `SuggestedPortUnavailable`
 /// rejection.
 ///
-/// - `Pinned`: the user chose the port. Honour-or-error: a conflict is
-///   surfaced as `Failed(SuggestedPortInUse)` and the loop stops.
+/// - `Pinned`: the user chose the port. Honour-or-error: it is never
+///   substituted, and a conflict is re-tried for
+///   [`PINNED_CONFLICT_RETRY_WINDOW_SECS`] before being surfaced as
+///   `Failed(SuggestedPortInUse)`.
 /// - `Sticky`: the port is a previously-granted value carried over so
 ///   the public port follows the client (reconnect, exit maintenance
 ///   migration). Best-effort: on conflict the loop downgrades to a
@@ -80,7 +84,8 @@ use std::time::Duration;
 /// Irrelevant when `suggested_external_port == 0` (nothing to honour).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SuggestionKind {
-    /// User-chosen port: strict honour-or-error.
+    /// User-chosen port: never substituted, waited for while it may
+    /// still come back.
     Pinned,
     /// Carried-over preference: downgrade to a server pick on conflict.
     Sticky,
@@ -158,6 +163,35 @@ const MAX_BACKOFF_SECS: u32 = 60;
 /// roughly 35-40 s before giving up - long enough to ride out a slow
 /// first handshake, short enough that a dead exit is reported promptly.
 const MAX_INITIAL_MAP_ATTEMPTS: u32 = 3;
+
+/// How long the loop keeps re-requesting a PINNED external port the exit
+/// refused as already in use, before surfacing the refusal.
+///
+/// The usual holder of a user-pinned port is the client's OWN previous
+/// session: exits key port ownership on the tunnel inner IP, so a reconnect
+/// that lands on a different inner address finds its own predecessor holding
+/// the port. It comes back without anyone doing anything, once the
+/// predecessor's session lapses, its mappings are reaped and the post-release
+/// cooldown clears. Failing on the first refusal turned that delay into a dead
+/// end: the rule stopped for good and only a manual action revived it.
+pub const PINNED_CONFLICT_RETRY_WINDOW_SECS: u32 = 600;
+
+/// Ceiling for the pinned-conflict retry delay, so a lasting conflict settles
+/// into one probe every 30 s instead of hammering the exit's rate limit.
+const PINNED_CONFLICT_MAX_BACKOFF_SECS: u32 = 30;
+
+/// Delay before re-requesting a pinned port the exit reported as in use, given
+/// the seconds already spent waiting for it, or `None` once
+/// [`PINNED_CONFLICT_RETRY_WINDOW_SECS`] is spent and the refusal has to be
+/// surfaced.
+///
+/// Tracking the time already waited yields 1 s, 1 s, 2 s, 4 s ... up to the
+/// cap: a port freed early is reclaimed within seconds, while a port held for
+/// the long run costs a handful of requests.
+fn pinned_conflict_retry_delay(waited_secs: u32) -> Option<u32> {
+    (waited_secs < PINNED_CONFLICT_RETRY_WINDOW_SECS)
+        .then(|| waited_secs.clamp(1, PINNED_CONFLICT_MAX_BACKOFF_SECS))
+}
 
 /// RFC 6886 §3.6: the gateway's Seconds-Since-Start-of-Epoch increases
 /// monotonically while it preserves its mappings. If a renewal observes the
@@ -523,6 +557,10 @@ pub fn spawn_refresh_loop_protos_from_addr(
         // Exponential backoff for transient-failure retries; reset to
         // the initial value after every successful (re)mapping.
         let mut backoff_secs = INITIAL_BACKOFF_SECS;
+        // Seconds spent so far waiting for a pinned port held by somebody
+        // else, bounded by `PINNED_CONFLICT_RETRY_WINDOW_SECS`. Reset on every
+        // successful cycle so a conflict met later gets the full window.
+        let mut pinned_conflict_waited = 0u32;
         let mut last_epoch_secs: Option<u32> = None;
         'cycle: loop {
             // One cycle = one Map per leg. `granted_this_cycle` tracks
@@ -565,6 +603,7 @@ pub fn spawn_refresh_loop_protos_from_addr(
                 match result {
                     Ok(m) => {
                         backoff_secs = INITIAL_BACKOFF_SECS; // recovered
+                        pinned_conflict_waited = 0;
                         pair_port = m.external_port;
                         external_port = m.external_port;
                         min_lifetime = min_lifetime.min(m.lifetime_secs);
@@ -615,6 +654,41 @@ pub fn spawn_refresh_loop_protos_from_addr(
                         // pair port, a contract rather than a preference.
                         tracing::debug!("sticky suggested port taken; retrying with a server pick");
                         suggested_external_port = 0;
+                        continue 'cycle;
+                    }
+                    Err(e @ NatPmpClientError::Server(ResultCode::SuggestedPortUnavailable))
+                        if leg_index == 0
+                            && suggestion == SuggestionKind::Pinned
+                            && suggested_external_port != 0 =>
+                    {
+                        // A pinned port is a contract, so it is never
+                        // substituted; but the holder is most often this
+                        // client's own predecessor session, which the exit
+                        // drops shortly after it departs. Keep asking across
+                        // the window in which the port can come back
+                        // (nothing is granted yet at the first leg, so there
+                        // is nothing to release meanwhile).
+                        let Some(delay_secs) = pinned_conflict_retry_delay(pinned_conflict_waited)
+                        else {
+                            let _ = event_tx.send(NatPmpEvent::Failed {
+                                reason: NatPmpFailureReason::from_client_error(&e),
+                                error: e.to_string(),
+                            });
+                            return;
+                        };
+                        tracing::debug!(
+                            waited_secs = pinned_conflict_waited,
+                            "pinned port still held; re-requesting it"
+                        );
+                        tokio::select! {
+                            biased;
+                            _ = &mut cancel_rx => {
+                                let _ = event_tx.send(NatPmpEvent::Cancelled);
+                                return;
+                            }
+                            () = tokio::time::sleep(Duration::from_secs(u64::from(delay_secs))) => {}
+                        }
+                        pinned_conflict_waited = pinned_conflict_waited.saturating_add(delay_secs);
                         continue 'cycle;
                     }
                     Err(err) => {
@@ -754,6 +828,76 @@ mod tests {
         // (RFC 6886 §3.6), so the renewed mapping is actually fresh.
         assert!(epoch_indicates_restart(100, 50));
         assert!(epoch_indicates_restart(1, 0));
+    }
+
+    #[test]
+    fn failure_reason_separates_the_actionable_refusals_from_the_rest() {
+        use crate::NatPmpClientError;
+        assert_eq!(
+            NatPmpFailureReason::from_client_error(&NatPmpClientError::Server(
+                ResultCode::SuggestedPortUnavailable
+            )),
+            NatPmpFailureReason::SuggestedPortInUse
+        );
+        assert_eq!(
+            NatPmpFailureReason::from_client_error(&NatPmpClientError::Server(
+                ResultCode::NotAuthorized
+            )),
+            NatPmpFailureReason::NotAuthorized
+        );
+        assert_eq!(
+            NatPmpFailureReason::from_client_error(&NatPmpClientError::Server(
+                ResultCode::OutOfResources
+            )),
+            NatPmpFailureReason::OutOfResources
+        );
+        // Anything else is not something the user can act on.
+        assert_eq!(
+            NatPmpFailureReason::from_client_error(&NatPmpClientError::Server(
+                ResultCode::UnsupportedVersion
+            )),
+            NatPmpFailureReason::Other
+        );
+    }
+
+    #[test]
+    fn pinned_conflict_retries_then_gives_up_at_the_window() {
+        assert_eq!(pinned_conflict_retry_delay(0), Some(1));
+        assert!(pinned_conflict_retry_delay(PINNED_CONFLICT_RETRY_WINDOW_SECS - 1).is_some());
+        assert_eq!(
+            pinned_conflict_retry_delay(PINNED_CONFLICT_RETRY_WINDOW_SECS),
+            None
+        );
+    }
+
+    #[test]
+    fn pinned_conflict_backoff_grows_from_seconds_to_a_cap() {
+        assert_eq!(pinned_conflict_retry_delay(2), Some(2));
+        assert_eq!(pinned_conflict_retry_delay(16), Some(16));
+        assert_eq!(
+            pinned_conflict_retry_delay(300),
+            Some(PINNED_CONFLICT_MAX_BACKOFF_SECS)
+        );
+    }
+
+    /// The window only earns its keep if it outlasts the exit-side path by
+    /// which a pinned port held by the client's own predecessor comes back:
+    /// the predecessor's session must lapse, its mappings must be reaped,
+    /// and the post-release cooldown must clear. Raising any of those
+    /// exit-side constants without widening the window silently restores
+    /// the dead end this retry exists to remove.
+    #[test]
+    fn pinned_conflict_window_outlasts_the_exit_side_reclaim_path() {
+        let exit_side_reclaim_secs = u32::try_from(
+            warrenguard_config::QUIC_MAX_IDLE_TIMEOUT_SECS
+                + warrenguard_config::NATPMP_PORT_COOLDOWN_SECS,
+        )
+        .expect("exit-side reclaim path fits in u32");
+        assert!(
+            PINNED_CONFLICT_RETRY_WINDOW_SECS > exit_side_reclaim_secs,
+            "retry window {PINNED_CONFLICT_RETRY_WINDOW_SECS}s must outlast the \
+             {exit_side_reclaim_secs}s exit-side reclaim path"
+        );
     }
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};

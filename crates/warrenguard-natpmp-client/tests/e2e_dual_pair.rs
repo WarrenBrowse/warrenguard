@@ -9,8 +9,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use warrenguard_natpmp_client::{
-    ForwardProtos, NatPmpEvent, NatPmpFailureReason, SuggestionKind,
-    spawn_refresh_loop_protos_from_addr,
+    ForwardProtos, NatPmpEvent, SuggestionKind, spawn_refresh_loop_protos_from_addr,
 };
 use warrenguard_natpmp_server::Proto;
 use warrenguard_natpmp_server::server::{Server, SourceFilter};
@@ -84,7 +83,7 @@ async fn dual_pair_maps_both_slots_of_one_port_on_the_real_allocator() {
 }
 
 #[tokio::test]
-async fn dual_pair_pinned_on_a_foreign_port_fails_whole_and_leaves_owner_intact() {
+async fn dual_pair_pinned_on_a_foreign_port_never_half_maps_nor_disturbs_the_owner() {
     let (server, backend) = spawn_real_server().await;
     // Another client already owns the pinned port through its UDP slot.
     let other = Ipv4Addr::new(10, 66, 0, 99);
@@ -106,23 +105,21 @@ async fn dual_pair_pinned_on_a_foreign_port_fails_whole_and_leaves_owner_intact(
         None,
     );
 
-    let ev = next_event(&mut rx).await;
+    // The loop keeps asking for the exact port (the holder may release it),
+    // so it reports nothing meanwhile and takes nothing on the side.
+    let observed = tokio::time::timeout(TIMEOUT, rx.recv()).await;
     assert!(
-        matches!(
-            ev,
-            NatPmpEvent::Failed {
-                reason: NatPmpFailureReason::SuggestedPortInUse,
-                ..
-            }
-        ),
-        "the pair must fail as a unit on a foreign pinned port, got {ev:?}"
+        observed.is_err(),
+        "a pinned pair must neither substitute nor announce anything while \
+         its port is taken, got {observed:?}"
     );
 
     let active = backend.allocator().snapshot_active();
     assert_eq!(
         active.len(),
         1,
-        "the foreign owner's mapping must survive untouched: {active:?}"
+        "the foreign owner's mapping must survive untouched, and no leg of \
+         the pair may be half-granted: {active:?}"
     );
     assert_eq!(active[0].internal_ip, other);
     let _ = handle;
