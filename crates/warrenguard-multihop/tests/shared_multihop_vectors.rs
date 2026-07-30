@@ -187,6 +187,13 @@ fn message_for(v: &ControlVec) -> WarrenControlMessage {
         },
         "ip_exhausted" => WarrenControlMessage::IpExhausted,
         "rejected" => WarrenControlMessage::Rejected,
+        // Both vectors share the variant and differ only by the trailing
+        // product code, so the code comes from the file rather than the arm.
+        "rejected_banned_unspecified" | "rejected_banned_port_forwarding" => {
+            WarrenControlMessage::RejectedBanned {
+                reason_code: v.reason_code.expect("reason_code"),
+            }
+        }
         "exit_draining" => WarrenControlMessage::ExitDraining {
             deadline_unix_secs: v.deadline_unix_secs.expect("deadline_unix_secs"),
             reason_code: v.reason_code.expect("reason_code"),
