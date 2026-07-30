@@ -522,6 +522,30 @@ mod tests {
 
     // --- credential trailer -------------------------------------------------
 
+    /// Freezes the trailer's bytes. Any reimplementation has to produce
+    /// exactly these, and a change here is a wire break, not a test nuisance:
+    /// an exit reads this from clients it did not ship with.
+    #[test]
+    fn credential_trailer_wire_layout_is_frozen() {
+        let mut frame = serialize_request(&Request::Map {
+            proto: MapProto::Tcp,
+            internal_port: 8080,
+            suggested_external_port: 50000,
+            lifetime_secs: 600,
+        });
+        append_credential_trailer(&mut frame, &[0x11, 0x22, 0x33]).expect("credential fits");
+
+        assert_eq!(
+            frame,
+            vec![
+                // RFC 6886 Map request, untouched by the trailer.
+                0x00, 0x02, 0x00, 0x00, 0x1F, 0x90, 0xC3, 0x50, 0x00, 0x00, 0x02, 0x58,
+                // magic 0x5747, length 3 (big endian), then the credential.
+                0x57, 0x47, 0x00, 0x03, 0x11, 0x22, 0x33,
+            ]
+        );
+    }
+
     #[test]
     fn a_plain_request_carries_no_credential() {
         let frame = serialize_request(&Request::Map {
