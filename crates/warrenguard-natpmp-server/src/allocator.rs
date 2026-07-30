@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -18,6 +19,24 @@ use warrenguard_config::{
 
 use crate::protocol::RateLimitInfo;
 use crate::{Allocation, NatPmpError, Proto};
+
+/// Resolves which tunnel addresses answer for the same tenant, so the
+/// per-client quota bounds a SUBSCRIBER rather than a session.
+///
+/// The allocator knows a client only by the inner address its NAT-PMP
+/// datagrams come from, and a deployer that places each live session of one
+/// identity on its own address (as Warren does, to keep two sessions from
+/// stealing each other's downlink) hands it several addresses for one payer.
+/// The budget would then be per session, and opening sessions would multiply
+/// it. The deployer holds the mapping, so it supplies it here.
+///
+/// Deliberately shaped as addresses in, addresses out: no identity material
+/// enters the engine, and the allocator cannot log or leak one.
+pub trait QuotaPeers: Send + Sync {
+    /// Every address that shares `client_ip`'s port budget, `client_ip`
+    /// included. An unknown address answers with just itself.
+    fn peer_addresses(&self, client_ip: Ipv4Addr) -> Vec<Ipv4Addr>;
+}
 
 /// Tunable configuration for the [`Allocator`]. Use [`Allocator::new`]
 /// for the Warren defaults; reach for `with_config` when a test needs
@@ -34,10 +53,14 @@ pub struct AllocatorConfig {
     pub rate_limit_max: usize,
     /// Sliding window for the per-source rate limit.
     pub rate_limit_window: Duration,
-    /// Max simultaneous distinct external PORT NUMBERS per source IP.
-    /// A TCP + UDP pair on one port counts once. With the
-    /// one-IP-per-pubkey tunnel model, this caps the per-pubkey
-    /// port-forward budget at the same value.
+    /// Max simultaneous distinct external PORT NUMBERS per client. A
+    /// TCP + UDP pair on one port counts once.
+    ///
+    /// "Client" means one source address, unless the deployer wires a
+    /// [`QuotaPeers`] grouping, in which case it means one tenant across
+    /// every address it holds. Without that grouping, a deployer whose
+    /// clients can hold several addresses at once (one per live session)
+    /// grants this budget per session, so opening sessions multiplies it.
     pub quota_per_client: usize,
 }
 
@@ -113,6 +136,11 @@ pub struct Allocator {
     rate_limit_max: usize,
     rate_limit_window: Duration,
     quota_per_client: usize,
+    /// Groups the addresses of one tenant for the quota count. Unset
+    /// counts per address, which is right for a deployer that gives one
+    /// address per client and wrong for one that does not (see
+    /// [`QuotaPeers`]).
+    quota_peers: OnceLock<Arc<dyn QuotaPeers>>,
     counters: AllocatorCounters,
 }
 
@@ -229,8 +257,23 @@ impl Allocator {
             rate_limit_max: config.rate_limit_max,
             rate_limit_window: config.rate_limit_window,
             quota_per_client: config.quota_per_client,
+            quota_peers: OnceLock::new(),
             counters: AllocatorCounters::default(),
         }
+    }
+
+    /// Count the port quota per TENANT rather than per address, using
+    /// `peers` to group the addresses one tenant holds. See [`QuotaPeers`]
+    /// for why a deployer needs this. Without it the quota stays per
+    /// address, which is the correct reading only when a client can never
+    /// hold two addresses at once.
+    ///
+    /// Wired once, at startup: the allocator is usually already behind an
+    /// `Arc` (a backend owns it) by the time the deployer has a session
+    /// registry to answer with. A later call is ignored and returns
+    /// `false`, so a second wiring can never silently loosen the budget.
+    pub fn set_quota_peers(&self, peers: Arc<dyn QuotaPeers>) -> bool {
+        self.quota_peers.set(peers).is_ok()
     }
 
     /// Snapshot of the monotonic event counters. Useful for ops
@@ -619,10 +662,21 @@ impl Allocator {
         // is quota-free; only a genuinely new port number is refused
         // once the client holds `NATPMP_QUOTA_PER_CLIENT_IP` (currently
         // 5) of them.
+        // The budget belongs to whoever pays for it, which is the tenant
+        // behind the address, not the address. `peer_addresses` is what the
+        // deployer knows and the allocator does not.
+        let budget_addresses: HashSet<Ipv4Addr> = match self.quota_peers.get() {
+            Some(peers) => peers
+                .peer_addresses(client_ip)
+                .into_iter()
+                .chain(std::iter::once(client_ip))
+                .collect(),
+            None => std::iter::once(client_ip).collect(),
+        };
         let held_ports: HashSet<u16> = g
             .active
             .iter()
-            .filter(|(_, a)| a.internal_ip == client_ip)
+            .filter(|(_, a)| budget_addresses.contains(&a.internal_ip))
             .map(|(key, _)| key.0)
             .collect();
         let reuses_held_port = if suggested != 0 {

@@ -12,6 +12,9 @@ use warrenguard_natpmp_server::{NatPmpError, Proto};
 
 const ALICE: Ipv4Addr = Ipv4Addr::new(10, 66, 0, 42);
 const BOB: Ipv4Addr = Ipv4Addr::new(10, 66, 0, 99);
+/// A second live session of ALICE's tenant: the exit places it on its own
+/// inner address, so the allocator sees two "clients" for one subscriber.
+const ALICE_SECOND_SESSION: Ipv4Addr = Ipv4Addr::new(10, 66, 0, 43);
 
 // ---------------------------------------------------------------------------
 // Nominal allocation
@@ -906,6 +909,123 @@ fn over_quota_alloc_is_rejected_with_quota_exceeded_not_partial() {
         alloc.active_count(),
         quota,
         "the failed alloc must not leave a partial entry behind"
+    );
+}
+
+/// The quota counts a tunnel address, and one tenant can hold several of
+/// them at once (the exit places each of its live sessions on its own inner
+/// address). Without a way to tell the allocator which addresses are the same
+/// tenant, the budget is per session, so opening sessions multiplies it. The
+/// deployer supplies that grouping; the allocator never learns who the tenant
+/// is, only which addresses answer for one.
+#[test]
+fn quota_is_shared_by_every_address_of_one_tenant() {
+    use std::sync::Arc;
+    use warrenguard_natpmp_server::allocator::{AllocatorConfig, QuotaPeers};
+
+    struct SameTenant;
+    impl QuotaPeers for SameTenant {
+        fn peer_addresses(&self, client_ip: Ipv4Addr) -> Vec<Ipv4Addr> {
+            // Keyed on the argument, so an implementation that grouped by
+            // anything other than the requesting address fails this test.
+            if client_ip == ALICE || client_ip == ALICE_SECOND_SESSION {
+                vec![ALICE, ALICE_SECOND_SESSION]
+            } else {
+                vec![client_ip]
+            }
+        }
+    }
+
+    let quota = AllocatorConfig::warren_default().quota_per_client;
+    let alloc = Allocator::new();
+    assert!(
+        alloc.set_quota_peers(Arc::new(SameTenant)),
+        "the first wiring must be accepted"
+    );
+    let now = Instant::now();
+    for i in 0..quota {
+        alloc
+            .allocate_at(
+                ALICE,
+                Proto::Tcp,
+                4242 + u16::try_from(i).unwrap(),
+                0,
+                600,
+                now,
+            )
+            .expect("alloc within quota");
+    }
+
+    let res = alloc.allocate_at(ALICE_SECOND_SESSION, Proto::Tcp, 9000, 0, 600, now);
+
+    assert!(
+        matches!(res, Err(NatPmpError::QuotaExceeded(ip)) if ip == ALICE_SECOND_SESSION),
+        "a second session of the same tenant must not get a fresh budget, got {res:?}"
+    );
+}
+
+/// Wiring the grouping twice would let a later caller widen every budget by
+/// answering with a narrower group, so only the first one counts.
+#[test]
+fn quota_grouping_refuses_to_be_rewired() {
+    use std::sync::Arc;
+    use warrenguard_natpmp_server::allocator::QuotaPeers;
+
+    struct Alone;
+    impl QuotaPeers for Alone {
+        fn peer_addresses(&self, client_ip: Ipv4Addr) -> Vec<Ipv4Addr> {
+            vec![client_ip]
+        }
+    }
+
+    let alloc = Allocator::new();
+    assert!(alloc.set_quota_peers(Arc::new(Alone)));
+    assert!(
+        !alloc.set_quota_peers(Arc::new(Alone)),
+        "a second wiring must be refused, not silently applied"
+    );
+}
+
+/// The grouping never merges two tenants: an address the oracle does not
+/// name keeps its own budget.
+#[test]
+fn quota_grouping_leaves_a_different_tenant_alone() {
+    use std::sync::Arc;
+    use warrenguard_natpmp_server::allocator::{AllocatorConfig, QuotaPeers};
+
+    struct AliceSessions;
+    impl QuotaPeers for AliceSessions {
+        fn peer_addresses(&self, client_ip: Ipv4Addr) -> Vec<Ipv4Addr> {
+            if client_ip == BOB {
+                vec![BOB]
+            } else {
+                vec![ALICE, ALICE_SECOND_SESSION]
+            }
+        }
+    }
+
+    let quota = AllocatorConfig::warren_default().quota_per_client;
+    let alloc = Allocator::new();
+    alloc.set_quota_peers(Arc::new(AliceSessions));
+    let now = Instant::now();
+    for i in 0..quota {
+        alloc
+            .allocate_at(
+                ALICE,
+                Proto::Tcp,
+                4242 + u16::try_from(i).unwrap(),
+                0,
+                600,
+                now,
+            )
+            .expect("alloc within quota");
+    }
+
+    assert!(
+        alloc
+            .allocate_at(BOB, Proto::Tcp, 9000, 0, 600, now)
+            .is_ok(),
+        "another tenant must keep its own budget while alice is at quota"
     );
 }
 
