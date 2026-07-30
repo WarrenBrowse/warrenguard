@@ -615,6 +615,41 @@ impl MultiHopSupervisor {
         self.fatal_tx.subscribe()
     }
 
+    /// Continue the session that `assigned_v4` belongs to instead of starting
+    /// an independent one, for a supervisor built to REPLACE a previous one
+    /// (a deployer that rebuilds its whole tunnel rather than redialing).
+    /// Call before [`Self::run`].
+    ///
+    /// A supervisor learns its session's address from the exit and names it on
+    /// every redial, which is what keeps a reconnect on one inner IP. That
+    /// memory dies with the supervisor, so a rebuilt tunnel would introduce
+    /// itself as a brand-new session and the exit, which never co-houses an
+    /// independent session with a live one of the same identity, would place
+    /// it elsewhere. Anything the exit keys on the inner address then looks
+    /// like it belongs to a stranger: NAT-PMP port ownership above all, where
+    /// the rebuilt tunnel finds its own forwarded ports taken by its
+    /// predecessor. Naming the address makes the exit hand it back and evict
+    /// the stale predecessor. A stale or foreign address costs nothing: the
+    /// exit degrades it to an independent session start.
+    pub fn resume_session_placement(&self, assigned_v4: std::net::Ipv4Addr) {
+        *self
+            .last_assigned_v4
+            .lock()
+            .expect("last_assigned_v4 lock poisoned") = Some(assigned_v4);
+    }
+
+    /// Session-placement hint for the next setup request: the address this
+    /// session already holds, or the all-zero session-fresh sentinel when
+    /// there is no predecessor to continue.
+    fn session_placement_hint(&self) -> Option<std::net::Ipv4Addr> {
+        Some(
+            self.last_assigned_v4
+                .lock()
+                .expect("last_assigned_v4 lock poisoned")
+                .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+        )
+    }
+
     /// Subscribe to the dead-datapath escalation signal. The receiver
     /// observes `true` once [`DATAPATH_DEAD_FATAL_REDIALS`] consecutive
     /// watchdog-forced redials each carried ZERO application downlink over
@@ -1106,12 +1141,7 @@ impl MultiHopSupervisor {
         // the predecessor); a first session sends the session-fresh
         // sentinel so it can never be co-housed with another live session
         // of the same identity. Exits predating the hint ignore it.
-        let placement = Some(
-            self.last_assigned_v4
-                .lock()
-                .expect("last_assigned_v4 lock poisoned")
-                .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
-        );
+        let placement = self.session_placement_hint();
         let setup_result = primary
             .setup_over_stream_with_options(
                 Some(&self.config.client_signing),
@@ -2192,6 +2222,27 @@ mod tests {
             &[([7u8; 32], 23)]
         );
         drop(supervisor);
+    }
+
+    #[test]
+    fn a_fresh_supervisor_asks_the_exit_for_a_session_of_its_own() {
+        let (supervisor, _rx) = MultiHopSupervisor::new(dummy_config());
+        assert_eq!(
+            supervisor.session_placement_hint(),
+            Some(std::net::Ipv4Addr::UNSPECIFIED),
+            "with no predecessor to name, the hint must be the session-fresh sentinel"
+        );
+    }
+
+    #[test]
+    fn a_resumed_supervisor_names_its_predecessors_address() {
+        let (supervisor, _rx) = MultiHopSupervisor::new(dummy_config());
+        supervisor.resume_session_placement(std::net::Ipv4Addr::new(10, 66, 0, 7));
+        assert_eq!(
+            supervisor.session_placement_hint(),
+            Some(std::net::Ipv4Addr::new(10, 66, 0, 7)),
+            "a rebuilt tunnel must keep its session on the address it already holds"
+        );
     }
 
     #[test]

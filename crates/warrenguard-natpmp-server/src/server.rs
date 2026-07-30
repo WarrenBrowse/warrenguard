@@ -311,7 +311,18 @@ fn map_failure_response(
         crate::NatPmpError::Exhausted | crate::NatPmpError::QuotaExceeded(_) => {
             (ResultCode::OutOfResources, None)
         }
-        crate::NatPmpError::SuggestedPortInUse(_) => (ResultCode::SuggestedPortUnavailable, None),
+        crate::NatPmpError::SuggestedPortInUse(external_port) => {
+            // The one refusal an operator cannot reconstruct after the fact:
+            // it leaves no trace in the allocator, in the backend rules, or
+            // in the reaper's accounting, and a support report describes it
+            // only as "port in use". The port is the exit's own resource; the
+            // requester stays out of the record.
+            tracing::info!(
+                external_port,
+                "natpmp refused a suggested port already held on this exit"
+            );
+            (ResultCode::SuggestedPortUnavailable, None)
+        }
         crate::NatPmpError::NotAuthorized(_) => (ResultCode::NotAuthorized, None),
         crate::NatPmpError::Backend(_) => (ResultCode::NetworkFailure, None),
     };
