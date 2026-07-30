@@ -2589,6 +2589,30 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
         self.snapshot_ipv4_to_pubkey_hex_at(Instant::now())
     }
 
+    /// Every tunnel address held by the account that holds `ip`, `ip`
+    /// included, and just `ip` when the registry does not know it.
+    ///
+    /// One account can hold several addresses at once, since each of its live
+    /// sessions is placed on its own. Anything budgeted per address therefore
+    /// needs this grouping to bound a payer rather than a session. Only
+    /// addresses come out: the account never leaves this registry, so a
+    /// caller cannot log or export it.
+    ///
+    /// A departed-but-tombstoned address stays in the group: the lease it
+    /// left behind is still allocated until the reaper sweeps it, so it still
+    /// occupies the account's budget.
+    #[must_use]
+    pub fn addresses_sharing_owner(&self, ip: Ipv4Addr) -> Vec<Ipv4Addr> {
+        let map = self.ipv4_to_pubkey.lock();
+        let Some(owner) = map.get(&ip).map(|o| o.pubkey) else {
+            return vec![ip];
+        };
+        map.iter()
+            .filter(|(_, o)| o.pubkey == owner)
+            .map(|(addr, _)| *addr)
+            .collect()
+    }
+
     /// `now`-injected core of [`snapshot_ipv4_to_pubkey_hex`]: lazily drops
     /// tombstoned entries whose retention has elapsed, then returns the rest.
     fn snapshot_ipv4_to_pubkey_hex_at(&self, now: Instant) -> HashMap<Ipv4Addr, String> {
@@ -4595,6 +4619,68 @@ mod tests {
                 .is_empty(),
             "attribution is dropped once the retention window elapses"
         );
+    }
+
+    #[test]
+    fn registry_groups_the_addresses_one_account_holds_at_once() {
+        // Each live session of one account sits on its own tunnel address, so
+        // anything budgeted per address (the port-forward quota) has to be
+        // told which addresses answer for one payer. Only addresses leave the
+        // registry: the caller never handles the account.
+        let registry: MultihopSessionRegistry<FakeConn> = MultihopSessionRegistry::default();
+        let first = Ipv4Addr::new(10, 66, 0, 5);
+        let second = Ipv4Addr::new(10, 66, 0, 6);
+        let stranger = Ipv4Addr::new(10, 66, 0, 7);
+        registry.register(reg_pk(1), 100, FakeConn::new());
+        registry.register(reg_pk(1), 101, FakeConn::new());
+        registry.register(reg_pk(2), 200, FakeConn::new());
+        registry.record_assigned_ipv4(first, reg_pk(1));
+        registry.record_assigned_ipv4(second, reg_pk(1));
+        registry.record_assigned_ipv4(stranger, reg_pk(2));
+
+        let mut group = registry.addresses_sharing_owner(first);
+        group.sort();
+        assert_eq!(
+            group,
+            vec![first, second],
+            "both sessions of one account must share one budget"
+        );
+        assert_eq!(
+            registry.addresses_sharing_owner(stranger),
+            vec![stranger],
+            "another account keeps its own budget"
+        );
+    }
+
+    #[test]
+    fn registry_groups_an_unknown_address_with_itself_only() {
+        // A NAT-PMP request can arrive from an address the registry never
+        // recorded (single-hop path, or a race with setup). Answering with an
+        // empty group would erase the requester's own held ports from the
+        // count and hand it a fresh budget.
+        let registry: MultihopSessionRegistry<FakeConn> = MultihopSessionRegistry::default();
+        let unknown = Ipv4Addr::new(10, 66, 0, 9);
+        assert_eq!(registry.addresses_sharing_owner(unknown), vec![unknown]);
+    }
+
+    #[test]
+    fn registry_group_keeps_a_departed_address_until_its_lease_can_be_reaped() {
+        // A departed session's ports survive until the reaper sweeps them, so
+        // they still occupy the account's budget. Dropping the address from
+        // the group at departure would let a client churn sessions to grant
+        // itself a fresh budget every time.
+        let registry: MultihopSessionRegistry<FakeConn> = MultihopSessionRegistry::default();
+        let live = Ipv4Addr::new(10, 66, 0, 5);
+        let departed = Ipv4Addr::new(10, 66, 0, 6);
+        registry.register(reg_pk(1), 100, FakeConn::new());
+        registry.register(reg_pk(1), 101, FakeConn::new());
+        registry.record_assigned_ipv4(live, reg_pk(1));
+        registry.record_assigned_ipv4(departed, reg_pk(1));
+        registry.unregister(&reg_pk(1), 101);
+
+        let mut group = registry.addresses_sharing_owner(live);
+        group.sort();
+        assert_eq!(group, vec![live, departed]);
     }
 
     #[test]
