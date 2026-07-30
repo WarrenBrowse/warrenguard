@@ -543,6 +543,72 @@ pub fn spawn_refresh_loop_protos_from_addr(
     event_tx: mpsc::UnboundedSender<NatPmpEvent>,
     bind_addr: Option<std::net::IpAddr>,
 ) -> RefreshLoopHandle {
+    spawn_refresh_loop_with(
+        RefreshLoopConfig {
+            server,
+            protos,
+            internal_port,
+            suggested_external_port,
+            lifetime_secs,
+            suggestion,
+            bind_addr,
+            credential: None,
+        },
+        event_tx,
+    )
+}
+
+/// Supplies the credential each cycle presents, or `None` for a cycle that
+/// presents nothing.
+///
+/// Consulted once per cycle rather than captured once, because a credential
+/// expires: a port entitlement is valid for its own epoch only (warren-core
+/// doc 99), so a mapping that outlives one epoch has to present the next
+/// epoch's credential at its next renewal, without the loop restarting.
+pub type CredentialProvider = std::sync::Arc<dyn Fn() -> Option<Vec<u8>> + Send + Sync>;
+
+/// Everything [`spawn_refresh_loop_with`] needs. A struct rather than a tenth
+/// positional argument: the older entry points keep their exact surface and
+/// delegate here.
+pub struct RefreshLoopConfig {
+    /// NAT-PMP server address (typically the tunnel gateway on 5351).
+    pub server: SocketAddr,
+    /// Which wire protocols the rule maps.
+    pub protos: ForwardProtos,
+    /// Client-side port.
+    pub internal_port: u16,
+    /// Requested external port; 0 lets the server pick.
+    pub suggested_external_port: u16,
+    /// Requested lifetime; the server may grant less.
+    pub lifetime_secs: u32,
+    /// What to do when the server refuses the suggested port.
+    pub suggestion: SuggestionKind,
+    /// Local source IP to bind, when the egress interface must be forced.
+    pub bind_addr: Option<std::net::IpAddr>,
+    /// Credential presented with every request of every cycle.
+    pub credential: Option<CredentialProvider>,
+}
+
+/// Spawns the auto-renewing NAT-PMP loop from a [`RefreshLoopConfig`]. The
+/// widest entry point; the others delegate to it.
+///
+/// Every leg of one cycle presents the SAME credential: a TCP+UDP pair is one
+/// forwarded port, and presenting two credentials for it would read as two.
+#[must_use = "the returned handle owns the spawned task; drop discards control"]
+pub fn spawn_refresh_loop_with(
+    config: RefreshLoopConfig,
+    event_tx: mpsc::UnboundedSender<NatPmpEvent>,
+) -> RefreshLoopHandle {
+    let RefreshLoopConfig {
+        server,
+        protos,
+        internal_port,
+        suggested_external_port,
+        lifetime_secs,
+        suggestion,
+        bind_addr,
+        credential,
+    } = config;
     let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
 
     let join_handle = tokio::spawn(async move {
@@ -573,6 +639,10 @@ pub fn spawn_refresh_loop_protos_from_addr(
             let mut external_port = 0u16;
             let mut rate_limit = None;
             let mut epoch_secs = 0u32;
+            // Once per cycle, before the first leg: a credential that rotated
+            // between renewals is picked up here, and both legs of a pair
+            // present the same one.
+            let cycle_credential = credential.as_ref().and_then(|f| f());
             for (leg_index, &proto) in legs.iter().enumerate() {
                 let leg_suggested = if leg_index == 0 {
                     suggested_external_port
@@ -582,7 +652,7 @@ pub fn spawn_refresh_loop_protos_from_addr(
                 // Race the request_map call against cancellation so a
                 // cancel during a slow / unreachable server does not wait
                 // for the RFC §3.1 retry exhaustion (~7.75s).
-                let req_fut = crate::request_map_with_retries_from_addr(
+                let req_fut = crate::request_map_with_credential(
                     server,
                     proto,
                     internal_port,
@@ -590,6 +660,7 @@ pub fn spawn_refresh_loop_protos_from_addr(
                     lifetime_secs,
                     crate::DEFAULT_MAX_ATTEMPTS,
                     bind_addr,
+                    cycle_credential.as_deref(),
                 );
                 let result = tokio::select! {
                     biased;

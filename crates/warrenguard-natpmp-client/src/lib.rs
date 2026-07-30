@@ -34,8 +34,9 @@
 pub mod refresh;
 
 pub use refresh::{
-    ForwardProtos, NatPmpEvent, NatPmpFailureReason, RefreshLoopHandle, SuggestionKind,
-    spawn_refresh_loop, spawn_refresh_loop_from_addr, spawn_refresh_loop_protos_from_addr,
+    CredentialProvider, ForwardProtos, NatPmpEvent, NatPmpFailureReason, RefreshLoopConfig,
+    RefreshLoopHandle, SuggestionKind, spawn_refresh_loop, spawn_refresh_loop_from_addr,
+    spawn_refresh_loop_protos_from_addr, spawn_refresh_loop_with,
 };
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};

@@ -16,6 +16,8 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true
