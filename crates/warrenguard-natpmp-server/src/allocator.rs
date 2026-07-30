@@ -38,6 +38,20 @@ pub trait QuotaPeers: Send + Sync {
     fn peer_addresses(&self, client_ip: Ipv4Addr) -> Vec<Ipv4Addr>;
 }
 
+/// Tells the allocator how many ports one client may hold, when that is not
+/// one number for everybody.
+///
+/// A deployer that gates port forwarding on something the client presents (a
+/// subscription tier, a credential) knows the answer per client; the
+/// allocator does not. `None` means "no answer", and the allocator then
+/// applies its configured default, which is what lets a deployer degrade
+/// gracefully when it cannot verify what the client presented instead of
+/// refusing the request.
+pub trait PortBudget: Send + Sync {
+    /// Ports `client_ip` may hold at once, or `None` for the default.
+    fn budget_for(&self, client_ip: Ipv4Addr) -> Option<usize>;
+}
+
 /// Tunable configuration for the [`Allocator`]. Use [`Allocator::new`]
 /// for the Warren defaults; reach for `with_config` when a test needs
 /// to shrink limits or a future subscription tier needs to widen the
@@ -141,6 +155,9 @@ pub struct Allocator {
     /// address per client and wrong for one that does not (see
     /// [`QuotaPeers`]).
     quota_peers: OnceLock<Arc<dyn QuotaPeers>>,
+    /// Per-client budget, when the deployer sells one. Unset means every
+    /// client gets `quota_per_client`.
+    port_budget: OnceLock<Arc<dyn PortBudget>>,
     counters: AllocatorCounters,
 }
 
@@ -258,6 +275,7 @@ impl Allocator {
             rate_limit_window: config.rate_limit_window,
             quota_per_client: config.quota_per_client,
             quota_peers: OnceLock::new(),
+            port_budget: OnceLock::new(),
             counters: AllocatorCounters::default(),
         }
     }
@@ -274,6 +292,18 @@ impl Allocator {
     /// `false`, so a second wiring can never silently loosen the budget.
     pub fn set_quota_peers(&self, peers: Arc<dyn QuotaPeers>) -> bool {
         self.quota_peers.set(peers).is_ok()
+    }
+
+    /// Take the per-client port budget from `budget` rather than from the
+    /// configured quota, for a deployer whose clients do not all buy the same
+    /// number of ports. See [`PortBudget`]; an address it does not answer for
+    /// keeps the configured quota.
+    ///
+    /// Wired once, at startup, like [`Self::set_quota_peers`]: a later call is
+    /// ignored and returns `false`, so a second wiring can never quietly widen
+    /// a budget.
+    pub fn set_port_budget(&self, budget: Arc<dyn PortBudget>) -> bool {
+        self.port_budget.set(budget).is_ok()
     }
 
     /// Snapshot of the monotonic event counters. Useful for ops
@@ -684,7 +714,12 @@ impl Allocator {
         } else {
             previously_held.is_some_and(|p| held_ports.contains(&p))
         };
-        if !reuses_held_port && held_ports.len() >= self.quota_per_client {
+        let budget = self
+            .port_budget
+            .get()
+            .and_then(|b| b.budget_for(client_ip))
+            .unwrap_or(self.quota_per_client);
+        if !reuses_held_port && held_ports.len() >= budget {
             self.counters.quota_exceeded.fetch_add(1, Ordering::Relaxed);
             return AllocateOutcome {
                 result: Err(NatPmpError::QuotaExceeded(client_ip)),

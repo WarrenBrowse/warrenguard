@@ -14,7 +14,9 @@
 //!        backend's underlying allocator (RFC §3.3.2).
 //!      - `Map { lifetime>0 }` → `backend.allocate(...)`.
 
+use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -22,8 +24,8 @@ use anyhow::{Context, Result};
 use tokio::net::UdpSocket;
 
 use crate::protocol::{
-    MapProto, NATPMP_VERSION, ParseError, RateLimitInfo, Request, Response, ResultCode,
-    parse_request, serialize_response,
+    MAP_REQUEST_LEN, MAX_CREDENTIAL_LEN, MapProto, NATPMP_VERSION, ParseError, RateLimitInfo,
+    Request, Response, ResultCode, credential_trailer, parse_request, serialize_response,
 };
 use crate::{Allocation, PortForwardingBackend, Proto};
 
@@ -53,6 +55,23 @@ fn proto_to_wire(p: Proto) -> MapProto {
 /// allowed to talk to the server.
 pub type SourceFilter = Arc<dyn Fn(Ipv4Addr) -> bool + Send + Sync>;
 
+/// Receives the credential a client presented with its Map request, before
+/// the request is served.
+///
+/// The engine carries the bytes and forms no opinion about them: a deployer
+/// verifies them, spends them if that is what they are, and decides what
+/// budget they buy (see [`crate::allocator::PortBudget`]). Presentation is
+/// awaited, so an authority that has to reach the network holds the request
+/// while it does; keep it quick, and answer rather than hang.
+pub trait CredentialAuthority: Send + Sync {
+    /// Hand `credential`, as presented by `client_ip`, to the deployer.
+    fn present<'a>(
+        &'a self,
+        client_ip: Ipv4Addr,
+        credential: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+}
+
 /// RFC 6886 NAT-PMP server - UDP listening loop.
 ///
 /// Generic over `B: PortForwardingBackend` to allow monomorphization:
@@ -66,6 +85,9 @@ pub struct Server<B> {
     public_ip: Ipv4Addr,
     epoch: Instant,
     auth_filter: SourceFilter,
+    /// Where a presented credential goes. `None` (the default) means the
+    /// deployer gates nothing on one, and any trailer is ignored.
+    credential_authority: Option<Arc<dyn CredentialAuthority>>,
 }
 
 impl<B: PortForwardingBackend + 'static> Server<B> {
@@ -101,7 +123,17 @@ impl<B: PortForwardingBackend + 'static> Server<B> {
             public_ip,
             epoch: Instant::now(),
             auth_filter,
+            credential_authority: None,
         })
+    }
+
+    /// Send every presented credential to `authority` before the request it
+    /// came with is served. Without one, a credential trailer is ignored and
+    /// every client gets the configured budget.
+    #[must_use]
+    pub fn with_credential_authority(mut self, authority: Arc<dyn CredentialAuthority>) -> Self {
+        self.credential_authority = Some(authority);
+        self
     }
 
     /// Local address actually bound (resolved port when `:0` was
@@ -121,7 +153,11 @@ impl<B: PortForwardingBackend + 'static> Server<B> {
     ///
     /// Non-recoverable `recv_from` or `send_to` error.
     pub async fn run(self) -> Result<()> {
-        let mut buf = [0u8; 16];
+        // Must hold the largest frame a client can legitimately send: an RFC
+        // Map request plus a full credential trailer. Sized short, a
+        // credential is silently truncated away and the deployer never sees
+        // what the client presented.
+        let mut buf = [0u8; MAP_REQUEST_LEN + 4 + MAX_CREDENTIAL_LEN];
         loop {
             let res = self.socket.recv_from(&mut buf).await;
             let (n, src) = match res {
@@ -221,6 +257,18 @@ impl<B: PortForwardingBackend + 'static> Server<B> {
                 suggested_external_port,
                 lifetime_secs,
             } => {
+                // Before serving: hand the deployer whatever the client
+                // presented, so the budget this allocation is measured
+                // against is the one the credential bought. A client that
+                // presented nothing reaches the authority not at all, which is
+                // how a deployer tells "claimed nothing" from "claimed
+                // something I could not verify".
+                if let (Some(authority), Some(credential)) = (
+                    self.credential_authority.as_ref(),
+                    credential_trailer(frame),
+                ) {
+                    authority.present(src_v4, credential).await;
+                }
                 // Defense in depth: clamp
                 // the wire-supplied lifetime to RFC 6886 §3.3 bounds
                 // before crossing the backend trait boundary. The

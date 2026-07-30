@@ -964,6 +964,43 @@ fn quota_is_shared_by_every_address_of_one_tenant() {
     );
 }
 
+/// A deployer that sells port budgets per subscriber needs the cap to come
+/// from what the client presented, not from one number baked into the
+/// allocator. What it does not answer for keeps the configured default, which
+/// is what makes an unverifiable credential degrade instead of refusing.
+#[test]
+fn a_client_budget_overrides_the_configured_quota() {
+    use std::sync::Arc;
+    use warrenguard_natpmp_server::allocator::PortBudget;
+
+    struct OnePortForAlice;
+    impl PortBudget for OnePortForAlice {
+        fn budget_for(&self, client_ip: Ipv4Addr) -> Option<usize> {
+            (client_ip == ALICE).then_some(1)
+        }
+    }
+
+    let alloc = Allocator::new();
+    assert!(alloc.set_port_budget(Arc::new(OnePortForAlice)));
+    let now = Instant::now();
+
+    alloc
+        .allocate_at(ALICE, Proto::Tcp, 4242, 0, 600, now)
+        .expect("first port is within the granted budget");
+    let second = alloc.allocate_at(ALICE, Proto::Tcp, 4243, 0, 600, now);
+
+    assert!(
+        matches!(second, Err(NatPmpError::QuotaExceeded(ip)) if ip == ALICE),
+        "a budget of one must refuse the second port, got {second:?}"
+    );
+    assert!(
+        alloc
+            .allocate_at(BOB, Proto::Tcp, 5252, 0, 600, now)
+            .is_ok(),
+        "an address the authority does not answer for keeps the default quota"
+    );
+}
+
 /// Wiring the grouping twice would let a later caller widen every budget by
 /// answering with a narrower group, so only the first one counts.
 #[test]
