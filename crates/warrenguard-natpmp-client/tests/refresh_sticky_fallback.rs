@@ -82,6 +82,48 @@ async fn next_event(rx: &mut mpsc::UnboundedReceiver<NatPmpEvent>) -> NatPmpEven
         .expect("channel open")
 }
 
+/// A presented credential must reach the server as a trailer on the very
+/// request it belongs to, and must never change how that request is read.
+#[tokio::test]
+async fn a_credential_rides_the_mapping_request_it_belongs_to() {
+    use warrenguard_natpmp_protocol::credential_trailer;
+
+    let seen: Arc<std::sync::Mutex<Vec<Vec<u8>>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind stub");
+    let addr = sock.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1024];
+        while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+            sink.lock().expect("sink").push(buf[..n].to_vec());
+            // Answer Success so the caller completes rather than retrying.
+            let resp = [
+                0x00, 0x82, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2A, 0x1F, 0x90, 0xC3, 0x50, 0x00, 0x00,
+                0x02, 0x58,
+            ];
+            let _ = sock.send_to(&resp, peer).await;
+        }
+    });
+
+    let credential = vec![0x7Eu8; 354];
+    warrenguard_natpmp_client::request_map_with_credential(
+        addr,
+        MapProto::Tcp,
+        8080,
+        50000,
+        600,
+        1,
+        None,
+        Some(&credential),
+    )
+    .await
+    .expect("mapping granted");
+
+    let frames = seen.lock().expect("sink").clone();
+    assert_eq!(frames.len(), 1, "expected one request: {frames:?}");
+    assert_eq!(credential_trailer(&frames[0]), Some(credential.as_slice()));
+}
+
 #[tokio::test]
 async fn sticky_suggestion_downgrades_to_server_pick_on_conflict() {
     let server_addr = spawn_test_server().await;

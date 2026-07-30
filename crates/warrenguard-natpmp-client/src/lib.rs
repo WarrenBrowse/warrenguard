@@ -273,6 +273,46 @@ pub async fn request_map_with_retries_from_addr(
     max_attempts: u32,
     bind_addr: Option<IpAddr>,
 ) -> Result<NatPmpMapping, NatPmpClientError> {
+    request_map_with_credential(
+        server,
+        proto,
+        internal_port,
+        suggested_external_port,
+        lifetime_secs,
+        max_attempts,
+        bind_addr,
+        None,
+    )
+    .await
+}
+
+/// [`request_map_with_retries_from_addr`] presenting `credential` with the
+/// request, for a deployer whose server gates the port budget on one.
+///
+/// The credential rides a trailer after the RFC frame, so a server that does
+/// not know about it answers exactly as it would have without one. Too long a
+/// credential ([`warrenguard_natpmp_protocol::MAX_CREDENTIAL_LEN`]) is dropped
+/// rather than failing the request: a mapping is worth more than the budget it
+/// would have bought.
+///
+/// # Errors
+///
+/// See [`request_map_with_retries_from_addr`].
+///
+/// # Panics
+///
+/// If `max_attempts` is zero.
+#[expect(clippy::too_many_arguments)]
+pub async fn request_map_with_credential(
+    server: SocketAddr,
+    proto: MapProto,
+    internal_port: u16,
+    suggested_external_port: u16,
+    lifetime_secs: u32,
+    max_attempts: u32,
+    bind_addr: Option<IpAddr>,
+    credential: Option<&[u8]>,
+) -> Result<NatPmpMapping, NatPmpClientError> {
     assert!(max_attempts >= 1, "max_attempts must be ≥ 1");
 
     let bind_socket_addr: SocketAddr = match bind_addr {
@@ -291,7 +331,13 @@ pub async fn request_map_with_retries_from_addr(
         suggested_external_port,
         lifetime_secs,
     };
-    let req_bytes = serialize_request(&req);
+    let mut req_bytes = serialize_request(&req);
+    if let Some(credential) = credential
+        && let Err(e) =
+            warrenguard_natpmp_protocol::append_credential_trailer(&mut req_bytes, credential)
+    {
+        tracing::debug!(error = %e, "credential not presented with the mapping request");
+    }
 
     let mut timeout_ms = INITIAL_TIMEOUT_MS;
     for attempt in 1..=max_attempts {
