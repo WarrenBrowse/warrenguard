@@ -3795,6 +3795,10 @@ async fn serve_terminating_connection<T>(
                 continue;
             }
             *current_rx.lock() = (session, frame_epoch);
+            // Authenticated: this datagram really is the client's uplink, so
+            // from here on failing to reach the TUN is a black-hole and not
+            // the noise any public UDP endpoint receives.
+            report.opened += 1;
             // TunnelRecv fires for every received frame, real or dummy, then
             // either PaddingRecv (dropped before the TUN) or NormalRecv (after
             // a successful tun.send).
@@ -4118,6 +4122,10 @@ async fn serve_pq_datagram_pump<T>(
                 continue;
             }
             *current_rx.lock() = (session, frame_epoch);
+            // Authenticated: this datagram really is the client's uplink, so
+            // from here on failing to reach the TUN is a black-hole and not
+            // the noise any public UDP endpoint receives.
+            report.opened += 1;
             match warrenguard_multihop::try_decode_control(&plaintext) {
                 Ok(None) => {}
                 Ok(Some(_)) => {

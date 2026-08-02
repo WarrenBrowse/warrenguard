@@ -449,6 +449,10 @@ pub(crate) struct RxReport {
     /// verdict can name it without borrowing the gate back.
     pub(crate) spoofed: u64,
     pub(crate) datagrams: u64,
+    /// Datagrams that cleared decode, exit-id, session lookup, AEAD open and
+    /// anti-replay: this client's actual uplink, as opposed to everything a
+    /// public UDP endpoint receives.
+    pub(crate) opened: u64,
     pub(crate) decode_errs: u64,
     pub(crate) exit_id_mismatches: u64,
     pub(crate) session_errs: u64,
@@ -470,6 +474,7 @@ impl RxReport {
         Self {
             spoofed: 0,
             datagrams: 0,
+            opened: 0,
             decode_errs: 0,
             exit_id_mismatches: 0,
             session_errs: 0,
@@ -521,7 +526,7 @@ impl RxReport {
     /// as one that dropped one stray in-flight packet. That ambiguity is
     /// what made a 2026-08-02 exit black-hole undiagnosable from the logs.
     pub(crate) const fn is_uplink_blackhole(&self) -> bool {
-        self.to_tun == 0 && self.datagrams > self.dummies + self.control_frames
+        self.to_tun == 0 && self.opened > self.dummies + self.control_frames
     }
 }
 
@@ -533,6 +538,7 @@ impl Drop for RxReport {
         if self.is_uplink_blackhole() {
             tracing::warn!(
                 datagrams = self.datagrams,
+                opened = self.opened,
                 to_tun = self.to_tun,
                 spoofed_drops = self.spoofed,
                 decode_errs = self.decode_errs,
@@ -549,6 +555,7 @@ impl Drop for RxReport {
         } else {
             tracing::debug!(
                 datagrams = self.datagrams,
+                opened = self.opened,
                 to_tun = self.to_tun,
                 spoofed_drops = self.spoofed,
                 pump = self.label,
@@ -922,9 +929,10 @@ pub(crate) mod tests {
         // rate-limited to its first occurrence.
         let mut report = RxReport::new("test");
         report.datagrams = 6;
+        report.opened = 6;
         assert!(
             report.is_uplink_blackhole(),
-            "6 real datagrams in and 0 to the TUN is a black-hole"
+            "6 authenticated datagrams in and 0 to the TUN is a black-hole"
         );
     }
 
@@ -932,6 +940,7 @@ pub(crate) mod tests {
     fn a_pump_that_delivered_anything_is_not_a_blackhole() {
         let mut report = RxReport::new("test");
         report.datagrams = 6;
+        report.opened = 6;
         report.to_tun = 1;
         assert!(
             !report.is_uplink_blackhole(),
@@ -946,11 +955,32 @@ pub(crate) mod tests {
         // nothing and must not raise the alarm.
         let mut report = RxReport::new("test");
         report.datagrams = 9;
+        report.opened = 9;
         report.dummies = 7;
         report.control_frames = 2;
         assert!(
             !report.is_uplink_blackhole(),
             "cover and control traffic never reaches the TUN by design"
+        );
+    }
+
+    #[test]
+    fn a_pump_that_never_authenticated_a_datagram_is_not_a_blackhole() {
+        // Traffic rejected BEFORE it was ever opened was never this client's
+        // uplink: an internet scanner's garbage, a stale key after an epoch
+        // rotation, a reconnect burst hitting the session-creation rate limit.
+        // Counting it would flood the alarm exactly when the exit is busiest,
+        // which is when the alarm has to be readable.
+        let mut report = RxReport::new("test");
+        report.datagrams = 40;
+        report.decode_errs = 10;
+        report.exit_id_mismatches = 10;
+        report.session_errs = 10;
+        report.open_errs = 5;
+        report.replays = 5;
+        assert!(
+            !report.is_uplink_blackhole(),
+            "a connection that never authenticated a datagram black-holed nothing"
         );
     }
 
