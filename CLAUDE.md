@@ -46,7 +46,7 @@ socket-buffer sizing, and the Apple fast datapath. No vendored tree, no
 `[patch.crates-io]`, no setup script.
 
 The hard anti-depatch guard is the E0599 compile error from the fork-only knobs in
-`warrenguard-transport-core/src/transport_config.rs`. Bumping the fork means
+`crates/warrenguard-transport-core/src/transport_config.rs`. Bumping the fork means
 pushing a new tag on `warren-quinn` and bumping the `tag` here.
 
 ## 4. Code style specifics
