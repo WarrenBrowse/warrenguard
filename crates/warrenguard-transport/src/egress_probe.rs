@@ -112,7 +112,14 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_millis(2500);
 /// (`every_probe_datagram_can_still_be_answered_inside_the_deadline`). Only a
 /// failing probe ever sends more than the first: a healthy circuit answers in
 /// ~370 ms and returns.
-const PROBE_SENDS: [Duration; 3] = [
+///
+/// Exported for the same reason as [`PROBE_QNAME`] and [`PROBE_TIMEOUT`]: an
+/// external probe driver MUST follow this schedule, not just the deadline. The
+/// three constants were sized together, and [`PROBE_TIMEOUT`] is only safe
+/// because a lost datagram is retransmitted twice inside it. A driver that
+/// sends once and waits out the deadline has no retransmit at all, so one lost
+/// datagram is a failed probe, and three of those convict a healthy exit.
+pub const PROBE_SENDS: [Duration; 3] = [
     Duration::ZERO,
     Duration::from_millis(700),
     Duration::from_millis(1400),
