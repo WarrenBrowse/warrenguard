@@ -22,9 +22,21 @@
 //! escalates a full reconnect through the caller's escalation channel (the same
 //! path RX-silence uses): a live QUIC session over an exit that forwards nothing
 //! is a dead path the RX-silence guards cannot see, so banner-and-wait would
-//! leave the user offline until the exit self-healed. A faster startup cadence
-//! probes until the first success so a circuit that is dead from connect is
-//! caught in ~20 s instead of ~75 s.
+//! leave the user offline until the exit self-healed.
+//!
+//! Two cadences, and which one applies is the whole timing design. A circuit
+//! that has answered and has nothing pending is polled on
+//! [`EgressProbeConfig::interval`]; a circuit that is unproven (dead from
+//! connect, or fresh out of a redial) or already carrying a failure is polled on
+//! the much faster [`EgressProbeConfig::startup_interval`], because in both
+//! cases the next probe decides something. The verdict still needs the same
+//! consecutive failures, so the evidence is unchanged and only the waiting
+//! between the probes is gone. Against the shipped defaults, with the timings
+//! justified on [`PROBE_TIMEOUT`] from a measurement on the beta network, that
+//! bounds the user's time on a silently dead tunnel at ~11 s from connect and
+//! ~39 s from a mid-session death, and requires ~9 s of unbroken silence before
+//! a working tunnel can be torn down. The scheduler tests assert those three
+//! numbers in wall-clock terms.
 //!
 //! This is the reusable engine home for that behavior. The scheduler
 //! [`run_egress_probe`] is transport-agnostic: a consumer implements
@@ -41,17 +53,19 @@ use std::time::Duration;
 pub const EGRESS_PROBE_ENV: &str = "WARREN_EGRESS_PROBE";
 /// Steady-state probe cadence in seconds (jittered +/-15% per tick).
 pub const EGRESS_PROBE_INTERVAL_ENV: &str = "WARREN_EGRESS_PROBE_INTERVAL_SECS";
-/// Faster cadence used until the first probe proves the circuit forwards.
+/// Faster cadence for a circuit that is unproven or carrying a failure.
 pub const EGRESS_PROBE_STARTUP_ENV: &str = "WARREN_EGRESS_PROBE_STARTUP_SECS";
 /// Consecutive failures before the egress-dead verdict.
 pub const EGRESS_PROBE_FAILURES_ENV: &str = "WARREN_EGRESS_PROBE_FAILURES";
 
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(25);
 const INTERVAL_RANGE_SECS: std::ops::RangeInclusive<u64> = 5..=600;
-/// Until the first success, probe on this shorter cadence: a circuit that never
-/// forwards from connect is then detected and reconnected in ~20 s instead of a
-/// full steady interval.
-const DEFAULT_STARTUP_INTERVAL: Duration = Duration::from_secs(3);
+/// Cadence for a circuit that is unproven or under suspicion. One second is
+/// still ~1.3x the measured p99 round trip (see [`PROBE_TIMEOUT`]), so
+/// consecutive probes never overlap on a healthy circuit, and it keeps the first
+/// probe far enough behind the TUN coming up that a local routing error cannot
+/// be mistaken for an answer.
+const DEFAULT_STARTUP_INTERVAL: Duration = Duration::from_secs(1);
 const STARTUP_RANGE_SECS: std::ops::RangeInclusive<u64> = 1..=60;
 const DEFAULT_FAILURE_THRESHOLD: u32 = 3;
 const FAILURE_RANGE: std::ops::RangeInclusive<u32> = 1..=10;
@@ -68,21 +82,41 @@ const GATEWAY_DNS: SocketAddr =
 /// re-declaring it.
 pub const PROBE_QNAME: &str = "warrenbrowse.com";
 
-/// Overall wait for an answer within one probe (two sends inside). Exported
-/// for external probe drivers, like [`PROBE_QNAME`].
-pub const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
-/// Retransmit offset of the second datagram inside one probe, so a single lost
-/// UDP packet does not count as an egress failure.
-const PROBE_RETRANSMIT: Duration = Duration::from_secs(2);
+/// Overall wait for an answer within one probe. Exported for external probe
+/// drivers, like [`PROBE_QNAME`].
+///
+/// Measured on the beta network (Android, two-hop circuit to Falkenstein,
+/// 2026-08-02): 536 in-tunnel DNS round trips over 7 minutes on one stable
+/// session, p50 368 ms, p95 574 ms, p99 737 ms, max 1186 ms, and one datagram
+/// lost outright. 2.5 s is 2.1x the worst round trip that measurement saw and
+/// 3.4x its p99, so the deadline still absorbs a far worse link than the one it
+/// was measured on, while costing a third of the old 4 s wait on every failed
+/// probe. Three probes have to spend it before an exit is convicted, so it is
+/// the dominant term in the detection time.
+pub const PROBE_TIMEOUT: Duration = Duration::from_millis(2500);
+/// Offsets, from the start of one probe, at which that probe sends its query.
+///
+/// Retransmitting inside the probe is what keeps a shorter deadline safe: a lost
+/// datagram costs a retransmit, never a failed probe. The offsets are spaced by
+/// roughly the measured p99 round trip and the last one still leaves 1.1 s, so
+/// every datagram in the schedule can genuinely be answered before the deadline
+/// (`every_probe_datagram_can_still_be_answered_inside_the_deadline`). Only a
+/// failing probe ever sends more than the first: a healthy circuit answers in
+/// ~370 ms and returns.
+const PROBE_SENDS: [Duration; 3] = [
+    Duration::ZERO,
+    Duration::from_millis(700),
+    Duration::from_millis(1400),
+];
 
 /// Resolved probe settings (env knobs applied once at tunnel start).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EgressProbeConfig {
     /// `false` when `WARREN_EGRESS_PROBE=0` disables the probe entirely.
     pub enabled: bool,
-    /// Steady-state cadence, used once the first probe has proven the circuit.
+    /// Steady-state cadence, for a proven circuit with no failure pending.
     pub interval: Duration,
-    /// Faster startup cadence, used until the first successful probe.
+    /// Faster cadence, for a circuit that is unproven or under suspicion.
     pub startup_interval: Duration,
     /// Consecutive failures before the egress-dead verdict fires.
     pub failure_threshold: u32,
@@ -198,10 +232,11 @@ pub fn is_matching_response(buf: &[u8], txid: u16) -> bool {
 /// `async fn`) so this public trait is free of the `async_fn_in_trait`
 /// caveat; an implementor may still write `async fn` for each.
 pub trait EgressProbeIo {
-    /// Waits for the next probe tick. `settled` is `false` until the first probe
-    /// has succeeded, selecting the faster startup cadence. A `false` return =
-    /// teardown, so the loop exits.
-    fn next_tick(&mut self, settled: bool) -> impl Future<Output = bool> + Send;
+    /// Waits for the next probe tick. `steady` is `true` only for a circuit that
+    /// has answered and has no failure pending; an unproven or suspect circuit
+    /// passes `false` and takes the faster cadence. A `false` return = teardown,
+    /// so the loop exits.
+    fn next_tick(&mut self, steady: bool) -> impl Future<Output = bool> + Send;
     /// `true` while the supervisor has a live published session (always `true`
     /// for an unsupervised pump, which has no supervisor).
     fn session_present(&mut self) -> bool;
@@ -234,19 +269,27 @@ pub trait EgressProbeIo {
 pub async fn run_egress_probe<I: EgressProbeIo>(io: &mut I, failure_threshold: u32) {
     let mut consecutive_failures: u32 = 0;
     let mut dead = false;
-    let mut settled = false;
+    let mut proven = false;
     loop {
-        if !io.next_tick(settled).await {
+        // The steady cadence is for a circuit that is both proven and quiet.
+        // Confirming a suspicion on it would spend two more steady intervals
+        // deciding, so a pending failure takes the fast cadence too: the
+        // evidence required is unchanged (the same consecutive probes), only the
+        // waiting between them is gone.
+        let steady = proven && consecutive_failures == 0;
+        if !io.next_tick(steady).await {
             return;
         }
         if !io.session_present() {
             // A redial in flight: failures across it would conflate two
-            // different exits (a failover may land elsewhere).
+            // different exits (a failover may land elsewhere), and for the same
+            // reason the circuit that comes back is unproven until it answers.
             consecutive_failures = 0;
+            proven = false;
             continue;
         }
         if io.probe().await {
-            settled = true;
+            proven = true;
             consecutive_failures = 0;
             if dead {
                 dead = false;
@@ -282,7 +325,7 @@ pub async fn run_egress_probe<I: EgressProbeIo>(io: &mut I, failure_threshold: u
 }
 
 /// One in-tunnel DNS round trip to the exit resolver, for TUN-routed consumers.
-/// Two datagrams spaced [`PROBE_RETRANSMIT`], overall deadline [`PROBE_TIMEOUT`].
+/// Datagrams at the [`PROBE_SENDS`] offsets, overall deadline [`PROBE_TIMEOUT`].
 /// Local socket errors (bind/send) are inconclusive, not egress-dead: they
 /// report success so a host-side hiccup never raises the banner.
 ///
@@ -303,22 +346,22 @@ pub async fn probe_gateway_dns() -> bool {
     }
     let txid = rand::random::<u16>();
     let query = build_dns_query(txid, PROBE_QNAME);
+    let started = tokio::time::Instant::now();
     if sock.send(&query).await.is_err() {
         // Send failures are routing/firewall races during teardown, not an exit
         // verdict.
         return true;
     }
     let mut buf = [0u8; 512];
-    let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
-    let retransmit = tokio::time::sleep(PROBE_RETRANSMIT);
-    tokio::pin!(retransmit);
-    let mut retransmitted = false;
+    let deadline = started + PROBE_TIMEOUT;
+    // The first offset was just sent; the rest are retransmits still to come.
+    let mut retransmits = PROBE_SENDS.iter().skip(1).map(|offset| started + *offset);
+    let mut next_send = retransmits.next();
     loop {
+        // Absolute instants, so re-arming the timer on every loop turn (the
+        // stray-datagram path) never shifts the schedule.
+        let wake = next_send.unwrap_or(deadline).min(deadline);
         tokio::select! {
-            () = &mut retransmit, if !retransmitted => {
-                retransmitted = true;
-                let _ = sock.send(&query).await;
-            }
             recv = sock.recv(&mut buf) => {
                 match recv {
                     Ok(n) if is_matching_response(&buf[..n], txid) => return true,
@@ -326,7 +369,13 @@ pub async fn probe_gateway_dns() -> bool {
                     Err(_) => return false,
                 }
             }
-            () = tokio::time::sleep_until(deadline) => return false,
+            () = tokio::time::sleep_until(wake) => {
+                if wake >= deadline {
+                    return false;
+                }
+                let _ = sock.send(&query).await;
+                next_send = retransmits.next();
+            }
         }
     }
 }
@@ -649,6 +698,249 @@ mod tests {
             vec![false, false, false, true, true],
             "settled flips to true only after the first successful probe"
         );
+    }
+
+    // --- schedule timing ----------------------------------------------
+    //
+    // The bounds below are the point of the whole module: how long a user sits
+    // on a tunnel that carries nothing, and how much healthy turbulence it takes
+    // to tear a working tunnel down. They are asserted in WALL-CLOCK terms over
+    // tokio's paused clock, against the shipped defaults, so a constant edited
+    // without thinking moves a test rather than only a number.
+
+    /// Round trip a healthy probe takes in the model below.
+    ///
+    /// The measured p99 of the in-tunnel DNS round trip on the beta network
+    /// (see [`PROBE_TIMEOUT`] for the sample). Modelling the p99 rather than the
+    /// median keeps every bound below pessimistic.
+    const MODEL_RTT: Duration = Duration::from_millis(750);
+
+    /// Worst-case jitter draw, so an asserted bound is a true upper bound.
+    const WORST_JITTER: f64 = 1.0;
+
+    /// Datagrams one probe sends, at these offsets from its start.
+    fn probe_send_offsets() -> Vec<Duration> {
+        PROBE_SENDS.to_vec()
+    }
+
+    /// Scheduler mock that spends real (simulated) time: `next_tick` sleeps the
+    /// jittered cadence the shipped defaults produce and `probe` consumes the
+    /// real deadline when nothing answers. A test can then assert on elapsed
+    /// time rather than on tick counts.
+    struct TimedIo {
+        /// Window, from loop start, during which the exit forwards nothing.
+        dead: std::ops::Range<Duration>,
+        /// Every `lose_every`-th probe loses all of its datagrams, modelling
+        /// isolated packet loss on an otherwise healthy circuit.
+        lose_every: usize,
+        probes: usize,
+        started: tokio::time::Instant,
+        stop_after: Duration,
+        escalated_at: Option<Duration>,
+        published: Vec<bool>,
+        fast_ticks: usize,
+        steady_ticks: usize,
+    }
+
+    impl TimedIo {
+        fn new(dead: std::ops::Range<Duration>, stop_after: Duration) -> Self {
+            Self {
+                dead,
+                lose_every: 0,
+                probes: 0,
+                started: tokio::time::Instant::now(),
+                stop_after,
+                escalated_at: None,
+                published: Vec::new(),
+                fast_ticks: 0,
+                steady_ticks: 0,
+            }
+        }
+
+        fn healthy(stop_after: Duration) -> Self {
+            Self::new(Duration::MAX..Duration::MAX, stop_after)
+        }
+
+        fn elapsed(&self) -> Duration {
+            self.started.elapsed()
+        }
+
+        /// `true` when the exit forwards nothing at any point of `[from, to]`.
+        fn dead_over(&self, from: Duration, to: Duration) -> bool {
+            from < self.dead.end && to >= self.dead.start
+        }
+    }
+
+    impl EgressProbeIo for TimedIo {
+        async fn next_tick(&mut self, settled: bool) -> bool {
+            if self.elapsed() >= self.stop_after {
+                return false;
+            }
+            let base = if settled {
+                self.steady_ticks += 1;
+                DEFAULT_INTERVAL
+            } else {
+                self.fast_ticks += 1;
+                DEFAULT_STARTUP_INTERVAL
+            };
+            tokio::time::sleep(jittered(base, WORST_JITTER)).await;
+            true
+        }
+
+        fn session_present(&mut self) -> bool {
+            true
+        }
+
+        async fn probe(&mut self) -> bool {
+            self.probes += 1;
+            let start = self.elapsed();
+            let lost = self.lose_every > 0 && self.probes % self.lose_every == 0;
+            if !lost {
+                for offset in probe_send_offsets() {
+                    let sent = start + offset;
+                    let answered = offset + MODEL_RTT;
+                    if answered <= PROBE_TIMEOUT && !self.dead_over(sent, sent + MODEL_RTT) {
+                        tokio::time::sleep(answered).await;
+                        return true;
+                    }
+                }
+            }
+            tokio::time::sleep(PROBE_TIMEOUT).await;
+            false
+        }
+
+        fn publish(&mut self, egress_dead: bool) {
+            self.published.push(egress_dead);
+        }
+
+        fn drain_active(&mut self) -> bool {
+            false
+        }
+
+        async fn try_migrate(&mut self) -> bool {
+            false
+        }
+
+        fn escalate_reconnect(&mut self, _msg: String) {
+            self.escalated_at = Some(self.elapsed());
+        }
+    }
+
+    /// A circuit that never forwards from connect is the cheapest case to
+    /// convict: nothing has ever crossed it, so no success has to be explained
+    /// away. The user must not sit in front of "You are protected" over a dead
+    /// tunnel for the length of a steady cadence.
+    #[tokio::test(start_paused = true)]
+    async fn a_circuit_dead_from_connect_is_convicted_within_twelve_seconds() {
+        let mut io = TimedIo::new(Duration::ZERO..Duration::MAX, Duration::from_secs(300));
+        run_egress_probe(&mut io, DEFAULT_FAILURE_THRESHOLD).await;
+        let convicted = io.escalated_at.expect("a dead circuit must escalate");
+        assert!(
+            convicted <= Duration::from_secs(12),
+            "a circuit dead from connect must be convicted within 12 s, took {convicted:?}"
+        );
+        assert_eq!(io.published, vec![true]);
+    }
+
+    /// An exit that stops forwarding mid-session must not be confirmed on the
+    /// steady cadence: the first failure is a suspicion, and confirming it takes
+    /// the fast cadence, so the whole verdict lands inside one steady interval
+    /// of the death instead of three.
+    #[tokio::test(start_paused = true)]
+    async fn a_circuit_that_dies_mid_session_is_convicted_within_forty_seconds() {
+        // 61 s falls just after a probe has answered, which is the worst place
+        // for the exit to die: a whole steady interval passes before anything
+        // suspects it. The lower bound below keeps the test on that worst case
+        // instead of silently drifting onto a lucky phase.
+        let death = Duration::from_secs(61);
+        let mut io = TimedIo::new(death..Duration::MAX, Duration::from_secs(600));
+        run_egress_probe(&mut io, DEFAULT_FAILURE_THRESHOLD).await;
+        let convicted = io.escalated_at.expect("a dead exit must escalate");
+        let after_death = convicted.saturating_sub(death);
+        assert!(
+            after_death >= Duration::from_secs(30),
+            "this bound is about a death that wastes a full steady interval; \
+             {after_death:?} means the death no longer lands there"
+        );
+        assert!(
+            after_death <= Duration::from_secs(40),
+            "an exit that stops forwarding must be convicted within 40 s of the \
+             death, took {after_death:?}"
+        );
+    }
+
+    /// The other half of the trade: a verdict tears a working tunnel down, so a
+    /// turbulence burst shorter than the conviction window must never reach it.
+    /// Eight seconds of total silence is well past anything the beta measurement
+    /// showed on a live circuit (zero probe loss in 431 samples).
+    #[tokio::test(start_paused = true)]
+    async fn a_stall_shorter_than_the_conviction_window_never_convicts() {
+        let stall = Duration::from_secs(30)..Duration::from_secs(38);
+        let mut io = TimedIo::new(stall, Duration::from_secs(300));
+        run_egress_probe(&mut io, DEFAULT_FAILURE_THRESHOLD).await;
+        assert!(
+            io.escalated_at.is_none(),
+            "an 8 s stall must never tear the tunnel down"
+        );
+        assert!(
+            io.published.is_empty(),
+            "an 8 s stall must not even banner: {:?}",
+            io.published
+        );
+    }
+
+    /// A healthy circuit that loses the odd probe must never be convicted, and
+    /// each isolated failure must cost exactly one fast confirmation tick before
+    /// the loop settles back onto the steady cadence.
+    #[tokio::test(start_paused = true)]
+    async fn an_occasional_lost_probe_never_convicts_and_returns_to_the_steady_cadence() {
+        let mut io = TimedIo::healthy(Duration::from_secs(3600));
+        io.lose_every = 5;
+        run_egress_probe(&mut io, DEFAULT_FAILURE_THRESHOLD).await;
+        assert!(
+            io.published.is_empty() && io.escalated_at.is_none(),
+            "isolated losses must never convict: {:?}",
+            io.published
+        );
+        let lost = io.probes / io.lose_every;
+        assert_eq!(
+            io.fast_ticks,
+            1 + lost,
+            "the fast cadence must be used once at startup and once per pending \
+             failure, never beyond it"
+        );
+        assert!(
+            io.steady_ticks > 100,
+            "a healthy circuit must spend its life on the steady cadence"
+        );
+    }
+
+    /// A redial may land on a different exit, so the new circuit is unproven:
+    /// it must be re-proven on the fast cadence, exactly like the first one.
+    #[tokio::test]
+    async fn a_redial_reproves_the_new_circuit_on_the_fast_cadence() {
+        let mut io = MockIo::scripted([Some(true), None, Some(true)]);
+        run_egress_probe(&mut io, 3).await;
+        assert_eq!(
+            io.settled_seen,
+            vec![false, true, false, true],
+            "the tick after a redial must drop back to the fast cadence, and the \
+             one after the new circuit answers must return to the steady one"
+        );
+    }
+
+    /// The deadline has to leave the last retransmit room to be answered, or the
+    /// extra datagram buys nothing. The budget is the measured p99 of the
+    /// in-tunnel round trip (see [`MODEL_RTT`]).
+    #[test]
+    fn every_probe_datagram_can_still_be_answered_inside_the_deadline() {
+        for offset in probe_send_offsets() {
+            assert!(
+                offset + MODEL_RTT <= PROBE_TIMEOUT,
+                "a datagram sent at {offset:?} cannot be answered within \
+                 {PROBE_TIMEOUT:?} at the measured p99 round trip"
+            );
+        }
     }
 
     #[test]
