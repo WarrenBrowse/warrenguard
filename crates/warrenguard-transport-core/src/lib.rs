@@ -25,7 +25,8 @@ pub use inner_mtu::{
     uplink_frag_needed,
 };
 pub use ip_parse::{
-    extract_dst_ipv4, extract_dst_ipv6, extract_src_ipv4, extract_src_ipv6, source_ip_matches,
+    SpoofRefusal, classify_source, extract_dst_ipv4, extract_dst_ipv6, extract_src_ipv4,
+    extract_src_ipv6, source_ip_matches,
 };
 pub use packet_device::{FakeTun, PacketDevice};
 pub use path_probe::{PATH_PROBE_INTERVAL, PathProbeDelta, spawn_path_probe};

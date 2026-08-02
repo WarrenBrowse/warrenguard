@@ -52,6 +52,11 @@ pub struct UplinkMetrics {
     dropped_spoofed_source: AtomicU64,
     dropped_rate_limit: AtomicU64,
     dropped_tun_write: AtomicU64,
+    /// Refinement of `dropped_spoofed_source`, in [`crate::datapath::SpoofTally::CLASSES`]
+    /// order. Kept a separate series rather than five more `reason` values
+    /// so the closed ten-reason set, and the invariant that it sums to
+    /// `received - forwarded`, both stay exactly as they are.
+    spoofed_by_class: [AtomicU64; 5],
 }
 
 /// The node's block, folded into by every exit rx pump in this process.
@@ -93,6 +98,7 @@ impl UplinkMetrics {
             dropped_spoofed_source: AtomicU64::new(0),
             dropped_rate_limit: AtomicU64::new(0),
             dropped_tun_write: AtomicU64::new(0),
+            spoofed_by_class: [const { AtomicU64::new(0) }; 5],
         }
     }
 
@@ -136,7 +142,17 @@ impl UplinkMetrics {
             published.control_frames,
         );
         add(&self.dropped_daita_dummy, now.dummies, published.dummies);
-        add(&self.dropped_spoofed_source, now.spoofed, published.spoofed);
+        // The total is derived from the classes, so the refinement can
+        // never disagree with the series it refines.
+        add(
+            &self.dropped_spoofed_source,
+            now.spoof.total(),
+            published.spoof.total(),
+        );
+        let (now_classes, published_classes) = (now.spoof.as_array(), published.spoof.as_array());
+        for (i, slot) in self.spoofed_by_class.iter().enumerate() {
+            add(slot, now_classes[i], published_classes[i]);
+        }
         add(
             &self.dropped_rate_limit,
             now.rate_drops,
@@ -168,6 +184,9 @@ impl UplinkMetrics {
             dropped_spoofed_source: self.dropped_spoofed_source.load(Ordering::Relaxed),
             dropped_rate_limit: self.dropped_rate_limit.load(Ordering::Relaxed),
             dropped_tun_write: self.dropped_tun_write.load(Ordering::Relaxed),
+            spoofed_by_class: std::array::from_fn(|i| {
+                self.spoofed_by_class[i].load(Ordering::Relaxed)
+            }),
         }
     }
 }
@@ -319,6 +338,8 @@ pub struct UplinkSnapshot {
     pub dropped_rate_limit: u64,
     /// The TUN write itself failed (kernel queue pressure, device gone).
     pub dropped_tun_write: u64,
+    /// See [`Self::spoofed_by_class`].
+    pub spoofed_by_class: [u64; 5],
 }
 
 impl UplinkSnapshot {
@@ -353,6 +374,27 @@ impl UplinkSnapshot {
             ("tun_write", self.dropped_tun_write),
         ]
     }
+
+    /// What the anti-spoof gate refused, split by the class of packet that
+    /// caused it, as `(class, count)`. The classes sum to
+    /// [`Self::dropped_spoofed_source`], so this refines that reason rather
+    /// than competing with it.
+    ///
+    /// It exists because `spoofed_source` merged two facts that want
+    /// opposite responses: `v4_mismatch` is a tunnel client impersonating
+    /// another, and `v6_link_local` is a client's own neighbour-discovery
+    /// chatter on a link that does not exist. Node-level aggregates, and
+    /// every class is a property of the packet's own header, never of who
+    /// sent it.
+    #[must_use]
+    pub fn spoofed_by_class(&self) -> [(&'static str, u64); 5] {
+        std::array::from_fn(|i| {
+            (
+                crate::datapath::SpoofTally::CLASSES[i],
+                self.spoofed_by_class[i],
+            )
+        })
+    }
 }
 
 #[cfg(test)]
@@ -373,7 +415,13 @@ mod tests {
             replays: 5,
             control_frames: 6,
             dummies: 7,
-            spoofed: 8,
+            spoof: crate::datapath::SpoofTally {
+                malformed: 1,
+                v4_mismatch: 2,
+                v6_link_local: 3,
+                v6_unallocated: 1,
+                v6_mismatch: 1,
+            },
             rate_drops: 9,
             tun_write_errs: 10,
         }
@@ -423,6 +471,33 @@ mod tests {
     }
 
     #[test]
+    fn each_spoof_class_folds_into_its_own_series_and_they_sum_to_the_reason() {
+        // The refinement must never disagree with the reason it refines: a
+        // scrape that reads `spoofed_source=23` and a breakdown summing to
+        // 22 tells an investigator nothing it can trust.
+        let m = UplinkMetrics::new();
+        m.fold(&distinct(), &RxCounters::default());
+        let s = m.snapshot();
+
+        assert_eq!(
+            s.spoofed_by_class(),
+            [
+                ("malformed", 1),
+                ("v4_mismatch", 2),
+                ("v6_link_local", 3),
+                ("v6_unallocated", 1),
+                ("v6_mismatch", 1),
+            ],
+            "a stale class ordering would mislabel every series"
+        );
+        let named: u64 = s.spoofed_by_class().iter().map(|(_, n)| n).sum();
+        assert_eq!(
+            named, s.dropped_spoofed_source,
+            "the classes must account for every refusal the gate counted"
+        );
+    }
+
+    #[test]
     fn a_forwarded_datagram_increments_no_drop_counter() {
         let m = UplinkMetrics::new();
         m.fold(
@@ -453,7 +528,10 @@ mod tests {
             datagrams: 10,
             opened: 10,
             to_tun: 8,
-            spoofed: 2,
+            spoof: crate::datapath::SpoofTally {
+                v4_mismatch: 2,
+                ..crate::datapath::SpoofTally::default()
+            },
             ..RxCounters::default()
         };
         m.fold(&first_half, &RxCounters::default());
@@ -463,7 +541,10 @@ mod tests {
             datagrams: 30,
             opened: 30,
             to_tun: 25,
-            spoofed: 5,
+            spoof: crate::datapath::SpoofTally {
+                v4_mismatch: 5,
+                ..crate::datapath::SpoofTally::default()
+            },
             ..RxCounters::default()
         };
         m.fold(&whole, &first_half);

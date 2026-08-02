@@ -21,8 +21,8 @@ use parking_lot::Mutex;
 use quinn::{Connection, DatagramClass, SendDatagramError};
 use warrenguard_daita::daita::{DaitaEvent, DaitaMetrics, DaitaState};
 use warrenguard_pump::is_daita_dummy;
-use warrenguard_server::tun_dispatch::source_ip_matches;
 use warrenguard_transport_core::PacketDevice;
+use warrenguard_transport_core::ip_parse::{SpoofRefusal, classify_source};
 use warrenguard_transport_core::{build_frag_needed, clamp_syn_mss, is_tcp_syn};
 
 /// Bound on each connection's downlink channel. Full ⇒ the router drops
@@ -398,15 +398,92 @@ impl<T: PacketDevice> TunWriter<T> {
     }
 }
 
+/// One connection's refusals, split by the class of packet that caused
+/// them. `spoofed_source` on its own could not separate the impersonation
+/// the gate exists for from a client's own link-local stack chatter, and a
+/// rate-limited WARN printed the same single line for both, so a universal
+/// benign class read as an attack for months (2026-08-02).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SpoofTally {
+    pub(crate) malformed: u64,
+    pub(crate) v4_mismatch: u64,
+    pub(crate) v6_link_local: u64,
+    pub(crate) v6_unallocated: u64,
+    pub(crate) v6_mismatch: u64,
+}
+
+impl SpoofTally {
+    /// Every refusal, whatever its class: the quantity the node-wide
+    /// `spoofed_source` series carries.
+    pub(crate) const fn total(&self) -> u64 {
+        self.malformed
+            + self.v4_mismatch
+            + self.v6_link_local
+            + self.v6_unallocated
+            + self.v6_mismatch
+    }
+
+    /// Records one refusal and returns that class's running count.
+    fn bump(&mut self, refusal: SpoofRefusal) -> u64 {
+        let slot = match refusal {
+            SpoofRefusal::Malformed => &mut self.malformed,
+            SpoofRefusal::V4Mismatch => &mut self.v4_mismatch,
+            SpoofRefusal::V6LinkLocal => &mut self.v6_link_local,
+            SpoofRefusal::V6Unallocated => &mut self.v6_unallocated,
+            SpoofRefusal::V6Mismatch => &mut self.v6_mismatch,
+        };
+        *slot += 1;
+        *slot
+    }
+
+    /// The class names, in the order [`Self::as_array`] reports them. Shared
+    /// with the metric labels so an exposition cannot drift from the gate.
+    pub(crate) const CLASSES: [&'static str; 5] = [
+        "malformed",
+        "v4_mismatch",
+        "v6_link_local",
+        "v6_unallocated",
+        "v6_mismatch",
+    ];
+
+    pub(crate) const fn as_array(&self) -> [u64; 5] {
+        [
+            self.malformed,
+            self.v4_mismatch,
+            self.v6_link_local,
+            self.v6_unallocated,
+            self.v6_mismatch,
+        ]
+    }
+}
+
+/// The label a refusal is reported under, in a log and in a metric.
+pub(crate) const fn refusal_class(refusal: SpoofRefusal) -> &'static str {
+    match refusal {
+        SpoofRefusal::Malformed => SpoofTally::CLASSES[0],
+        SpoofRefusal::V4Mismatch => SpoofTally::CLASSES[1],
+        SpoofRefusal::V6LinkLocal => SpoofTally::CLASSES[2],
+        SpoofRefusal::V6Unallocated => SpoofTally::CLASSES[3],
+        SpoofRefusal::V6Mismatch => SpoofTally::CLASSES[4],
+    }
+}
+
 /// Inner-source anti-spoof gate: a decrypted uplink packet may only carry the
 /// address this connection was assigned. Load-bearing authorization, which is
 /// why the v4 address is not optional: setup refuses any session it could not
-/// assign one to, so the gate is armed for every served connection. Only the
-/// drop COUNT is ever logged, never the address (no-log discipline).
+/// assign one to, so the gate is armed for every served connection.
+///
+/// No-log discipline: the refusal CLASS, the version nibble, the packet
+/// length and a count are reported. The address that failed to match, in
+/// either direction, never is.
 pub struct SpoofGate {
     pub(crate) v4: Ipv4Addr,
     pub(crate) v6: Option<Ipv6Addr>,
-    pub(crate) drops: RateLimited,
+    pub(crate) tally: SpoofTally,
+    /// One rate limiter per class, so the FIRST refusal of each class is
+    /// always logged. A single shared limiter fired on the first refusal of
+    /// any class and then hid every other class behind it.
+    pub(crate) logs: [RateLimited; 5],
     pub(crate) label: &'static str,
 }
 
@@ -418,28 +495,45 @@ impl SpoofGate {
         Self {
             v4,
             v6,
-            drops: RateLimited::new(10_000),
+            tally: SpoofTally::default(),
+            logs: [const { RateLimited::new(10_000) }; 5],
             label,
         }
     }
 
-    /// `false` when the packet must be dropped, counting the rejection.
+    /// `false` when the packet must be dropped, counting the rejection under
+    /// its class.
     pub fn admits(&mut self, plaintext: &[u8]) -> bool {
-        if source_ip_matches(plaintext, self.v4, self.v6) {
+        let Some(refusal) = classify_source(plaintext, self.v4, self.v6) else {
             return true;
-        }
-        if self.drops.hit() {
+        };
+        let class = refusal_class(refusal);
+        let drops = self.tally.bump(refusal);
+        if self.logs[Self::slot(refusal)].hit() {
             tracing::warn!(
-                spoofed_drops = self.drops.count(),
+                refusal = class,
+                version = plaintext.first().map_or(0, |b| b >> 4),
+                len = plaintext.len(),
+                drops,
                 pump = self.label,
-                "rx_task: dropped packet with spoofed inner source IP"
+                "rx_task: dropped an uplink packet whose inner source the gate could not match"
             );
         }
         false
     }
 
-    pub(crate) const fn drops(&self) -> u64 {
-        self.drops.count()
+    const fn slot(refusal: SpoofRefusal) -> usize {
+        match refusal {
+            SpoofRefusal::Malformed => 0,
+            SpoofRefusal::V4Mismatch => 1,
+            SpoofRefusal::V6LinkLocal => 2,
+            SpoofRefusal::V6Unallocated => 3,
+            SpoofRefusal::V6Mismatch => 4,
+        }
+    }
+
+    pub(crate) const fn tally(&self) -> SpoofTally {
+        self.tally
     }
 }
 
@@ -503,9 +597,10 @@ pub(crate) struct RxCounters {
     pub(crate) replays: u64,
     pub(crate) control_frames: u64,
     pub(crate) dummies: u64,
-    /// Mirror of the spoof gate's own count (the gate owns the rate-limited
-    /// log, this side owns the accounting).
-    pub(crate) spoofed: u64,
+    /// Mirror of the spoof gate's own tally (the gate owns the rate-limited
+    /// log, this side owns the accounting). Its total is the `spoofed_source`
+    /// drop reason, so the classes sum to that series by construction.
+    pub(crate) spoof: SpoofTally,
     pub(crate) rate_drops: u64,
     /// The TUN write itself failed and swallowed the packet.
     pub(crate) tun_write_errs: u64,
@@ -516,9 +611,9 @@ pub(crate) struct RxCounters {
 /// diagnosable from production logs without per-packet spam. Counters only, no
 /// identity material.
 pub(crate) struct RxReport {
-    /// Last spoof-gate drop count seen, mirrored here so the end-of-pump
-    /// verdict can name it without borrowing the gate back.
-    pub(crate) spoofed: u64,
+    /// Last spoof-gate tally seen, mirrored here so the end-of-pump verdict
+    /// can name every refusal class without borrowing the gate back.
+    pub(crate) spoof: SpoofTally,
     pub(crate) datagrams: u64,
     /// Datagrams that cleared decode, exit-id, session lookup, AEAD open and
     /// anti-replay: this client's actual uplink, as opposed to everything a
@@ -547,7 +642,7 @@ pub(crate) const RX_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 impl RxReport {
     pub(crate) fn new(label: &'static str) -> Self {
         Self {
-            spoofed: 0,
+            spoof: SpoofTally::default(),
             datagrams: 0,
             opened: 0,
             decode_errs: 0,
@@ -579,7 +674,7 @@ impl RxReport {
             replays: self.replays,
             control_frames: self.control_frames,
             dummies: self.dummies,
-            spoofed: self.spoofed,
+            spoof: self.spoof,
             rate_drops: self.rate_drops,
             tun_write_errs: self.tun_write_errs,
         }
@@ -603,8 +698,8 @@ impl RxReport {
     /// progress to the node-wide counters on the same cadence. The clock is
     /// only read once per [`RX_REPORT_CHECK_EVERY`] datagrams so the
     /// per-packet cost is a counter test, not a `clock_gettime`.
-    pub(crate) fn maybe_emit(&mut self, spoofed_drops: u64) {
-        self.spoofed = spoofed_drops;
+    pub(crate) fn maybe_emit(&mut self, spoof: SpoofTally) {
+        self.spoof = spoof;
         if !self.datagrams.is_multiple_of(RX_REPORT_CHECK_EVERY)
             || self.last_report.elapsed() < RX_REPORT_INTERVAL
         {
@@ -623,7 +718,12 @@ impl RxReport {
             replays = self.replays,
             rate_drops = self.rate_drops,
             tun_write_errs = self.tun_write_errs,
-            spoofed_drops,
+            spoofed_drops = spoof.total(),
+            spoofed_v4_mismatch = spoof.v4_mismatch,
+            spoofed_v6_link_local = spoof.v6_link_local,
+            spoofed_v6_unallocated = spoof.v6_unallocated,
+            spoofed_v6_mismatch = spoof.v6_mismatch,
+            spoofed_malformed = spoof.malformed,
             pump = self.label,
             "rx_task report"
         );
@@ -657,7 +757,12 @@ impl Drop for RxReport {
                 datagrams = self.datagrams,
                 opened = self.opened,
                 to_tun = self.to_tun,
-                spoofed_drops = self.spoofed,
+                spoofed_drops = self.spoof.total(),
+                spoofed_v4_mismatch = self.spoof.v4_mismatch,
+                spoofed_v6_link_local = self.spoof.v6_link_local,
+                spoofed_v6_unallocated = self.spoof.v6_unallocated,
+                spoofed_v6_mismatch = self.spoof.v6_mismatch,
+                spoofed_malformed = self.spoof.malformed,
                 decode_errs = self.decode_errs,
                 exit_id_mismatches = self.exit_id_mismatches,
                 session_errs = self.session_errs,
@@ -675,7 +780,7 @@ impl Drop for RxReport {
                 datagrams = self.datagrams,
                 opened = self.opened,
                 to_tun = self.to_tun,
-                spoofed_drops = self.spoofed,
+                spoofed_drops = self.spoof.total(),
                 pump = self.label,
                 "rx_task ended"
             );
@@ -1026,7 +1131,11 @@ pub(crate) mod tests {
             !gate.admits(&ipv4_packet_from(Ipv4Addr::new(93, 184, 216, 34))),
             "an arbitrary forged public source must be dropped"
         );
-        assert_eq!(gate.drops(), 2, "every rejection is counted for the report");
+        assert_eq!(
+            gate.tally().total(),
+            2,
+            "every rejection is counted for the report"
+        );
     }
 
     #[test]
@@ -1037,6 +1146,55 @@ pub(crate) mod tests {
         let mut v6 = vec![0u8; 40];
         v6[0] = 0x60;
         assert!(!gate.admits(&v6));
+    }
+
+    #[test]
+    fn spoof_gate_tallies_each_refusal_under_its_own_class() {
+        // `spoofed_source` alone cannot separate the attack the gate exists
+        // for from a client's own link-local chatter, and the two want
+        // opposite responses. The classes are what a scrape reads.
+        let mut gate = SpoofGate::new(Ipv4Addr::new(10, 66, 0, 7), None, "test");
+        gate.admits(&ipv4_packet_from(Ipv4Addr::new(10, 66, 0, 8)));
+
+        let mut link_local = vec![0u8; 60];
+        link_local[0] = 0x60;
+        link_local[8] = 0xfe;
+        link_local[9] = 0x80;
+        gate.admits(&link_local);
+        gate.admits(&link_local);
+
+        let mut routable = vec![0u8; 60];
+        routable[0] = 0x60;
+        routable[8] = 0x20;
+        routable[9] = 0x01;
+        gate.admits(&routable);
+
+        gate.admits(&[0x45; 10]);
+
+        let tally = gate.tally();
+        assert_eq!(tally.v4_mismatch, 1);
+        assert_eq!(tally.v6_link_local, 2);
+        assert_eq!(tally.v6_unallocated, 1);
+        assert_eq!(tally.v6_mismatch, 0);
+        assert_eq!(tally.malformed, 1);
+        assert_eq!(
+            tally.total(),
+            5,
+            "the classes must account for every refusal, or the breakdown \
+             would not sum to the spoofed_source series it refines"
+        );
+    }
+
+    #[test]
+    fn spoof_gate_admits_without_tallying_anything() {
+        let assigned = Ipv4Addr::new(10, 66, 0, 7);
+        let mut gate = SpoofGate::new(assigned, None, "test");
+        assert!(gate.admits(&ipv4_packet_from(assigned)));
+        assert_eq!(
+            gate.tally(),
+            SpoofTally::default(),
+            "an admitted packet must leave every class at zero"
+        );
     }
 
     #[test]

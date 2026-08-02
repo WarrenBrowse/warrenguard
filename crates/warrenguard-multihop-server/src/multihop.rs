@@ -3750,7 +3750,7 @@ async fn serve_terminating_connection<T>(
             // the published reading is fully classified, so a scrape can
             // never show a received datagram that no reason and no forward
             // accounts for.
-            report.maybe_emit(spoof_gate.drops());
+            report.maybe_emit(spoof_gate.tally());
             report.datagrams += 1;
             // One lock-free bump per inbound datagram: a live peer keeps this
             // advancing, a dead predecessor freezes it (takeover check).
@@ -3830,7 +3830,7 @@ async fn serve_terminating_connection<T>(
                 }
             }
             if !spoof_gate.admits(&plaintext) {
-                report.maybe_emit(spoof_gate.drops());
+                report.maybe_emit(spoof_gate.tally());
                 continue;
             }
             // Per-session uplink budget, enforced only on authenticated
@@ -3841,7 +3841,7 @@ async fn serve_terminating_connection<T>(
                 && !policy.admits_uplink(key, plaintext.len())
             {
                 report.rate_drops += 1;
-                report.maybe_emit(spoof_gate.drops());
+                report.maybe_emit(spoof_gate.tally());
                 continue;
             }
             // Anti-spoof passed: the inner source IP is this connection's
@@ -3864,7 +3864,7 @@ async fn serve_terminating_connection<T>(
                     return;
                 }
             }
-            report.maybe_emit(spoof_gate.drops());
+            report.maybe_emit(spoof_gate.tally());
         }
     });
 
@@ -4065,7 +4065,7 @@ async fn serve_pq_datagram_pump<T>(
             };
             // Same top-of-loop publication as the classical pump, and for
             // the same two reasons.
-            report.maybe_emit(spoof_gate.drops());
+            report.maybe_emit(spoof_gate.tally());
             report.datagrams += 1;
             rx_activity.fetch_add(1, Ordering::Relaxed);
             let frame = match decode_frame_v2(&datagram) {
@@ -4149,7 +4149,7 @@ async fn serve_pq_datagram_pump<T>(
                 }
             }
             if !spoof_gate.admits(&plaintext) {
-                report.maybe_emit(spoof_gate.drops());
+                report.maybe_emit(spoof_gate.tally());
                 continue;
             }
             // Per-session uplink budget: same gate and placement as the
@@ -4158,7 +4158,7 @@ async fn serve_pq_datagram_pump<T>(
                 && !policy.admits_uplink(key, plaintext.len())
             {
                 report.rate_drops += 1;
-                report.maybe_emit(spoof_gate.drops());
+                report.maybe_emit(spoof_gate.tally());
                 continue;
             }
             if flows.is_first_of_flow(&plaintext) {
@@ -4179,7 +4179,7 @@ async fn serve_pq_datagram_pump<T>(
                     return;
                 }
             }
-            report.maybe_emit(spoof_gate.drops());
+            report.maybe_emit(spoof_gate.tally());
         }
     });
 
