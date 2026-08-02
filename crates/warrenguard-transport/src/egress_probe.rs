@@ -89,10 +89,10 @@ pub const PROBE_QNAME: &str = "warrenbrowse.com";
 /// 2026-08-02): 536 in-tunnel DNS round trips over 7 minutes on one stable
 /// session, p50 368 ms, p95 574 ms, p99 737 ms, max 1186 ms, and one datagram
 /// lost outright. 2.5 s is 2.1x the worst round trip that measurement saw and
-/// 3.4x its p99, so the deadline still absorbs a far worse link than the one it
-/// was measured on, while costing a third of the old 4 s wait on every failed
-/// probe. Three probes have to spend it before an exit is convicted, so it is
-/// the dominant term in the detection time.
+/// 3.4x its p99, so the deadline absorbs a far worse link than the one it was
+/// measured on. Three probes have to spend it in full before an exit is
+/// convicted, which makes it the dominant term in the detection time: every
+/// 100 ms here is 300 ms of a user staring at a tunnel that carries nothing.
 pub const PROBE_TIMEOUT: Duration = Duration::from_millis(2500);
 /// Offsets, from the start of one probe, at which that probe sends its query.
 ///
@@ -480,8 +480,8 @@ mod tests {
         drain_active: bool,
         migrate_succeeds: bool,
         migrate_attempts: u32,
-        /// `settled` flags observed at each `next_tick` (cadence proof).
-        settled_seen: Vec<bool>,
+        /// `steady` flags observed at each `next_tick` (cadence proof).
+        steady_seen: Vec<bool>,
         /// Reconnect escalations (the fix): the messages passed.
         reconnects: Vec<String>,
     }
@@ -494,15 +494,15 @@ mod tests {
                 drain_active: false,
                 migrate_succeeds: false,
                 migrate_attempts: 0,
-                settled_seen: Vec::new(),
+                steady_seen: Vec::new(),
                 reconnects: Vec::new(),
             }
         }
     }
 
     impl EgressProbeIo for MockIo {
-        async fn next_tick(&mut self, settled: bool) -> bool {
-            self.settled_seen.push(settled);
+        async fn next_tick(&mut self, steady: bool) -> bool {
+            self.steady_seen.push(steady);
             !self.script.is_empty()
         }
         fn session_present(&mut self) -> bool {
@@ -688,15 +688,15 @@ mod tests {
 
     #[tokio::test]
     async fn startup_cadence_is_used_until_the_first_success() {
-        // `next_tick` sees settled=false until a probe succeeds, then true: the
-        // scheduler drives the fast startup cadence only while the circuit is
-        // unproven. High threshold so it never escalates.
+        // An unproven circuit takes the fast cadence however many probes it
+        // costs, and only the first success buys the steady one. High threshold
+        // so it never escalates.
         let mut io = MockIo::scripted([Some(false), Some(false), Some(true), Some(true)]);
         run_egress_probe(&mut io, 10).await;
         assert_eq!(
-            io.settled_seen,
+            io.steady_seen,
             vec![false, false, false, true, true],
-            "settled flips to true only after the first successful probe"
+            "the steady cadence starts only after the first successful probe"
         );
     }
 
@@ -772,11 +772,11 @@ mod tests {
     }
 
     impl EgressProbeIo for TimedIo {
-        async fn next_tick(&mut self, settled: bool) -> bool {
+        async fn next_tick(&mut self, steady: bool) -> bool {
             if self.elapsed() >= self.stop_after {
                 return false;
             }
-            let base = if settled {
+            let base = if steady {
                 self.steady_ticks += 1;
                 DEFAULT_INTERVAL
             } else {
@@ -922,7 +922,7 @@ mod tests {
         let mut io = MockIo::scripted([Some(true), None, Some(true)]);
         run_egress_probe(&mut io, 3).await;
         assert_eq!(
-            io.settled_seen,
+            io.steady_seen,
             vec![false, true, false, true],
             "the tick after a redial must drop back to the fast cadence, and the \
              one after the new circuit answers must return to the steady one"
