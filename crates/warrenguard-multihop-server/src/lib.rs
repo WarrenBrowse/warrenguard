@@ -13,6 +13,11 @@
 /// (routing keys, security gates, drop accounting, MTU adaptation).
 pub(crate) mod datapath;
 
+/// Node-wide uplink accounting the pumps fold into, for a deployer's
+/// `/metrics`: how many datagrams this exit received and never forwarded,
+/// and which gate ate them.
+pub mod metrics;
+
 /// Multihop termination: HPKE-aware Quinn datagram loop wired against
 /// the [`warrenguard_multihop`] `/v1` wire format, consumed end-to-end
 /// behind a `warrenguard-relay`.

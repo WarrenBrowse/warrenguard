@@ -3742,6 +3742,12 @@ async fn serve_terminating_connection<T>(
                 return;
             };
             report.datagrams += 1;
+            // Publish from the TOP of the loop, so a pump whose every
+            // datagram dies at an early gate (decode, exit_id, session)
+            // still reaches the node counters on the normal cadence. Those
+            // paths `continue` and never see the tail of the loop, which is
+            // exactly the shape a black-hole has.
+            report.maybe_emit(spoof_gate.drops());
             // One lock-free bump per inbound datagram: a live peer keeps this
             // advancing, a dead predecessor freezes it (takeover check).
             rx_activity.fetch_add(1, Ordering::Relaxed);
@@ -3856,8 +3862,11 @@ async fn serve_terminating_connection<T>(
                     report.to_tun += 1;
                     daita_rx.fire(&[DaitaEvent::NormalRecv]);
                 }
-                TunWrite::Dropped => {}
-                TunWrite::Fatal => return,
+                TunWrite::Dropped => report.tun_write_errs += 1,
+                TunWrite::Fatal => {
+                    report.tun_write_errs += 1;
+                    return;
+                }
             }
             report.maybe_emit(spoof_gate.drops());
         }
@@ -4059,6 +4068,9 @@ async fn serve_pq_datagram_pump<T>(
                 return;
             };
             report.datagrams += 1;
+            // Same top-of-loop publication as the classical pump: an early
+            // gate `continue`s and never reaches the tail.
+            report.maybe_emit(spoof_gate.drops());
             rx_activity.fetch_add(1, Ordering::Relaxed);
             let frame = match decode_frame_v2(&datagram) {
                 Ok(f) => f,
@@ -4163,8 +4175,11 @@ async fn serve_pq_datagram_pump<T>(
             );
             match tun_writer.write(&plaintext).await {
                 TunWrite::Wrote => report.to_tun += 1,
-                TunWrite::Dropped => {}
-                TunWrite::Fatal => return,
+                TunWrite::Dropped => report.tun_write_errs += 1,
+                TunWrite::Fatal => {
+                    report.tun_write_errs += 1;
+                    return;
+                }
             }
             report.maybe_emit(spoof_gate.drops());
         }
@@ -7184,7 +7199,14 @@ mod tests {
         /// Seal and send one `len`-byte uplink IPv4 packet sourced from this
         /// session's assigned address (so the anti-spoof gate admits it).
         fn send_uplink(&mut self, len: usize) {
-            let mut pkt = ipv4_tcp_full(self.assigned_ip, RATE_PEER, 51_000, 443);
+            let src = self.assigned_ip;
+            self.send_uplink_from(src, len);
+        }
+
+        /// Same, from an arbitrary inner source address, so a test can make
+        /// the exit refuse an authenticated datagram at a NAMED gate.
+        fn send_uplink_from(&mut self, src: Ipv4Addr, len: usize) {
+            let mut pkt = ipv4_tcp_full(src, RATE_PEER, 51_000, 443);
             pkt.resize(len, 0);
             let seq = self.next_seq;
             self.next_seq += 1;
@@ -7264,6 +7286,86 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         got.extend(tun.take_outbound());
         got
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_node_counters_see_the_real_pump_forward_and_refuse_uplink() {
+        // The plumbing test, not the arithmetic one: an incident-driven
+        // observability feature once shipped dead because it sampled a map
+        // the serving path never wrote (2026-07-17). So this drives the
+        // REAL accept loop, a real QUIC connection and the real rx pump,
+        // and reads the node-wide block a deployer's /metrics scrapes.
+        //
+        // Deltas, and `>=`: the block is process-wide by design, so every
+        // other test in this binary folds into it too. Only this session's
+        // own contribution is asserted.
+        let before = crate::metrics::uplink_snapshot();
+        let tun = warrenguard_transport_core::FakeTun::new();
+        let exit = spawn_rate_limited_exit(None, tun.clone(), None);
+        let mut client = data_client(&exit, |_| WarrenControlMessage::IpRequest {
+            prefer_ipv4: None,
+            client_pubkey: Some([0x5E; 32]),
+            wants_ipv6: false,
+            pop_sig: None,
+            wants_daita: false,
+        })
+        .await;
+
+        // Three datagrams the exit must forward, then four it must refuse
+        // at the anti-spoof gate: authenticated uplink claiming a source
+        // address this session was never assigned.
+        for _ in 0..3 {
+            client.send_uplink(100);
+        }
+        let forwarded = settled_tun_outbound(&tun, 3, Duration::from_secs(5)).await;
+        assert_eq!(forwarded.len(), 3, "the healthy uplink must reach the TUN");
+        for _ in 0..4 {
+            client.send_uplink_from(Ipv4Addr::new(10, 66, 0, 254), 100);
+        }
+        let after_spoof = settled_tun_outbound(&tun, 0, Duration::from_secs(1)).await;
+        assert!(
+            after_spoof.is_empty(),
+            "a spoofed inner source must never reach the TUN"
+        );
+
+        // End the session so the pump publishes its tail, then let the
+        // close propagate.
+        client.conn.close(0u32.into(), b"done");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let after = crate::metrics::uplink_snapshot();
+
+        assert!(
+            after.received - before.received >= 7,
+            "the node must count every datagram it read: {} to {}",
+            before.received,
+            after.received
+        );
+        assert!(
+            after.authenticated - before.authenticated >= 7,
+            "all seven cleared decode, session and AEAD: {} to {}",
+            before.authenticated,
+            after.authenticated
+        );
+        assert!(
+            after.forwarded - before.forwarded >= 3,
+            "the three admitted packets reached the TUN: {} to {}",
+            before.forwarded,
+            after.forwarded
+        );
+        assert!(
+            after.dropped_spoofed_source - before.dropped_spoofed_source >= 4,
+            "the four spoofed packets are named by their own gate: {} to {}",
+            before.dropped_spoofed_source,
+            after.dropped_spoofed_source
+        );
+        assert_eq!(
+            after.dropped_decode, before.dropped_decode,
+            "nothing this session sent failed to decode"
+        );
+        assert_eq!(
+            after.dropped_replay, before.dropped_replay,
+            "nothing this session sent was a replay"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

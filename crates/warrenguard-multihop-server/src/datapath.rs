@@ -440,6 +440,41 @@ impl FlowNoter {
 /// every few seconds on a lightly-loaded connection.
 pub(crate) const RX_REPORT_CHECK_EVERY: u64 = 64;
 
+/// One pump's tally of what it did with every datagram it read. Plain
+/// `u64`, never atomics: a datagram must not pay for shared state, so the
+/// node-wide view is built by folding these deltas into
+/// [`crate::metrics::UplinkMetrics`] on the report cadence instead.
+///
+/// The fields are exhaustive by construction: a datagram counted in
+/// `datagrams` either ends in `to_tun` or in exactly one of the drop
+/// fields. Adding a gate to a pump without adding its counter here breaks
+/// that, and `the_breakdown_accounts_for_every_datagram_that_was_not_forwarded`
+/// is what says so.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RxCounters {
+    /// Everything read off the connection, whatever became of it.
+    pub(crate) datagrams: u64,
+    /// Datagrams that cleared decode, exit-id, session lookup, AEAD open and
+    /// anti-replay: this client's actual uplink, as opposed to everything a
+    /// public UDP endpoint receives.
+    pub(crate) opened: u64,
+    /// Written to the TUN device.
+    pub(crate) to_tun: u64,
+    pub(crate) decode_errs: u64,
+    pub(crate) exit_id_mismatches: u64,
+    pub(crate) session_errs: u64,
+    pub(crate) open_errs: u64,
+    pub(crate) replays: u64,
+    pub(crate) control_frames: u64,
+    pub(crate) dummies: u64,
+    /// Mirror of the spoof gate's own count (the gate owns the rate-limited
+    /// log, this side owns the accounting).
+    pub(crate) spoofed: u64,
+    pub(crate) rate_drops: u64,
+    /// The TUN write itself failed and swallowed the packet.
+    pub(crate) tun_write_errs: u64,
+}
+
 /// Per-connection rx counters, reported every [`RX_REPORT_INTERVAL`] so a
 /// silent drop class (decode, exit_id, session, open, replay, spoof) is
 /// diagnosable from production logs without per-packet spam. Counters only, no
@@ -462,6 +497,10 @@ pub(crate) struct RxReport {
     pub(crate) to_tun: u64,
     pub(crate) replays: u64,
     pub(crate) rate_drops: u64,
+    pub(crate) tun_write_errs: u64,
+    /// What this pump has already folded into the node-wide block, so a
+    /// publication carries the delta and the node counters stay monotonic.
+    pub(crate) published: RxCounters,
     pub(crate) last_report: Instant,
     pub(crate) label: &'static str,
 }
@@ -484,14 +523,50 @@ impl RxReport {
             to_tun: 0,
             replays: 0,
             rate_drops: 0,
+            tun_write_errs: 0,
+            published: RxCounters::default(),
             last_report: Instant::now(),
             label,
         }
     }
 
-    /// Emit the report when the interval has elapsed. The clock is only read
-    /// once per [`RX_REPORT_CHECK_EVERY`] datagrams so the per-packet cost is
-    /// a counter test, not a `clock_gettime`.
+    /// This pump's current reading, the shape the node-wide block folds.
+    pub(crate) const fn counters(&self) -> RxCounters {
+        RxCounters {
+            datagrams: self.datagrams,
+            opened: self.opened,
+            to_tun: self.to_tun,
+            decode_errs: self.decode_errs,
+            exit_id_mismatches: self.exit_id_mismatches,
+            session_errs: self.session_errs,
+            open_errs: self.open_errs,
+            replays: self.replays,
+            control_frames: self.control_frames,
+            dummies: self.dummies,
+            spoofed: self.spoofed,
+            rate_drops: self.rate_drops,
+            tun_write_errs: self.tun_write_errs,
+        }
+    }
+
+    /// Fold everything counted since the last publication into `sink`, and
+    /// remember the watermark. Never called per datagram: see the cost note
+    /// on [`crate::metrics`].
+    pub(crate) fn publish_into(&mut self, sink: &crate::metrics::UplinkMetrics) {
+        let now = self.counters();
+        sink.fold(&now, &self.published);
+        self.published = now;
+    }
+
+    /// [`Self::publish_into`] the node's own block.
+    pub(crate) fn publish(&mut self) {
+        self.publish_into(crate::metrics::uplink_metrics());
+    }
+
+    /// Emit the report when the interval has elapsed, and publish the pump's
+    /// progress to the node-wide counters on the same cadence. The clock is
+    /// only read once per [`RX_REPORT_CHECK_EVERY`] datagrams so the
+    /// per-packet cost is a counter test, not a `clock_gettime`.
     pub(crate) fn maybe_emit(&mut self, spoofed_drops: u64) {
         self.spoofed = spoofed_drops;
         if !self.datagrams.is_multiple_of(RX_REPORT_CHECK_EVERY)
@@ -499,6 +574,7 @@ impl RxReport {
         {
             return;
         }
+        self.publish();
         tracing::debug!(
             datagrams = self.datagrams,
             decode_errs = self.decode_errs,
@@ -510,6 +586,7 @@ impl RxReport {
             to_tun = self.to_tun,
             replays = self.replays,
             rate_drops = self.rate_drops,
+            tun_write_errs = self.tun_write_errs,
             spoofed_drops,
             pump = self.label,
             "rx_task report"
@@ -534,7 +611,11 @@ impl Drop for RxReport {
     /// Final verdict of a finished rx pump. A pump that delivered nothing is
     /// named as such, loudly and with the drop breakdown that says which
     /// gate ate the traffic; anything else stays at debug.
+    ///
+    /// Publishing here is what makes a short session count at all: a probe
+    /// or a failed dial can end well before the periodic cadence fires.
     fn drop(&mut self) {
+        self.publish();
         if self.is_uplink_blackhole() {
             tracing::warn!(
                 datagrams = self.datagrams,
@@ -547,6 +628,7 @@ impl Drop for RxReport {
                 open_errs = self.open_errs,
                 replays = self.replays,
                 rate_drops = self.rate_drops,
+                tun_write_errs = self.tun_write_errs,
                 dummies = self.dummies,
                 control_frames = self.control_frames,
                 pump = self.label,
