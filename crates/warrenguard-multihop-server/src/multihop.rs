@@ -1820,26 +1820,55 @@ fn spawn_drain_emitter(
 /// reconnect can briefly hold both the dying and the fresh generation.
 const MAX_SENDERS_PER_IP: usize = 16;
 
-/// Delay after a sticky-IP takeover before the stale-predecessor re-check
-/// runs. Long enough that a predecessor still serving traffic has advanced
-/// its inbound counter (one uplink packet, sub-RTT in practice), short
-/// enough to re-pin a dead predecessor's re-used flows in ~2s instead of
-/// the ~80s QUIC idle timeout that black-holed a fast single-hop ->
-/// multihop reconnect (client kept the same sticky inner IP, so its flows
-/// stayed pinned to the just-closed connection's downlink channel).
+/// Interval between two looks at a predecessor during the sticky-IP
+/// takeover re-check.
 const TAKEOVER_STALE_RECHECK: Duration = Duration::from_millis(2000);
 
-/// One downlink channel of an assigned IP's fan-out, plus an optional
-/// liveness handle. `activity` is a monotonic count of inbound datagrams
+/// How many looks the re-check takes before it is allowed to convict a
+/// predecessor on silence alone. The product must exceed the client
+/// keep-alive cadence (`CLIENT_KEEP_ALIVE_INTERVAL_SECS`, 5 s), because a
+/// live peer that has no application traffic to send only proves it is
+/// there when its next keep-alive PING arrives. A predecessor whose
+/// connection is already closed is evicted on the first look regardless,
+/// which is the common shape of a reconnect, so the window is only ever
+/// paid by a client that abandoned a connection without closing it: the
+/// 2026-07-16 shape, and still an order of magnitude faster than the
+/// ~80 s QUIC idle timeout that black-holed it back then.
+const TAKEOVER_STALE_ROUNDS: u32 = 4;
+
+/// QUIC-level liveness of a downlink owner, read by the sticky-IP takeover
+/// re-check. Application datagrams alone cannot tell a dead peer from an
+/// idle one: a phone between requests, or a client between two 25 s egress
+/// probes, sends nothing for seconds while its QUIC peer keeps ACKing and
+/// keep-aliving. Counting what arrives from the peer at the UDP level, and
+/// asking whether the connection has closed, separates them.
+trait PeerLiveness: Send + Sync {
+    /// UDP datagrams received from the peer on this connection so far.
+    fn packets_from_peer(&self) -> u64;
+    /// `true` once the connection is closed for good.
+    fn is_closed(&self) -> bool;
+}
+
+impl PeerLiveness for Connection {
+    fn packets_from_peer(&self) -> u64 {
+        self.stats().udp_rx.datagrams
+    }
+    fn is_closed(&self) -> bool {
+        self.close_reason().is_some()
+    }
+}
+
+/// One downlink channel of an assigned IP's fan-out, plus its optional
+/// liveness handles. `activity` is a monotonic count of inbound datagrams
 /// the owning connection's RX pump has read from its peer; the pump bumps
-/// it lock-free on the hot path. It stays frozen the moment that peer goes
-/// silent, which is how a takeover re-check tells a dead sticky-reconnect
-/// predecessor (client abandoned it, no more uplink) from a live owner
-/// still serving traffic. `None` until the pump attaches it (and on the
-/// plain channels the unit tests register).
+/// it lock-free on the hot path. `peer` reads the same connection at the
+/// QUIC level, which is what keeps an application-idle owner from being
+/// mistaken for a dead one. Both are `None` until the pump attaches them
+/// (and on the plain channels the unit tests register).
 struct Downlink {
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     activity: Option<Arc<AtomicU64>>,
+    peer: Option<Arc<dyn PeerLiveness>>,
 }
 
 /// One assigned IP's downlink fan-out: every live connection of the
@@ -1861,7 +1890,11 @@ struct RouteSlot<A> {
 impl<A> RouteSlot<A> {
     fn new(tx: tokio::sync::mpsc::Sender<Vec<u8>>) -> Self {
         Self {
-            senders: vec![Downlink { tx, activity: None }],
+            senders: vec![Downlink {
+                tx,
+                activity: None,
+                peer: None,
+            }],
             rr: std::sync::atomic::AtomicUsize::new(0),
             flows: HashMap::new(),
             _addr: std::marker::PhantomData,
@@ -1891,9 +1924,16 @@ impl<A> RouteSlot<A> {
 }
 
 /// A predecessor route captured for the sticky-IP takeover re-check: its
-/// downlink channel, its inbound-activity counter, and that counter's value
-/// at snapshot time. The re-check evicts it iff the counter has not moved.
-type PredecessorSnapshot = (tokio::sync::mpsc::Sender<Vec<u8>>, Arc<AtomicU64>, u64);
+/// downlink channel plus both liveness readings taken at snapshot time. The
+/// re-check convicts it only if NEITHER has moved by the end of the window,
+/// or if its connection has closed.
+struct PredecessorSnapshot {
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    activity: Arc<AtomicU64>,
+    activity_seen: u64,
+    peer: Option<Arc<dyn PeerLiveness>>,
+    peer_packets_seen: u64,
+}
 
 /// Address-generic route table shared by the IPv4 and IPv6 maps.
 struct RouteTable<A: std::hash::Hash + Eq + Copy>(Mutex<HashMap<A, RouteSlot<A>>>);
@@ -1921,27 +1961,33 @@ impl<A: std::hash::Hash + Eq + Copy> RouteTable<A> {
         if slot.senders.len() >= MAX_SENDERS_PER_IP {
             slot.senders.remove(0);
         }
-        slot.senders.push(Downlink { tx, activity: None });
+        slot.senders.push(Downlink {
+            tx,
+            activity: None,
+            peer: None,
+        });
         tracing::info!(
             senders = slot.senders.len(),
             "multihop: bonded downlink route registered"
         );
     }
 
-    /// Attaches an inbound-activity counter to `tx`'s route entry under
-    /// `ip`, so a later takeover re-check can judge that connection's
-    /// liveness. No-op if the slot or the channel is already gone.
+    /// Attaches the liveness handles to `tx`'s route entry under `ip`, so a
+    /// later takeover re-check can judge that connection. No-op if the slot
+    /// or the channel is already gone.
     fn attach_liveness(
         &self,
         ip: A,
         tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
         activity: Arc<AtomicU64>,
+        peer: Option<Arc<dyn PeerLiveness>>,
     ) {
         let mut routes = self.0.lock();
         if let Some(slot) = routes.get_mut(&ip)
             && let Some(d) = slot.senders.iter_mut().find(|d| d.tx.same_channel(tx))
         {
             d.activity = Some(activity);
+            d.peer = peer;
         }
     }
 
@@ -1965,30 +2011,52 @@ impl<A: std::hash::Hash + Eq + Copy> RouteTable<A> {
             .iter()
             .filter(|d| !d.tx.same_channel(newcomer))
             .filter_map(|d| {
-                d.activity
-                    .as_ref()
-                    .map(|a| (d.tx.clone(), a.clone(), a.load(Ordering::Relaxed)))
+                d.activity.as_ref().map(|a| PredecessorSnapshot {
+                    tx: d.tx.clone(),
+                    activity: a.clone(),
+                    activity_seen: a.load(Ordering::Relaxed),
+                    peer: d.peer.clone(),
+                    peer_packets_seen: d.peer.as_ref().map_or(0, |p| p.packets_from_peer()),
+                })
             })
             .collect()
     }
 
-    /// Drops every predecessor from `snapshot` whose inbound-activity
-    /// counter has NOT advanced since the snapshot: a frozen counter means
-    /// the peer went silent (a dead sticky-reconnect predecessor), so its
-    /// channel and learned flows are removed and the re-used flows re-pin
-    /// to a live sender on the next downlink packet instead of black-holing
-    /// until the QUIC idle timeout. A predecessor still serving traffic has
-    /// advanced its counter and is left untouched (first-writer-wins owner
-    /// preference is preserved for a genuinely live owner). Returns how many
+    /// One look at the predecessors of a sticky-IP takeover. A predecessor
+    /// whose connection has closed is dropped immediately; one that has gone
+    /// silent at BOTH the application and the QUIC level is dropped once
+    /// `convict_on_silence` says the window is over. Dropping it removes its
+    /// channel and its learned flows, so the re-used flows re-pin to a live
+    /// sender on the next downlink packet instead of black-holing until the
+    /// QUIC idle timeout.
+    ///
+    /// Application silence alone is NOT a death certificate: a live client
+    /// with nothing to send goes quiet for seconds at a time, and convicting
+    /// it took its flows away and black-holed it permanently (2026-08-02).
+    /// Survivors stay in `snapshot` for the next look; the convicted are
+    /// removed, so a repeated call never double-counts. Returns how many
     /// were evicted.
-    fn evict_stale_predecessors(&self, ip: A, snapshot: &[PredecessorSnapshot]) -> usize {
+    fn evict_stale_predecessors(
+        &self,
+        ip: A,
+        snapshot: &mut Vec<PredecessorSnapshot>,
+        convict_on_silence: bool,
+    ) -> usize {
         let mut evicted = 0;
-        for (tx, activity, seen) in snapshot {
-            if activity.load(Ordering::Relaxed) == *seen {
-                self.unregister_if_owner(ip, tx);
+        snapshot.retain(|p| {
+            let closed = p.peer.as_ref().is_some_and(|c| c.is_closed());
+            let app_silent = p.activity.load(Ordering::Relaxed) == p.activity_seen;
+            let peer_silent = p
+                .peer
+                .as_ref()
+                .is_none_or(|c| c.packets_from_peer() == p.peer_packets_seen);
+            let dead = closed || (convict_on_silence && app_silent && peer_silent);
+            if dead {
+                self.unregister_if_owner(ip, &p.tx);
                 evicted += 1;
             }
-        }
+            !dead
+        });
         evicted
     }
 
@@ -2142,15 +2210,16 @@ impl MultihopTunRouter {
         self.routes_v6.register(ip, tx);
     }
 
-    /// Attach a connection's inbound-activity counter to its downlink
-    /// route(s) (see [`RouteTable::attach_liveness`]).
+    /// Attach a connection's liveness handles to its downlink route(s)
+    /// (see [`RouteTable::attach_liveness`]).
     fn attach_liveness(
         &self,
         ip: Ipv4Addr,
         tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
         activity: Arc<AtomicU64>,
+        peer: Option<Arc<dyn PeerLiveness>>,
     ) {
-        self.routes.attach_liveness(ip, tx, activity);
+        self.routes.attach_liveness(ip, tx, activity, peer);
     }
 
     /// `/v2` dual-stack mirror of [`Self::attach_liveness`].
@@ -2159,8 +2228,9 @@ impl MultihopTunRouter {
         ip: Ipv6Addr,
         tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
         activity: Arc<AtomicU64>,
+        peer: Option<Arc<dyn PeerLiveness>>,
     ) {
-        self.routes_v6.attach_liveness(ip, tx, activity);
+        self.routes_v6.attach_liveness(ip, tx, activity, peer);
     }
 
     /// Snapshot the predecessors a sticky-IP takeover landed on (see
@@ -2182,15 +2252,27 @@ impl MultihopTunRouter {
         self.routes_v6.snapshot_predecessors(ip, newcomer)
     }
 
-    /// Evict the predecessors whose peer went silent (see
+    /// Evict the predecessors proven dead (see
     /// [`RouteTable::evict_stale_predecessors`]).
-    fn evict_stale_predecessors(&self, ip: Ipv4Addr, snapshot: &[PredecessorSnapshot]) -> usize {
-        self.routes.evict_stale_predecessors(ip, snapshot)
+    fn evict_stale_predecessors(
+        &self,
+        ip: Ipv4Addr,
+        snapshot: &mut Vec<PredecessorSnapshot>,
+        convict_on_silence: bool,
+    ) -> usize {
+        self.routes
+            .evict_stale_predecessors(ip, snapshot, convict_on_silence)
     }
 
     /// `/v2` dual-stack mirror of [`Self::evict_stale_predecessors`].
-    fn evict_stale_predecessors_v6(&self, ip: Ipv6Addr, snapshot: &[PredecessorSnapshot]) -> usize {
-        self.routes_v6.evict_stale_predecessors(ip, snapshot)
+    fn evict_stale_predecessors_v6(
+        &self,
+        ip: Ipv6Addr,
+        snapshot: &mut Vec<PredecessorSnapshot>,
+        convict_on_silence: bool,
+    ) -> usize {
+        self.routes_v6
+            .evict_stale_predecessors(ip, snapshot, convict_on_silence)
     }
 
     /// Routes one inner packet to a connection owning its destination
@@ -3352,24 +3434,29 @@ pub async fn terminate_connection<T>(
 /// Why a re-check and not an immediate eviction: a genuinely live
 /// same-pubkey session (two devices on one wallet, both active) shares the
 /// same sticky IP and must keep serving; only a predecessor whose client
-/// stopped feeding it is dead. Advancing inbound activity is what tells
-/// them apart. The check runs off the datapath (spawned, once per
-/// takeover) so the per-packet fast path pays nothing. A connection
-/// serving no traffic at all for the whole window owns no active flow and
-/// so black-holes nothing; it is the concurrent same-pubkey-collision case
-/// (decision pending), not the single-user reconnect this fixes.
+/// stopped feeding it is dead. The check runs off the datapath (spawned,
+/// once per takeover) so the per-packet fast path pays nothing.
+///
+/// What tells them apart is deliberately NOT application traffic alone. A
+/// live client with nothing to send is silent for seconds at a time, and
+/// convicting it took its learned flows away and black-holed it for the
+/// rest of its life (2026-08-02, reproduced on two exits). The verdict
+/// therefore rests on the QUIC connection: closed means dead now, and only
+/// a peer that sends nothing at all for the whole window, keep-alives
+/// included, is convicted on silence.
 fn arm_takeover_recheck(
     router: &Arc<MultihopTunRouter>,
     down_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
     assigned_ip: Ipv4Addr,
     assigned_ip_v6: Option<Ipv6Addr>,
     activity: &Arc<AtomicU64>,
+    peer: Option<Arc<dyn PeerLiveness>>,
 ) {
-    router.attach_liveness(assigned_ip, down_tx, activity.clone());
-    let predecessors_v4 = router.snapshot_predecessors(assigned_ip, down_tx);
+    router.attach_liveness(assigned_ip, down_tx, activity.clone(), peer.clone());
+    let mut predecessors_v4 = router.snapshot_predecessors(assigned_ip, down_tx);
     let mut predecessors_v6 = Vec::new();
     if let Some(ip6) = assigned_ip_v6 {
-        router.attach_liveness_v6(ip6, down_tx, activity.clone());
+        router.attach_liveness_v6(ip6, down_tx, activity.clone(), peer);
         predecessors_v6 = router.snapshot_predecessors_v6(ip6, down_tx);
     }
     if predecessors_v4.is_empty() && predecessors_v6.is_empty() {
@@ -3385,15 +3472,22 @@ fn arm_takeover_recheck(
     );
     let router = router.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(TAKEOVER_STALE_RECHECK).await;
-        let mut evicted = router.evict_stale_predecessors(assigned_ip, &predecessors_v4);
-        if let Some(ip6) = assigned_ip_v6 {
-            evicted += router.evict_stale_predecessors_v6(ip6, &predecessors_v6);
+        let mut evicted = 0;
+        for round in 1..=TAKEOVER_STALE_ROUNDS {
+            tokio::time::sleep(TAKEOVER_STALE_RECHECK).await;
+            let last = round == TAKEOVER_STALE_ROUNDS;
+            evicted += router.evict_stale_predecessors(assigned_ip, &mut predecessors_v4, last);
+            if let Some(ip6) = assigned_ip_v6 {
+                evicted += router.evict_stale_predecessors_v6(ip6, &mut predecessors_v6, last);
+            }
+            if predecessors_v4.is_empty() && predecessors_v6.is_empty() {
+                break;
+            }
         }
         if evicted > 0 {
             tracing::info!(
                 evicted,
-                "multihop: evicted stale downlink predecessor(s) after sticky-IP takeover (peer went silent)"
+                "multihop: evicted dead downlink predecessor(s) after sticky-IP takeover"
             );
         }
     });
@@ -3607,7 +3701,14 @@ async fn serve_terminating_connection<T>(
     // sticky-IP takeover re-check so a dead predecessor's re-used flows re-pin
     // to this live connection in bounded time.
     let rx_activity = Arc::new(AtomicU64::new(0));
-    arm_takeover_recheck(&router, &down_tx, assigned_ip, assigned_ip_v6, &rx_activity);
+    arm_takeover_recheck(
+        &router,
+        &down_tx,
+        assigned_ip,
+        assigned_ip_v6,
+        &rx_activity,
+        Some(Arc::new(conn.clone())),
+    );
 
     // ADR 36 soft drain signal: park on the exit-wide drain watch and, when
     // the exit is marked for maintenance, seal+emit ExitDraining on this
@@ -3922,7 +4023,14 @@ async fn serve_pq_datagram_pump<T>(
     // classical pump). Registration already happened in `run_setup`; here we
     // attach the counter and arm the re-check for the `/v2` path too.
     let rx_activity = Arc::new(AtomicU64::new(0));
-    arm_takeover_recheck(&router, &down_tx, assigned_ip, assigned_ip_v6, &rx_activity);
+    arm_takeover_recheck(
+        &router,
+        &down_tx,
+        assigned_ip,
+        assigned_ip_v6,
+        &rx_activity,
+        Some(Arc::new(conn.clone())),
+    );
 
     drop(warrenguard_transport_core::spawn_path_probe(
         "exit-mh-pq",
@@ -5413,7 +5521,7 @@ mod tests {
         let act_succ = Arc::new(AtomicU64::new(0));
 
         router.register(ip, tx_pred.clone());
-        router.attach_liveness(ip, &tx_pred, act_pred.clone());
+        router.attach_liveness(ip, &tx_pred, act_pred.clone(), None);
         // The client's established flow was learned to the predecessor.
         let uplink = ipv4_tcp_full(ip, peer, 51000, 443);
         let downlink = ipv4_tcp_full(peer, ip, 443, 51000);
@@ -5421,8 +5529,8 @@ mod tests {
 
         // Successor takes over the same sticky IP.
         router.register(ip, tx_succ.clone());
-        let snapshot = {
-            router.attach_liveness(ip, &tx_succ, act_succ.clone());
+        let mut snapshot = {
+            router.attach_liveness(ip, &tx_succ, act_succ.clone(), None);
             router.snapshot_predecessors(ip, &tx_succ)
         };
         assert_eq!(
@@ -5446,7 +5554,7 @@ mod tests {
         // The successor is alive (its RX task advanced its counter); the
         // predecessor stayed silent (frozen). The re-check evicts it.
         act_succ.fetch_add(3, Ordering::Relaxed);
-        let evicted = router.evict_stale_predecessors(ip, &snapshot);
+        let evicted = router.evict_stale_predecessors(ip, &mut snapshot, true);
         assert_eq!(evicted, 1, "the frozen predecessor must be evicted");
 
         // Now the re-used flow re-pins to the sole live sender.
@@ -5481,19 +5589,19 @@ mod tests {
         let act_new = Arc::new(AtomicU64::new(0));
 
         router.register(ip, tx_live.clone());
-        router.attach_liveness(ip, &tx_live, act_live.clone());
+        router.attach_liveness(ip, &tx_live, act_live.clone(), None);
         let uplink = ipv4_tcp_full(ip, peer, 40000, 443);
         let downlink = ipv4_tcp_full(peer, ip, 443, 40000);
         router.note_uplink(&uplink, &tx_live);
 
         router.register(ip, tx_new.clone());
-        router.attach_liveness(ip, &tx_new, act_new.clone());
-        let snapshot = router.snapshot_predecessors(ip, &tx_new);
+        router.attach_liveness(ip, &tx_new, act_new.clone(), None);
+        let mut snapshot = router.snapshot_predecessors(ip, &tx_new);
         assert_eq!(snapshot.len(), 1);
 
         // The incumbent keeps serving traffic during the window.
         act_live.fetch_add(5, Ordering::Relaxed);
-        let evicted = router.evict_stale_predecessors(ip, &snapshot);
+        let evicted = router.evict_stale_predecessors(ip, &mut snapshot, true);
         assert_eq!(evicted, 0, "a live owner must never be evicted");
         assert_eq!(
             router.routes.0.lock().get(&ip).unwrap().senders.len(),
@@ -5510,12 +5618,158 @@ mod tests {
         );
     }
 
+    /// Test double for a downlink owner's QUIC connection.
+    struct FakePeer {
+        packets: AtomicU64,
+        closed: std::sync::atomic::AtomicBool,
+    }
+
+    impl FakePeer {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                packets: AtomicU64::new(0),
+                closed: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+    }
+
+    impl PeerLiveness for FakePeer {
+        fn packets_from_peer(&self) -> u64 {
+            self.packets.load(Ordering::Relaxed)
+        }
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::Relaxed)
+        }
+    }
+
+    #[tokio::test]
+    async fn an_idle_predecessor_whose_quic_peer_still_speaks_is_never_evicted() {
+        // The defect this guards: a live session that simply has no
+        // application traffic during the re-check window (a phone between
+        // requests, a client between two egress probes) used to be read as
+        // "peer went silent" and evicted, which handed its flows to the
+        // newcomer and black-holed it for the rest of its life. Its QUIC peer
+        // never stopped speaking (keep-alive PINGs and ACKs), so that is the
+        // signal the verdict must rest on.
+        let router = MultihopTunRouter::default();
+        let ip = Ipv4Addr::new(10, 66, 0, 20);
+        let peer_addr = Ipv4Addr::new(1, 1, 1, 1);
+        let (tx_idle, mut rx_idle) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx_new, mut rx_new) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let act_idle = Arc::new(AtomicU64::new(42));
+        let quic_idle = FakePeer::new();
+
+        router.register(ip, tx_idle.clone());
+        router.attach_liveness(ip, &tx_idle, act_idle, Some(quic_idle.clone()));
+        let uplink = ipv4_tcp_full(ip, peer_addr, 40000, 443);
+        let downlink = ipv4_tcp_full(peer_addr, ip, 443, 40000);
+        router.note_uplink(&uplink, &tx_idle);
+
+        router.register(ip, tx_new.clone());
+        router.attach_liveness(ip, &tx_new, Arc::new(AtomicU64::new(0)), None);
+        let mut snapshot = router.snapshot_predecessors(ip, &tx_new);
+        assert_eq!(snapshot.len(), 1);
+
+        // No application datagram all window long, but the QUIC peer keeps
+        // sending (keep-alive / ACK): this session is alive.
+        quic_idle.packets.fetch_add(7, Ordering::Relaxed);
+        let evicted = router.evict_stale_predecessors(ip, &mut snapshot, true);
+
+        assert_eq!(
+            evicted, 0,
+            "an app-idle owner whose QUIC peer still speaks MUST keep its route"
+        );
+        router.dispatch(&downlink);
+        assert!(
+            rx_idle.try_recv().is_ok(),
+            "the idle owner must still receive its own flow"
+        );
+        assert!(
+            rx_new.try_recv().is_err(),
+            "the newcomer must not steal an app-idle live owner's reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_predecessor_whose_quic_connection_is_closed_is_evicted_before_the_silence_window() {
+        // A closed connection is dead beyond doubt, so it costs nothing to
+        // wait for: evicting it on the first look re-pins the re-used flows
+        // faster than the silence verdict ever could.
+        let router = MultihopTunRouter::default();
+        let ip = Ipv4Addr::new(10, 66, 0, 21);
+        let peer_addr = Ipv4Addr::new(1, 1, 1, 1);
+        let (tx_dead, _rx_dead) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx_new, mut rx_new) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let act_dead = Arc::new(AtomicU64::new(5));
+        let quic_dead = FakePeer::new();
+
+        router.register(ip, tx_dead.clone());
+        router.attach_liveness(ip, &tx_dead, act_dead.clone(), Some(quic_dead.clone()));
+        let uplink = ipv4_tcp_full(ip, peer_addr, 40001, 443);
+        let downlink = ipv4_tcp_full(peer_addr, ip, 443, 40001);
+        router.note_uplink(&uplink, &tx_dead);
+
+        router.register(ip, tx_new.clone());
+        router.attach_liveness(ip, &tx_new, Arc::new(AtomicU64::new(0)), None);
+        let mut snapshot = router.snapshot_predecessors(ip, &tx_new);
+
+        // Counters even advance, so only the closed state can convict it.
+        act_dead.fetch_add(3, Ordering::Relaxed);
+        quic_dead.packets.fetch_add(3, Ordering::Relaxed);
+        quic_dead
+            .closed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let evicted = router.evict_stale_predecessors(ip, &mut snapshot, false);
+
+        assert_eq!(evicted, 1, "a closed connection must be evicted at once");
+        router.dispatch(&downlink);
+        assert!(
+            rx_new.try_recv().is_ok(),
+            "the flow must re-pin to the live successor"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fully_silent_predecessor_survives_until_the_final_round() {
+        // The silence verdict is only allowed on the last round, so a peer
+        // that speaks anywhere inside the window is never convicted by a
+        // single unlucky sample.
+        let router = MultihopTunRouter::default();
+        let ip = Ipv4Addr::new(10, 66, 0, 22);
+        let (tx_pred, _rx_pred) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx_new, _rx_new) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let quic_pred = FakePeer::new();
+
+        router.register(ip, tx_pred.clone());
+        router.attach_liveness(
+            ip,
+            &tx_pred,
+            Arc::new(AtomicU64::new(1)),
+            Some(quic_pred.clone()),
+        );
+        router.register(ip, tx_new.clone());
+        router.attach_liveness(ip, &tx_new, Arc::new(AtomicU64::new(0)), None);
+        let mut snapshot = router.snapshot_predecessors(ip, &tx_new);
+
+        assert_eq!(
+            router.evict_stale_predecessors(ip, &mut snapshot, false),
+            0,
+            "silence alone must not convict before the final round"
+        );
+        assert_eq!(
+            router.evict_stale_predecessors(ip, &mut snapshot, true),
+            1,
+            "a peer silent at BOTH levels through the whole window is dead"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn arm_takeover_recheck_evicts_dead_predecessor_after_the_window() {
         // End-to-end of the armed path: `arm_takeover_recheck` attaches the
-        // successor's liveness, detects the takeover, and after
-        // `TAKEOVER_STALE_RECHECK` evicts the frozen predecessor so its flow
-        // re-pins. Time is paused so the 2s window is deterministic.
+        // successor's liveness, detects the takeover, and once the whole
+        // silence window has elapsed evicts the frozen predecessor so its
+        // flow re-pins. Time is paused so the window is deterministic.
         let router = Arc::new(MultihopTunRouter::default());
         let ip = Ipv4Addr::new(10, 66, 0, 166);
         let peer = Ipv4Addr::new(93, 184, 216, 34);
@@ -5526,13 +5780,13 @@ mod tests {
         let uplink = ipv4_tcp_full(ip, peer, 51000, 443);
 
         router.register(ip, tx_pred.clone());
-        router.attach_liveness(ip, &tx_pred, act_pred);
+        router.attach_liveness(ip, &tx_pred, act_pred, None);
         router.note_uplink(&uplink, &tx_pred);
 
         // Successor registers, then arms the re-check (its own live counter).
         router.register(ip, tx_succ.clone());
         let succ_activity = Arc::new(AtomicU64::new(9));
-        arm_takeover_recheck(&router, &tx_succ, ip, None, &succ_activity);
+        arm_takeover_recheck(&router, &tx_succ, ip, None, &succ_activity, None);
         // Let the spawned re-check task run up to its sleep so its timer is
         // registered before we advance the (paused) clock.
         tokio::task::yield_now().await;
@@ -5546,14 +5800,29 @@ mod tests {
         );
         assert!(rx_succ.try_recv().is_err());
 
-        // Advance past the window and let the spawned re-check run. Yield a
-        // few times so the current-thread runtime polls the woken task.
+        // One round is deliberately not enough: silence only convicts on the
+        // final look, which is what stops an app-idle live owner losing its
+        // route to a single unlucky sample.
         tokio::time::advance(TAKEOVER_STALE_RECHECK + Duration::from_millis(1)).await;
         for _ in 0..16 {
-            if router.routes.0.lock().get(&ip).unwrap().senders.len() == 1 {
-                break;
-            }
             tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            router.routes.0.lock().get(&ip).unwrap().senders.len(),
+            2,
+            "a single silent round must not evict anybody"
+        );
+
+        // Advance past the rest of the window and let the spawned re-check
+        // run. Yield a few times so the current-thread runtime polls it.
+        for _ in 1..TAKEOVER_STALE_ROUNDS {
+            tokio::time::advance(TAKEOVER_STALE_RECHECK).await;
+            for _ in 0..16 {
+                if router.routes.0.lock().get(&ip).unwrap().senders.len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
         }
 
         assert_eq!(

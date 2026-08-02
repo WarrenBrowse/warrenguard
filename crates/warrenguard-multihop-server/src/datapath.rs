@@ -445,6 +445,9 @@ pub(crate) const RX_REPORT_CHECK_EVERY: u64 = 64;
 /// diagnosable from production logs without per-packet spam. Counters only, no
 /// identity material.
 pub(crate) struct RxReport {
+    /// Last spoof-gate drop count seen, mirrored here so the end-of-pump
+    /// verdict can name it without borrowing the gate back.
+    pub(crate) spoofed: u64,
     pub(crate) datagrams: u64,
     pub(crate) decode_errs: u64,
     pub(crate) exit_id_mismatches: u64,
@@ -465,6 +468,7 @@ pub(crate) const RX_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 impl RxReport {
     pub(crate) fn new(label: &'static str) -> Self {
         Self {
+            spoofed: 0,
             datagrams: 0,
             decode_errs: 0,
             exit_id_mismatches: 0,
@@ -484,6 +488,7 @@ impl RxReport {
     /// once per [`RX_REPORT_CHECK_EVERY`] datagrams so the per-packet cost is
     /// a counter test, not a `clock_gettime`.
     pub(crate) fn maybe_emit(&mut self, spoofed_drops: u64) {
+        self.spoofed = spoofed_drops;
         if !self.datagrams.is_multiple_of(RX_REPORT_CHECK_EVERY)
             || self.last_report.elapsed() < RX_REPORT_INTERVAL
         {
@@ -505,6 +510,51 @@ impl RxReport {
             "rx_task report"
         );
         self.last_report = Instant::now();
+    }
+
+    /// Whether this pump black-holed its peer's uplink: real datagrams
+    /// arrived and not one of them reached the TUN. DAITA dummies and
+    /// control frames are excluded, they are dropped by design.
+    ///
+    /// Every uplink drop class is rate-limited to its first occurrence, so a
+    /// session whose ENTIRE uplink is discarded prints the same single line
+    /// as one that dropped one stray in-flight packet. That ambiguity is
+    /// what made a 2026-08-02 exit black-hole undiagnosable from the logs.
+    pub(crate) const fn is_uplink_blackhole(&self) -> bool {
+        self.to_tun == 0 && self.datagrams > self.dummies + self.control_frames
+    }
+}
+
+impl Drop for RxReport {
+    /// Final verdict of a finished rx pump. A pump that delivered nothing is
+    /// named as such, loudly and with the drop breakdown that says which
+    /// gate ate the traffic; anything else stays at debug.
+    fn drop(&mut self) {
+        if self.is_uplink_blackhole() {
+            tracing::warn!(
+                datagrams = self.datagrams,
+                to_tun = self.to_tun,
+                spoofed_drops = self.spoofed,
+                decode_errs = self.decode_errs,
+                exit_id_mismatches = self.exit_id_mismatches,
+                session_errs = self.session_errs,
+                open_errs = self.open_errs,
+                replays = self.replays,
+                rate_drops = self.rate_drops,
+                dummies = self.dummies,
+                control_frames = self.control_frames,
+                pump = self.label,
+                "rx_task ended having delivered NO uplink to the TUN: this session black-holed"
+            );
+        } else {
+            tracing::debug!(
+                datagrams = self.datagrams,
+                to_tun = self.to_tun,
+                spoofed_drops = self.spoofed,
+                pump = self.label,
+                "rx_task ended"
+            );
+        }
     }
 }
 
@@ -862,6 +912,55 @@ pub(crate) mod tests {
         let mut v6 = vec![0u8; 40];
         v6[0] = 0x60;
         assert!(!gate.admits(&v6));
+    }
+
+    #[test]
+    fn a_pump_that_delivered_no_real_uplink_to_the_tun_is_a_blackhole() {
+        // The shape that cost 2026-08-02 its afternoon: the session is up,
+        // the client's uplink arrives, and not one packet reaches the exit's
+        // TUN. Nothing in the log said so, because every drop class is
+        // rate-limited to its first occurrence.
+        let mut report = RxReport::new("test");
+        report.datagrams = 6;
+        assert!(
+            report.is_uplink_blackhole(),
+            "6 real datagrams in and 0 to the TUN is a black-hole"
+        );
+    }
+
+    #[test]
+    fn a_pump_that_delivered_anything_is_not_a_blackhole() {
+        let mut report = RxReport::new("test");
+        report.datagrams = 6;
+        report.to_tun = 1;
+        assert!(
+            !report.is_uplink_blackhole(),
+            "one delivered packet proves the path works"
+        );
+    }
+
+    #[test]
+    fn a_pump_that_only_saw_cover_and_control_traffic_is_not_a_blackhole() {
+        // DAITA dummies and control frames are dropped by design and never
+        // reach a TUN, so a connection carrying only those has black-holed
+        // nothing and must not raise the alarm.
+        let mut report = RxReport::new("test");
+        report.datagrams = 9;
+        report.dummies = 7;
+        report.control_frames = 2;
+        assert!(
+            !report.is_uplink_blackhole(),
+            "cover and control traffic never reaches the TUN by design"
+        );
+    }
+
+    #[test]
+    fn an_idle_pump_that_saw_nothing_at_all_is_not_a_blackhole() {
+        let report = RxReport::new("test");
+        assert!(
+            !report.is_uplink_blackhole(),
+            "a connection with no uplink at all has dropped nothing"
+        );
     }
 
     #[test]
