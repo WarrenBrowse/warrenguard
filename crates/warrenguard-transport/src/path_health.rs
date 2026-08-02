@@ -16,7 +16,8 @@
 //! Large probe dead while the small one survives = size-selective
 //! blackhole (last-mile shrink / brownout); both dead while transport
 //! ACKs still flow = wedged datapath. Only the wedge (`DegradedBoth`)
-//! requests ONE overlap migration per episode: a fresh session can cure
+//! requests an overlap migration, retried while it persists and capped
+//! per episode: a fresh session can cure
 //! a session-state wedge, whereas a same-exit re-dial cannot fix a
 //! last-mile shrink and (with sticky-IP preservation unmerged) would
 //! force an IP-change tunnel rebuild. Both verdicts publish on a watch
@@ -65,8 +66,11 @@ pub enum HealthEvent {
     /// The tracker returned to [`PathHealth::Healthy`].
     Recovered,
     /// The episode reached a state a fresh session can plausibly cure (a
-    /// [`PathHealth::DegradedBoth`] datapath wedge): request ONE overlap
-    /// migration for the episode.
+    /// [`PathHealth::DegradedBoth`] datapath wedge): request an overlap
+    /// migration. Re-emitted while the wedge persists, spaced by
+    /// [`MIGRATION_RETRY_COOLDOWN`] and capped at
+    /// [`MAX_MIGRATIONS_PER_EPISODE`] per episode, because the first
+    /// migration can land straight back on the wedged path.
     ///
     /// NOT emitted for [`PathHealth::DegradedLarge`]: that is the
     /// large-frame-selective signature of a last-mile brownout / shrunk
@@ -88,6 +92,16 @@ const DEGRADE_MIN_LOST: usize = 4;
 const SMALL_SURVIVES_MAX_LOST: usize = 1;
 /// Consecutive fully-clean pairs required to declare recovery.
 const RECOVER_STREAK: usize = 3;
+/// Probe rounds to wait before asking for another overlap migration while a
+/// [`PathHealth::DegradedBoth`] wedge persists. A degraded tracker probes at
+/// [`FAST_CADENCE`], so one full window spaces the retries by ~10s: long
+/// enough to judge the fresh session on its own evidence, short enough that a
+/// user is not left on a dead tunnel.
+const MIGRATION_RETRY_COOLDOWN: usize = WINDOW;
+/// Overlap migrations allowed per degraded episode. Bounded because a wedge a
+/// re-dial cannot cure must not turn into an endless re-dial storm; once the
+/// budget is spent the episode stays degraded and the consumer surfaces it.
+const MAX_MIGRATIONS_PER_EPISODE: usize = 3;
 
 /// Fixed-size ring of the last [`WINDOW`] boolean outcomes.
 #[derive(Debug, Default, Clone)]
@@ -126,7 +140,8 @@ pub struct HealthTracker {
     large: OutcomeRing,
     state: PathHealth,
     recover_streak: usize,
-    migration_requested: bool,
+    migrations_requested: usize,
+    migration_cooldown: usize,
 }
 
 impl HealthTracker {
@@ -161,7 +176,8 @@ impl HealthTracker {
                 if self.recover_streak >= RECOVER_STREAK {
                     self.state = PathHealth::Healthy;
                     self.recover_streak = 0;
-                    self.migration_requested = false;
+                    self.migrations_requested = 0;
+                    self.migration_cooldown = 0;
                     self.small.clear();
                     self.large.clear();
                     events.push(HealthEvent::Recovered);
@@ -179,14 +195,25 @@ impl HealthTracker {
             self.state = verdict;
             self.recover_streak = 0;
             events.push(HealthEvent::Entered(verdict));
-            // Only a DegradedBoth wedge is worth a re-dial: a fresh
-            // session can cure a session-state datapath wedge, but a
-            // same-exit re-dial cannot fix the last-mile shrink that
-            // DegradedLarge signals (and, with sticky-IP preservation
-            // unmerged, would force an IP-change tunnel rebuild). One
-            // request per episode.
-            if verdict == PathHealth::DegradedBoth && !self.migration_requested {
-                self.migration_requested = true;
+        }
+
+        // Only a DegradedBoth wedge is worth a re-dial: a fresh session can
+        // cure a session-state datapath wedge, but a same-exit re-dial cannot
+        // fix the last-mile shrink that DegradedLarge signals (and, with
+        // sticky-IP preservation unmerged, would force an IP-change tunnel
+        // rebuild).
+        //
+        // Deliberately evaluated on every round rather than only on the state
+        // transition: a wedge that the first migration does not cure keeps
+        // classifying as DegradedBoth, so a transition-only request fired once
+        // and never again, leaving the tunnel dead with the uplink still
+        // sending into the void. Retries are spaced and capped below.
+        if verdict == PathHealth::DegradedBoth {
+            if self.migration_cooldown > 0 {
+                self.migration_cooldown -= 1;
+            } else if self.migrations_requested < MAX_MIGRATIONS_PER_EPISODE {
+                self.migrations_requested += 1;
+                self.migration_cooldown = MIGRATION_RETRY_COOLDOWN;
                 events.push(HealthEvent::RequestMigration);
             }
         }
@@ -433,7 +460,8 @@ async fn probe_round(
                 }
                 HealthEvent::RequestMigration => {
                     tracing::info!(
-                        "path health: datapath wedge (both probe sizes dead), requesting one overlap migration for this episode"
+                        max_per_episode = MAX_MIGRATIONS_PER_EPISODE,
+                        "path health: datapath wedge (both probe sizes dead), requesting an overlap migration"
                     );
                     overlap.notify_one();
                 }
@@ -516,7 +544,8 @@ mod tests {
                 HealthEvent::RequestMigration
             ]
         );
-        // Never a second migration for the same episode.
+        // The next round is inside the retry cooldown, so it stays quiet;
+        // the spacing and the cap are pinned by the retry tests below.
         assert!(t.record_pair(false, false).is_empty());
     }
 
@@ -569,6 +598,53 @@ mod tests {
         assert!(
             t.record_pair(false, false)
                 .contains(&HealthEvent::RequestMigration)
+        );
+    }
+
+    #[test]
+    fn a_persisting_wedge_retries_the_migration_up_to_the_cap() {
+        // One migration that lands back on the same wedged path leaves the
+        // tunnel dead with no further attempt: observed on Android after an
+        // in-place exit switch, where the uplink kept sending while zero
+        // bytes ever came back, for as long as the tunnel stayed up.
+        let mut t = HealthTracker::default();
+        let mut migrations = 0;
+        let rounds = (MIGRATION_RETRY_COOLDOWN + 1) * (MAX_MIGRATIONS_PER_EPISODE + 3);
+        for _ in 0..rounds {
+            for e in t.record_pair(false, false) {
+                if e == HealthEvent::RequestMigration {
+                    migrations += 1;
+                }
+            }
+        }
+        assert_eq!(t.state(), PathHealth::DegradedBoth);
+        assert_eq!(
+            migrations, MAX_MIGRATIONS_PER_EPISODE,
+            "a wedge the first migration does not cure must be retried, and bounded"
+        );
+    }
+
+    #[test]
+    fn a_wedge_retry_waits_a_full_probe_window_between_attempts() {
+        let mut t = HealthTracker::default();
+        let mut events = Vec::new();
+        for _ in 0..5 {
+            events = t.record_pair(false, false);
+        }
+        assert!(events.contains(&HealthEvent::RequestMigration));
+        // The cooldown holds the next attempt back so each retry is judged on
+        // a fresh window of evidence instead of firing on every probe round.
+        for _ in 0..MIGRATION_RETRY_COOLDOWN {
+            assert!(
+                !t.record_pair(false, false)
+                    .contains(&HealthEvent::RequestMigration),
+                "retry fired before the cooldown elapsed"
+            );
+        }
+        assert!(
+            t.record_pair(false, false)
+                .contains(&HealthEvent::RequestMigration),
+            "retry never fired after the cooldown elapsed"
         );
     }
 
