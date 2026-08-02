@@ -172,6 +172,112 @@ impl UplinkMetrics {
     }
 }
 
+/// Node-wide count of downlink packets the exit read off its TUN and could
+/// not hand to a client connection, by reason. The uplink block above
+/// answers "did the exit forward what the client sent"; these answer the
+/// mirror question, which is the one the 2026-08-02 black-hole actually
+/// turned on.
+///
+/// Only the drop paths are counted, and every one of them is cold on a
+/// healthy node, so these are incremented directly with a relaxed
+/// `fetch_add` at the drop site. There is deliberately no per-packet
+/// denominator here: adding one would put an atomic on the single TUN
+/// reader's hot loop, and the delivered volume is already visible as
+/// `warren_exit_bytes_tx_total`.
+#[derive(Debug)]
+pub struct DownlinkMetrics {
+    dropped_no_route: AtomicU64,
+    dropped_channel_full: AtomicU64,
+    dropped_unroutable: AtomicU64,
+}
+
+/// The node's downlink block.
+static DOWNLINK: DownlinkMetrics = DownlinkMetrics::new();
+
+/// The process-wide downlink block.
+#[must_use]
+pub fn downlink_metrics() -> &'static DownlinkMetrics {
+    &DOWNLINK
+}
+
+/// Point-in-time read of the process-wide downlink block.
+#[must_use]
+pub fn downlink_snapshot() -> DownlinkSnapshot {
+    DOWNLINK.snapshot()
+}
+
+impl Default for DownlinkMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DownlinkMetrics {
+    /// A zeroed block.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            dropped_no_route: AtomicU64::new(0),
+            dropped_channel_full: AtomicU64::new(0),
+            dropped_unroutable: AtomicU64::new(0),
+        }
+    }
+
+    /// A reply arrived for a tunnel address no live connection owns: the
+    /// session that opened the flow is gone, or its downlink route was
+    /// taken away.
+    pub(crate) fn inc_no_route(&self) {
+        self.dropped_no_route.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The owning connection's downlink channel was full. One is a burst;
+    /// a sustained rate means that connection's tx task is not draining
+    /// and every flow pinned to it stalls silently.
+    pub(crate) fn inc_channel_full(&self) {
+        self.dropped_channel_full.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The packet carried no routable inner destination (neither a valid
+    /// IPv4 nor a valid IPv6 header).
+    pub(crate) fn inc_unroutable(&self) {
+        self.dropped_unroutable.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Reads every counter.
+    #[must_use]
+    pub fn snapshot(&self) -> DownlinkSnapshot {
+        DownlinkSnapshot {
+            dropped_no_route: self.dropped_no_route.load(Ordering::Relaxed),
+            dropped_channel_full: self.dropped_channel_full.load(Ordering::Relaxed),
+            dropped_unroutable: self.dropped_unroutable.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// A point-in-time view of [`DownlinkMetrics`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DownlinkSnapshot {
+    /// See [`DownlinkMetrics::inc_no_route`].
+    pub dropped_no_route: u64,
+    /// See [`DownlinkMetrics::inc_channel_full`].
+    pub dropped_channel_full: u64,
+    /// See [`DownlinkMetrics::inc_unroutable`].
+    pub dropped_unroutable: u64,
+}
+
+impl DownlinkSnapshot {
+    /// The breakdown as `(reason, count)`, same contract as
+    /// [`UplinkSnapshot::dropped_by_reason`].
+    #[must_use]
+    pub const fn dropped_by_reason(&self) -> [(&'static str, u64); 3] {
+        [
+            ("no_route", self.dropped_no_route),
+            ("channel_full", self.dropped_channel_full),
+            ("unroutable", self.dropped_unroutable),
+        ]
+    }
+}
+
 /// A point-in-time view of [`UplinkMetrics`]. Deliberately constructible
 /// by a consumer, so a deployer can unit-test its own exposition against a
 /// crafted reading instead of having to drive a live pump.
@@ -387,6 +493,35 @@ mod tests {
             after_session_two.dropped_spoofed_source, 5,
             "a healthy second session leaves the first one's drops alone"
         );
+    }
+
+    #[test]
+    fn each_downlink_fault_increments_only_its_own_counter() {
+        let m = DownlinkMetrics::new();
+        m.inc_no_route();
+        m.inc_no_route();
+        m.inc_channel_full();
+        m.inc_unroutable();
+        m.inc_unroutable();
+        m.inc_unroutable();
+        let s = m.snapshot();
+
+        assert_eq!(s.dropped_no_route, 2);
+        assert_eq!(s.dropped_channel_full, 1);
+        assert_eq!(s.dropped_unroutable, 3);
+        assert_eq!(
+            s.dropped_by_reason(),
+            [("no_route", 2), ("channel_full", 1), ("unroutable", 3)],
+            "a stale reason ordering would mislabel every series"
+        );
+    }
+
+    #[test]
+    fn a_fresh_downlink_block_has_dropped_nothing() {
+        let s = DownlinkMetrics::new().snapshot();
+        for (reason, count) in s.dropped_by_reason() {
+            assert_eq!(count, 0, "{reason} must start at zero");
+        }
     }
 
     #[test]

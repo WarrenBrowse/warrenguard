@@ -2107,10 +2107,12 @@ impl<A: std::hash::Hash + Eq + Copy> RouteTable<A> {
             let tx = {
                 let routes = self.0.lock();
                 let Some(slot) = routes.get(&ip) else {
+                    crate::metrics::downlink_metrics().inc_no_route();
                     return;
                 };
                 let n = slot.senders.len();
                 if n == 0 {
+                    crate::metrics::downlink_metrics().inc_no_route();
                     return;
                 }
                 // Prefer the flow's learned owner, but only while it is
@@ -2141,6 +2143,7 @@ impl<A: std::hash::Hash + Eq + Copy> RouteTable<A> {
                     // Drop (TCP retransmits), but keep the loss visible: a
                     // sustained Full means this connection's tx task is not
                     // draining and every flow pinned to it stalls silently.
+                    crate::metrics::downlink_metrics().inc_channel_full();
                     static FULL_DROPS: std::sync::atomic::AtomicU64 =
                         std::sync::atomic::AtomicU64::new(0);
                     let n = FULL_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2282,16 +2285,14 @@ impl MultihopTunRouter {
     /// retransmits); prunes channels whose receiver is gone.
     fn dispatch(&self, pkt: &[u8]) {
         match pkt.first().map(|b| b >> 4) {
-            Some(6) => {
-                if let Some(dst) = dst_ipv6(pkt) {
-                    self.routes_v6.dispatch(dst, pkt);
-                }
-            }
-            _ => {
-                if let Some(dst) = dst_ipv4(pkt) {
-                    self.routes.dispatch(dst, pkt);
-                }
-            }
+            Some(6) => match dst_ipv6(pkt) {
+                Some(dst) => self.routes_v6.dispatch(dst, pkt),
+                None => crate::metrics::downlink_metrics().inc_unroutable(),
+            },
+            _ => match dst_ipv4(pkt) {
+                Some(dst) => self.routes.dispatch(dst, pkt),
+                None => crate::metrics::downlink_metrics().inc_unroutable(),
+            },
         }
     }
 
@@ -5318,6 +5319,57 @@ mod tests {
         assert!(rx_a.try_recv().is_err(), "A must get exactly its packet");
         assert_eq!(dst_ipv4(&rx_b.try_recv().unwrap()), Some(ip_b));
         assert!(rx_b.try_recv().is_err(), "B must get exactly its packet");
+    }
+
+    #[tokio::test]
+    async fn the_node_counters_name_why_a_downlink_packet_was_not_delivered() {
+        // The mirror of the uplink accounting, and the direction the
+        // 2026-08-02 black-hole actually turned on: a reply arriving for a
+        // tunnel address no live connection owns, and a connection whose
+        // downlink channel is not draining, are two different faults and
+        // must not share one number.
+        // Deltas, and `>=`: the block is process-wide by design, so the
+        // other router tests in this binary fold into it too. The exact
+        // one-reason-per-fault arithmetic is asserted on an isolated block
+        // in `metrics::tests`.
+        let before = crate::metrics::downlink_snapshot();
+        let router = MultihopTunRouter::default();
+        let ip = Ipv4Addr::new(10, 66, 0, 41);
+        // Capacity 1 and a receiver nobody reads: the second packet finds
+        // the channel full.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        router.register(ip, tx);
+
+        router.dispatch(&ipv4_packet_to(ip));
+        assert_eq!(
+            dst_ipv4(&rx.try_recv().expect("the first packet is delivered")),
+            Some(ip)
+        );
+
+        router.dispatch(&ipv4_packet_to(ip));
+        router.dispatch(&ipv4_packet_to(ip));
+        router.dispatch(&ipv4_packet_to(Ipv4Addr::new(10, 66, 0, 99)));
+        router.dispatch(&[0x45u8; 8]);
+        let after = crate::metrics::downlink_snapshot();
+
+        assert!(
+            after.dropped_channel_full - before.dropped_channel_full >= 1,
+            "the full channel is named as such: {} to {}",
+            before.dropped_channel_full,
+            after.dropped_channel_full
+        );
+        assert!(
+            after.dropped_no_route - before.dropped_no_route >= 1,
+            "an unowned tunnel address is named as such: {} to {}",
+            before.dropped_no_route,
+            after.dropped_no_route
+        );
+        assert!(
+            after.dropped_unroutable - before.dropped_unroutable >= 1,
+            "a packet with no parseable inner destination is named as such: {} to {}",
+            before.dropped_unroutable,
+            after.dropped_unroutable
+        );
     }
 
     #[tokio::test]
