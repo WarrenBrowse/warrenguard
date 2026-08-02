@@ -134,11 +134,20 @@ pub const DEFAULT_CLIENT_REAL_IPS_SET: &str = "warren_client_real_ips";
 /// selects exactly the forwarded-port traffic without needing a separate
 /// port set (which the Debian nft parser rejects as a `dport @set` matcher).
 ///
-/// Documented rare false positive: a connected subscriber reaching ANY
-/// forwarded port on THIS exit from its own real IP off-tunnel is also
-/// dropped, including its own port. That case is not a deanonymization (the
-/// owner already knows its own IP), only a minor reachability quirk, and is
-/// vanishingly rare in practice.
+/// Established flows are exempt, and that exemption is what keeps the match
+/// narrow enough to be correct. `ip daddr <pool_cidr>` does NOT select only
+/// forwarded-port traffic: it is equally the destination of the RETURN leg of
+/// any connection the subscriber itself opened. So a subscriber reaching a
+/// service hosted at its own public address (a home server, or anything behind
+/// the same CGNAT address) would have every reply dropped, with the exit
+/// forwarding the SYN, the far end answering, and the SYN-ACK never reaching
+/// the tunnel. Port Fail is an unsolicited probe, which conntrack sees as
+/// `new`, so exempting `established,related` costs the defence nothing.
+///
+/// Remaining, genuinely rare false positive: a connected subscriber opening a
+/// NEW connection to a forwarded port on THIS exit from its own real IP
+/// off-tunnel is still dropped. That one is not a deanonymization (the owner
+/// already knows its own IP), only a reachability quirk.
 #[must_use]
 pub fn render_portfail_guard_setup(
     table: &str,
@@ -149,6 +158,7 @@ pub fn render_portfail_guard_setup(
     format!(
         "add set inet {table} {set_name} {{ type ipv4_addr ; }}\n\
          add chain inet {table} {guard_chain} {{ type filter hook forward priority -10 ; policy accept ; }}\n\
+         add rule inet {table} {guard_chain} ct state established,related accept\n\
          add rule inet {table} {guard_chain} ip saddr @{set_name} ip daddr {pool_cidr} drop\n"
     )
 }

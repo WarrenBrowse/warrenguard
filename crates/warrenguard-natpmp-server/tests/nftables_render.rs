@@ -247,6 +247,35 @@ fn portfail_guard_has_no_unconditional_or_tunnel_wide_drop() {
     }
 }
 
+#[test]
+fn portfail_guard_lets_the_reply_of_a_client_initiated_flow_through() {
+    // A subscriber reaching a service hosted at its OWN public address (a home
+    // server, or anything behind the same CGNAT address) gets replies whose
+    // source is that address and whose destination is its inner pool IP. That
+    // matches the drop pattern exactly, so without this the guard silently
+    // black-holes every such connection: the exit forwards the SYN, the far
+    // end answers, and the SYN-ACK never reaches the tunnel.
+    //
+    // Port Fail is an UNSOLICITED probe, which conntrack sees as `new`, so
+    // exempting established flows keeps the defence whole.
+    let script = render_portfail_guard_setup(
+        "warren",
+        "warren_portfail_guard",
+        "warren_client_real_ips",
+        "10.66.0.0/16",
+    );
+    let accept_idx = script
+        .find("add rule inet warren warren_portfail_guard ct state established,related accept")
+        .expect("the guard must accept replies to flows the client itself opened");
+    let drop_idx = script
+        .find("ip saddr @warren_client_real_ips ip daddr 10.66.0.0/16 drop")
+        .expect("the drop must still be there");
+    assert!(
+        accept_idx < drop_idx,
+        "the established exemption must precede the drop, got {accept_idx} vs {drop_idx} in:\n{script}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // render_sync_client_ips: atomically replace the set membership
 // ---------------------------------------------------------------------------
