@@ -38,6 +38,14 @@
 //! a working tunnel can be torn down. The scheduler tests assert those three
 //! numbers in wall-clock terms.
 //!
+//! Both ends of that trade were then measured on a live circuit (2026-08-02,
+//! Android over two hops). An exit that forwards nothing is convicted 10.2 to
+//! 11.3 s after the session comes up. A datapath outage on a proven circuit
+//! costs one failed probe, then confirmations ~3.6 s apart: a 6 s outage clears
+//! on the third probe with no verdict and the loop returns to the steady
+//! cadence, while an outage that persists is convicted 9.6 s after the first
+//! probe that noticed it.
+//!
 //! This is the reusable engine home for that behavior. The scheduler
 //! [`run_egress_probe`] is transport-agnostic: a consumer implements
 //! [`EgressProbeIo`] over its own tunnel (the SDK userland proxy, the desktop
@@ -60,11 +68,12 @@ pub const EGRESS_PROBE_FAILURES_ENV: &str = "WARREN_EGRESS_PROBE_FAILURES";
 
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(25);
 const INTERVAL_RANGE_SECS: std::ops::RangeInclusive<u64> = 5..=600;
-/// Cadence for a circuit that is unproven or under suspicion. One second is
-/// still ~1.3x the measured p99 round trip (see [`PROBE_TIMEOUT`]), so
-/// consecutive probes never overlap on a healthy circuit, and it keeps the first
-/// probe far enough behind the TUN coming up that a local routing error cannot
-/// be mistaken for an answer.
+/// Cadence for a circuit that is unproven or under suspicion. Deliberately not
+/// tighter than a second: back-to-back retries would spend the whole conviction
+/// budget inside one bad moment, whereas a second between them lets a transient
+/// (a route being installed, a radio waking) clear on its own. It also keeps the
+/// first probe of a session behind the TUN coming up, so a local routing error
+/// cannot be mistaken for an answer.
 const DEFAULT_STARTUP_INTERVAL: Duration = Duration::from_secs(1);
 const STARTUP_RANGE_SECS: std::ops::RangeInclusive<u64> = 1..=60;
 const DEFAULT_FAILURE_THRESHOLD: u32 = 3;
@@ -85,8 +94,8 @@ pub const PROBE_QNAME: &str = "warrenbrowse.com";
 /// Overall wait for an answer within one probe. Exported for external probe
 /// drivers, like [`PROBE_QNAME`].
 ///
-/// Measured on the beta network (Android, two-hop circuit to Falkenstein,
-/// 2026-08-02): 536 in-tunnel DNS round trips over 7 minutes on one stable
+/// Measured over a two-hop circuit from an Android client to a European exit
+/// (2026-08-02): 536 in-tunnel DNS round trips over 7 minutes on one stable
 /// session, p50 368 ms, p95 574 ms, p99 737 ms, max 1186 ms, and one datagram
 /// lost outright. 2.5 s is 2.1x the worst round trip that measurement saw and
 /// 3.4x its p99, so the deadline absorbs a far worse link than the one it was
@@ -871,8 +880,9 @@ mod tests {
 
     /// The other half of the trade: a verdict tears a working tunnel down, so a
     /// turbulence burst shorter than the conviction window must never reach it.
-    /// Eight seconds of total silence is well past anything the beta measurement
-    /// showed on a live circuit (zero probe loss in 431 samples).
+    /// Eight seconds of total silence is well past anything the measurement
+    /// behind [`PROBE_TIMEOUT`] saw, and a 6 s outage was confirmed on a live
+    /// circuit to cost two failed probes and then clear.
     #[tokio::test(start_paused = true)]
     async fn a_stall_shorter_than_the_conviction_window_never_convicts() {
         let stall = Duration::from_secs(30)..Duration::from_secs(38);
