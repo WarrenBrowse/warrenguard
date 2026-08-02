@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use quinn::{Connection, DatagramClass, SendDatagramError};
 use warrenguard_daita::daita::{DaitaEvent, DaitaMetrics, DaitaState};
+use warrenguard_pump::is_daita_dummy;
 use warrenguard_server::tun_dispatch::source_ip_matches;
 use warrenguard_transport_core::PacketDevice;
 use warrenguard_transport_core::{build_frag_needed, clamp_syn_mss, is_tcp_syn};
@@ -300,6 +301,41 @@ impl RateLimited {
     pub(crate) const fn count(&self) -> u64 {
         self.count
     }
+}
+
+/// What an authenticated uplink datagram turned out to be, once it has
+/// cleared decode, exit-id, session lookup, AEAD open and anti-replay.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum UplinkKind {
+    /// A real inner IP packet: forward it, subject to the gates that follow.
+    Packet,
+    /// A control message on the DATA path. Dropped by design: the setup
+    /// stream carries the real control plane, and `0xC0` is not a valid IP
+    /// version nibble.
+    ControlFrame,
+    /// DAITA cover traffic. Dropped by design, before the TUN.
+    DaitaDummy,
+}
+
+/// Classifies an authenticated uplink datagram. Shared by the `/v1` and
+/// `/v2` pumps so a class cannot exist on one and not the other: until
+/// 2026-08-02 only `/v1` recognised cover traffic, so every dummy a `/v2`
+/// client sent fell through to the anti-spoof gate and was counted (and
+/// logged) as a spoofed source. That reads as an attack, and it was our own
+/// defense, on the datapath the whole fleet serves.
+pub(crate) fn classify_uplink(plaintext: &[u8]) -> UplinkKind {
+    match warrenguard_multihop::try_decode_control(plaintext) {
+        Ok(None) => {}
+        Ok(Some(_)) => return UplinkKind::ControlFrame,
+        Err(e) => {
+            tracing::debug!(error = %e, "rx_task control-message decode failed; dropping frame");
+            return UplinkKind::ControlFrame;
+        }
+    }
+    if is_daita_dummy(plaintext) {
+        return UplinkKind::DaitaDummy;
+    }
+    UplinkKind::Packet
 }
 
 /// What a TUN write did, so the caller can both account for it and decide
@@ -1001,6 +1037,50 @@ pub(crate) mod tests {
         let mut v6 = vec![0u8; 40];
         v6[0] = 0x60;
         assert!(!gate.admits(&v6));
+    }
+
+    #[test]
+    fn cover_traffic_is_classified_as_cover_and_never_as_a_spoofed_source() {
+        // The `/v2` pump had no dummy branch, so every DAITA dummy a client
+        // sent fell through to the anti-spoof gate and was counted as a
+        // spoofed source: our own defense, reported as an attack signal, on
+        // the datapath the whole fleet serves. Live on 2026-08-02:
+        // `spoofed_source=28` against 105 forwarded, every WARN `pump="v2"`.
+        let dummy = vec![warrenguard_pump::DAITA_DUMMY_FIRST_BYTE; 1280];
+        assert!(
+            matches!(classify_uplink(&dummy), UplinkKind::DaitaDummy),
+            "a dummy is cover traffic, whichever pump reads it"
+        );
+    }
+
+    #[test]
+    fn a_real_inner_packet_is_classified_as_a_packet_to_forward() {
+        let pkt = ipv4_tcp_full(
+            Ipv4Addr::new(10, 66, 0, 7),
+            Ipv4Addr::new(93, 184, 216, 34),
+            51_000,
+            443,
+        );
+        assert!(matches!(classify_uplink(&pkt), UplinkKind::Packet));
+    }
+
+    #[test]
+    fn a_control_message_on_the_data_path_is_classified_as_control() {
+        // 0xC0 is the control marker and is not a valid IP version nibble,
+        // so it must never be mistaken for cover traffic nor forwarded.
+        let control = warrenguard_multihop::encode_control(
+            &warrenguard_multihop::WarrenControlMessage::Rejected,
+        )
+        .expect("encode a control message");
+        assert!(matches!(
+            classify_uplink(&control),
+            UplinkKind::ControlFrame
+        ));
+    }
+
+    #[test]
+    fn an_empty_datagram_is_cover_and_not_a_packet() {
+        assert!(matches!(classify_uplink(&[]), UplinkKind::DaitaDummy));
     }
 
     #[test]

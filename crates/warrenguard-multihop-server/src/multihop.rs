@@ -48,7 +48,7 @@ use warrenguard_multihop::{
     MULTIHOP_FRAME_V2_DATA_MAX_OVERHEAD, PqExitSession, WarrenMultihopFrameV2,
     XWingRecipientSecretKey, decode_frame_v2, encode_frame_v2,
 };
-use warrenguard_pump::{DAITA_DUMMY_FIRST_BYTE, is_daita_dummy};
+use warrenguard_pump::DAITA_DUMMY_FIRST_BYTE;
 use warrenguard_ratelimit::{RateOverride, RatePolicyHandle, RateSpec};
 use warrenguard_server::{AllowlistHandle, SessionTokenAdmitter};
 use warrenguard_transport_core::PacketDevice;
@@ -56,8 +56,8 @@ use warrenguard_wire::WarrenPubkey;
 
 use crate::datapath::{
     DOWNLINK_CHANNEL_BOUND, DaitaSink, FLOW_TABLE_CAP_PER_IP, FlowNoter, RateLimited, RxReport,
-    SpoofGate, TunWrite, TunWriter, TxReport, canonical_flow_key, clamp_uplink_syn, dst_ipv4,
-    next_sealable, send_sealed, src_ipv4,
+    SpoofGate, TunWrite, TunWriter, TxReport, UplinkKind, canonical_flow_key, clamp_uplink_syn,
+    classify_uplink, dst_ipv4, next_sealable, send_sealed, src_ipv4,
 };
 use crate::ip_pool::{ConnId, IpAllocator, IpAllocatorV6, SessionIntent, SessionIntentV6};
 
@@ -3742,13 +3742,16 @@ async fn serve_terminating_connection<T>(
             let Ok(datagram) = conn_rx.read_datagram().await else {
                 return;
             };
-            report.datagrams += 1;
-            // Publish from the TOP of the loop, so a pump whose every
-            // datagram dies at an early gate (decode, exit_id, session)
-            // still reaches the node counters on the normal cadence. Those
-            // paths `continue` and never see the tail of the loop, which is
-            // exactly the shape a black-hole has.
+            // Publish from the TOP of the loop, BEFORE counting this
+            // datagram. Two reasons: a pump whose every datagram dies at an
+            // early gate (decode, exit_id, session) `continue`s and never
+            // sees the tail of the loop, which is exactly the shape a
+            // black-hole has; and publishing here means every datagram in
+            // the published reading is fully classified, so a scrape can
+            // never show a received datagram that no reason and no forward
+            // accounts for.
             report.maybe_emit(spoof_gate.drops());
+            report.datagrams += 1;
             // One lock-free bump per inbound datagram: a live peer keeps this
             // advancing, a dead predecessor freezes it (takeover check).
             rx_activity.fetch_add(1, Ordering::Relaxed);
@@ -3810,29 +3813,21 @@ async fn serve_terminating_connection<T>(
             // either PaddingRecv (dropped before the TUN) or NormalRecv (after
             // a successful tun.send).
             daita_rx.fire(&[DaitaEvent::TunnelRecv]);
-            // The setup round-trip is reliable, so a DATA datagram is normally
-            // a real IP packet. A control frame here (a stray legacy IpRequest
-            // retry, an unknown future control message, or a payload whose
-            // 0xC0 marker fails to decode) is dropped rather than forwarded:
-            // the setup stream already delivered the IpAssign, and 0xC0 is not
-            // a valid IP version nibble.
-            match warrenguard_multihop::try_decode_control(&plaintext) {
-                Ok(None) => {}
-                Ok(Some(_)) => {
+            // The setup round-trip is reliable, so a DATA datagram is
+            // normally a real IP packet. Anything else is dropped by design
+            // and named by the shared classifier, never left to fall through
+            // to a security gate.
+            match classify_uplink(&plaintext) {
+                UplinkKind::Packet => {}
+                UplinkKind::ControlFrame => {
                     report.control_frames += 1;
                     continue;
                 }
-                Err(e) => {
-                    report.control_frames += 1;
-                    tracing::debug!(error = %e, "rx_task control-message decode failed; dropping frame");
+                UplinkKind::DaitaDummy => {
+                    report.dummies += 1;
+                    daita_rx.fire(&[DaitaEvent::PaddingRecv]);
                     continue;
                 }
-            }
-            if is_daita_dummy(&plaintext) {
-                report.dummies += 1;
-                daita_rx.fire(&[DaitaEvent::PaddingRecv]);
-                report.maybe_emit(spoof_gate.drops());
-                continue;
             }
             if !spoof_gate.admits(&plaintext) {
                 report.maybe_emit(spoof_gate.drops());
@@ -4068,10 +4063,10 @@ async fn serve_pq_datagram_pump<T>(
             let Ok(datagram) = conn_rx.read_datagram().await else {
                 return;
             };
-            report.datagrams += 1;
-            // Same top-of-loop publication as the classical pump: an early
-            // gate `continue`s and never reaches the tail.
+            // Same top-of-loop publication as the classical pump, and for
+            // the same two reasons.
             report.maybe_emit(spoof_gate.drops());
+            report.datagrams += 1;
             rx_activity.fetch_add(1, Ordering::Relaxed);
             let frame = match decode_frame_v2(&datagram) {
                 Ok(f) => f,
@@ -4139,15 +4134,17 @@ async fn serve_pq_datagram_pump<T>(
             // from here on failing to reach the TUN is a black-hole and not
             // the noise any public UDP endpoint receives.
             report.opened += 1;
-            match warrenguard_multihop::try_decode_control(&plaintext) {
-                Ok(None) => {}
-                Ok(Some(_)) => {
+            // Same shared classifier as the classical pump. Before it, `/v2`
+            // had no cover-traffic branch and every DAITA dummy reached the
+            // anti-spoof gate, which counted our own defense as an attack.
+            match classify_uplink(&plaintext) {
+                UplinkKind::Packet => {}
+                UplinkKind::ControlFrame => {
                     report.control_frames += 1;
                     continue;
                 }
-                Err(e) => {
-                    report.control_frames += 1;
-                    tracing::debug!(error = %e, "pq rx_task control-message decode failed; dropping frame");
+                UplinkKind::DaitaDummy => {
+                    report.dummies += 1;
                     continue;
                 }
             }
