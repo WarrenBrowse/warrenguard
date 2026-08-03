@@ -241,6 +241,24 @@ pub fn is_matching_response(buf: &[u8], txid: u16) -> bool {
     buf.len() >= 12 && buf[0..2] == txid.to_be_bytes() && buf[2] & 0x80 != 0
 }
 
+/// What one probe established about the exit's egress.
+///
+/// The third case is the one that matters: a probe that never reached the wire
+/// (a socket that would not bind, a datapath torn down under it) has observed
+/// NOTHING about the exit. It is host-side evidence, not exit evidence, and the
+/// scheduler must not spend it either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    /// A matching answer came back through the tunnel: the exit decapsulates,
+    /// forwards, and reached its upstream.
+    Alive,
+    /// Every datagram in [`PROBE_SENDS`] went out and none was answered within
+    /// [`PROBE_TIMEOUT`]. Evidence against the exit.
+    Dead,
+    /// The probe could not be carried out at all. No evidence either way.
+    Inconclusive,
+}
+
 /// IO surface consumed by [`run_egress_probe`]; a consumer implements it over
 /// its own tunnel and the scheduler owns the escalation logic.
 ///
@@ -256,8 +274,8 @@ pub trait EgressProbeIo {
     /// `true` while the supervisor has a live published session (always `true`
     /// for an unsupervised pump, which has no supervisor).
     fn session_present(&mut self) -> bool;
-    /// One end-to-end probe through the tunnel. `true` = egress alive.
-    fn probe(&mut self) -> impl Future<Output = bool> + Send;
+    /// One end-to-end probe through the tunnel.
+    fn probe(&mut self) -> impl Future<Output = ProbeOutcome> + Send;
     /// Publishes the verdict to the consumer (edge-triggered only).
     fn publish(&mut self, egress_dead: bool);
     /// `true` while a drain advisory is active on this tunnel.
@@ -304,7 +322,18 @@ pub async fn run_egress_probe<I: EgressProbeIo>(io: &mut I, failure_threshold: u
             proven = false;
             continue;
         }
-        if io.probe().await {
+        let outcome = io.probe().await;
+        // A probe that never reached the wire is host-side evidence, not exit
+        // evidence: it neither proves the circuit nor counts against it, so the
+        // scheduler carries its state across untouched. Spending it either way
+        // is a real failure mode in both directions: read as a success it
+        // launders away accumulated failures and marks a never-answered circuit
+        // proven (dropping it onto the slow cadence), and read as a failure a
+        // host hiccup convicts a healthy exit.
+        if outcome == ProbeOutcome::Inconclusive {
+            continue;
+        }
+        if outcome == ProbeOutcome::Alive {
             proven = true;
             consecutive_failures = 0;
             if dead {
@@ -342,23 +371,23 @@ pub async fn run_egress_probe<I: EgressProbeIo>(io: &mut I, failure_threshold: u
 
 /// One in-tunnel DNS round trip to the exit resolver, for TUN-routed consumers.
 /// Datagrams at the [`PROBE_SENDS`] offsets, overall deadline [`PROBE_TIMEOUT`].
-/// Local socket errors (bind/send) are inconclusive, not egress-dead: they
-/// report success so a host-side hiccup never raises the banner.
+/// Local socket errors (bind/send) never reached the exit, so they report
+/// [`ProbeOutcome::Inconclusive`] and the scheduler spends them neither way.
 ///
 /// This is the datapath probe a consumer whose tunnel is a real OS TUN plugs
 /// into [`EgressProbeIo::probe`]. A userland-proxy datapath, where the gateway
 /// is not OS-routable, supplies its own probe over its session instead.
-pub async fn probe_gateway_dns() -> bool {
+pub async fn probe_gateway_dns() -> ProbeOutcome {
     let sock = match tokio::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).await {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!("egress probe: local socket bind failed (inconclusive): {e}");
-            return true;
+            return ProbeOutcome::Inconclusive;
         }
     };
     if let Err(e) = sock.connect(GATEWAY_DNS).await {
         tracing::warn!("egress probe: connect failed (inconclusive): {e}");
-        return true;
+        return ProbeOutcome::Inconclusive;
     }
     let txid = rand::random::<u16>();
     let query = build_dns_query(txid, PROBE_QNAME);
@@ -366,7 +395,7 @@ pub async fn probe_gateway_dns() -> bool {
     if sock.send(&query).await.is_err() {
         // Send failures are routing/firewall races during teardown, not an exit
         // verdict.
-        return true;
+        return ProbeOutcome::Inconclusive;
     }
     let mut buf = [0u8; 512];
     let deadline = started + PROBE_TIMEOUT;
@@ -380,14 +409,14 @@ pub async fn probe_gateway_dns() -> bool {
         tokio::select! {
             recv = sock.recv(&mut buf) => {
                 match recv {
-                    Ok(n) if is_matching_response(&buf[..n], txid) => return true,
+                    Ok(n) if is_matching_response(&buf[..n], txid) => return ProbeOutcome::Alive,
                     Ok(_) => {} // unrelated datagram, keep reading
-                    Err(_) => return false,
+                    Err(_) => return ProbeOutcome::Dead,
                 }
             }
             () = tokio::time::sleep_until(wake) => {
                 if wake >= deadline {
-                    return false;
+                    return ProbeOutcome::Dead;
                 }
                 let _ = sock.send(&query).await;
                 next_send = retransmits.next();
@@ -490,8 +519,8 @@ mod tests {
 
     /// Scripted mock: one entry per tick.
     struct MockIo {
-        /// Per tick: `None` = no session (skip), `Some(ok)` = probe result.
-        script: VecDeque<Option<bool>>,
+        /// Per tick: `None` = no session (skip), `Some(o)` = probe outcome.
+        script: VecDeque<Option<ProbeOutcome>>,
         published: Vec<bool>,
         drain_active: bool,
         migrate_succeeds: bool,
@@ -503,7 +532,21 @@ mod tests {
     }
 
     impl MockIo {
+        /// Answered/unanswered script, for the cases that predate the tri-state
+        /// outcome and read better as a plain yes/no.
         fn scripted(script: impl IntoIterator<Item = Option<bool>>) -> Self {
+            Self::scripted_outcomes(script.into_iter().map(|tick| {
+                tick.map(|ok| {
+                    if ok {
+                        ProbeOutcome::Alive
+                    } else {
+                        ProbeOutcome::Dead
+                    }
+                })
+            }))
+        }
+
+        fn scripted_outcomes(script: impl IntoIterator<Item = Option<ProbeOutcome>>) -> Self {
             Self {
                 script: script.into_iter().collect(),
                 published: Vec::new(),
@@ -536,7 +579,7 @@ mod tests {
                 false
             }
         }
-        async fn probe(&mut self) -> bool {
+        async fn probe(&mut self) -> ProbeOutcome {
             self.script
                 .pop_front()
                 .flatten()
@@ -624,6 +667,48 @@ mod tests {
             io.published.is_empty(),
             "non-consecutive failures must not accumulate: {:?}",
             io.published
+        );
+    }
+
+    #[tokio::test]
+    async fn an_inconclusive_probe_does_not_clear_accumulated_failure_evidence() {
+        // A probe that never reached the wire observed nothing about the exit,
+        // so it must not launder away the failures on either side of it. Read
+        // as a success it would, and an exit that forwards nothing could then
+        // stay convicted-free forever behind a host that hiccups periodically.
+        let mut io = MockIo::scripted_outcomes([
+            Some(ProbeOutcome::Dead),
+            Some(ProbeOutcome::Dead),
+            Some(ProbeOutcome::Inconclusive),
+            Some(ProbeOutcome::Dead),
+        ]);
+        run_egress_probe(&mut io, 3).await;
+        assert_eq!(
+            io.published,
+            vec![true],
+            "three failed probes must convict the exit even with an inconclusive \
+             probe among them"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_inconclusive_probe_never_proves_the_circuit() {
+        // `proven` is what drops the probe onto the slow steady cadence. A
+        // circuit that has never answered must stay on the fast one, or a
+        // tunnel dead from connect behind a failing local socket is polled
+        // every steady interval instead of every startup interval.
+        let mut io = MockIo::scripted_outcomes([
+            Some(ProbeOutcome::Inconclusive),
+            Some(ProbeOutcome::Inconclusive),
+            Some(ProbeOutcome::Alive),
+        ]);
+        run_egress_probe(&mut io, 3).await;
+        // Three probe ticks then the teardown tick, which is the first to see
+        // the circuit proven.
+        assert_eq!(
+            io.steady_seen,
+            vec![false, false, false, true],
+            "only an answered probe proves the circuit and earns the steady cadence"
         );
     }
 
@@ -807,7 +892,7 @@ mod tests {
             true
         }
 
-        async fn probe(&mut self) -> bool {
+        async fn probe(&mut self) -> ProbeOutcome {
             self.probes += 1;
             let start = self.elapsed();
             let lost = self.lose_every > 0 && self.probes % self.lose_every == 0;
@@ -817,12 +902,12 @@ mod tests {
                     let answered = offset + MODEL_RTT;
                     if answered <= PROBE_TIMEOUT && !self.dead_over(sent, sent + MODEL_RTT) {
                         tokio::time::sleep(answered).await;
-                        return true;
+                        return ProbeOutcome::Alive;
                     }
                 }
             }
             tokio::time::sleep(PROBE_TIMEOUT).await;
-            false
+            ProbeOutcome::Dead
         }
 
         fn publish(&mut self, egress_dead: bool) {
