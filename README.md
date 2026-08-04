@@ -1,5 +1,7 @@
 # WarrenGuard
 
+[![CI](https://github.com/WarrenBrowse/warrenguard/actions/workflows/ci.yml/badge.svg)](https://github.com/WarrenBrowse/warrenguard/actions/workflows/ci.yml)
+
 A generic **VPN-over-QUIC engine**: the data-plane building block behind the
 [Warren](https://warrenbrowse.com) VPN, carved out to stand on its own. Like
 WireGuard's kernel module, it is the reusable primitive; a deployer brings their
@@ -24,20 +26,28 @@ Licensed **AGPL-3.0-or-later**.
   automatically). The toolchain file pre-declares the `x86_64-unknown-linux-gnu`
   and `aarch64-apple-darwin` targets; on any other host add yours with
   `rustup target add <triple>`.
-- **git + SSH access to GitHub** on the first build: the quinn fork is a
-  published git dependency (`WarrenBrowse/warren-quinn`) that cargo fetches over
-  SSH.
+- **git** on the first build: the quinn fork is a published git dependency
+  ([`WarrenBrowse/warren-quinn`](https://github.com/WarrenBrowse/warren-quinn))
+  that cargo fetches over HTTPS.
 
 It depends on a pinned **quinn fork** (GSO transmit constants, the obfuscation
 knobs, socket-buffer sizing, an Apple fast datapath), published as the
-standalone `warren-quinn` repo and consumed as a git dependency pinned by tag in
-the root `Cargo.toml` (the crates are renamed `warren-quinn`/`-proto`/`-udp` but
-keep the lib names `quinn`/`quinn_proto`/`quinn_udp`, so `use quinn` is
-unchanged). Nothing to reassemble: cargo fetches it on the first build.
+standalone [`warren-quinn`](https://github.com/WarrenBrowse/warren-quinn) repo
+and consumed as a git dependency pinned by tag in the root `Cargo.toml` (the
+crates are renamed `warren-quinn`/`-proto`/`-udp` but keep the lib names
+`quinn`/`quinn_proto`/`quinn_udp`, so `use quinn` is unchanged). Nothing to
+reassemble: cargo fetches it on the first build.
 
 ```sh
 cargo build --workspace
 ```
+
+The `vectors/` directory is a git submodule
+([`WarrenBrowse/warren-vectors`](https://github.com/WarrenBrowse/warren-vectors)):
+the golden wire-format vectors shared with the sibling Warren SDKs. The
+workspace builds without it. The conformance tests read it at runtime, so fetch
+it (`git clone --recursive`, or `git submodule update --init`) before running
+the full test suite.
 
 ## Reference CLI
 
@@ -72,6 +82,7 @@ teardown policy:
 
 - `crates/warrenguard-*`: the engine crates (wire, identity, multihop, daita,
   tls, transport, pump, server, relay, tun, natpmp, killswitch, eDNS, ...).
+- `vectors/`: the golden-vector submodule shared with the sibling Warren SDKs.
 - The QUIC fork lives in its own repo, `WarrenBrowse/warren-quinn`, pinned by
   tag as a git dependency in the root `Cargo.toml` (no vendored tree here).
 
@@ -82,3 +93,9 @@ overrides (not bugs): the obfuscation SNI suffix, the eDNS default upstream, and
 "subscription"-worded auth-rejection strings. The Warren product adds its
 account/subscription admission by implementing the engine's authorizer in its
 own backend, never by patching the engine.
+
+## Contributing and security
+
+[CONTRIBUTING.md](CONTRIBUTING.md) covers the contribution bar, the build and
+test workflow, and the review expectations. Report vulnerabilities privately
+per [SECURITY.md](SECURITY.md), never in a public issue.
