@@ -13,6 +13,9 @@ there is not even a BIP39 dependency. Keys are raw 32-byte seeds.
 
 ## Quickstart (3 commands)
 
+Every seed and key in this document is a throwaway documentation example; never
+reuse one in a real deployment.
+
 ```sh
 # 1. Generate a node key on each side. Keep the seed secret; share the public key.
 $ warrenguard keygen
