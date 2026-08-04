@@ -76,4 +76,4 @@ unknown-git = "warn"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # The warren-quinn fork is the only sanctioned git dependency (see CLAUDE.md
 # section 3: the QUIC stack is pinned by tag on this fork).
-allow-git = ["ssh://git@github.com/WarrenBrowse/warren-quinn.git"]
+allow-git = ["https://github.com/WarrenBrowse/warren-quinn.git"]
