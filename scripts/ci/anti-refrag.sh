@@ -4,7 +4,8 @@
 #
 # Runnable form of doc 47 section 5 invariants 1 ("dependency direction") and 6
 # ("un seul foyer"), against the doc-94 single-home catalog
-# (warren-core/docs/94-DEDUP-AUDIT-2026-07-16.md). The engine is generic and
+# (warren-core/docs/94-DEDUP-AUDIT-2026-07-16.md; doc 47 and doc 94 are design
+# records in the private warren-core repo). The engine is generic and
 # knows NOTHING of Warren (no account, no SS58, no signed directory, no product
 # identity): a Warren-specific responsibility appearing here is a second home for
 # something owned by warren-contract or the SDK/backend, and an upward dependency

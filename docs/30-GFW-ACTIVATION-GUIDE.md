@@ -116,8 +116,9 @@ checkout cannot perform on its own:
 
 ## Cross-repo integration status (wg-0005 Lot F)
 
-The engine APIs above are consumed by the sibling repos (not part of this repo).
-Verified against this engine checkout:
+The engine APIs above are consumed by the sibling repos (private, not part of
+this repo; the `warren-core` paths and doc numbers below refer to that internal
+corpus). Verified against this engine checkout:
 
 - **Exit (`warren-core` / `warren-exit`): DONE.** Single-cover-domain X.509 is
   wired end to end: `--tls-cert` / `--tls-key` (env `WARREN_TLS_CERT` /

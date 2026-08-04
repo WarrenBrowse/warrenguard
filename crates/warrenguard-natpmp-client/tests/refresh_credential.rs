@@ -1,6 +1,6 @@
 //! The refresh loop presents a credential on every request it makes.
 //!
-//! A port entitlement buys one forwarded port (warren-core doc 99), and the
+//! A port entitlement buys one forwarded port (internal warren-core doc 99), and the
 //! exit spends it on presentation. Two properties the loop owes that design:
 //! every leg of a cycle carries the SAME credential (a TCP+UDP pair is one
 //! port, so it must not read as two), and a credential that has rotated

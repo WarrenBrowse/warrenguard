@@ -562,8 +562,8 @@ pub fn spawn_refresh_loop_protos_from_addr(
 /// presents nothing.
 ///
 /// Consulted once per cycle rather than captured once, because a credential
-/// expires: a port entitlement is valid for its own epoch only (warren-core
-/// doc 99), so a mapping that outlives one epoch has to present the next
+/// expires: a port entitlement is valid for its own epoch only (internal
+/// warren-core doc 99), so a mapping that outlives one epoch has to present the next
 /// epoch's credential at its next renewal, without the loop restarting.
 pub type CredentialProvider = std::sync::Arc<dyn Fn() -> Option<Vec<u8>> + Send + Sync>;
 
