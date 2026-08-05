@@ -653,6 +653,155 @@ pub fn build_uninstall_commands_v6(_exit_ip_v6: Option<Ipv6Addr>) -> Vec<Vec<Str
         .collect()
 }
 
+/// Next-hop for the IPv6 unreachable halves. A reject route still needs a
+/// gateway for the routing socket to accept it; loopback is the conventional
+/// placeholder and is never forwarded to, because `RTF_REJECT` makes the
+/// kernel answer the sender instead of transmitting.
+const V6_UNREACHABLE_GATEWAY: &str = "::1";
+
+/// macOS argv builder for the IPv6 halves installed while the tunnel carries
+/// no IPv6 of its own.
+///
+/// The firewall already blocks native v6, so nothing leaks without these
+/// routes. What it does not do is fail *predictably*: the catch-all is
+/// `block return out`, and the RST it synthesises races `connect()` to
+/// completion. macOS then reports the socket connected and only surfaces the
+/// error on the first `send()`, at which point the application has committed
+/// to the v6 address and never tries the destination's IPv4 one. The
+/// in-tunnel resolver answers AAAA for every dual-stack host, so that race
+/// sits on the critical path of nearly every page load.
+///
+/// A reject route removes the race: `connect()` fails synchronously with
+/// `EHOSTUNREACH` before a packet is emitted, which is the outcome Happy
+/// Eyeballs is specified against, so the v4 address is tried immediately.
+///
+/// The `/1` pair shadows the router-advertised `::/0` default without
+/// replacing it (longer prefix wins), exactly like the v4 halves. The on-link
+/// prefix and link-local keep their own longer routes, so LAN IPv6 is
+/// untouched.
+#[must_use]
+pub fn build_install_commands_v6_unreachable() -> Vec<Vec<String>> {
+    SPLIT_NETS_V6
+        .iter()
+        .map(|net| {
+            vec![
+                "add".into(),
+                "-inet6".into(),
+                "-net".into(),
+                (*net).into(),
+                V6_UNREACHABLE_GATEWAY.into(),
+                "-reject".into(),
+            ]
+        })
+        .collect()
+}
+
+/// Argv builder to undo [`build_install_commands_v6_unreachable`]. The halves
+/// are the same two prefixes the tunnel-routed split uses, so the teardown
+/// argv is shared: what differs between the two guards is which of them is
+/// allowed to fire, decided by [`parse_route_is_reject`].
+#[must_use]
+pub fn build_uninstall_commands_v6_unreachable() -> Vec<Vec<String>> {
+    build_uninstall_commands_v6(None)
+}
+
+/// Whether `route -n get -inet6 <probe>` output describes a reject route.
+///
+/// This is the ownership signal for the stateless unreachable-half sweep.
+/// The halves this guard installs are the only `/1` v6 routes on the host
+/// carrying `RTF_REJECT`; a co-resident VPN's live `::/1 -interface <tun>`
+/// split carries no such flag, so the sweep can never tear it down. That is
+/// the invariant [`reclaim_decision`] enforces for the tunnel-routed halves,
+/// expressed here without needing a registry, which is what lets a crashed
+/// predecessor's leak be reclaimed too.
+///
+/// Pure, so it is unit-tested against recorded `route` output.
+#[must_use]
+pub fn parse_route_is_reject(out: &str) -> bool {
+    out.lines()
+        .filter_map(|line| {
+            let rest = line.trim_start().strip_prefix("flags:")?;
+            rest.trim().strip_prefix('<')?.strip_suffix('>')
+        })
+        .any(|flags| flags.split(',').any(|flag| flag.trim() == "REJECT"))
+}
+
+/// Whether `probe` currently resolves through a reject route.
+fn route_is_reject_v6(probe: &str) -> bool {
+    run_blocking_bounded("route", &["-n", "get", "-inet6", probe])
+        .filter(|out| out.status.success())
+        .is_some_and(|out| parse_route_is_reject(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Delete each `/1` half that is currently a reject route, leaving anything
+/// else untouched. Synchronous, panic-free and privilege-tolerant, so it is
+/// safe to call from `Drop`.
+fn remove_v6_unreachable_halves() {
+    for (net, probe) in SPLIT_NET_PROBES_V6 {
+        if route_is_reject_v6(probe) {
+            let _ = run_blocking_bounded("route", &["delete", "-inet6", "-net", net]);
+        }
+    }
+}
+
+/// Force out any IPv6 unreachable half this process, or a crashed
+/// predecessor, left behind. Stateless: the reject flag is the ownership
+/// proof, so no registry has to survive the crash. Called from the same reset
+/// paths as [`force_cleanup_all_v6`] so a leaked half can never keep global
+/// IPv6 down once the tunnel is gone.
+pub fn force_cleanup_all_v6_unreachable() {
+    remove_v6_unreachable_halves();
+}
+
+/// RAII guard making global IPv6 unreachable for as long as the tunnel
+/// carries only IPv4. Installed instead of [`DefaultRouteSplitV6Guard`], never
+/// alongside it: one routes v6 into the tunnel, the other declares it has
+/// nowhere to go.
+#[derive(Debug)]
+pub struct Ipv6UnreachableGuard {
+    installed: bool,
+}
+
+impl Ipv6UnreachableGuard {
+    /// Install the reject halves.
+    ///
+    /// # Errors
+    ///
+    /// - Missing privileges (`route` requires root).
+    /// - `RTM_ADD: File exists` is tolerated (idempotent re-install).
+    pub async fn install() -> Result<Self> {
+        for args in &build_install_commands_v6_unreachable() {
+            run_route_tolerant_exists(args)
+                .await
+                .with_context(|| format!("route {}", args.join(" ")))?;
+        }
+        tracing::info!("Warren IPv6 unreachable guard installed (macOS), tunnel is IPv4-only");
+        Ok(Self { installed: true })
+    }
+
+    /// Remove the halves. Idempotent, best-effort.
+    ///
+    /// # Errors
+    ///
+    /// Never returns `Err`; the signature matches the other route guards so
+    /// the teardown call site stays uniform.
+    pub async fn uninstall(mut self) -> Result<()> {
+        self.installed = false;
+        remove_v6_unreachable_halves();
+        Ok(())
+    }
+}
+
+impl Drop for Ipv6UnreachableGuard {
+    fn drop(&mut self) {
+        if !self.installed {
+            return;
+        }
+        self.installed = false;
+        remove_v6_unreachable_halves();
+    }
+}
+
 /// Parse the `interface: <name>` line out of `route -n get default`
 /// output. Pure - exposed so the parser can be unit-tested against
 /// recorded fixtures without invoking `route`.
@@ -1267,6 +1416,91 @@ mod tests {
         let cmds = build_uninstall_commands_v6(None);
         assert_eq!(cmds.len(), 2, "no host exception to delete when v4-dialed");
         assert!(cmds.iter().all(|c| c.contains(&"-inet6".to_string())));
+    }
+
+    // --- IPv6 unreachable guard (tunnel is IPv4-only) ---
+
+    #[test]
+    fn v6_unreachable_install_emits_reject_halves_via_loopback() {
+        // A v4-only tunnel must make global v6 fail SYNCHRONOUSLY, so the
+        // resolver's AAAA answer costs one instant errno instead of a
+        // firewall RST that races connect() to completion.
+        let cmds = build_install_commands_v6_unreachable();
+        assert_eq!(cmds.len(), 2, "both /1 halves, nothing else");
+        assert_eq!(
+            cmds[0],
+            vec!["add", "-inet6", "-net", "::/1", "::1", "-reject"]
+        );
+        assert_eq!(
+            cmds[1],
+            vec!["add", "-inet6", "-net", "8000::/1", "::1", "-reject"]
+        );
+    }
+
+    #[test]
+    fn v6_unreachable_install_never_blackholes() {
+        // `-blackhole` drops silently, which turns every AAAA destination
+        // into a full TCP timeout instead of an instant fallback. The whole
+        // point of this guard is the immediate error.
+        let joined = build_install_commands_v6_unreachable()
+            .iter()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            !joined.contains("-blackhole"),
+            "must reject, never blackhole; got: {joined}"
+        );
+    }
+
+    #[test]
+    fn v6_unreachable_uninstall_deletes_both_halves() {
+        let cmds = build_uninstall_commands_v6_unreachable();
+        assert_eq!(cmds.len(), 2);
+        assert_eq!(cmds[0], vec!["delete", "-inet6", "-net", "::/1"]);
+        assert_eq!(cmds[1], vec!["delete", "-inet6", "-net", "8000::/1"]);
+    }
+
+    /// Recorded `route -n get -inet6` output for a half this guard installed.
+    const FIXTURE_REJECT_ROUTE: &str = "   route to: 100::\n\
+         destination: ::\n\
+             gateway: ::1\n\
+           interface: lo0\n\
+               flags: <UP,GATEWAY,DONE,STATIC,REJECT>\n";
+
+    /// Recorded output for a live route through the physical NIC.
+    const FIXTURE_PHYSICAL_ROUTE: &str = "   route to: 2001:4860:4860::8888\n\
+         destination: 2001:4860:4860::8888\n\
+             gateway: fe80::8e97:eaff:fe32:3e4d%en0\n\
+           interface: en0\n\
+               flags: <UP,GATEWAY,HOST,DONE,WASCLONED,IFSCOPE,IFREF,GLOBAL>\n";
+
+    #[test]
+    fn reject_flag_identifies_a_half_this_guard_installed() {
+        assert!(parse_route_is_reject(FIXTURE_REJECT_ROUTE));
+    }
+
+    #[test]
+    fn a_live_foreign_v6_split_is_never_seen_as_ours() {
+        // Ownership signal for the stateless sweep: only a REJECT half is
+        // ours. A co-resident VPN routing `::/1` into its own TUN carries no
+        // REJECT flag, so the sweep must leave it alone (same invariant the
+        // `reclaim_decision` ownership check protects for the v4 halves).
+        let foreign_tunnel_split = "   route to: 100::\n\
+             destination: ::\n\
+               interface: utun9\n\
+                   flags: <UP,DONE,STATIC>\n";
+        assert!(!parse_route_is_reject(foreign_tunnel_split));
+        assert!(!parse_route_is_reject(FIXTURE_PHYSICAL_ROUTE));
+    }
+
+    #[test]
+    fn reject_detection_matches_the_whole_flag_not_a_substring() {
+        // Guard against a naive `contains("REJECT")`: the flag list is
+        // comma-separated and must be compared token by token.
+        assert!(!parse_route_is_reject("flags: <UP,XREJECTED,DONE>\n"));
+        assert!(!parse_route_is_reject("no flags line here\n"));
     }
 
     #[test]
