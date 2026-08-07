@@ -34,9 +34,20 @@
 //! between the probes is gone. Against the shipped defaults, with the timings
 //! justified on [`PROBE_TIMEOUT`] from a measurement on the beta network, that
 //! bounds the user's time on a silently dead tunnel at ~11 s from connect and
-//! ~39 s from a mid-session death, and requires ~9 s of unbroken silence before
-//! a working tunnel can be torn down. The scheduler tests assert those three
-//! numbers in wall-clock terms.
+//! ~39 s from a mid-session death. The scheduler tests assert both numbers in
+//! wall-clock terms.
+//!
+//! What that fast confirmation cadence cost, until it was measured: the three
+//! "consecutive" probes all fall inside the same ~9 s, so ANY 8.5 s stall was
+//! enough to convict an exit that was forwarding perfectly well, and the
+//! conviction costs the user every request in flight (a redial is a fresh QUIC
+//! epoch). The window cannot simply be widened back: that trades the detection
+//! time this module exists to keep short. The evidence is qualified instead.
+//! Before convicting, the scheduler consults [`TransportEvidence`]: this whole
+//! module is about an exit that ACKs keep-alives and forwards nothing, so while
+//! the peer has ACKed nothing at all the premise does not hold, the path is the
+//! suspect, and the QUIC idle timeout owns that death. See
+//! `a_path_stall_never_convicts_the_exit_however_long_it_lasts`.
 //!
 //! Both ends of that trade were then measured on a live circuit (2026-08-02,
 //! Android over two hops). An exit that forwards nothing is convicted 10.2 to
@@ -259,6 +270,27 @@ pub enum ProbeOutcome {
     Inconclusive,
 }
 
+/// What the transport saw while the in-tunnel probe was failing.
+///
+/// This module's entire premise is an exit that ACKs keep-alives and forwards
+/// nothing, so a conviction is only meaningful while the transport underneath is
+/// actually carrying traffic. When it is not, the unanswered query says nothing
+/// about the exit: the path stopped carrying anything, a redial goes over that
+/// same path, and the QUIC idle timeout already owns that death.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportEvidence {
+    /// The peer kept acknowledging what we sent. Only the peer can ACK what it
+    /// received, so the path is live and an unanswered in-tunnel query is
+    /// evidence against the EXIT.
+    Progressing,
+    /// Nothing came back from the peer either, not even an ACK of our
+    /// keep-alives. The path is the suspect, not the exit.
+    Silent,
+    /// The consumer does not report it. Kept distinct from `Progressing` so a
+    /// reader can tell "the transport was fine" from "nobody looked".
+    Unknown,
+}
+
 /// IO surface consumed by [`run_egress_probe`]; a consumer implements it over
 /// its own tunnel and the scheduler owns the escalation logic.
 ///
@@ -288,6 +320,16 @@ pub trait EgressProbeIo {
     /// forwarding but no gap-free drain migration took it: the state machine
     /// leaves Connected and redials onto a fresh circuit.
     fn escalate_reconnect(&mut self, msg: String);
+    /// What the transport carried since the current failure streak began, read
+    /// once at the threshold. Defaults to [`TransportEvidence::Unknown`], which
+    /// keeps a consumer that has not wired it on the pre-existing behaviour.
+    fn transport_evidence(&mut self) -> TransportEvidence {
+        TransportEvidence::Unknown
+    }
+    /// Marks the start of a failure streak, so the next
+    /// [`Self::transport_evidence`] answers about THIS streak and not about the
+    /// whole session.
+    fn mark_streak_start(&mut self) {}
 }
 
 /// Probe scheduler: counts consecutive failures while a session is published,
@@ -341,7 +383,32 @@ pub async fn run_egress_probe<I: EgressProbeIo>(io: &mut I, failure_threshold: u
                 io.publish(false);
             }
         } else {
+            if consecutive_failures == 0 {
+                io.mark_streak_start();
+            }
             consecutive_failures = consecutive_failures.saturating_add(1);
+            // A conviction is only meaningful while the transport underneath is
+            // carrying traffic, because that is the whole condition this probe
+            // exists to catch: an exit that ACKs and forwards nothing. When the
+            // peer has ACKed nothing since the streak began, the path stopped
+            // carrying anything and the exit is not the suspect. Convicting
+            // anyway costs the user every request in flight (the redial is a
+            // fresh QUIC epoch) and cannot help, since the redial rides the same
+            // path. The QUIC idle timeout owns that death instead.
+            //
+            // The failures are KEPT, not reset: if the path comes back and the
+            // exit is still silent, the very next probe convicts it.
+            if !dead
+                && consecutive_failures >= failure_threshold
+                && io.transport_evidence() == TransportEvidence::Silent
+            {
+                tracing::debug!(
+                    "egress probe: {consecutive_failures} failed probes, but the \
+                     transport carried nothing over them; the path is the \
+                     suspect, not the exit"
+                );
+                continue;
+            }
             if !dead && consecutive_failures >= failure_threshold {
                 dead = true;
                 io.publish(true);
@@ -829,8 +896,16 @@ mod tests {
     /// real deadline when nothing answers. A test can then assert on elapsed
     /// time rather than on tick counts.
     struct TimedIo {
-        /// Window, from loop start, during which the exit forwards nothing.
+        /// Window, from loop start, during which the exit forwards nothing
+        /// while the transport underneath keeps carrying traffic. This is the
+        /// condition the probe exists to catch.
         dead: std::ops::Range<Duration>,
+        /// Window during which NOTHING crosses the path: the probe gets no
+        /// answer and the peer ACKs nothing either. A residential stall.
+        stalled: std::ops::Range<Duration>,
+        /// Where the current failure streak began, so the evidence answers
+        /// about that streak rather than about the whole run.
+        streak_start: Option<Duration>,
         /// Every `lose_every`-th probe loses all of its datagrams, modelling
         /// isolated packet loss on an otherwise healthy circuit.
         lose_every: usize,
@@ -847,6 +922,8 @@ mod tests {
         fn new(dead: std::ops::Range<Duration>, stop_after: Duration) -> Self {
             Self {
                 dead,
+                stalled: Duration::MAX..Duration::MAX,
+                streak_start: None,
                 lose_every: 0,
                 probes: 0,
                 started: tokio::time::Instant::now(),
@@ -860,6 +937,19 @@ mod tests {
 
         fn healthy(stop_after: Duration) -> Self {
             Self::new(Duration::MAX..Duration::MAX, stop_after)
+        }
+
+        /// A path that carries nothing at all over `stalled`, with a perfectly
+        /// healthy exit behind it.
+        fn stalling(stalled: std::ops::Range<Duration>, stop_after: Duration) -> Self {
+            let mut io = Self::new(Duration::MAX..Duration::MAX, stop_after);
+            io.stalled = stalled;
+            io
+        }
+
+        /// `true` when the path carries nothing at any point of `[from, to]`.
+        fn stalled_over(&self, from: Duration, to: Duration) -> bool {
+            from < self.stalled.end && to >= self.stalled.start
         }
 
         fn elapsed(&self) -> Duration {
@@ -900,7 +990,10 @@ mod tests {
                 for offset in probe_send_offsets() {
                     let sent = start + offset;
                     let answered = offset + MODEL_RTT;
-                    if answered <= PROBE_TIMEOUT && !self.dead_over(sent, sent + MODEL_RTT) {
+                    if answered <= PROBE_TIMEOUT
+                        && !self.dead_over(sent, sent + MODEL_RTT)
+                        && !self.stalled_over(sent, sent + MODEL_RTT)
+                    {
                         tokio::time::sleep(answered).await;
                         return ProbeOutcome::Alive;
                     }
@@ -924,6 +1017,21 @@ mod tests {
 
         fn escalate_reconnect(&mut self, _msg: String) {
             self.escalated_at = Some(self.elapsed());
+        }
+
+        fn mark_streak_start(&mut self) {
+            self.streak_start = Some(self.elapsed());
+        }
+
+        /// ACKs stop arriving exactly while the path carries nothing; a dead
+        /// EXIT behind a live path keeps ACKing our keep-alives.
+        fn transport_evidence(&mut self) -> TransportEvidence {
+            let from = self.streak_start.unwrap_or_else(|| self.elapsed());
+            if self.stalled_over(from, self.elapsed()) {
+                TransportEvidence::Silent
+            } else {
+                TransportEvidence::Progressing
+            }
         }
     }
 
@@ -988,6 +1096,64 @@ mod tests {
             io.published.is_empty(),
             "an 8 s stall must not even banner: {:?}",
             io.published
+        );
+    }
+
+    /// A path stall must never be blamed on the EXIT, however long it lasts.
+    ///
+    /// This module convicts an exit that ACKs keep-alives and forwards nothing.
+    /// While the path itself carries nothing, that premise does not hold: the
+    /// unanswered query says nothing about the exit, the redial the conviction
+    /// triggers goes over the same dead path, and the QUIC idle timeout already
+    /// owns that death. What the conviction does cost is certain: a reconnect is
+    /// a fresh QUIC epoch, so every request in flight through the tunnel dies
+    /// with the old one.
+    ///
+    /// Measured before the fix: 8.5 s of silence was enough, at the worst
+    /// alignment, because a pending failure drops the cadence to one second and
+    /// the three "consecutive" probes then all fall inside the SAME bad moment.
+    /// A residential path stalls that long routinely.
+    #[tokio::test(start_paused = true)]
+    async fn a_path_stall_never_convicts_the_exit_however_long_it_lasts() {
+        // Swept over both the length of the stall and where it falls relative
+        // to the cadence: a real stall starts whenever it wants, and the old
+        // budget was only reachable at one alignment.
+        for silence_s in [3u64, 8, 9, 12, 20, 45, 90] {
+            let silence = Duration::from_secs(silence_s);
+            for offset_ms in (0..30_000).step_by(500) {
+                let start = Duration::from_secs(120) + Duration::from_millis(offset_ms as u64);
+                let mut io =
+                    TimedIo::stalling(start..start + silence, start + Duration::from_secs(120));
+                run_egress_probe(&mut io, DEFAULT_FAILURE_THRESHOLD).await;
+                assert!(
+                    io.escalated_at.is_none(),
+                    "a {silence_s} s path stall starting at +{offset_ms} ms tore \
+                     the tunnel down, killing every request in flight, over a \
+                     path that was carrying nothing for the exit to be blamed for"
+                );
+            }
+        }
+    }
+
+    /// The other side of the same coin, and the reason the probe exists: when
+    /// the path IS carrying traffic (the peer keeps ACKing) and the exit still
+    /// answers nothing, that is evidence against the exit and it must still be
+    /// convicted as fast as it ever was.
+    #[tokio::test(start_paused = true)]
+    async fn an_exit_that_forwards_nothing_behind_a_live_path_is_still_convicted() {
+        let dead_from = Duration::from_secs(120);
+        let mut io = TimedIo::new(
+            dead_from..Duration::MAX,
+            dead_from + Duration::from_secs(120),
+        );
+        run_egress_probe(&mut io, DEFAULT_FAILURE_THRESHOLD).await;
+        let at = io
+            .escalated_at
+            .expect("an exit forwarding nothing over a live path must be convicted");
+        assert!(
+            at - dead_from <= Duration::from_secs(40),
+            "conviction of a genuinely dead exit must not regress: took {:?}",
+            at - dead_from
         );
     }
 
