@@ -3,7 +3,7 @@
 [![CI](https://github.com/WarrenBrowse/warrenguard/actions/workflows/ci.yml/badge.svg)](https://github.com/WarrenBrowse/warrenguard/actions/workflows/ci.yml)
 
 A generic **VPN-over-QUIC engine**: the data-plane building block behind the
-[Warren](https://warrenbrowse.com) VPN, carved out to stand on its own. Like
+[Warren](https://warren.ro) VPN, carved out to stand on its own. Like
 WireGuard's kernel module, it is the reusable primitive; a deployer brings their
 own control-plane (admission, accounting, discovery) on top.
 
