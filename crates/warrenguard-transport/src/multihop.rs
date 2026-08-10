@@ -171,6 +171,11 @@ pub enum MultiHopError {
     /// holding only the cover cert must not be dialed.
     #[error("entry relay identity proof failed: {0}")]
     RelayIdentity(&'static str),
+    /// A caller addressed a bonded leg by index that the bundle no longer
+    /// has, which a leg-explicit send races with a width change to produce.
+    /// Never path evidence: the leg is gone, not broken.
+    #[error("no bonded session at that leg index")]
+    NoSession,
 }
 
 impl MultiHopError {

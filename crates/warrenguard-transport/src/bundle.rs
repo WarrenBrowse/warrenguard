@@ -41,6 +41,107 @@ pub const MAX_BONDED_CONNECTIONS: usize = 8;
 /// into Quinn's own receive queue; nothing is dropped here.
 const MERGED_DOWNLINK_BOUND: usize = 2048;
 
+/// Uplink packets between two refreshes of the cached [`RoutingPlan`].
+///
+/// The plan reads every leg's `max_datagram_size`, which locks each Quinn
+/// connection, so recomputing it per packet would put eight lock round-trips
+/// on the hottest path in the engine. Quinn moves a path MTU on the scale of
+/// its DPLPMTUD timers (seconds to minutes), never per packet, so a bounded
+/// staleness of this many packets costs at most that many drops on a leg that
+/// has just collapsed, each of which is still counted and reflected as PTB.
+/// Counted in packets rather than elapsed time so an idle tunnel, which has
+/// nothing to black-hole, never pays for a refresh.
+const ROUTING_PLAN_REFRESH_PACKETS: u64 = 256;
+
+/// Which legs may carry user traffic, and which one a given packet goes to.
+///
+/// The whole bond-level MTU policy, kept pure and free of I/O so it is
+/// exhaustively unit-testable: [`MultiHopBundle`] only samples the live
+/// per-leg budgets and caches the result.
+///
+/// Two rules, each bought by the 2026-08-10 incident where one of eight legs
+/// fell to Quinn's 1200-byte base MTU under congestion loss:
+///
+/// - **Quarantine.** A leg strictly worse than the best one AND under
+///   [`QUIC_SAFE_INNER_MTU`] carries nothing and sets nothing. Without this,
+///   the bond published the `min` across its legs, so one collapsed leg
+///   dictated an inner MTU below the floor for all eight and inner QUIC could
+///   not be established at all. The best leg is never quarantined, so the
+///   usable set is never empty and a session legitimately under the floor on
+///   every leg (the TLS-over-TCP carrier) keeps all of them.
+/// - **Size-aware routing.** A packet too large for its flow-pinned leg moves
+///   to a leg that can carry it instead of being dropped while healthy legs
+///   sit idle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RoutingPlan {
+    /// Inner budget per leg, indexed by leg, quarantined legs included.
+    budgets: Vec<usize>,
+    /// Legs allowed to carry user traffic, ascending.
+    usable: Vec<usize>,
+    /// Budget published to the MSS clamp and the PTB reflection: the
+    /// smallest among the usable legs.
+    published: usize,
+}
+
+impl RoutingPlan {
+    fn from_budgets(budgets: Vec<usize>) -> Self {
+        let Some(best) = budgets.iter().copied().max() else {
+            return Self {
+                budgets,
+                usable: Vec::new(),
+                published: usize::from(warrenguard_config::TUNNEL_MIN_MTU)
+                    - MULTIHOP_FRAME_MAX_OVERHEAD,
+            };
+        };
+        let usable: Vec<usize> = budgets
+            .iter()
+            .enumerate()
+            .filter(|&(_, &b)| {
+                // `b < best` keeps at least the best leg, so a uniformly
+                // sub-floor path is never left with nothing to send on.
+                !(b < best && b < warrenguard_transport_core::QUIC_SAFE_INNER_MTU)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let published = usable.iter().map(|&i| budgets[i]).min().unwrap_or(
+            usize::from(warrenguard_config::TUNNEL_MIN_MTU) - MULTIHOP_FRAME_MAX_OVERHEAD,
+        );
+        Self {
+            budgets,
+            usable,
+            published,
+        }
+    }
+
+    /// Leg index for a `pkt_len`-byte inner packet: the flow-pinned usable
+    /// leg when it fits, else the next usable leg that does, else the widest
+    /// usable leg so an unavoidable drop is charged to the best path there is.
+    fn route(&self, hash: Option<u64>, rr: usize, pkt_len: usize) -> usize {
+        let n = self.usable.len();
+        if n == 0 {
+            return 0;
+        }
+        let start = match hash {
+            Some(h) => (h as usize) % n,
+            None => rr % n,
+        };
+        let pinned = self.usable[start];
+        if self.budgets[pinned] >= pkt_len {
+            return pinned;
+        }
+        (1..n)
+            .map(|step| self.usable[(start + step) % n])
+            .find(|&leg| self.budgets[leg] >= pkt_len)
+            .unwrap_or_else(|| {
+                self.usable
+                    .iter()
+                    .copied()
+                    .max_by_key(|&leg| self.budgets[leg])
+                    .unwrap_or(pinned)
+            })
+    }
+}
+
 /// N bonded multi-hop sessions behind the API surface of one.
 ///
 /// Constructed by the supervisor once the PRIMARY session is set up;
@@ -78,6 +179,12 @@ pub struct MultiHopBundle {
     /// probe traffic never reaches the TUN nor the real-traffic
     /// counters.
     probe_tap: RwLock<Option<Arc<crate::path_health::ProbeTap>>>,
+    /// Cached per-leg MTU policy, refreshed every
+    /// [`ROUTING_PLAN_REFRESH_PACKETS`] uplink packets and on every bundle
+    /// width change. Read on the uplink hot path; never computed there.
+    routing: RwLock<RoutingPlan>,
+    /// Uplink packets since the last [`Self::refresh_routing_plan`].
+    routing_tick: AtomicU64,
 }
 
 impl MultiHopBundle {
@@ -114,6 +221,8 @@ impl MultiHopBundle {
             .iter()
             .map(|client| Self::spawn_reader(client.clone(), merged_tx.clone(), closed_tx.clone()))
             .collect();
+        let plan =
+            RoutingPlan::from_budgets(clients.iter().map(|c| c.max_inner_payload()).collect());
         Arc::new(Self {
             clients: RwLock::new(clients),
             rr: AtomicUsize::new(0),
@@ -124,6 +233,8 @@ impl MultiHopBundle {
             real_tx: AtomicU64::new(0),
             real_rx: AtomicU64::new(0),
             probe_tap: RwLock::new(None),
+            routing: RwLock::new(plan),
+            routing_tick: AtomicU64::new(0),
         })
     }
 
@@ -151,6 +262,13 @@ impl MultiHopBundle {
         let reader = Self::spawn_reader(client.clone(), merged_tx.clone(), self.closed_tx.clone());
         clients.push(client);
         self.reader_tasks.lock().push(reader);
+        let budgets = clients.iter().map(|c| c.max_inner_payload()).collect();
+        drop(clients);
+        // A width change re-indexes every leg, so the cached plan is stale
+        // the instant the secondary lands: refresh it here rather than let
+        // the packet tick route against indices that no longer mean the
+        // same thing.
+        *self.routing.write() = RoutingPlan::from_budgets(budgets);
         true
     }
 
@@ -226,22 +344,55 @@ impl MultiHopBundle {
         self.clients.read().iter().map(|c| c.clone_conn()).collect()
     }
 
-    /// Flow-pinned session for `pkt`: 5-tuple hash for TCP/UDP,
-    /// round-robin fallback otherwise.
+    /// Recomputes the cached [`RoutingPlan`] from the live per-leg budgets.
     ///
-    /// A flow keeps its pinned session at a given bundle width; a
-    /// mid-session width change (background bonding completing) may
-    /// re-pin flows once, exactly like a reconnect re-pins them, which
-    /// QUIC datagram delivery tolerates (no per-flow ordering promise
-    /// across different sessions is ever made to the exit).
+    /// Deliberately samples every leg in one pass: reading a leg's budget
+    /// locks its Quinn connection, so this is the only place in the engine
+    /// allowed to pay that cost.
+    fn refresh_routing_plan(&self) {
+        let budgets: Vec<usize> = self
+            .clients
+            .read()
+            .iter()
+            .map(|c| c.max_inner_payload())
+            .collect();
+        *self.routing.write() = RoutingPlan::from_budgets(budgets);
+    }
+
+    /// Session that must carry `pkt`: the flow-pinned leg when it is usable
+    /// and wide enough, else the nearest leg that can take the packet. See
+    /// [`RoutingPlan`] for the policy and why one leg's collapse must not
+    /// reach the other seven.
+    ///
+    /// A flow keeps its pinned session at a given usable-leg set; a width
+    /// change (background bonding completing) or a leg entering or leaving
+    /// quarantine may re-pin flows once, exactly like a reconnect re-pins
+    /// them, which QUIC datagram delivery tolerates (no per-flow ordering
+    /// promise across different sessions is ever made to the exit).
     fn pick(&self, pkt: &[u8]) -> Arc<MultiHopClient> {
-        let clients = self.clients.read();
-        let n = clients.len();
-        let idx = match warrenguard_transport_core::flow_hash_5tuple(pkt) {
-            Some(h) => (h as usize) % n,
-            None => self.rr.fetch_add(1, Ordering::Relaxed) % n,
+        if self
+            .routing_tick
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(ROUTING_PLAN_REFRESH_PACKETS)
+        {
+            self.refresh_routing_plan();
+        }
+        let hash = warrenguard_transport_core::flow_hash_5tuple(pkt);
+        // The round-robin cursor only advances for packets that have no
+        // 5-tuple to hash, so hashed flows never consume its sequence.
+        let rr = if hash.is_none() {
+            self.rr.fetch_add(1, Ordering::Relaxed)
+        } else {
+            0
         };
-        clients[idx].clone()
+        let idx = self.routing.read().route(hash, rr, pkt.len());
+        let clients = self.clients.read();
+        // The plan can lag a width change by up to one refresh, so an index
+        // it produced is not guaranteed to still exist.
+        clients
+            .get(idx)
+            .unwrap_or_else(|| &clients[clients.len() - 1])
+            .clone()
     }
 
     /// Seals and sends one inner packet on its flow-pinned session.
@@ -260,16 +411,42 @@ impl MultiHopBundle {
         sent
     }
 
-    /// Seals and sends one path-health probe packet on its flow-pinned
-    /// session, WITHOUT feeding the real-traffic liveness counters:
-    /// engine-generated probes must never satisfy (or trip) the
-    /// app-traffic dead-path watches.
+    /// Seals and sends one path-health probe on the leg at `leg`, WITHOUT
+    /// feeding the real-traffic liveness counters: engine-generated probes
+    /// must never satisfy (or trip) the app-traffic dead-path watches.
+    ///
+    /// The leg is explicit because the prober's whole value is comparing a
+    /// small and a large probe **on one leg**: routed by [`Self::pick`],
+    /// an ICMP probe has no 5-tuple to hash, falls into the round-robin
+    /// branch, and the two halves of a pair leave on two different legs,
+    /// which is how a collapsed leg went unnoticed for six minutes on
+    /// 2026-08-10. Quarantined legs are probed too: the probe is how a
+    /// quarantined leg proves it deserves to come back.
     ///
     /// # Errors
     ///
-    /// Propagates [`MultiHopClient::send`] errors of the picked session.
-    pub async fn send_probe(&self, payload: &[u8]) -> Result<(), MultiHopError> {
-        self.pick(payload).send(payload).await
+    /// Propagates [`MultiHopClient::send`] errors of that leg. Returns
+    /// [`MultiHopError::NoSession`] when `leg` is out of range.
+    pub async fn send_probe_on(&self, leg: usize, payload: &[u8]) -> Result<(), MultiHopError> {
+        let client = self
+            .clients
+            .read()
+            .get(leg)
+            .cloned()
+            .ok_or(MultiHopError::NoSession)?;
+        client.send(payload).await
+    }
+
+    /// Per-leg inner budgets, indexed like [`Self::clients`]: what the
+    /// prober sizes each leg's large probe against, and what names a leg
+    /// that has fallen out of family in a log line.
+    #[must_use]
+    pub fn leg_inner_payloads(&self) -> Vec<usize> {
+        self.clients
+            .read()
+            .iter()
+            .map(|c| c.max_inner_payload())
+            .collect()
     }
 
     /// Installs the path-health reply intercept consulted by
@@ -377,33 +554,39 @@ impl MultiHopBundle {
             .find_map(|c| c.rejection_reason())
     }
 
-    /// Most conservative datagram budget across the bonded sessions
-    /// (a packet may be pinned to any of them).
+    /// WIDEST datagram budget any usable leg can carry, for reporting a
+    /// packet the bond had to drop.
+    ///
+    /// A max, not a min, and only because [`Self::pick`] already routes a
+    /// packet to whatever leg can take it: reaching a `TooLarge` drop means
+    /// NO leg could, so the widest is both the truthful ceiling to log and
+    /// the correct next-hop MTU to reflect back as PTB. Sizing anything that
+    /// must FIT every leg belongs to [`Self::max_inner_payload`].
     #[must_use]
     pub fn max_datagram_size(&self) -> Option<usize> {
-        self.clients
-            .read()
+        // Cloning the (at most eight) usable indices keeps the two locks
+        // from ever nesting. This is the drop-report path, not a hot one.
+        let usable = self.routing.read().usable.clone();
+        let clients = self.clients.read();
+        usable
             .iter()
-            .filter_map(|c| c.max_datagram_size())
-            .min()
+            .filter_map(|&i| clients.get(i).and_then(|c| c.max_datagram_size()))
+            .max()
     }
 
-    /// Most conservative inner-packet budget across the bonded sessions:
-    /// the largest inner IP packet every session can currently carry in
-    /// one datagram (path budget minus that session's frame overhead).
-    /// This is the live "effective inner MTU" of the tunnel; when it
-    /// drops below the TUN MTU the pumps clamp TCP MSS and reflect
-    /// PMTUD so the datapath keeps flowing on reduced-MTU underlays.
+    /// Largest inner IP packet EVERY usable leg can currently carry in one
+    /// datagram: the live "effective inner MTU" of the tunnel, which the
+    /// pumps clamp TCP MSS and reflect PMTUD against on reduced-MTU
+    /// underlays.
+    ///
+    /// Quarantined legs are excluded, so one leg collapsing to Quinn's base
+    /// MTU no longer drags the whole bond under [`QUIC_SAFE_INNER_MTU`] and
+    /// kills inner QUIC on the seven healthy ones. Served from the cached
+    /// [`RoutingPlan`], so it lags a real change by at most
+    /// [`ROUTING_PLAN_REFRESH_PACKETS`] uplink packets.
     #[must_use]
     pub fn max_inner_payload(&self) -> usize {
-        self.clients
-            .read()
-            .iter()
-            .map(|c| c.max_inner_payload())
-            .min()
-            .unwrap_or(
-                usize::from(warrenguard_config::TUNNEL_MIN_MTU) - MULTIHOP_FRAME_MAX_OVERHEAD,
-            )
+        self.routing.read().published
     }
 
     /// Primary session's Quinn stats (bench scraping; per-session stats
@@ -574,6 +757,114 @@ mod tests {
             "the last slot below the cap is still attachable"
         );
     }
+
+    // The routing plan is the whole bond-level MTU policy, extracted pure so
+    // the quarantine and the size-aware fallback are exhaustively testable
+    // without eight live QUIC sessions.
+
+    #[test]
+    fn a_leg_under_the_quic_floor_with_a_healthier_peer_is_quarantined() {
+        // The 2026-08-10 shape: seven legs at 1242, one collapsed to the
+        // QUIC base MTU. The collapsed leg must stop dictating the bond.
+        let plan = RoutingPlan::from_budgets(vec![1242, 1242, 1242, 1076]);
+        assert_eq!(plan.usable, vec![0, 1, 2]);
+        assert_eq!(
+            plan.published, 1242,
+            "one collapsed leg must not drag the published budget under the QUIC floor"
+        );
+    }
+
+    #[test]
+    fn the_best_leg_is_never_quarantined() {
+        // A session on the TLS-over-TCP carrier is legitimately under the
+        // floor on EVERY leg (CARRIER_MAX_INNER_MTU is 1100 on purpose).
+        // Quarantining them all would leave nothing to send on.
+        let uniform = RoutingPlan::from_budgets(vec![1100, 1100, 1100]);
+        assert_eq!(uniform.usable, vec![0, 1, 2]);
+        assert_eq!(uniform.published, 1100);
+
+        let ragged = RoutingPlan::from_budgets(vec![1076, 1100]);
+        assert_eq!(ragged.usable, vec![1], "the worse sub-floor leg is dropped");
+        assert_eq!(ragged.published, 1100);
+
+        let single = RoutingPlan::from_budgets(vec![900]);
+        assert_eq!(single.usable, vec![0], "a lone leg is always usable");
+        assert_eq!(single.published, 900);
+    }
+
+    #[test]
+    fn a_leg_at_or_above_the_quic_floor_is_kept_even_when_it_is_the_worst() {
+        // Above the floor a smaller leg is merely slower, and dropping it
+        // would throw away capacity for nothing.
+        let plan = RoutingPlan::from_budgets(vec![1400, 1228]);
+        assert_eq!(plan.usable, vec![0, 1]);
+        assert_eq!(plan.published, 1228);
+    }
+
+    #[test]
+    fn route_never_hands_a_packet_to_a_quarantined_leg() {
+        let plan = RoutingPlan::from_budgets(vec![1242, 1242, 1076]);
+        for hash in 0..24u64 {
+            let leg = plan.route(Some(hash), 0, 800);
+            assert_ne!(leg, 2, "hash {hash} must not land on the quarantined leg");
+        }
+        for rr in 0..24 {
+            assert_ne!(plan.route(None, rr, 800), 2, "round-robin must skip it too");
+        }
+    }
+
+    #[test]
+    fn route_falls_back_to_a_leg_that_can_carry_an_oversized_packet() {
+        // Every leg is above the floor so all stay usable, but only some
+        // can take this packet. Dropping it while a capable leg sits idle
+        // is the defect that black-holed inner QUIC.
+        //
+        // The widest leg is deliberately NOT the first that fits: the scan
+        // takes the nearest capable leg from the pin, which spreads
+        // oversized flows instead of piling them all on one leg, and it is
+        // what tells this branch apart from the undeliverable fallback.
+        let plan = RoutingPlan::from_budgets(vec![1240, 1300, 1400]);
+        assert_eq!(plan.usable, vec![0, 1, 2]);
+        assert_eq!(
+            plan.route(Some(0), 0, 800),
+            0,
+            "a packet that fits stays on its pinned leg"
+        );
+        assert_eq!(
+            plan.route(Some(0), 0, 1300),
+            1,
+            "a packet too large for the pinned leg moves to the nearest one that fits"
+        );
+    }
+
+    #[test]
+    fn route_attributes_an_undeliverable_packet_to_the_widest_leg() {
+        // No leg can take it: the drop is unavoidable, but it must be
+        // charged to the widest leg so the counter and the reflected PTB
+        // carry the largest MTU actually achievable.
+        let plan = RoutingPlan::from_budgets(vec![1240, 1400, 1300]);
+        assert_eq!(plan.route(Some(0), 0, 1500), 1);
+    }
+
+    #[test]
+    fn route_is_stable_for_a_given_flow() {
+        let plan = RoutingPlan::from_budgets(vec![1242, 1242, 1242, 1076]);
+        let first = plan.route(Some(0xdead_beef), 0, 900);
+        for _ in 0..8 {
+            assert_eq!(
+                plan.route(Some(0xdead_beef), 0, 900),
+                first,
+                "flow pinning must be deterministic across calls"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_bundle_plan_is_inert_rather_than_panicking() {
+        let plan = RoutingPlan::from_budgets(Vec::new());
+        assert!(plan.usable.is_empty());
+        assert_eq!(plan.route(Some(7), 3, 900), 0);
+    }
 }
 
 /// Live loopback tests for the paths that need a real QUIC session:
@@ -588,7 +879,7 @@ mod live_tests {
     use warrenguard_multihop::ExitId;
 
     use super::*;
-    use crate::test_support::spawn_loopback_multihop;
+    use crate::test_support::{spawn_loopback_multihop, spawn_loopback_multihop_with_transport};
 
     #[tokio::test]
     async fn closed_resolves_once_the_peer_closes_the_connection() {
@@ -660,6 +951,96 @@ mod live_tests {
         assert!(
             matches!(result, Err(MultiHopError::Recv(_))),
             "a drained bundle must map to Err(MultiHopError::Recv(_)), got {result:?}"
+        );
+    }
+
+    /// Transport config pinning a session to a fixed path MTU: MTU discovery
+    /// off so the loopback cannot grow it, which is how a leg is held at
+    /// Quinn's base MTU the way the 2026-08-10 black-hole detector held one.
+    fn transport_pinned_to_mtu(mtu: u16) -> Arc<quinn::TransportConfig> {
+        let mut cfg = quinn::TransportConfig::default();
+        cfg.initial_mtu(mtu).mtu_discovery_config(None);
+        Arc::new(cfg)
+    }
+
+    /// The incident, replayed on real QUIC: one leg pinned under the
+    /// inner-QUIC floor beside a healthy one. The bond must publish the
+    /// HEALTHY leg's budget and route a large packet to it, instead of
+    /// letting the collapsed leg set an inner MTU on which no inner QUIC
+    /// handshake can exist.
+    #[tokio::test]
+    async fn a_collapsed_leg_sets_neither_the_budget_nor_the_route() {
+        let healthy = spawn_loopback_multihop_with_transport(
+            ExitId::from_bytes([0x81; 16]),
+            Some(transport_pinned_to_mtu(1452)),
+        )
+        .await;
+        let collapsed = spawn_loopback_multihop_with_transport(
+            ExitId::from_bytes([0x82; 16]),
+            Some(transport_pinned_to_mtu(warrenguard_config::TUNNEL_MIN_MTU)),
+        )
+        .await;
+
+        let healthy_budget = healthy.client.max_inner_payload();
+        let collapsed_budget = collapsed.client.max_inner_payload();
+        assert!(
+            collapsed_budget < warrenguard_transport_core::QUIC_SAFE_INNER_MTU
+                && healthy_budget >= warrenguard_transport_core::QUIC_SAFE_INNER_MTU,
+            "the fixture must straddle the floor: healthy {healthy_budget}, \
+             collapsed {collapsed_budget}"
+        );
+
+        let bundle = MultiHopBundle::new(vec![healthy.client.clone(), collapsed.client.clone()]);
+        assert_eq!(
+            bundle.max_inner_payload(),
+            healthy_budget,
+            "a `min` across legs would publish {collapsed_budget} here and kill inner QUIC"
+        );
+
+        // Drive every flow hash: none may land on the collapsed leg.
+        let plan = bundle.routing.read().clone();
+        assert_eq!(plan.usable, vec![0], "leg 1 must be quarantined");
+        for hash in 0..16u64 {
+            assert_eq!(plan.route(Some(hash), 0, healthy_budget), 0);
+        }
+    }
+
+    /// A probe addressed to a leg must leave on THAT leg. The whole
+    /// small-versus-large comparison is worthless otherwise, which is how a
+    /// collapsed leg stayed invisible for six minutes on 2026-08-10.
+    #[tokio::test]
+    async fn send_probe_on_puts_the_packet_on_the_leg_it_was_given() {
+        let a = spawn_loopback_multihop(ExitId::from_bytes([0x83; 16])).await;
+        let b = spawn_loopback_multihop(ExitId::from_bytes([0x84; 16])).await;
+        let bundle = MultiHopBundle::new(vec![a.client.clone(), b.client.clone()]);
+
+        // DATAGRAM frames, not UDP packets: Quinn sends ACKs and keep-alives
+        // of its own on every leg, so a UDP counter cannot tell a probe from
+        // the transport's own chatter.
+        let before_a = a.client.quinn_stats().frame_tx.datagram;
+        let before_b = b.client.quinn_stats().frame_tx.datagram;
+        const PROBES: u64 = 5;
+        for _ in 0..PROBES {
+            bundle
+                .send_probe_on(1, &[0x45; 200])
+                .await
+                .expect("leg 1 accepts the probe");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert_eq!(
+            a.client.quinn_stats().frame_tx.datagram,
+            before_a,
+            "leg 0 must not have carried a probe addressed to leg 1"
+        );
+        assert_eq!(
+            b.client.quinn_stats().frame_tx.datagram,
+            before_b + PROBES,
+            "leg 1 must have carried every one of them"
+        );
+        assert!(
+            bundle.send_probe_on(9, &[0x45; 200]).await.is_err(),
+            "an out-of-range leg is an error, never a silent send elsewhere"
         );
     }
 

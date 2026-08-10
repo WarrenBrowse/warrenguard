@@ -292,6 +292,10 @@ pub struct ProberShared {
     endpoints: parking_lot::Mutex<Option<(Ipv4Addr, Ipv4Addr)>>,
     health_tx: watch::Sender<PathHealth>,
     seq: std::sync::atomic::AtomicU16,
+    /// Whether the last sweep found the bond's published inner budget under
+    /// [`warrenguard_transport_core::QUIC_SAFE_INNER_MTU`]. Kept so the
+    /// condition is logged on its transitions instead of on every round.
+    under_quic_floor: std::sync::atomic::AtomicBool,
 }
 
 impl ProberShared {
@@ -307,6 +311,7 @@ impl ProberShared {
             endpoints: parking_lot::Mutex::new(None),
             health_tx,
             seq: std::sync::atomic::AtomicU16::new(0),
+            under_quic_floor: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -344,7 +349,91 @@ const FAST_CADENCE: Duration = Duration::from_secs(2);
 /// path.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 /// Total IP length of the small probe (the classic 56-byte ping).
+///
+/// Under Quinn's `min_mtu`, which is load-bearing beyond the measurement:
+/// its black-hole detector only refuses to call a loss burst "suspicious"
+/// when the burst held a packet smaller than `min_mtu`, and a tunnel
+/// otherwise emits almost nothing but max-size datagrams. Sweeping every leg
+/// with this probe is what keeps ordinary congestion loss from reading to
+/// Quinn as an MTU black hole and collapsing a healthy leg to its base MTU.
 const SMALL_PROBE_LEN: usize = 84;
+
+/// Sequence number of one probe in a round: legs are laid out in pairs from
+/// `base`, small first. Wraps with `base`, which is why the round is decoded
+/// with [`decode_probe_seq`] rather than compared.
+fn probe_seq(base: u16, leg: usize, large: bool) -> u16 {
+    base.wrapping_add(2 * leg as u16 + u16::from(large))
+}
+
+/// Inverse of [`probe_seq`], rejecting anything outside this round's
+/// `2 * legs` window so a straggler from an earlier round cannot credit a
+/// leg it never crossed.
+fn decode_probe_seq(base: u16, seq: u16, legs: usize) -> Option<(usize, bool)> {
+    let offset = usize::from(seq.wrapping_sub(base));
+    (offset < 2 * legs).then_some((offset / 2, offset % 2 == 1))
+}
+
+/// Per-leg outcome of one sweep.
+///
+/// The comparison that matters is small-versus-large **on the same leg**:
+/// that is what separates a size-selective blackhole from congestion, and
+/// what the previous round-robin routing made impossible to observe.
+struct Sweep {
+    small_ok: Vec<bool>,
+    large_ok: Vec<bool>,
+}
+
+impl Sweep {
+    fn new(legs: usize) -> Self {
+        Self {
+            small_ok: vec![false; legs],
+            large_ok: vec![false; legs],
+        }
+    }
+
+    fn record(&mut self, leg: usize, large: bool) {
+        let row = if large {
+            &mut self.large_ok
+        } else {
+            &mut self.small_ok
+        };
+        if let Some(slot) = row.get_mut(leg) {
+            *slot = true;
+        }
+    }
+
+    fn complete(&self) -> bool {
+        self.small_ok.iter().all(|ok| *ok) && self.large_ok.iter().all(|ok| *ok)
+    }
+
+    /// Bond-level pair fed to [`HealthTracker::record_pair`]: a size class is
+    /// deliverable when ANY leg delivered it.
+    ///
+    /// `any`, not `all`, because the tracker drives user-visible verdicts and
+    /// migrations, and a single leg out of eight failing is invisible to the
+    /// user once that leg is quarantined out of the routing plan. Every leg
+    /// failing is a real bond-wide shrink and still classifies as it always
+    /// did. The per-leg detail is not lost: it goes to
+    /// [`Self::size_blackholed_legs`].
+    fn aggregate(&self) -> (bool, bool) {
+        (
+            self.small_ok.iter().any(|ok| *ok),
+            self.large_ok.iter().any(|ok| *ok),
+        )
+    }
+
+    /// Legs that returned their small probe and lost their large one: the
+    /// size-selective signature, named leg by leg.
+    fn size_blackholed_legs(&self) -> Vec<usize> {
+        self.small_ok
+            .iter()
+            .zip(&self.large_ok)
+            .enumerate()
+            .filter(|&(_, (&small, &large))| small && !large)
+            .map(|(leg, _)| leg)
+            .collect()
+    }
+}
 
 /// Spawns the prober for one published bundle. The task holds only a
 /// `Weak` on the bundle (a strong reference here would keep the session
@@ -397,45 +486,117 @@ async fn probe_round(
             return;
         };
 
-        let small_seq = shared
-            .seq
-            .fetch_add(2, std::sync::atomic::Ordering::Relaxed);
-        let large_seq = small_seq.wrapping_add(1);
-        let large_len = bundle.max_inner_payload().max(SMALL_PROBE_LEN);
-        let small = build_echo_request(src, gw, shared.tap.id(), small_seq, SMALL_PROBE_LEN);
-        let large = build_echo_request(src, gw, shared.tap.id(), large_seq, large_len);
-        let (Some(small), Some(large)) = (small, large) else {
+        // Every leg is probed, and each leg's pair is sized against ITS OWN
+        // budget: a leg that has quietly stopped carrying full-size frames
+        // is only visible when the packet it is asked to carry is the one it
+        // claims to support.
+        let budgets = bundle.leg_inner_payloads();
+        let legs = budgets.len();
+        if legs == 0 {
             return;
-        };
+        }
+        let base = shared
+            .seq
+            .fetch_add(2 * legs as u16, std::sync::atomic::Ordering::Relaxed);
 
-        let (small_ok, large_ok) = {
+        let sweep = {
             let mut replies = shared.replies.lock().await;
             // Stale replies of older rounds must not credit this one.
             while replies.try_recv().is_ok() {}
-            if bundle.send_probe(&small).await.is_err() || bundle.send_probe(&large).await.is_err()
-            {
-                // Dying connection: the supervisor is already on it; a
-                // send failure is not path evidence.
-                return;
+            for (leg, budget) in budgets.iter().enumerate() {
+                let large_len = (*budget).max(SMALL_PROBE_LEN);
+                let (Some(small), Some(large)) = (
+                    build_echo_request(
+                        src,
+                        gw,
+                        shared.tap.id(),
+                        probe_seq(base, leg, false),
+                        SMALL_PROBE_LEN,
+                    ),
+                    build_echo_request(
+                        src,
+                        gw,
+                        shared.tap.id(),
+                        probe_seq(base, leg, true),
+                        large_len,
+                    ),
+                ) else {
+                    return;
+                };
+                if bundle.send_probe_on(leg, &small).await.is_err()
+                    || bundle.send_probe_on(leg, &large).await.is_err()
+                {
+                    // Dying connection: the supervisor is already on it; a
+                    // send failure is not path evidence.
+                    return;
+                }
             }
-            let mut small_ok = false;
-            let mut large_ok = false;
+            let mut sweep = Sweep::new(legs);
             let deadline = tokio::time::Instant::now() + REPLY_TIMEOUT;
-            while !(small_ok && large_ok) {
+            while !sweep.complete() {
                 let reply = tokio::select! {
                     reply = replies.recv() => reply,
                     () = tokio::time::sleep_until(deadline) => break,
                 };
                 match reply {
-                    Some(s) if s == small_seq => small_ok = true,
-                    Some(s) if s == large_seq => large_ok = true,
-                    Some(_) => {}
+                    Some(seq) => {
+                        if let Some((leg, large)) = decode_probe_seq(base, seq, legs) {
+                            sweep.record(leg, large);
+                        }
+                    }
                     None => return,
                 }
             }
-            (small_ok, large_ok)
+            sweep
         };
 
+        // The bond has run out of legs above the inner-QUIC floor: quarantine
+        // cannot route around it, PTB reflection has no legal answer (RFC 9000
+        // forbids shrinking an Initial below 1200 bytes), and the MSS clamp
+        // keeps TCP flowing, so the user sees "some sites work, HTTP/3 sites
+        // hang" on a tunnel that reports Connected. Logged on the transitions
+        // only, in both directions, so it dates the episode instead of
+        // repeating every round.
+        let published = bundle.max_inner_payload();
+        let under_floor = published < warrenguard_transport_core::QUIC_SAFE_INNER_MTU;
+        if under_floor
+            != shared
+                .under_quic_floor
+                .swap(under_floor, std::sync::atomic::Ordering::Relaxed)
+        {
+            if under_floor {
+                tracing::warn!(
+                    inner_mtu = published,
+                    floor = warrenguard_transport_core::QUIC_SAFE_INNER_MTU,
+                    legs,
+                    uplink_too_large_drops = warrenguard_pump::uplink_too_large_drop_total(),
+                    "path health: no bonded leg reaches the inner-QUIC floor, so inner QUIC \
+                     (HTTP/3, DNS-over-QUIC) cannot be ESTABLISHED on this path at all while \
+                     MSS-clamped TCP keeps flowing"
+                );
+            } else {
+                tracing::info!(
+                    inner_mtu = published,
+                    "path health: inner budget back above the inner-QUIC floor"
+                );
+            }
+        }
+
+        // The sentence that names a collapsed leg. Logged before the
+        // aggregate verdict because a single leg failing is deliberately
+        // invisible to the bond-level tracker.
+        for leg in sweep.size_blackholed_legs() {
+            tracing::warn!(
+                leg,
+                leg_inner_mtu = budgets[leg],
+                legs,
+                "path health: leg passes small probes and loses large ones (size-selective \
+                 blackhole on this leg alone); it is quarantined out of the routing plan while \
+                 it stays under the inner-QUIC floor"
+            );
+        }
+
+        let (small_ok, large_ok) = sweep.aggregate();
         let (events, small_lost, large_lost) = {
             let mut tracker = shared.tracker.lock();
             let events = tracker.record_pair(small_ok, large_ok);
@@ -477,6 +638,93 @@ mod tests {
 
     const SRC: Ipv4Addr = Ipv4Addr::new(10, 66, 0, 177);
     const GW: Ipv4Addr = Ipv4Addr::new(10, 66, 0, 1);
+
+    #[test]
+    fn a_probe_sequence_number_round_trips_to_its_leg_and_size() {
+        // Correlating a reply back to (leg, size class) is the whole
+        // instrument: get it wrong and the sweep reports noise.
+        for base in [0u16, 1, 40_000, u16::MAX - 3] {
+            for leg in 0..8 {
+                for large in [false, true] {
+                    let seq = probe_seq(base, leg, large);
+                    assert_eq!(
+                        decode_probe_seq(base, seq, 8),
+                        Some((leg, large)),
+                        "base {base} leg {leg} large {large} must round trip across u16 wrap"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_sequence_number_outside_this_round_is_rejected() {
+        let base = 100u16;
+        assert_eq!(decode_probe_seq(base, base.wrapping_sub(1), 4), None);
+        assert_eq!(
+            decode_probe_seq(base, base.wrapping_add(8), 4),
+            None,
+            "8 is the first seq past a 4-leg round"
+        );
+        assert_eq!(
+            decode_probe_seq(base, base.wrapping_add(7), 4),
+            Some((3, true))
+        );
+    }
+
+    #[test]
+    fn a_size_class_counts_as_deliverable_when_any_leg_delivered_it() {
+        // One collapsed leg out of four must NOT read as a bond-wide
+        // large-frame blackhole: after quarantine it carries no user
+        // traffic, so declaring DegradedLarge here would be a false alarm.
+        let mut sweep = Sweep::new(4);
+        for leg in 0..4 {
+            sweep.record(leg, false);
+        }
+        for leg in [0, 1, 3] {
+            sweep.record(leg, true);
+        }
+        assert_eq!(sweep.aggregate(), (true, true));
+    }
+
+    #[test]
+    fn a_size_class_counts_as_dead_only_when_every_leg_lost_it() {
+        let mut sweep = Sweep::new(3);
+        for leg in 0..3 {
+            sweep.record(leg, false);
+        }
+        assert_eq!(
+            sweep.aggregate(),
+            (true, false),
+            "no leg returned a large probe: that is a real bond-wide shrink"
+        );
+
+        let dead = Sweep::new(3);
+        assert_eq!(dead.aggregate(), (false, false));
+    }
+
+    #[test]
+    fn only_the_leg_whose_large_probe_died_is_named() {
+        let mut sweep = Sweep::new(3);
+        for leg in 0..3 {
+            sweep.record(leg, false);
+        }
+        sweep.record(0, true);
+        sweep.record(2, true);
+        assert_eq!(
+            sweep.size_blackholed_legs(),
+            vec![1],
+            "small alive and large dead on leg 1 is the size-selective signature"
+        );
+
+        let mut both_dead = Sweep::new(2);
+        both_dead.record(0, false);
+        both_dead.record(0, true);
+        assert!(
+            both_dead.size_blackholed_legs().is_empty(),
+            "a leg that lost BOTH sizes is congestion or a dead leg, not a size blackhole"
+        );
+    }
 
     fn reply_packet(id: u16, seq: u16, len: usize) -> Vec<u8> {
         // The gateway mirrors the request with type flipped to reply;

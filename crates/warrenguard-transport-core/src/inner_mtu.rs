@@ -182,6 +182,28 @@ pub fn clamp_downlink_syn(pkt: &mut [u8], budget: u16) -> Option<(u16, u16)> {
     clamp_syn_mss(pkt, budget)
 }
 
+/// Smallest inner MTU on which an inner QUIC connection can still be
+/// ESTABLISHED, as opposed to merely being slow.
+///
+/// RFC 9000 § 14.1 requires a client to pad every Initial-carrying datagram to
+/// at least 1200 bytes, and forbids shrinking below it; an inner IPv4 + UDP
+/// header adds 28. Under this threshold an inner QUIC client therefore has no
+/// legal way to obey a smaller next-hop MTU, so neither the MSS clamp (TCP
+/// only) nor [`uplink_frag_needed`] can rescue it: every handshake attempt is
+/// dropped and HTTP/3 is not degraded, it is impossible, while TCP keeps
+/// flowing and makes the tunnel look merely slow.
+///
+/// This is a threshold to route AROUND while any path can do better, never a
+/// hard refusal: [`CARRIER_MAX_INNER_MTU`] sits below it on purpose, so a
+/// session that has fallen back to the TLS-over-TCP carrier is legitimately
+/// under it on every leg and must keep carrying TCP rather than be torn down.
+pub const QUIC_SAFE_INNER_MTU: usize = 1228;
+
+/// The floor is exactly RFC 9000's mandatory Initial padding plus an inner
+/// IPv4 + UDP header. Enforced by the compiler because it is arithmetic on
+/// constants: a runtime test of it would be optimised away.
+const _: () = assert!(QUIC_SAFE_INNER_MTU == 1200 + 20 + 8);
+
 /// Inner-IP MTU ceiling for a session riding the TLS-over-TCP fallback carrier.
 ///
 /// The carrier delivers datagrams whole, but quinn's DPLPMTUD is OFF on it (the
@@ -200,6 +222,14 @@ pub fn clamp_downlink_syn(pkt: &mut [u8], budget: u16) -> Option<(u16, u16)> {
 /// path: inner TCP is clamped (SYN/SYN-ACK) and non-TCP flows converge via PTB,
 /// so full-size uplink segments fit the carrier frame instead of black-holing.
 pub const CARRIER_MAX_INNER_MTU: usize = 1100;
+
+/// Load-bearing for the bond's quarantine rule, which drops a leg under
+/// [`QUIC_SAFE_INNER_MTU`] only when a HEALTHIER leg exists: a carrier session
+/// is under the floor on every leg at once, so it keeps all of them and
+/// carries TCP instead of being routed to nothing. Raising the carrier cap
+/// above the floor would silently change that policy, so the compiler holds
+/// the relationship.
+const _: () = assert!(CARRIER_MAX_INNER_MTU < QUIC_SAFE_INNER_MTU);
 
 /// Caps an inner-MTU budget at [`CARRIER_MAX_INNER_MTU`] when the session rides
 /// the TLS-over-TCP carrier, else returns it unchanged.

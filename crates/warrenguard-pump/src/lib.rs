@@ -225,6 +225,22 @@ fn uplink_batch_max() -> usize {
     warrenguard_config::knobs::uplink_batch_max()
 }
 
+/// Process-global tally behind [`record_uplink_too_large_drop`].
+static UPLINK_TOO_LARGE_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Uplink packets dropped so far for exceeding every usable leg's datagram
+/// budget.
+///
+/// Readable so a diagnostic can quote the tally alongside the condition that
+/// produced it, instead of the number existing only inside a rate-limited log
+/// line that fires on the 1st drop and every 64th. Process-global by the same
+/// contract as [`record_uplink_too_large_drop`]: compare two reads, never
+/// assert an absolute value.
+#[must_use]
+pub fn uplink_too_large_drop_total() -> u64 {
+    UPLINK_TOO_LARGE_DROPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Rate-limited visibility into silent uplink too-large drops.
 ///
 /// A datagram that exceeds the connection's `max_datagram_size` is dropped
@@ -242,8 +258,7 @@ fn uplink_batch_max() -> usize {
 /// [`TunIoTolerance::global_error_total`], so an absolute-value assertion
 /// would be racy against other tests running in the same process).
 pub fn record_uplink_too_large_drop(pkt_size: usize, max_datagram: Option<usize>) -> u64 {
-    static DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let n = UPLINK_TOO_LARGE_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let total = n + 1;
     if n == 0 || n.is_multiple_of(64) {
         tracing::warn!(
@@ -2573,6 +2588,20 @@ mod tests {
             after,
             before + 1,
             "each call must increment the running total by exactly 1"
+        );
+    }
+
+    #[test]
+    fn the_drop_total_is_readable_without_recording_a_drop() {
+        // A diagnostic must be able to quote the tally; reading it must not
+        // itself count as a drop, or the reader would inflate what it reports.
+        let seen = uplink_too_large_drop_total();
+        assert_eq!(uplink_too_large_drop_total(), seen, "a read is not a drop");
+        let recorded = record_uplink_too_large_drop(1500, Some(1400));
+        assert_eq!(
+            uplink_too_large_drop_total(),
+            recorded,
+            "the accessor must observe the same counter the recorder advances"
         );
     }
 

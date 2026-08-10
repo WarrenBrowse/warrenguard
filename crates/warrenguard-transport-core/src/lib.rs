@@ -20,9 +20,9 @@ pub use client_metrics::{ClientMetrics, ClientMetricsSnapshot, MetricsRegistry};
 pub use error::{Result, TunnelError};
 pub use flow_hash::flow_hash_5tuple;
 pub use inner_mtu::{
-    CARRIER_MAX_INNER_MTU, PROXY_BUDGET_MARGIN, build_frag_needed, carrier_capped_inner_mtu,
-    clamp_downlink_syn, clamp_syn_mss, clamp_uplink_syn, effective_mss, is_tcp_syn,
-    uplink_frag_needed,
+    CARRIER_MAX_INNER_MTU, PROXY_BUDGET_MARGIN, QUIC_SAFE_INNER_MTU, build_frag_needed,
+    carrier_capped_inner_mtu, clamp_downlink_syn, clamp_syn_mss, clamp_uplink_syn, effective_mss,
+    is_tcp_syn, uplink_frag_needed,
 };
 pub use ip_parse::{
     SpoofRefusal, classify_source, extract_dst_ipv4, extract_dst_ipv6, extract_src_ipv4,
