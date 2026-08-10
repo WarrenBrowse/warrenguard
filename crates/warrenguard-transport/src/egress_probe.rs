@@ -136,6 +136,101 @@ pub const PROBE_SENDS: [Duration; 3] = [
     Duration::from_millis(1400),
 ];
 
+/// Spacing between the datagrams of one probe, and the room the deadline leaves
+/// after the last one. The shipped [`PROBE_SENDS`] and [`PROBE_TIMEOUT`] are
+/// exactly these two quantities at [`MODEL_PATH_RTT`].
+const PROBE_SPACING: Duration = Duration::from_millis(700);
+const PROBE_SLACK: Duration = Duration::from_millis(1100);
+
+/// The path round trip the shipped schedule was sized for.
+///
+/// The 2026-08-02 sample behind [`PROBE_TIMEOUT`] was taken on one stable
+/// circuit, so every constant above is that schedule instantiated at a single
+/// round trip. Naming it is what lets the schedule follow a path that is slower
+/// than the one it was measured on.
+pub const MODEL_PATH_RTT: Duration = Duration::from_millis(700);
+
+/// A round trip past this cannot be probed for exit liveness at all: see
+/// [`ProbeSchedule::carries_exit_evidence`].
+const MAX_PROBED_RTT: Duration = Duration::from_millis(3000);
+
+/// How much of the in-tunnel round trip is the exit's own resolver leg, on top
+/// of the path round trip the transport reports. The probe crosses the tunnel
+/// once each way plus that leg, so the room the deadline must leave after the
+/// last datagram grows faster than the path round trip alone.
+const RESOLVER_LEG: f64 = 1.5;
+
+/// One probe's datagram offsets and overall deadline, sized for the path the
+/// probe will actually run on.
+///
+/// The shipped constants assume a path whose round trip is [`MODEL_PATH_RTT`].
+/// On a congested uplink the queueing delay alone can exceed the whole deadline,
+/// and then all three datagrams of [`PROBE_SENDS`] queue behind the same delay
+/// and expire together: the probe reports [`ProbeOutcome::Dead`] about an exit it
+/// never gave a chance to answer. Measured on a member's line 2026-08-10, a 57 ms
+/// idle path sat at 1400 ms under its own sustained upload, and the exit was
+/// convicted 126 times over three weeks while the QUIC session stayed open.
+///
+/// So the schedule follows the path: identical to the shipped constants at or
+/// under [`MODEL_PATH_RTT`], stretched proportionally above it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeSchedule {
+    /// Offsets, from the start of the probe, at which it sends its query.
+    pub sends: [Duration; 3],
+    /// Overall wait for an answer, from the start of the probe.
+    pub deadline: Duration,
+}
+
+impl ProbeSchedule {
+    /// The shipped schedule: what a path at or under [`MODEL_PATH_RTT`] gets.
+    pub const SHIPPED: Self = Self {
+        sends: PROBE_SENDS,
+        deadline: PROBE_TIMEOUT,
+    };
+
+    /// The schedule for a path whose smoothed round trip is `rtt`.
+    ///
+    /// `None` (the consumer does not report one) keeps [`Self::SHIPPED`], so a
+    /// driver that has not wired the round trip is on the pre-existing
+    /// behaviour.
+    ///
+    /// Widening only: a path faster than the model keeps the shipped schedule,
+    /// because the detection times this module documents are stated against it
+    /// and a tighter deadline would buy nothing but false convictions.
+    #[must_use]
+    pub fn for_path_rtt(rtt: Option<Duration>) -> Self {
+        let Some(rtt) = rtt else {
+            return Self::SHIPPED;
+        };
+        // Past the cap the schedule stops following the path: the probe reports
+        // no evidence there (`carries_exit_evidence`), and a deadline that kept
+        // growing would just park the loop.
+        let rtt = rtt.min(MAX_PROBED_RTT);
+        let spacing = PROBE_SPACING.max(rtt);
+        // The room after the last datagram is what makes the extra datagrams
+        // worth sending: it has to hold a whole in-tunnel round trip, which is
+        // the path round trip plus the exit's own resolver leg.
+        let slack = PROBE_SLACK.max(rtt.mul_f64(RESOLVER_LEG));
+        let sends = [Duration::ZERO, spacing, spacing * 2];
+        Self {
+            deadline: spacing * 2 + slack,
+            sends,
+        }
+    }
+
+    /// Whether a [`ProbeOutcome::Dead`] from this schedule is evidence about the
+    /// EXIT rather than about the path.
+    ///
+    /// Past [`MAX_PROBED_RTT`] the path cannot carry a query and its answer
+    /// inside any deadline this probe is willing to wait, so an unanswered query
+    /// says nothing about the exit and the outcome is
+    /// [`ProbeOutcome::Inconclusive`].
+    #[must_use]
+    pub fn carries_exit_evidence(rtt: Option<Duration>) -> bool {
+        rtt.is_none_or(|rtt| rtt <= MAX_PROBED_RTT)
+    }
+}
+
 /// Resolved probe settings (env knobs applied once at tunnel start).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EgressProbeConfig {
@@ -437,14 +532,26 @@ pub async fn run_egress_probe<I: EgressProbeIo>(io: &mut I, failure_threshold: u
 }
 
 /// One in-tunnel DNS round trip to the exit resolver, for TUN-routed consumers.
-/// Datagrams at the [`PROBE_SENDS`] offsets, overall deadline [`PROBE_TIMEOUT`].
-/// Local socket errors (bind/send) never reached the exit, so they report
-/// [`ProbeOutcome::Inconclusive`] and the scheduler spends them neither way.
+/// Datagrams and deadline come from [`ProbeSchedule::for_path_rtt`], so the
+/// probe follows the path it runs on. Local socket errors (bind/send) never
+/// reached the exit, so they report [`ProbeOutcome::Inconclusive`] and the
+/// scheduler spends them neither way.
+///
+/// `path_rtt` is the transport's smoothed round trip, or `None` from a consumer
+/// that does not track one (which keeps the shipped schedule).
 ///
 /// This is the datapath probe a consumer whose tunnel is a real OS TUN plugs
 /// into [`EgressProbeIo::probe`]. A userland-proxy datapath, where the gateway
 /// is not OS-routable, supplies its own probe over its session instead.
-pub async fn probe_gateway_dns() -> ProbeOutcome {
+pub async fn probe_gateway_dns(path_rtt: Option<Duration>) -> ProbeOutcome {
+    let schedule = ProbeSchedule::for_path_rtt(path_rtt);
+    // A deadline the path cannot fit a round trip into convicts nothing: the
+    // query never had a chance to be answered, so it is host-side evidence.
+    let expired = if ProbeSchedule::carries_exit_evidence(path_rtt) {
+        ProbeOutcome::Dead
+    } else {
+        ProbeOutcome::Inconclusive
+    };
     let sock = match tokio::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).await {
         Ok(s) => s,
         Err(e) => {
@@ -465,9 +572,13 @@ pub async fn probe_gateway_dns() -> ProbeOutcome {
         return ProbeOutcome::Inconclusive;
     }
     let mut buf = [0u8; 512];
-    let deadline = started + PROBE_TIMEOUT;
+    let deadline = started + schedule.deadline;
     // The first offset was just sent; the rest are retransmits still to come.
-    let mut retransmits = PROBE_SENDS.iter().skip(1).map(|offset| started + *offset);
+    let mut retransmits = schedule
+        .sends
+        .iter()
+        .skip(1)
+        .map(|offset| started + *offset);
     let mut next_send = retransmits.next();
     loop {
         // Absolute instants, so re-arming the timer on every loop turn (the
@@ -483,7 +594,7 @@ pub async fn probe_gateway_dns() -> ProbeOutcome {
             }
             () = tokio::time::sleep_until(wake) => {
                 if wake >= deadline {
-                    return ProbeOutcome::Dead;
+                    return expired;
                 }
                 let _ = sock.send(&query).await;
                 next_send = retransmits.next();
@@ -1209,6 +1320,97 @@ mod tests {
                  {PROBE_TIMEOUT:?} at the measured p99 round trip"
             );
         }
+    }
+
+    /// A driver that reports no round trip, and a path no slower than the one
+    /// the constants were measured on, must both keep the shipped schedule: the
+    /// detection times asserted above are stated against it.
+    #[test]
+    fn a_path_at_or_under_the_model_round_trip_keeps_the_shipped_schedule() {
+        assert_eq!(ProbeSchedule::for_path_rtt(None), ProbeSchedule::SHIPPED);
+        assert_eq!(
+            ProbeSchedule::for_path_rtt(Some(MODEL_PATH_RTT)),
+            ProbeSchedule::SHIPPED
+        );
+        assert_eq!(
+            ProbeSchedule::for_path_rtt(Some(Duration::from_millis(50))),
+            ProbeSchedule::SHIPPED,
+            "a fast path must not get a schedule tighter than the shipped one"
+        );
+    }
+
+    /// The bug this whole type exists for: on the member line measured
+    /// 2026-08-10 the queueing delay alone was 1400 ms, so all three shipped
+    /// datagrams expired inside one deadline and a live exit was convicted.
+    #[test]
+    fn a_congested_path_gets_a_schedule_its_datagrams_can_be_answered_in() {
+        let congested = Duration::from_millis(1400);
+        let schedule = ProbeSchedule::for_path_rtt(Some(congested));
+        assert!(
+            schedule.deadline > PROBE_TIMEOUT,
+            "a path slower than the model must widen the deadline, got {:?}",
+            schedule.deadline
+        );
+        let last = schedule.sends.last().copied().unwrap_or_default();
+        assert!(
+            last + congested.mul_f64(RESOLVER_LEG) <= schedule.deadline,
+            "the last datagram ({last:?}) cannot be answered within {:?} at a \
+             {congested:?} path round trip",
+            schedule.deadline
+        );
+    }
+
+    /// The generalised form of
+    /// `every_probe_datagram_can_still_be_answered_inside_the_deadline`: the
+    /// invariant has to hold at every round trip the schedule is willing to
+    /// probe, not only at the one it was measured on.
+    #[test]
+    fn every_datagram_can_be_answered_inside_the_deadline_at_any_probed_rtt() {
+        for ms in [1_u64, 50, 200, 700, 701, 900, 1400, 2000, 2999, 3000] {
+            let rtt = Duration::from_millis(ms);
+            let schedule = ProbeSchedule::for_path_rtt(Some(rtt));
+            let expected_round_trip = rtt.mul_f64(RESOLVER_LEG).max(MODEL_RTT);
+            for offset in schedule.sends {
+                assert!(
+                    offset + expected_round_trip <= schedule.deadline,
+                    "at a {rtt:?} path round trip, a datagram sent at {offset:?} \
+                     cannot be answered within {:?}",
+                    schedule.deadline
+                );
+            }
+        }
+    }
+
+    /// The schedule may only ever widen with the path, never narrow: a narrower
+    /// one on a slower path is exactly the failure being fixed.
+    #[test]
+    fn the_schedule_widens_monotonically_with_the_path_round_trip() {
+        let mut previous = ProbeSchedule::SHIPPED;
+        for ms in [700_u64, 800, 1000, 1400, 2000, 3000] {
+            let schedule = ProbeSchedule::for_path_rtt(Some(Duration::from_millis(ms)));
+            assert!(
+                schedule.deadline >= previous.deadline,
+                "the deadline shrank going to {ms} ms: {:?} then {:?}",
+                previous.deadline,
+                schedule.deadline
+            );
+            for (wider, narrower) in schedule.sends.iter().zip(previous.sends.iter()) {
+                assert!(wider >= narrower, "a send offset shrank going to {ms} ms");
+            }
+            previous = schedule;
+        }
+    }
+
+    /// Past the cap the probe cannot tell a dead exit from a path that cannot
+    /// carry the query, so it must not convict. The scheduler already spends an
+    /// inconclusive probe neither way.
+    #[test]
+    fn a_path_slower_than_the_cap_carries_no_evidence_about_the_exit() {
+        assert!(ProbeSchedule::carries_exit_evidence(None));
+        assert!(ProbeSchedule::carries_exit_evidence(Some(MAX_PROBED_RTT)));
+        assert!(!ProbeSchedule::carries_exit_evidence(Some(
+            MAX_PROBED_RTT + Duration::from_millis(1)
+        )));
     }
 
     #[test]
