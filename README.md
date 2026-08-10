@@ -1,3 +1,7 @@
+<p align="center">
+  <img src=".github/warren-logo.svg" alt="Warren" width="130"/>
+</p>
+
 # WarrenGuard
 
 [![CI](https://github.com/WarrenBrowse/warrenguard/actions/workflows/ci.yml/badge.svg)](https://github.com/WarrenBrowse/warrenguard/actions/workflows/ci.yml)
