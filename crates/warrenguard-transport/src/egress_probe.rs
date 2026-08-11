@@ -415,6 +415,47 @@ pub enum ExitEvidence {
     Unknown,
 }
 
+/// Maps two readings of the peer's ACK counter onto [`TransportEvidence`].
+///
+/// Single-homed here because three consumers (the SDK userland prober, the
+/// desktop tunnel, the Android JNI tunnel) each held an identical copy of these
+/// three arms, and a per-consumer copy of a verdict rule diverges silently.
+///
+/// `None` on either side means nobody observed the transport, which is not the
+/// same as observing it silent: absent evidence must never suppress a
+/// conviction.
+#[must_use]
+pub fn transport_evidence_from(
+    at_streak_start: Option<u64>,
+    now: Option<u64>,
+) -> TransportEvidence {
+    match (at_streak_start, now) {
+        (None, _) | (_, None) => TransportEvidence::Unknown,
+        (Some(before), Some(now)) if now > before => TransportEvidence::Progressing,
+        _ => TransportEvidence::Silent,
+    }
+}
+
+/// Maps two readings of the REAL received-payload counter onto
+/// [`ExitEvidence`].
+///
+/// The counter passed here must exclude cover traffic. An armed exit pads its
+/// downlink with dummies, so a frame or datagram counter keeps advancing over a
+/// tunnel carrying no user traffic at all, and feeding one of those in here
+/// would make this guard protect a genuinely dead exit forever. In this engine
+/// the counter to sample is
+/// [`MultiHopBundle::real_traffic_totals`](crate::bundle::MultiHopBundle::real_traffic_totals),
+/// whose downlink half counts decoded IP packets only, summed across every
+/// bonded leg.
+#[must_use]
+pub fn exit_evidence_from(at_streak_start: Option<u64>, now: Option<u64>) -> ExitEvidence {
+    match (at_streak_start, now) {
+        (None, _) | (_, None) => ExitEvidence::Unknown,
+        (Some(before), Some(now)) if now > before => ExitEvidence::Delivering,
+        _ => ExitEvidence::Quiet,
+    }
+}
+
 /// IO surface consumed by [`run_egress_probe`]; a consumer implements it over
 /// its own tunnel and the scheduler owns the escalation logic.
 ///
@@ -1532,6 +1573,37 @@ mod tests {
             }
             previous = schedule;
         }
+    }
+
+    /// Both evidence mappings are one rule each, used by every consumer, so a
+    /// reading nobody took can never be mistaken for a reading that came back
+    /// empty.
+    #[test]
+    fn absent_evidence_is_unknown_and_never_reads_as_observed_silence() {
+        assert_eq!(
+            transport_evidence_from(None, Some(5)),
+            TransportEvidence::Unknown
+        );
+        assert_eq!(
+            transport_evidence_from(Some(5), None),
+            TransportEvidence::Unknown
+        );
+        assert_eq!(
+            transport_evidence_from(Some(5), Some(6)),
+            TransportEvidence::Progressing
+        );
+        assert_eq!(
+            transport_evidence_from(Some(5), Some(5)),
+            TransportEvidence::Silent
+        );
+
+        assert_eq!(exit_evidence_from(None, Some(5)), ExitEvidence::Unknown);
+        assert_eq!(exit_evidence_from(Some(5), None), ExitEvidence::Unknown);
+        assert_eq!(
+            exit_evidence_from(Some(5), Some(6)),
+            ExitEvidence::Delivering
+        );
+        assert_eq!(exit_evidence_from(Some(5), Some(5)), ExitEvidence::Quiet);
     }
 
     /// Past the cap the probe cannot tell a dead exit from a path that cannot
