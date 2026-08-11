@@ -386,6 +386,35 @@ pub enum TransportEvidence {
     Unknown,
 }
 
+/// What the EXIT delivered while the in-tunnel probe was failing.
+///
+/// [`TransportEvidence`] answers a question about the path (did the peer ACK),
+/// and on a link that is merely congested the answer is always yes, which turns
+/// the verdict onto the exit. This answers the question the conviction actually
+/// rests on: did anything the EXIT forwarded reach us.
+///
+/// Measured on a member's line 2026-08-11, on the build that already sized the
+/// probe schedule to the path: 16 convictions in 11 hours, and at every one the
+/// datapath had opened between 0.5 MB and 5 MB of inner payload from that exit
+/// in the minutes before. The exit was forwarding megabytes while being
+/// convicted of forwarding nothing, and each conviction costs a fresh QUIC epoch
+/// and every request in flight with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitEvidence {
+    /// Inner payload from the exit was opened since the streak began. Only the
+    /// exit can produce it (it survives the exit-id pin, the replay window and
+    /// the AEAD), so the exit IS forwarding and an unanswered query is about the
+    /// query, not about the exit.
+    Delivering,
+    /// Nothing arrived. On its own this says little, since a session can be
+    /// legitimately quiet, so it does not protect the exit: the other guards
+    /// decide.
+    Quiet,
+    /// The consumer does not report it. Kept distinct from `Quiet` so a reader
+    /// can tell "nothing arrived" from "nobody looked".
+    Unknown,
+}
+
 /// IO surface consumed by [`run_egress_probe`]; a consumer implements it over
 /// its own tunnel and the scheduler owns the escalation logic.
 ///
@@ -420,6 +449,12 @@ pub trait EgressProbeIo {
     /// keeps a consumer that has not wired it on the pre-existing behaviour.
     fn transport_evidence(&mut self) -> TransportEvidence {
         TransportEvidence::Unknown
+    }
+    /// What the exit delivered since the current failure streak began, read once
+    /// at the threshold. Defaults to [`ExitEvidence::Unknown`], which keeps a
+    /// consumer that has not wired it on the pre-existing behaviour.
+    fn exit_evidence(&mut self) -> ExitEvidence {
+        ExitEvidence::Unknown
     }
     /// Marks the start of a failure streak, so the next
     /// [`Self::transport_evidence`] answers about THIS streak and not about the
@@ -500,6 +535,26 @@ pub async fn run_egress_probe<I: EgressProbeIo>(io: &mut I, failure_threshold: u
                 tracing::debug!(
                     "egress probe: {consecutive_failures} failed probes, but the \
                      transport carried nothing over them; the path is the \
+                     suspect, not the exit"
+                );
+                continue;
+            }
+            // An exit that is delivering inner payload is, by the only
+            // definition this module has, forwarding. The probe's own query
+            // going unanswered then describes the query (queued behind a
+            // saturated uplink, or a resolver that is slow) and not the exit,
+            // and convicting costs the user a fresh QUIC epoch plus every
+            // request in flight, over a datapath that was working.
+            //
+            // The failures are KEPT, like the `Silent` case above: the moment
+            // delivery stops, the next probe convicts with no delay added.
+            if !dead
+                && consecutive_failures >= failure_threshold
+                && io.exit_evidence() == ExitEvidence::Delivering
+            {
+                tracing::debug!(
+                    "egress probe: {consecutive_failures} failed probes, but the \
+                     exit kept delivering payload over them; the query is the \
                      suspect, not the exit"
                 );
                 continue;
@@ -1017,6 +1072,11 @@ mod tests {
         /// Where the current failure streak began, so the evidence answers
         /// about that streak rather than about the whole run.
         streak_start: Option<Duration>,
+        /// The exit keeps forwarding user payload while the probe's own query
+        /// goes unanswered: a saturated uplink queues the query away while
+        /// megabytes keep arriving. Off by default, so every other case reports
+        /// [`ExitEvidence::Quiet`] and the pre-existing verdicts stand.
+        payload_through_dead: bool,
         /// Every `lose_every`-th probe loses all of its datagrams, modelling
         /// isolated packet loss on an otherwise healthy circuit.
         lose_every: usize,
@@ -1035,6 +1095,7 @@ mod tests {
                 dead,
                 stalled: Duration::MAX..Duration::MAX,
                 streak_start: None,
+                payload_through_dead: false,
                 lose_every: 0,
                 probes: 0,
                 started: tokio::time::Instant::now(),
@@ -1055,6 +1116,17 @@ mod tests {
         fn stalling(stalled: std::ops::Range<Duration>, stop_after: Duration) -> Self {
             let mut io = Self::new(Duration::MAX..Duration::MAX, stop_after);
             io.stalled = stalled;
+            io
+        }
+
+        /// An exit whose answers never come back over `unanswered`, while user
+        /// payload from that same exit keeps arriving throughout.
+        fn answering_nothing_while_delivering(
+            unanswered: std::ops::Range<Duration>,
+            stop_after: Duration,
+        ) -> Self {
+            let mut io = Self::new(unanswered, stop_after);
+            io.payload_through_dead = true;
             io
         }
 
@@ -1142,6 +1214,14 @@ mod tests {
                 TransportEvidence::Silent
             } else {
                 TransportEvidence::Progressing
+            }
+        }
+
+        fn exit_evidence(&mut self) -> ExitEvidence {
+            if self.payload_through_dead {
+                ExitEvidence::Delivering
+            } else {
+                ExitEvidence::Quiet
             }
         }
     }
@@ -1244,6 +1324,59 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An exit that keeps DELIVERING while its answers do not come back is
+    /// forwarding, whatever the probe's own query did.
+    ///
+    /// Measured on a member's line 2026-08-11, already running the path-sized
+    /// schedule: 16 convictions in 11 hours, each one over a datapath that had
+    /// opened between 0.5 MB and 5 MB of payload from that same exit in the
+    /// minutes before. The uplink was saturated by the member's own upload, so
+    /// the probe's query queued away while the exit kept forwarding, and every
+    /// conviction cost a fresh QUIC epoch and the requests in flight with it.
+    ///
+    /// [`TransportEvidence`] cannot catch this: the peer keeps ACKing on a
+    /// merely congested link, which reads as `Progressing` and points the
+    /// verdict straight at the exit.
+    #[tokio::test(start_paused = true)]
+    async fn an_exit_still_delivering_payload_is_never_convicted() {
+        for silence_s in [3u64, 9, 20, 60, 300] {
+            let unanswered = Duration::from_secs(60);
+            let mut io = TimedIo::answering_nothing_while_delivering(
+                unanswered..unanswered + Duration::from_secs(silence_s),
+                unanswered + Duration::from_secs(600),
+            );
+            run_egress_probe(&mut io, DEFAULT_FAILURE_THRESHOLD).await;
+            assert!(
+                io.escalated_at.is_none(),
+                "{silence_s} s of unanswered queries convicted an exit that was \
+                 still delivering payload, killing every request in flight over \
+                 a tunnel that was working"
+            );
+        }
+    }
+
+    /// The guard must not become a blanket amnesty: once delivery stops, the
+    /// exit is convicted with no delay added by it.
+    #[tokio::test(start_paused = true)]
+    async fn delivery_that_stops_convicts_the_exit_as_fast_as_ever() {
+        let dead_from = Duration::from_secs(120);
+        let mut io = TimedIo::new(
+            dead_from..Duration::MAX,
+            dead_from + Duration::from_secs(120),
+        );
+        // Quiet, the default: nothing arrived, so the guard does not protect.
+        assert_eq!(io.exit_evidence(), ExitEvidence::Quiet);
+        run_egress_probe(&mut io, DEFAULT_FAILURE_THRESHOLD).await;
+        let at = io
+            .escalated_at
+            .expect("an exit delivering nothing must still be convicted");
+        assert!(
+            at - dead_from <= Duration::from_secs(40),
+            "conviction of a genuinely dead exit must not regress: took {:?}",
+            at - dead_from
+        );
     }
 
     /// The other side of the same coin, and the reason the probe exists: when
