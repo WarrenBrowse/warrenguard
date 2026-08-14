@@ -477,6 +477,220 @@ async fn serve_edge_entry_handshakes_then_pumps_the_session_to_the_exit() {
     let _ = tokio::time::timeout(Duration::from_secs(5), exit_task).await;
 }
 
+/// Fake exit that keeps serving for the whole life of its connection: it
+/// answers every setup stream and echoes every datagram, instead of the
+/// one-session-then-done shape of [`spawn_fake_exit`]. The task resolves with
+/// the close its connection eventually observes, so a test can assert on the
+/// exit's own view of the teardown.
+fn spawn_shared_fake_exit(
+    reply_frame: Vec<u8>,
+) -> (
+    std::net::SocketAddr,
+    Vec<u8>,
+    tokio::task::JoinHandle<quinn::ConnectionError>,
+) {
+    let (chain, key, root) = mint_cert("exit.example.com");
+    let server = server_endpoint(chain, key);
+    let addr = server.local_addr().expect("exit addr");
+    let task = tokio::spawn(async move {
+        let conn = server
+            .accept()
+            .await
+            .expect("exit incoming")
+            .await
+            .expect("exit handshake");
+        let setup_conn = conn.clone();
+        tokio::spawn(async move {
+            while let Ok((mut send, mut recv)) = setup_conn.accept_bi().await {
+                if recv.read_to_end(64 * 1024).await.is_err()
+                    || send.write_all(&reply_frame).await.is_err()
+                {
+                    break;
+                }
+                let _ = send.finish();
+            }
+        });
+        let echo_conn = conn.clone();
+        tokio::spawn(async move {
+            while let Ok(d) = echo_conn.read_datagram().await {
+                if echo_conn.send_datagram(d).is_err() {
+                    break;
+                }
+            }
+        });
+        conn.closed().await
+    });
+    (addr, root, task)
+}
+
+/// Drives one full browser session through `pump_multihop_entry` against the
+/// exit connection `dial_exit` yields, then closes the browser so the pump
+/// returns. Returns the pump's own result.
+async fn run_one_browser_session<D, Fut>(
+    edge_server: Endpoint,
+    edge_root: Vec<u8>,
+    exit_id: ExitId,
+    reply_frame: Vec<u8>,
+    dial_exit: D,
+) -> Result<warrenguard_edge_server::PumpSummary, PumpError>
+where
+    D: FnOnce(ExitId) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<quinn::Connection, PumpError>> + Send,
+{
+    let edge_addr = edge_server.local_addr().expect("edge addr");
+    let edge_task = tokio::spawn(async move {
+        let conn = edge_server
+            .accept()
+            .await
+            .expect("edge incoming")
+            .await
+            .expect("edge handshake");
+        let (mut c_send, mut c_recv) = conn.accept_bi().await.expect("edge accept connect bi");
+        let _headers = read_one_frame(&mut c_recv).await;
+        c_send
+            .write_all(&webtransport_accept_response())
+            .await
+            .expect("edge write 200");
+        pump_multihop_entry(&conn, c_send, c_recv, dial_exit).await
+    });
+
+    let browser = client_endpoint(edge_root);
+    let conn = browser
+        .connect(edge_addr, "cover.example.com")
+        .expect("connect builds")
+        .await
+        .expect("browser handshake");
+    let (mut connect_send, mut connect_recv) = conn.open_bi().await.expect("open connect bi");
+    let session_id = u64::from(connect_send.id());
+    connect_send
+        .write_all(&encode_frame(FRAME_HEADERS, &[0x00, 0x00]))
+        .await
+        .expect("write connect headers");
+    let _resp = read_one_frame(&mut connect_recv).await;
+
+    let (mut setup_send, mut setup_recv) = conn.open_bi().await.expect("open setup bi");
+    let mut wt_setup = encode_bidi_stream_header(session_id);
+    wt_setup.extend_from_slice(&setup_frame(exit_id));
+    setup_send
+        .write_all(&wt_setup)
+        .await
+        .expect("write wt setup");
+    setup_send.finish().expect("finish setup send");
+    let reply = setup_recv.read_to_end(64 * 1024).await.expect("read reply");
+    assert_eq!(reply, reply_frame, "the session must reach the DATA phase");
+
+    let wt_dgram = encode_wt_datagram(session_id, b"session-datagram");
+    for _ in 0..50 {
+        let _ = conn.send_datagram(Bytes::from(wt_dgram.clone()));
+        if let Ok(Ok(_)) =
+            tokio::time::timeout(Duration::from_millis(100), conn.read_datagram()).await
+        {
+            break;
+        }
+    }
+
+    conn.close(VarInt::from_u32(0), b"done");
+    tokio::time::timeout(Duration::from_secs(5), edge_task)
+        .await
+        .expect("the pump must return once the browser leaves")
+        .expect("edge join")
+}
+
+/// A node may hand the pump a connection it shares with other sessions (the
+/// exit pool's `get_or_create` returns the same `Arc<Connection>` per exit id).
+/// The pump borrows that connection; closing it when ONE browser leaves would
+/// tear down every other session bridged over it, and poison the pooled entry.
+#[tokio::test]
+async fn a_shared_exit_connection_outlives_the_browser_session_that_borrowed_it() {
+    let exit_id = ExitId::from_bytes([0x5A; 16]);
+    let reply_frame = setup_frame(exit_id);
+    let (exit_addr, exit_root, _exit_task) = spawn_shared_fake_exit(reply_frame.clone());
+
+    // Stands in for the pool entry: dialed once, kept by the caller, handed to
+    // the pump as a clone.
+    let exit_client = client_endpoint(exit_root);
+    let pooled = exit_client
+        .connect(exit_addr, "exit.example.com")
+        .expect("connect builds")
+        .await
+        .expect("exit handshake");
+    let borrowed = pooled.clone();
+
+    let (edge_chain, edge_key, edge_root) = mint_cert("cover.example.com");
+    let edge_server = server_endpoint(edge_chain, edge_key);
+    run_one_browser_session(
+        edge_server,
+        edge_root,
+        exit_id,
+        reply_frame,
+        move |_id| async move { Ok(borrowed) },
+    )
+    .await
+    .expect("pump ok");
+
+    assert!(
+        pooled.close_reason().is_none(),
+        "the pump closed a connection it only borrowed: every other session on \
+         it is now dead, got {:?}",
+        pooled.close_reason()
+    );
+    // Still carrying traffic, not merely un-closed on our side.
+    let mut echoed = false;
+    for _ in 0..50 {
+        let _ = pooled.send_datagram(Bytes::from_static(b"still-alive"));
+        if let Ok(Ok(_)) =
+            tokio::time::timeout(Duration::from_millis(100), pooled.read_datagram()).await
+        {
+            echoed = true;
+            break;
+        }
+    }
+    assert!(
+        echoed,
+        "the shared exit connection must still round-trip datagrams after one \
+         borrowing session ended"
+    );
+}
+
+/// The other half of the same contract: when the connection IS the session's
+/// own, nothing else holds it, so the session's end must release it and the
+/// exit must see the connection go. A pump that stopped closing but also
+/// stopped dropping would leak an exit-side session per browser that leaves.
+#[tokio::test]
+async fn a_per_session_exit_connection_is_released_when_the_browser_leaves() {
+    let exit_id = ExitId::from_bytes([0x5B; 16]);
+    let reply_frame = setup_frame(exit_id);
+    let (exit_addr, exit_root, exit_task) = spawn_shared_fake_exit(reply_frame.clone());
+
+    let (edge_chain, edge_key, edge_root) = mint_cert("cover.example.com");
+    let edge_server = server_endpoint(edge_chain, edge_key);
+    let exit_client = client_endpoint(exit_root);
+    run_one_browser_session(
+        edge_server,
+        edge_root,
+        exit_id,
+        reply_frame,
+        move |_id| async move {
+            exit_client
+                .connect(exit_addr, "exit.example.com")
+                .map_err(|_| PumpError::ExitDial)?
+                .await
+                .map_err(|_| PumpError::ExitDial)
+        },
+    )
+    .await
+    .expect("pump ok");
+
+    let observed = tokio::time::timeout(Duration::from_secs(5), exit_task)
+        .await
+        .expect("the exit must see a session-owned connection end promptly")
+        .expect("exit join");
+    assert!(
+        !matches!(observed, quinn::ConnectionError::TimedOut),
+        "the exit must observe an explicit close, not an idle timeout, got {observed:?}"
+    );
+}
+
 #[tokio::test]
 async fn run_edge_entry_listener_pumps_a_browser_session_end_to_end() {
     // The production-shaped path: the accept loop (`run_edge_entry_listener`, a

@@ -36,6 +36,7 @@
 //! pump is NOT mounted on a production exit until that closes the loop.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use quinn::{Connection, RecvStream, SendStream, VarInt};
@@ -96,8 +97,18 @@ pub struct PumpSummary {
 /// invoked with the `exit_id` parsed from the browser's setup frame and must
 /// return a live QUIC connection to that exit.
 ///
-/// Returns when either the browser or the exit closes; the session's
-/// connections are the caller's to close.
+/// **`dial_exit` must yield a connection dedicated to this session.** A Warren
+/// exit binds one multi-hop session to one QUIC connection (one setup stream,
+/// one downlink route), and QUIC datagram delivery is per connection: two
+/// sessions sharing one would have their DATA datagrams split at random between
+/// their two read loops, and only the first would ever get its setup stream
+/// accepted. A pooled dial therefore serves at most one browser at a time per
+/// exit.
+///
+/// Returns when either the browser or the exit stops delivering. The exit
+/// connection is only ever borrowed here, never closed: the pump drops its
+/// handle on return, which closes it when the caller dialed per session and
+/// leaves it alone when the caller keeps it.
 ///
 /// # Errors
 /// [`PumpError`] on a stream failure, a malformed setup stream, a failed exit
@@ -187,12 +198,15 @@ async fn shuttle_setup(
 async fn pump_datagrams(browser: &Connection, exit: &Connection, session_id: u64) -> PumpSummary {
     let expected_qsid = quarter_stream_id(session_id);
     let mut set = tokio::task::JoinSet::new();
+    // The teardown aborts whichever direction is still parked on its read, so
+    // a count kept inside that task would be lost with it.
+    let live = std::sync::Arc::new(LiveCounts::default());
 
     {
         let browser = browser.clone();
         let exit = exit.clone();
+        let live = live.clone();
         set.spawn(async move {
-            let mut n = 0u64;
             loop {
                 let Ok(dgram) = browser.read_datagram().await else {
                     break;
@@ -212,16 +226,15 @@ async fn pump_datagrams(browser: &Connection, exit: &Connection, session_id: u64
                 if exit.send_datagram(dgram.slice_ref(payload)).is_err() {
                     break;
                 }
-                n += 1;
+                live.browser_to_exit.fetch_add(1, Ordering::Relaxed);
             }
-            (Direction::BrowserToExit, n)
         });
     }
     {
         let browser = browser.clone();
         let exit = exit.clone();
+        let live = live.clone();
         set.spawn(async move {
-            let mut n = 0u64;
             loop {
                 let Ok(dgram) = exit.read_datagram().await else {
                     break;
@@ -230,30 +243,38 @@ async fn pump_datagrams(browser: &Connection, exit: &Connection, session_id: u64
                 if browser.send_datagram(Bytes::from(wt)).is_err() {
                     break;
                 }
-                n += 1;
+                live.exit_to_browser.fetch_add(1, Ordering::Relaxed);
             }
-            (Direction::ExitToBrowser, n)
         });
     }
 
-    let mut summary = PumpSummary::default();
-    while let Some(joined) = set.join_next().await {
-        if let Ok((dir, n)) = joined {
-            match dir {
-                Direction::BrowserToExit => summary.browser_to_exit = n,
-                Direction::ExitToBrowser => summary.exit_to_browser = n,
-            }
-        }
-        // The first direction to stop ends the session: close both so the twin
-        // task's blocked read unblocks and the loop drains its count too.
+    while set.join_next().await.is_some() {
+        // The first direction to stop ends the session. The browser connection
+        // carries this session alone, so closing it is how the browser learns
+        // the session is over. The exit connection is the CALLER's: a node may
+        // hand the same one to several sessions (a pooled dial), and closing it
+        // here would tear every one of them down. Aborting the twin releases
+        // its blocked read without touching that connection, and dropping the
+        // last handle closes it for a caller that dialed per session.
         browser.close(VarInt::from_u32(0), b"pump complete");
-        exit.close(VarInt::from_u32(0), b"pump complete");
+        set.abort_all();
     }
-    summary
+    live.snapshot()
 }
 
-#[derive(Clone, Copy)]
-enum Direction {
-    BrowserToExit,
-    ExitToBrowser,
+/// Per-direction counts, shared with the two pump tasks so the aborted twin's
+/// progress survives the teardown.
+#[derive(Default)]
+struct LiveCounts {
+    browser_to_exit: AtomicU64,
+    exit_to_browser: AtomicU64,
+}
+
+impl LiveCounts {
+    fn snapshot(&self) -> PumpSummary {
+        PumpSummary {
+            browser_to_exit: self.browser_to_exit.load(Ordering::Relaxed),
+            exit_to_browser: self.exit_to_browser.load(Ordering::Relaxed),
+        }
+    }
 }

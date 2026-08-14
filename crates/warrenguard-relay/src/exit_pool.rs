@@ -194,6 +194,18 @@ impl ExitConnPool {
     /// Returns the live connection to `descriptor.exit_id`, dialing
     /// fresh on cache miss or on stale entry (`close_reason() != None`).
     ///
+    /// **One session at a time per pooled connection.** The cached
+    /// `Arc<Connection>` is handed to every caller asking for that exit, and an
+    /// exit binds one multi-hop session per QUIC connection (one setup stream,
+    /// one downlink route) while QUIC delivers each datagram to exactly one
+    /// reader. Two concurrent sessions over one pooled connection would split
+    /// each other's DATA at random, and the second would never get its setup
+    /// stream accepted. Pooling buys the anti-amplification property (a flood
+    /// of client sessions cannot become one exit handshake each), so it fits a
+    /// caller that tolerates serialization; a caller that must carry concurrent
+    /// sessions to the same exit uses [`Self::dial_fresh`]. Whoever borrows a
+    /// pooled connection must also never close it: the pool owns that.
+    ///
     /// # Errors
     /// - [`ExitPoolError::Tls`] when building the client config fails.
     /// - [`ExitPoolError::Connect`] when Quinn rejects the dial setup.
