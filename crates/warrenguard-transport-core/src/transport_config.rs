@@ -285,6 +285,11 @@ const CLIENT_KEEP_ALIVE_INTERVAL_SECS: u64 = 5;
 ///   keep-alives, long suspend) closes the session on BOTH ends and
 ///   forces a redial on wake.
 ///
+/// This is also the window in which a relay discovers a client that vanished
+/// without a close, and so the window in which the exit stops holding a
+/// downlink sender for it: `warrenguard-relay`'s `silent_client_reaping` test
+/// measures both ends of that against the real transport.
+///
 /// Re-decide before a mobile client ships: either keep 25 s and
 /// accept redial-on-wake, or raise the client idle timeout back up and
 /// lean on the uplink dead-path watch (`WARREN_UPLINK_DEADPATH`)
