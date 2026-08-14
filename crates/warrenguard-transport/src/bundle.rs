@@ -704,7 +704,10 @@ impl MultiHopBundle {
     pub fn rebind_wildcard(&self, policy: RebindPolicy) -> Result<(), RebindError> {
         let mut rebound = 0usize;
         let mut first_err = None;
-        for client in self.clients.read().iter() {
+        // Snapshot first: a rebind binds a socket and applies an escape policy,
+        // and holding the leg lock across N of those would stall a background
+        // bonding attach behind syscalls.
+        for client in self.clients() {
             match client.rebind_wildcard(policy) {
                 Ok(()) => rebound += 1,
                 Err(RebindError::OverCarrier) => {}
