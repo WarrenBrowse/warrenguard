@@ -2647,6 +2647,13 @@ async fn pump_multihop_tun_router<T: PacketDevice>(tun: T, router: Arc<MultihopT
 /// the client chain, which closes a connection whose own peer stopped
 /// answering.
 ///
+/// Why running the takeover re-check's verdict continuously is not a wider
+/// risk than running it for 8 s after a collision: it is applied to the same
+/// population (only slots with more than one sender, the only ones where a
+/// dead sender takes a share of the 5-tuple hash away from a live one) and
+/// it demands three times the evidence, five missed keep-alive cadences
+/// instead of one and a half.
+///
 /// Cost: one short map lock per address family per round, and nothing at all
 /// on the per-packet path.
 async fn patrol_stale_downlinks(router: Arc<MultihopTunRouter>) {
