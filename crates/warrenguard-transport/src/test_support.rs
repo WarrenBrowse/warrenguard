@@ -119,6 +119,7 @@ impl LoopbackMultiHop {
 async fn bare_rpk_loopback(
     tls_key_seed: u8,
     transport_config: Option<Arc<quinn::TransportConfig>>,
+    allow_migration: bool,
 ) -> (Endpoint, Connection, Connection, Endpoint) {
     let tls_key = SigningKey::from_bytes(&[tls_key_seed; 32]);
     let mut server_cfg = warrenguard_tls::make_server_config(
@@ -127,6 +128,14 @@ async fn bare_rpk_loopback(
         &[warrenguard_config::ALPN_H3],
     )
     .expect("server cfg");
+    if allow_migration {
+        // The client's QUIC peer is the RELAY, which re-enables migration on
+        // top of the exit-flavoured `make_server_config` default; a server that
+        // forbids it discards every packet from a new 4-tuple, close frames
+        // included, so a migration test on the default fixture would observe
+        // the fixture's policy rather than the client's behaviour.
+        server_cfg.migration(true);
+    }
     if let Some(cfg) = &transport_config {
         server_cfg.transport_config(cfg.clone());
     }
@@ -174,7 +183,14 @@ async fn bare_rpk_loopback(
 /// `client.recv()` can decrypt, exactly mirroring a real exit's reverse
 /// direction without paying for the setup-stream round-trip.
 pub(crate) async fn spawn_loopback_multihop(exit_id: ExitId) -> LoopbackMultiHop {
-    spawn_loopback_multihop_with_transport(exit_id, None).await
+    spawn_loopback_multihop_inner(exit_id, None, false).await
+}
+
+/// [`spawn_loopback_multihop`] with a peer that accepts address migration, the
+/// way the production relay does: needed by any test that rebinds the client
+/// endpoint and then expects the peer to still receive what it sends.
+pub(crate) async fn spawn_loopback_multihop_migratable(exit_id: ExitId) -> LoopbackMultiHop {
+    spawn_loopback_multihop_inner(exit_id, None, true).await
 }
 
 /// [`spawn_loopback_multihop`] with an explicit QUIC transport config on both
@@ -184,8 +200,16 @@ pub(crate) async fn spawn_loopback_multihop_with_transport(
     exit_id: ExitId,
     transport_config: Option<Arc<quinn::TransportConfig>>,
 ) -> LoopbackMultiHop {
+    spawn_loopback_multihop_inner(exit_id, transport_config, false).await
+}
+
+async fn spawn_loopback_multihop_inner(
+    exit_id: ExitId,
+    transport_config: Option<Arc<quinn::TransportConfig>>,
+    allow_migration: bool,
+) -> LoopbackMultiHop {
     let (client_ep, client_conn, exit_conn, server_ep) =
-        bare_rpk_loopback(0x77, transport_config).await;
+        bare_rpk_loopback(0x77, transport_config, allow_migration).await;
 
     let (exit_priv, exit_pub) = derive_exit_keypair(&[0x99; 32]);
     let exit_pub_bytes = warrenguard_multihop::test_support::pubkey_to_bytes(&exit_pub);
@@ -322,6 +346,7 @@ pub(crate) async fn spawn_loopback_multihop_pq(exit_id: ExitId) -> LoopbackMulti
     let (client_ep, client_conn, exit_conn, server_ep) = bare_rpk_loopback(
         0x78,
         Some(warrenguard_transport_core::warren_transport_config_client_multihop_with_gso(false)),
+        false,
     )
     .await;
 

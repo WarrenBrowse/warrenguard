@@ -76,6 +76,15 @@ send anything on the fresh socket, and fails closed if the policy cannot be
 installed. A surface that builds its own socket has to remember all of that; one
 that calls `rebind_wildcard` cannot forget it.
 
+**Every bonded leg moves.** `MultiHopBundle::rebind_wildcard` rebinds all N
+sessions. A leg left on the socket of the network the client just left cannot
+deliver anything, and what it fails to deliver first is the single
+CONNECTION_CLOSE a forced reconnect emits: QUIC never retransmits that frame,
+and a UDP send on a dead interface reports no error, so the relay never learns
+the leg is gone and the exit keeps a downlink sender registered for it. A leg
+whose own rebind fails keeps its socket without costing the others theirs, and a
+carrier leg is skipped.
+
 **`session_can_migrate` must be honest about the carrier.** A session riding the
 TLS-over-TCP fallback has no UDP socket to swap. Rebinding it is meaningless and
 the recovery path is a full redial, so the cycle skips both the rebind and the

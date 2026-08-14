@@ -661,15 +661,13 @@ impl MultiHopBundle {
     }
 
     /// Rebinds the PRIMARY session's endpoint to `socket` (migration
-    /// watchdog bypass nudge). Secondaries are left alone on purpose:
-    /// if the path truly moved they all die together and the watchdog
-    /// escalation redials the whole bundle; if only the primary was
-    /// wedged, the nudge fixes the probe path without churning the
-    /// healthy siblings.
+    /// watchdog bypass nudge). Primary-only because one socket cannot serve
+    /// N endpoints: each leg owns its own, so a caller-injected socket has
+    /// exactly one possible destination. Production migration goes through
+    /// [`Self::rebind_wildcard`], which builds one fresh socket per leg.
     ///
     /// Hidden raw seam, like [`MultiHopClient::rebind`]: the caller owns the
-    /// escape contract of the socket it injects. Production migration goes
-    /// through [`Self::rebind_wildcard`].
+    /// escape contract of the socket it injects.
     ///
     /// # Errors
     ///
@@ -680,17 +678,49 @@ impl MultiHopBundle {
         self.primary().rebind(socket)
     }
 
-    /// Rebinds the PRIMARY session onto a fresh wildcard socket built under
-    /// `policy`, exactly as [`MultiHopClient::rebind_wildcard`] does at dial
-    /// time. Secondaries are left alone on purpose, matching [`Self::rebind`].
+    /// Rebinds EVERY bonded session onto its own fresh wildcard socket built
+    /// under `policy`, exactly as [`MultiHopClient::rebind_wildcard`] does at
+    /// dial time.
+    ///
+    /// Every leg, because a leg left on the socket of a network the client has
+    /// walked away from is not merely slow to die: QUIC emits its
+    /// CONNECTION_CLOSE once and never retransmits it, and a UDP send on a
+    /// dead interface is discarded without surfacing an error, so that leg's
+    /// close never reaches the relay. The exit keeps the corresponding
+    /// downlink sender registered and black-holes that leg's share of the
+    /// traffic until an idle timeout eventually reaps it.
+    ///
+    /// One leg's failure never costs the others theirs: a leg whose bind,
+    /// escape policy or `Endpoint::rebind` failed simply keeps its current
+    /// socket, and a leg riding the TLS-over-TCP carrier is skipped (it has no
+    /// UDP socket to swap; its recovery path is a redial).
     ///
     /// # Errors
     ///
-    /// Propagates [`MultiHopClient::rebind_wildcard`]: the primary rides the
-    /// TLS-over-TCP carrier, or the bind / escape policy / `Endpoint::rebind`
-    /// failed (the primary then keeps its current socket).
+    /// Only when NOT ONE leg moved, so the caller can tell a partial migration
+    /// (recoverable, at least one path is fresh) from a bundle that could not
+    /// migrate at all: [`RebindError::OverCarrier`] when every leg rides the
+    /// carrier, otherwise the first failure a leg reported.
     pub fn rebind_wildcard(&self, policy: RebindPolicy) -> Result<(), RebindError> {
-        self.primary().rebind_wildcard(policy)
+        let mut rebound = 0usize;
+        let mut first_err = None;
+        for client in self.clients.read().iter() {
+            match client.rebind_wildcard(policy) {
+                Ok(()) => rebound += 1,
+                Err(RebindError::OverCarrier) => {}
+                Err(e) => {
+                    // Keep going: the remaining legs can still be saved, and
+                    // this one simply keeps the socket it had.
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+        if rebound > 0 {
+            return Ok(());
+        }
+        Err(first_err.unwrap_or(RebindError::OverCarrier))
     }
 
     /// `true` when the primary session rides the TLS-over-TCP carrier, so the
@@ -879,7 +909,10 @@ mod live_tests {
     use warrenguard_multihop::ExitId;
 
     use super::*;
-    use crate::test_support::{spawn_loopback_multihop, spawn_loopback_multihop_with_transport};
+    use crate::test_support::{
+        spawn_loopback_multihop, spawn_loopback_multihop_migratable,
+        spawn_loopback_multihop_with_transport,
+    };
 
     #[tokio::test]
     async fn closed_resolves_once_the_peer_closes_the_connection() {
@@ -935,6 +968,97 @@ mod live_tests {
             ),
             "the bundle must propagate the primary's carrier refusal on the \
              policy-built rebind too"
+        );
+    }
+
+    /// The close a forced reconnect writes is emitted ONCE and never
+    /// retransmitted, and a UDP send on a dead interface is discarded without
+    /// an error, so a leg left on the socket of the network the client just
+    /// walked away from never reaches the relay: the exit keeps its downlink
+    /// sender registered and black-holes that leg's share of the traffic. The
+    /// bond only survives a network change if EVERY leg moves onto a socket
+    /// the current route can carry.
+    #[tokio::test]
+    async fn rebind_wildcard_moves_every_bonded_leg_onto_a_fresh_socket() {
+        let pairs = [
+            spawn_loopback_multihop_migratable(ExitId::from_bytes([0x7c; 16])).await,
+            spawn_loopback_multihop_migratable(ExitId::from_bytes([0x7d; 16])).await,
+            spawn_loopback_multihop_migratable(ExitId::from_bytes([0x7e; 16])).await,
+        ];
+        let bundle = MultiHopBundle::new(pairs.iter().map(|p| p.client.clone()).collect());
+
+        let before: Vec<_> = bundle
+            .clients()
+            .iter()
+            .map(|c| c.local_addr().expect("a live leg has a local addr"))
+            .collect();
+        bundle
+            .rebind_wildcard(RebindPolicy::Plain)
+            .expect("a bundle of native UDP legs must accept a wildcard rebind");
+        let after: Vec<_> = bundle
+            .clients()
+            .iter()
+            .map(|c| c.local_addr().expect("every leg must still hold a socket"))
+            .collect();
+
+        for (leg, (old, new)) in before.iter().zip(&after).enumerate() {
+            assert_ne!(
+                old.port(),
+                new.port(),
+                "leg {leg} kept its old socket, so its close is written to the \
+                 network that just went away"
+            );
+            assert!(
+                new.ip().is_unspecified(),
+                "leg {leg} must be wildcard-bound so the OS picks the source per packet"
+            );
+        }
+
+        // The sessions must survive the swap and still deliver: the close now
+        // leaves on the fresh socket, which is the whole point of the rebind.
+        bundle.force_close_for_reconnect();
+        for (leg, pair) in pairs.iter().enumerate() {
+            let peer_view = tokio::time::timeout(Duration::from_secs(2), pair.exit_conn.closed())
+                .await
+                .unwrap_or_else(|_| panic!("leg {leg}'s peer must observe the close"));
+            assert!(
+                !matches!(peer_view, quinn::ConnectionError::TimedOut),
+                "leg {leg} must deliver an explicit close over the new socket, got {peer_view:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_carrier_leg_is_skipped_without_failing_the_bundle_rebind() {
+        let native = spawn_loopback_multihop(ExitId::from_bytes([0x7f; 16])).await;
+        let mut carried = spawn_loopback_multihop(ExitId::from_bytes([0x80; 16])).await;
+        Arc::get_mut(&mut carried.client)
+            .expect("sole owner before the bundle clones it")
+            .set_over_carrier_for_test();
+        let bundle = MultiHopBundle::new(vec![native.client.clone(), carried.client.clone()]);
+
+        let before: Vec<_> = bundle
+            .clients()
+            .iter()
+            .map(|c| c.local_addr().expect("a live leg has a local addr"))
+            .collect();
+        bundle
+            .rebind_wildcard(RebindPolicy::Plain)
+            .expect("one unmigratable leg must not cost the others their rebind");
+        let after: Vec<_> = bundle
+            .clients()
+            .iter()
+            .map(|c| c.local_addr().expect("every leg must still hold a socket"))
+            .collect();
+
+        assert_ne!(
+            before[0].port(),
+            after[0].port(),
+            "the native leg must move"
+        );
+        assert_eq!(
+            before[1], after[1],
+            "a carrier leg has no UDP socket to swap and must be left as it is"
         );
     }
 
