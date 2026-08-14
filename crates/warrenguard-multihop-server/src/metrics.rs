@@ -297,6 +297,117 @@ impl DownlinkSnapshot {
     }
 }
 
+/// What proved a downlink sender dead before its route was taken away.
+/// Closed on a QUIC connection that reported itself closed, silent on one
+/// that moved neither its application counter nor its peer's UDP receive
+/// count for a whole conviction window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EvictReason {
+    /// The owning QUIC connection is closed for good.
+    Closed,
+    /// The owner went silent at BOTH the application and the QUIC level for
+    /// the whole window. Application silence alone never convicts.
+    Silent,
+}
+
+/// Node-wide accounting of the downlink ROUTE table itself, as opposed to
+/// the packets it carries: how many senders the exit took a route away from
+/// and what proved them dead.
+///
+/// These exist because a route the exit keeps pointing at a departed owner
+/// is invisible in every other series: the packets it swallows are neither
+/// dropped nor unroutable, they are handed to a channel that accepts them
+/// and nobody reads. An exit slot once held seven such senders out of
+/// fifteen for tens of minutes, each keeping its share of the 5-tuple hash
+/// and, because a learned flow is first-writer-wins, black-holing every
+/// flow it owned, while the node said nothing at all.
+///
+/// Same privacy contract as the blocks above: node-level totals, never a
+/// per-client, per-address or per-slot label.
+#[derive(Debug)]
+pub struct RouteMetrics {
+    evicted_closed: AtomicU64,
+    evicted_silent: AtomicU64,
+}
+
+/// The node's route block.
+static ROUTE: RouteMetrics = RouteMetrics::new();
+
+/// The process-wide downlink-route block.
+#[must_use]
+pub fn route_metrics() -> &'static RouteMetrics {
+    &ROUTE
+}
+
+/// Point-in-time read of the process-wide downlink-route block.
+#[must_use]
+pub fn route_snapshot() -> RouteSnapshot {
+    ROUTE.snapshot()
+}
+
+impl Default for RouteMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RouteMetrics {
+    /// A zeroed block.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            evicted_closed: AtomicU64::new(0),
+            evicted_silent: AtomicU64::new(0),
+        }
+    }
+
+    /// Folds `n` evictions attributed to `reason`. Called once per pass by
+    /// the task that drove it, so an eviction sweep costs one atomic per
+    /// reason rather than one per victim.
+    pub(crate) fn add_evicted(&self, reason: EvictReason, n: u64) {
+        if n == 0 {
+            return;
+        }
+        let slot = match reason {
+            EvictReason::Closed => &self.evicted_closed,
+            EvictReason::Silent => &self.evicted_silent,
+        };
+        slot.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Reads every counter.
+    #[must_use]
+    pub fn snapshot(&self) -> RouteSnapshot {
+        RouteSnapshot {
+            evicted_closed: self.evicted_closed.load(Ordering::Relaxed),
+            evicted_silent: self.evicted_silent.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// A point-in-time view of [`RouteMetrics`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RouteSnapshot {
+    /// Senders evicted because their QUIC connection was closed.
+    pub evicted_closed: u64,
+    /// Senders evicted after a whole window of silence at both levels.
+    pub evicted_silent: u64,
+}
+
+impl RouteSnapshot {
+    /// The eviction breakdown as `(reason, count)`, same contract as
+    /// [`DownlinkSnapshot::dropped_by_reason`]: the reason strings live
+    /// here so an exposition cannot drift from the verdicts that produce
+    /// the counts.
+    #[must_use]
+    pub const fn evicted_by_reason(&self) -> [(&'static str, u64); 2] {
+        [
+            ("closed", self.evicted_closed),
+            ("silent", self.evicted_silent),
+        ]
+    }
+}
+
 /// A point-in-time view of [`UplinkMetrics`]. Deliberately constructible
 /// by a consumer, so a deployer can unit-test its own exposition against a
 /// crafted reading instead of having to drive a live pump.
@@ -595,6 +706,30 @@ mod tests {
             [("no_route", 2), ("channel_full", 1), ("unroutable", 3)],
             "a stale reason ordering would mislabel every series"
         );
+    }
+
+    #[test]
+    fn each_route_eviction_increments_only_its_own_counter() {
+        let m = RouteMetrics::new();
+        m.add_evicted(EvictReason::Closed, 1);
+        m.add_evicted(EvictReason::Silent, 2);
+        let s = m.snapshot();
+
+        assert_eq!(s.evicted_closed, 1);
+        assert_eq!(s.evicted_silent, 2);
+        assert_eq!(
+            s.evicted_by_reason(),
+            [("closed", 1), ("silent", 2)],
+            "a stale reason ordering would mislabel every series"
+        );
+    }
+
+    #[test]
+    fn a_fresh_route_block_has_evicted_nothing() {
+        let s = RouteMetrics::new().snapshot();
+        for (reason, count) in s.evicted_by_reason() {
+            assert_eq!(count, 0, "{reason} must start at zero");
+        }
     }
 
     #[test]

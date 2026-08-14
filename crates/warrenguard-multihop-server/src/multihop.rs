@@ -60,6 +60,7 @@ use crate::datapath::{
     classify_uplink, dst_ipv4, next_sealable, send_sealed, src_ipv4,
 };
 use crate::ip_pool::{ConnId, IpAllocator, IpAllocatorV6, SessionIntent, SessionIntentV6};
+use crate::metrics::EvictReason;
 
 /// Retain anti-replay windows for at most this many recent epochs. Rekeys are
 /// infrequent, so a handful covers every in-flight frame around an epoch
@@ -1935,6 +1936,45 @@ struct PredecessorSnapshot {
     peer_packets_seen: u64,
 }
 
+/// How many downlink senders one eviction pass took the route away from,
+/// split by what proved them dead. Returned rather than counted in place so
+/// the process-wide series is fed once by the task that drove the pass, and
+/// so the verdict split is observable in a unit test without a global.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Evictions {
+    closed: u64,
+    silent: u64,
+}
+
+impl Evictions {
+    /// Records one eviction under the reason that justified it.
+    fn note(&mut self, reason: EvictReason) {
+        match reason {
+            EvictReason::Closed => self.closed += 1,
+            EvictReason::Silent => self.silent += 1,
+        }
+    }
+
+    /// Adds another pass's verdicts (a second address family, a later
+    /// round) to this one.
+    fn merge(&mut self, other: Self) {
+        self.closed += other.closed;
+        self.silent += other.silent;
+    }
+
+    /// Evictions under every reason.
+    const fn total(self) -> u64 {
+        self.closed + self.silent
+    }
+
+    /// Publishes the pass into the node's route series.
+    fn publish(self) {
+        let m = crate::metrics::route_metrics();
+        m.add_evicted(EvictReason::Closed, self.closed);
+        m.add_evicted(EvictReason::Silent, self.silent);
+    }
+}
+
 /// Address-generic route table shared by the IPv4 and IPv6 maps.
 struct RouteTable<A: std::hash::Hash + Eq + Copy>(Mutex<HashMap<A, RouteSlot<A>>>);
 
@@ -2034,15 +2074,15 @@ impl<A: std::hash::Hash + Eq + Copy> RouteTable<A> {
     /// with nothing to send goes quiet for seconds at a time, and convicting
     /// it took its flows away and black-holed it permanently (2026-08-02).
     /// Survivors stay in `snapshot` for the next look; the convicted are
-    /// removed, so a repeated call never double-counts. Returns how many
-    /// were evicted.
+    /// removed, so a repeated call never double-counts. Returns the
+    /// verdicts, split by what proved each victim dead.
     fn evict_stale_predecessors(
         &self,
         ip: A,
         snapshot: &mut Vec<PredecessorSnapshot>,
         convict_on_silence: bool,
-    ) -> usize {
-        let mut evicted = 0;
+    ) -> Evictions {
+        let mut evicted = Evictions::default();
         snapshot.retain(|p| {
             let closed = p.peer.as_ref().is_some_and(|c| c.is_closed());
             let app_silent = p.activity.load(Ordering::Relaxed) == p.activity_seen;
@@ -2050,12 +2090,18 @@ impl<A: std::hash::Hash + Eq + Copy> RouteTable<A> {
                 .peer
                 .as_ref()
                 .is_none_or(|c| c.packets_from_peer() == p.peer_packets_seen);
-            let dead = closed || (convict_on_silence && app_silent && peer_silent);
-            if dead {
+            let reason = if closed {
+                Some(EvictReason::Closed)
+            } else if convict_on_silence && app_silent && peer_silent {
+                Some(EvictReason::Silent)
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
                 self.unregister_if_owner(ip, &p.tx);
-                evicted += 1;
+                evicted.note(reason);
             }
-            !dead
+            reason.is_none()
         });
         evicted
     }
@@ -2262,7 +2308,7 @@ impl MultihopTunRouter {
         ip: Ipv4Addr,
         snapshot: &mut Vec<PredecessorSnapshot>,
         convict_on_silence: bool,
-    ) -> usize {
+    ) -> Evictions {
         self.routes
             .evict_stale_predecessors(ip, snapshot, convict_on_silence)
     }
@@ -2273,7 +2319,7 @@ impl MultihopTunRouter {
         ip: Ipv6Addr,
         snapshot: &mut Vec<PredecessorSnapshot>,
         convict_on_silence: bool,
-    ) -> usize {
+    ) -> Evictions {
         self.routes_v6
             .evict_stale_predecessors(ip, snapshot, convict_on_silence)
     }
@@ -3473,21 +3519,23 @@ fn arm_takeover_recheck(
     );
     let router = router.clone();
     tokio::spawn(async move {
-        let mut evicted = 0;
+        let mut evicted = Evictions::default();
         for round in 1..=TAKEOVER_STALE_ROUNDS {
             tokio::time::sleep(TAKEOVER_STALE_RECHECK).await;
             let last = round == TAKEOVER_STALE_ROUNDS;
-            evicted += router.evict_stale_predecessors(assigned_ip, &mut predecessors_v4, last);
+            evicted.merge(router.evict_stale_predecessors(assigned_ip, &mut predecessors_v4, last));
             if let Some(ip6) = assigned_ip_v6 {
-                evicted += router.evict_stale_predecessors_v6(ip6, &mut predecessors_v6, last);
+                evicted.merge(router.evict_stale_predecessors_v6(ip6, &mut predecessors_v6, last));
             }
             if predecessors_v4.is_empty() && predecessors_v6.is_empty() {
                 break;
             }
         }
-        if evicted > 0 {
+        if evicted.total() > 0 {
+            evicted.publish();
             tracing::info!(
-                evicted,
+                closed = evicted.closed,
+                silent = evicted.silent,
                 "multihop: evicted dead downlink predecessor(s) after sticky-IP takeover"
             );
         }
@@ -5627,7 +5675,7 @@ mod tests {
         // predecessor stayed silent (frozen). The re-check evicts it.
         act_succ.fetch_add(3, Ordering::Relaxed);
         let evicted = router.evict_stale_predecessors(ip, &mut snapshot, true);
-        assert_eq!(evicted, 1, "the frozen predecessor must be evicted");
+        assert_eq!(evicted.total(), 1, "the frozen predecessor must be evicted");
 
         // Now the re-used flow re-pins to the sole live sender.
         router.dispatch(&downlink);
@@ -5674,7 +5722,7 @@ mod tests {
         // The incumbent keeps serving traffic during the window.
         act_live.fetch_add(5, Ordering::Relaxed);
         let evicted = router.evict_stale_predecessors(ip, &mut snapshot, true);
-        assert_eq!(evicted, 0, "a live owner must never be evicted");
+        assert_eq!(evicted.total(), 0, "a live owner must never be evicted");
         assert_eq!(
             router.routes.0.lock().get(&ip).unwrap().senders.len(),
             2,
@@ -5748,7 +5796,8 @@ mod tests {
         let evicted = router.evict_stale_predecessors(ip, &mut snapshot, true);
 
         assert_eq!(
-            evicted, 0,
+            evicted.total(),
+            0,
             "an app-idle owner whose QUIC peer still speaks MUST keep its route"
         );
         router.dispatch(&downlink);
@@ -5794,7 +5843,11 @@ mod tests {
 
         let evicted = router.evict_stale_predecessors(ip, &mut snapshot, false);
 
-        assert_eq!(evicted, 1, "a closed connection must be evicted at once");
+        assert_eq!(
+            evicted.total(),
+            1,
+            "a closed connection must be evicted at once"
+        );
         router.dispatch(&downlink);
         assert!(
             rx_new.try_recv().is_ok(),
@@ -5826,14 +5879,58 @@ mod tests {
 
         assert_eq!(
             router.evict_stale_predecessors(ip, &mut snapshot, false),
-            0,
+            Evictions::default(),
             "silence alone must not convict before the final round"
         );
         assert_eq!(
             router.evict_stale_predecessors(ip, &mut snapshot, true),
-            1,
+            Evictions {
+                silent: 1,
+                ..Evictions::default()
+            },
             "a peer silent at BOTH levels through the whole window is dead"
         );
+    }
+
+    #[tokio::test]
+    async fn an_eviction_is_attributed_to_what_actually_proved_the_owner_dead() {
+        // A scrape that cannot tell a closed connection from a convicted
+        // silence cannot tell a healthy reconnect churn from an exit
+        // convicting live sessions, which is the failure the silence
+        // verdict is one bug away from.
+        let router = MultihopTunRouter::default();
+        let ip = Ipv4Addr::new(10, 66, 0, 23);
+        let (tx_closed, _rx_closed) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx_silent, _rx_silent) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx_new, _rx_new) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let quic_closed = FakePeer::new();
+        quic_closed
+            .closed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        for (tx, peer) in [
+            (&tx_closed, Some(quic_closed as Arc<dyn PeerLiveness>)),
+            (&tx_silent, Some(FakePeer::new() as Arc<dyn PeerLiveness>)),
+        ] {
+            router.register(ip, tx.clone());
+            router.attach_liveness(ip, tx, Arc::new(AtomicU64::new(1)), peer);
+        }
+        router.register(ip, tx_new.clone());
+        router.attach_liveness(ip, &tx_new, Arc::new(AtomicU64::new(0)), None);
+        let mut snapshot = router.snapshot_predecessors(ip, &tx_new);
+        assert_eq!(snapshot.len(), 2);
+
+        let evicted = router.evict_stale_predecessors(ip, &mut snapshot, true);
+
+        assert_eq!(
+            evicted,
+            Evictions {
+                closed: 1,
+                silent: 1
+            },
+            "each verdict must be counted under its own reason"
+        );
+        assert_eq!(evicted.total(), 2);
     }
 
     #[tokio::test(start_paused = true)]
