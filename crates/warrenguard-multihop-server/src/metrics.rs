@@ -312,7 +312,8 @@ pub(crate) enum EvictReason {
 
 /// Node-wide accounting of the downlink ROUTE table itself, as opposed to
 /// the packets it carries: how many senders the exit took a route away from
-/// and what proved them dead.
+/// and what proved them dead, plus how many are sitting application silent
+/// in a shared slot right now.
 ///
 /// These exist because a route the exit keeps pointing at a departed owner
 /// is invisible in every other series: the packets it swallows are neither
@@ -322,12 +323,18 @@ pub(crate) enum EvictReason {
 /// and, because a learned flow is first-writer-wins, black-holing every
 /// flow it owned, while the node said nothing at all.
 ///
+/// The gauge is deliberately wider than the counters. A sender whose client
+/// vanished behind a relay leg that keeps ACKing cannot be convicted (the
+/// exit's QUIC peer on a multi-hop session is the relay), so it is counted
+/// here and evicted nowhere.
+///
 /// Same privacy contract as the blocks above: node-level totals, never a
 /// per-client, per-address or per-slot label.
 #[derive(Debug)]
 pub struct RouteMetrics {
     evicted_closed: AtomicU64,
     evicted_silent: AtomicU64,
+    stale_senders: AtomicU64,
 }
 
 /// The node's route block.
@@ -358,6 +365,7 @@ impl RouteMetrics {
         Self {
             evicted_closed: AtomicU64::new(0),
             evicted_silent: AtomicU64::new(0),
+            stale_senders: AtomicU64::new(0),
         }
     }
 
@@ -375,12 +383,21 @@ impl RouteMetrics {
         slot.fetch_add(n, Ordering::Relaxed);
     }
 
+    /// Publishes the patrol's latest reading of how many senders sit
+    /// application silent in a shared slot. A gauge, republished whole every
+    /// round: it goes down as those senders are evicted, start speaking
+    /// again, or become the sole owner of their address.
+    pub(crate) fn set_stale_senders(&self, n: u64) {
+        self.stale_senders.store(n, Ordering::Relaxed);
+    }
+
     /// Reads every counter.
     #[must_use]
     pub fn snapshot(&self) -> RouteSnapshot {
         RouteSnapshot {
             evicted_closed: self.evicted_closed.load(Ordering::Relaxed),
             evicted_silent: self.evicted_silent.load(Ordering::Relaxed),
+            stale_senders: self.stale_senders.load(Ordering::Relaxed),
         }
     }
 }
@@ -392,6 +409,11 @@ pub struct RouteSnapshot {
     pub evicted_closed: u64,
     /// Senders evicted after a whole window of silence at both levels.
     pub evicted_silent: u64,
+    /// Senders that have carried no application traffic for a long while and
+    /// share their address with at least one other sender, as of the last
+    /// patrol round. A gauge, not a counter: see [`RouteMetrics`] for why it
+    /// is the wider number.
+    pub stale_senders: u64,
 }
 
 impl RouteSnapshot {
@@ -722,6 +744,19 @@ mod tests {
             [("closed", 1), ("silent", 2)],
             "a stale reason ordering would mislabel every series"
         );
+    }
+
+    #[test]
+    fn the_stale_sender_gauge_reports_the_latest_reading_not_a_running_total() {
+        // It answers "how many are stale right now", so it has to be able to
+        // go down: a patrol that published a sum would turn a slot that
+        // recovered into a permanent alert.
+        let m = RouteMetrics::new();
+        m.set_stale_senders(7);
+        assert_eq!(m.snapshot().stale_senders, 7);
+
+        m.set_stale_senders(2);
+        assert_eq!(m.snapshot().stale_senders, 2);
     }
 
     #[test]

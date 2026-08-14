@@ -1837,6 +1837,30 @@ const TAKEOVER_STALE_RECHECK: Duration = Duration::from_millis(2000);
 /// ~80 s QUIC idle timeout that black-holed it back then.
 const TAKEOVER_STALE_ROUNDS: u32 = 4;
 
+/// Interval between two rounds of the permanent downlink patrol. Matched to
+/// the client keep-alive cadence (`CLIENT_KEEP_ALIVE_INTERVAL_SECS`, 5 s) so
+/// every round of a live owner contains a keep-alive, and deliberately
+/// slower than the takeover re-check: the patrol sweeps every shared slot on
+/// the node instead of one address, and nothing about it is latency
+/// critical (a reconnect is served by the takeover path, which keeps its
+/// own 2 s cadence).
+const PATROL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Consecutive patrol rounds a sender must stay silent at BOTH levels
+/// before the patrol convicts it. The product with the interval (25 s)
+/// comfortably exceeds the takeover window (8 s) this backs up and covers
+/// five keep-alive cadences, so a live owner has to lose every one of them
+/// to be convicted, and it still bounds a dead sender's life two orders of
+/// magnitude below the tens of minutes one survived in production.
+const PATROL_SILENT_ROUNDS: u32 = 5;
+
+/// Consecutive patrol rounds of APPLICATION silence past which a sender
+/// sharing its address is COUNTED as stale (2 minutes). Nothing is ever
+/// evicted on this reading: it is the only signal for the senders the
+/// patrol is forbidden to convict, and a client legitimately idle for two
+/// minutes is common.
+const PATROL_STALE_ROUNDS: u32 = 24;
+
 /// QUIC-level liveness of a downlink owner, read by the sticky-IP takeover
 /// re-check. Application datagrams alone cannot tell a dead peer from an
 /// idle one: a phone between requests, or a client between two 25 s egress
@@ -1934,6 +1958,80 @@ struct PredecessorSnapshot {
     activity_seen: u64,
     peer: Option<Arc<dyn PeerLiveness>>,
     peer_packets_seen: u64,
+}
+
+/// The handles of one judgeable downlink sender, cloned out of the route
+/// map under a short lock. The patrol then reads the QUIC connection with
+/// the map UNLOCKED: that read takes the connection's own lock, and an
+/// eviction re-takes the map's, which is a plain non-reentrant
+/// `parking_lot::Mutex`.
+struct PatrolCandidate {
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    activity: Arc<AtomicU64>,
+    peer: Arc<dyn PeerLiveness>,
+}
+
+/// What the patrol remembers about one downlink sender between two rounds.
+///
+/// The two silences are tracked apart on purpose. Application silence is
+/// what names a black-holed sender, QUIC silence is the only thing allowed
+/// to convict one, and the two diverge exactly in the case the patrol must
+/// get right: a client gone from behind a relay leg that keeps ACKing.
+struct PatrolWatch {
+    who: PatrolCandidate,
+    /// Readings taken at the last round that saw this sender move.
+    activity_seen: u64,
+    peer_packets_seen: u64,
+    /// Consecutive rounds each reading has stayed put.
+    app_silent_rounds: u32,
+    peer_silent_rounds: u32,
+}
+
+impl PatrolWatch {
+    /// A sender seen for the first time. This round establishes its
+    /// baselines and has observed no interval yet, so it holds nothing
+    /// against it.
+    const fn new(who: PatrolCandidate, activity: u64, packets: u64) -> Self {
+        Self {
+            who,
+            activity_seen: activity,
+            peer_packets_seen: packets,
+            app_silent_rounds: 0,
+            peer_silent_rounds: 0,
+        }
+    }
+
+    /// Folds this round's readings: a counter that moved rebaselines and
+    /// resets its own silence run.
+    fn observe(&mut self, activity: u64, packets: u64) {
+        if activity == self.activity_seen {
+            self.app_silent_rounds = self.app_silent_rounds.saturating_add(1);
+        } else {
+            self.activity_seen = activity;
+            self.app_silent_rounds = 0;
+        }
+        if packets == self.peer_packets_seen {
+            self.peer_silent_rounds = self.peer_silent_rounds.saturating_add(1);
+        } else {
+            self.peer_packets_seen = packets;
+            self.peer_silent_rounds = 0;
+        }
+    }
+
+    /// Consecutive rounds silent at BOTH levels, the only run allowed to
+    /// convict.
+    fn silent_rounds(&self) -> u32 {
+        self.app_silent_rounds.min(self.peer_silent_rounds)
+    }
+}
+
+/// What one patrol round found, over one address family.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PatrolRound {
+    evicted: Evictions,
+    /// Senders past [`PATROL_STALE_ROUNDS`] of application silence that the
+    /// round left in place. A gauge reading, not an accumulation.
+    stale: u64,
 }
 
 /// How many downlink senders one eviction pass took the route away from,
@@ -2104,6 +2202,91 @@ impl<A: std::hash::Hash + Eq + Copy> RouteTable<A> {
             reason.is_none()
         });
         evicted
+    }
+
+    /// One round of the permanent patrol (see [`patrol_stale_downlinks`])
+    /// over the slots holding MORE THAN ONE sender: only a shared slot can
+    /// black-hole a flow, because only there does a dead sender hold a share
+    /// of the 5-tuple hash that a live one would otherwise have served.
+    ///
+    /// `state` carries the per-sender baselines between rounds and is
+    /// rebuilt each time, so a sender that left, and a slot that fell back
+    /// to a single owner, drop out of it.
+    ///
+    /// Lock discipline: the map guard is taken once, only to clone handles,
+    /// and released before any QUIC connection is read or any route removed.
+    /// [`Self::unregister_if_owner`] takes that same non-reentrant guard.
+    fn patrol_round(&self, state: &mut HashMap<A, Vec<PatrolWatch>>) -> PatrolRound {
+        let candidates: Vec<(A, Vec<PatrolCandidate>)> = {
+            let routes = self.0.lock();
+            routes
+                .iter()
+                .filter(|(_, slot)| slot.senders.len() > 1)
+                .map(|(ip, slot)| {
+                    let watched = slot
+                        .senders
+                        .iter()
+                        .filter_map(|d| {
+                            // A sender with no liveness handles cannot be
+                            // judged, so it is never a victim: the window
+                            // between `register` and `attach_liveness`, and
+                            // the plain channels the unit tests register.
+                            Some(PatrolCandidate {
+                                tx: d.tx.clone(),
+                                activity: d.activity.clone()?,
+                                peer: d.peer.clone()?,
+                            })
+                        })
+                        .collect();
+                    (*ip, watched)
+                })
+                .collect()
+        };
+
+        let mut round = PatrolRound::default();
+        let mut next: HashMap<A, Vec<PatrolWatch>> = HashMap::with_capacity(candidates.len());
+        for (ip, watched) in candidates {
+            let mut carried = state.remove(&ip).unwrap_or_default();
+            let mut kept = Vec::with_capacity(watched.len());
+            for who in watched {
+                let activity = who.activity.load(Ordering::Relaxed);
+                let packets = who.peer.packets_from_peer();
+                let closed = who.peer.is_closed();
+                let previous = carried.iter().position(|w| w.who.tx.same_channel(&who.tx));
+                let watch = match previous {
+                    Some(i) => {
+                        let mut w = carried.swap_remove(i);
+                        w.observe(activity, packets);
+                        w
+                    }
+                    None => PatrolWatch::new(who, activity, packets),
+                };
+                let reason = if closed {
+                    Some(EvictReason::Closed)
+                } else if watch.silent_rounds() >= PATROL_SILENT_ROUNDS {
+                    Some(EvictReason::Silent)
+                } else {
+                    None
+                };
+                match reason {
+                    Some(reason) => {
+                        self.unregister_if_owner(ip, &watch.who.tx);
+                        round.evicted.note(reason);
+                    }
+                    None => {
+                        if watch.app_silent_rounds >= PATROL_STALE_ROUNDS {
+                            round.stale += 1;
+                        }
+                        kept.push(watch);
+                    }
+                }
+            }
+            if !kept.is_empty() {
+                next.insert(ip, kept);
+            }
+        }
+        *state = next;
+        round
     }
 
     /// Removes ONLY `owner`'s channel from `ip`'s slot (and the slot
@@ -2424,6 +2607,56 @@ async fn pump_multihop_tun_router<T: PacketDevice>(tun: T, router: Arc<MultihopT
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
+        }
+    }
+}
+
+/// Permanent low-frequency patrol over the shared downlink slots, one task
+/// per router.
+///
+/// Every other janitor on this table is one-shot. A serve task unregisters
+/// its own channel when it ends, [`RouteTable::dispatch`] prunes a channel
+/// whose receiver is gone, and the sticky-IP takeover re-check watches its
+/// predecessors for 8 s and stops. A sender whose serve-task teardown raced
+/// or died, and a closed channel in a slot no downlink traffic reaches, are
+/// looked at by none of them ever again. In production one exit slot carried
+/// seven dead senders out of fifteen for tens of minutes: each kept its
+/// share of the 5-tuple hash, and since a learned flow is first-writer-wins,
+/// a re-established flow that landed on one black-holed completely.
+///
+/// What this deliberately CANNOT do: convict a sender whose client vanished
+/// while its relay leg stays up. On a multi-hop session the exit's QUIC peer
+/// is the RELAY, so `packets_from_peer` counts the relay's ACKs of the
+/// exit's own downlink sends and never freezes. Convicting on application
+/// silence alone is what black-holed live sessions on 2026-08-02, so the
+/// patrol refuses to; those senders are counted instead
+/// (`RouteSnapshot::stale_senders`) and bounding their lifetime belongs to
+/// the client chain, which closes a connection whose own peer stopped
+/// answering.
+///
+/// Cost: one short map lock per address family per round, and nothing at all
+/// on the per-packet path.
+async fn patrol_stale_downlinks(router: Arc<MultihopTunRouter>) {
+    let mut v4: HashMap<Ipv4Addr, Vec<PatrolWatch>> = HashMap::new();
+    let mut v6: HashMap<Ipv6Addr, Vec<PatrolWatch>> = HashMap::new();
+    loop {
+        tokio::time::sleep(PATROL_INTERVAL).await;
+        let mut round = router.routes.patrol_round(&mut v4);
+        let round_v6 = router.routes_v6.patrol_round(&mut v6);
+        round.evicted.merge(round_v6.evicted);
+        round.stale += round_v6.stale;
+        crate::metrics::route_metrics().set_stale_senders(round.stale);
+        if round.evicted.total() > 0 {
+            round.evicted.publish();
+            // At most one line per round, and a round can only evict senders
+            // registered since the previous one, so this cannot run away.
+            // Counts only: every address in this table is a client's.
+            tracing::info!(
+                closed = round.evicted.closed,
+                silent = round.evicted.silent,
+                stale = round.stale,
+                "multihop: patrol evicted dead downlink sender(s) from shared slot(s)"
+            );
         }
     }
 }
@@ -3192,6 +3425,9 @@ impl<T: PacketDevice + Clone> ExitTerminateCtx<T> {
     ) -> Self {
         let router = Arc::new(MultihopTunRouter::default());
         tokio::spawn(pump_multihop_tun_router(tun.clone(), router.clone()));
+        // One patrol for the whole router, never one per TUN queue: it walks
+        // the route table, which the queues share.
+        tokio::spawn(patrol_stale_downlinks(router.clone()));
         Self {
             cache: Arc::new(SessionCache::new()),
             privkey: Arc::new(exit_x25519_privkey),
@@ -5931,6 +6167,345 @@ mod tests {
             "each verdict must be counted under its own reason"
         );
         assert_eq!(evicted.total(), 2);
+    }
+
+    /// Registers `tx` under `ip` carrying the liveness handles the exit's rx
+    /// pump attaches in production, which is what makes a sender judgeable.
+    fn register_watched(
+        router: &MultihopTunRouter,
+        ip: Ipv4Addr,
+        tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+        activity: &Arc<AtomicU64>,
+        peer: &Arc<FakePeer>,
+    ) {
+        router.register(ip, tx.clone());
+        router.attach_liveness(ip, tx, activity.clone(), Some(peer.clone()));
+    }
+
+    /// One patrol round's worth of a live owner: its rx pump advanced its
+    /// application counter and its QUIC peer sent something.
+    fn breathe(activity: &Arc<AtomicU64>, peer: &Arc<FakePeer>) {
+        activity.fetch_add(1, Ordering::Relaxed);
+        peer.packets.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[tokio::test]
+    async fn the_patrol_evicts_a_closed_sender_from_a_shared_slot_with_no_takeover() {
+        // The corner the takeover re-check cannot cover: a serve task whose
+        // teardown raced or died leaves its channel in the slot, and no
+        // reconnect ever arms a look at it. Nothing here registers a
+        // successor or dispatches a packet, so only the patrol can act.
+        let router = MultihopTunRouter::default();
+        let ip = Ipv4Addr::new(10, 66, 0, 30);
+        let (tx_dead, _rx_dead) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx_live, _rx_live) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let quic_dead = FakePeer::new();
+        quic_dead
+            .closed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        register_watched(
+            &router,
+            ip,
+            &tx_dead,
+            &Arc::new(AtomicU64::new(1)),
+            &quic_dead,
+        );
+        register_watched(
+            &router,
+            ip,
+            &tx_live,
+            &Arc::new(AtomicU64::new(1)),
+            &FakePeer::new(),
+        );
+
+        let mut state = HashMap::new();
+        let round = router.routes.patrol_round(&mut state);
+
+        assert_eq!(
+            round.evicted,
+            Evictions {
+                closed: 1,
+                silent: 0
+            },
+            "a closed connection is dead beyond doubt, on the very first look"
+        );
+        assert_eq!(
+            router.routes.0.lock().get(&ip).unwrap().senders.len(),
+            1,
+            "the closed sender's channel must be gone from the slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_patrol_convicts_a_fully_silent_sender_only_after_the_whole_window() {
+        // Silence at both levels is the only other death certificate, and it
+        // is worth nothing until the whole window has passed: a single
+        // unlucky sample is how a live owner loses its route.
+        let router = MultihopTunRouter::default();
+        let ip = Ipv4Addr::new(10, 66, 0, 31);
+        let (tx_frozen, _rx_frozen) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx_live, _rx_live) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let act_live = Arc::new(AtomicU64::new(0));
+        let quic_live = FakePeer::new();
+        register_watched(
+            &router,
+            ip,
+            &tx_frozen,
+            &Arc::new(AtomicU64::new(9)),
+            &FakePeer::new(),
+        );
+        register_watched(&router, ip, &tx_live, &act_live, &quic_live);
+
+        let mut state = HashMap::new();
+        // The first round only takes the baselines, so the verdict lands one
+        // round after the window is full.
+        for round in 1..=PATROL_SILENT_ROUNDS {
+            breathe(&act_live, &quic_live);
+            let r = router.routes.patrol_round(&mut state);
+            assert_eq!(
+                r.evicted.total(),
+                0,
+                "round {round} of {PATROL_SILENT_ROUNDS} must not convict yet"
+            );
+            assert_eq!(router.routes.0.lock().get(&ip).unwrap().senders.len(), 2);
+        }
+        breathe(&act_live, &quic_live);
+        let r = router.routes.patrol_round(&mut state);
+
+        assert_eq!(
+            r.evicted,
+            Evictions {
+                closed: 0,
+                silent: 1
+            },
+            "a sender silent at both levels for the whole window is dead"
+        );
+        assert_eq!(
+            router.routes.0.lock().get(&ip).unwrap().senders.len(),
+            1,
+            "only the live sender may survive the window"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_patrol_never_convicts_a_sender_whose_quic_peer_still_speaks() {
+        // The 2026-08-02 regression guard, and the shape the patrol meets
+        // most often: on a multi-hop session the exit's QUIC peer is the
+        // RELAY, whose ACKs of the exit's own downlink sends keep arriving
+        // long after the client behind it is gone. Application silence alone
+        // must never convict, however long it lasts.
+        let router = MultihopTunRouter::default();
+        let ip = Ipv4Addr::new(10, 66, 0, 32);
+        let (tx_idle, _rx_idle) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx_live, _rx_live) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let act_live = Arc::new(AtomicU64::new(0));
+        let quic_live = FakePeer::new();
+        let quic_idle = FakePeer::new();
+        register_watched(
+            &router,
+            ip,
+            &tx_idle,
+            &Arc::new(AtomicU64::new(3)),
+            &quic_idle,
+        );
+        register_watched(&router, ip, &tx_live, &act_live, &quic_live);
+
+        let mut state = HashMap::new();
+        for round in 1..=(PATROL_STALE_ROUNDS + 4) {
+            // No application datagram ever, but the relay keeps ACKing.
+            quic_idle.packets.fetch_add(1, Ordering::Relaxed);
+            breathe(&act_live, &quic_live);
+            let r = router.routes.patrol_round(&mut state);
+            assert_eq!(
+                r.evicted.total(),
+                0,
+                "round {round}: an app-idle owner whose peer speaks MUST keep its route"
+            );
+        }
+        assert_eq!(
+            router.routes.0.lock().get(&ip).unwrap().senders.len(),
+            2,
+            "both channels must survive an arbitrarily long application silence"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_patrol_counts_a_long_app_silent_sender_it_is_not_allowed_to_convict() {
+        // The visibility half of the net: the senders the patrol must leave
+        // alone are exactly the ones the incident was made of, so the node
+        // has to be able to say how many of them it is carrying.
+        let router = MultihopTunRouter::default();
+        let ip = Ipv4Addr::new(10, 66, 0, 33);
+        let (tx_idle, _rx_idle) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx_live, _rx_live) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let act_live = Arc::new(AtomicU64::new(0));
+        let quic_live = FakePeer::new();
+        let quic_idle = FakePeer::new();
+        register_watched(
+            &router,
+            ip,
+            &tx_idle,
+            &Arc::new(AtomicU64::new(3)),
+            &quic_idle,
+        );
+        register_watched(&router, ip, &tx_live, &act_live, &quic_live);
+
+        let mut state = HashMap::new();
+        for round in 1..=PATROL_STALE_ROUNDS {
+            quic_idle.packets.fetch_add(1, Ordering::Relaxed);
+            breathe(&act_live, &quic_live);
+            let r = router.routes.patrol_round(&mut state);
+            assert_eq!(r.stale, 0, "round {round} is still inside the threshold");
+        }
+        quic_idle.packets.fetch_add(1, Ordering::Relaxed);
+        breathe(&act_live, &quic_live);
+        let r = router.routes.patrol_round(&mut state);
+
+        assert_eq!(
+            r.stale, 1,
+            "past the threshold the app-silent sender must be reported"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_patrol_leaves_a_sole_owner_alone() {
+        // A sender alone under its address owns nothing anyone else could
+        // serve, so evicting it would only turn a recoverable route into
+        // `no_route` drops. Only a shared slot can black-hole a flow.
+        let router = MultihopTunRouter::default();
+        let ip = Ipv4Addr::new(10, 66, 0, 34);
+        let (tx_only, _rx_only) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let quic_dead = FakePeer::new();
+        quic_dead
+            .closed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        register_watched(
+            &router,
+            ip,
+            &tx_only,
+            &Arc::new(AtomicU64::new(1)),
+            &quic_dead,
+        );
+
+        let mut state = HashMap::new();
+        for _ in 0..=PATROL_SILENT_ROUNDS {
+            assert_eq!(
+                router.routes.patrol_round(&mut state).evicted.total(),
+                0,
+                "a single-sender slot is never a patrol target"
+            );
+        }
+        assert_eq!(
+            router.routes.0.lock().get(&ip).unwrap().senders.len(),
+            1,
+            "the sole owner keeps its route"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_patrol_eviction_purges_the_learned_flows_so_they_repin_to_the_survivor() {
+        // Removing the channel is only half the repair: a flow whose
+        // first-writer-wins owner is gone stays pinned to it unless the
+        // eviction purges the learned entry too. This is the mechanism that
+        // black-holed a re-established flow 100 percent of the time.
+        let router = MultihopTunRouter::default();
+        let ip = Ipv4Addr::new(10, 66, 0, 35);
+        let peer = Ipv4Addr::new(93, 184, 216, 34);
+        let (tx_dead, mut rx_dead) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx_live, mut rx_live) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let quic_dead = FakePeer::new();
+        register_watched(
+            &router,
+            ip,
+            &tx_dead,
+            &Arc::new(AtomicU64::new(1)),
+            &quic_dead,
+        );
+        register_watched(
+            &router,
+            ip,
+            &tx_live,
+            &Arc::new(AtomicU64::new(1)),
+            &FakePeer::new(),
+        );
+        let uplink = ipv4_tcp_full(ip, peer, 51000, 443);
+        let downlink = ipv4_tcp_full(peer, ip, 443, 51000);
+        router.note_uplink(&uplink, &tx_dead);
+
+        router.dispatch(&downlink);
+        assert!(
+            rx_dead.try_recv().is_ok(),
+            "pre-patrol: the flow's reply goes to its learned owner"
+        );
+
+        quic_dead
+            .closed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut state = HashMap::new();
+        assert_eq!(router.routes.patrol_round(&mut state).evicted.closed, 1);
+
+        router.dispatch(&downlink);
+        assert!(
+            rx_live.try_recv().is_ok(),
+            "post-patrol: the re-established flow must re-pin to the survivor"
+        );
+        assert!(
+            rx_dead.try_recv().is_err(),
+            "nothing more may reach the evicted sender"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_spawned_patrol_sweeps_both_address_families_on_its_interval() {
+        // The wiring itself: one task per router, looping on its own
+        // interval, visiting the v4 and the v6 table. A patrol that only
+        // ever swept v4 would leave a dual-stack exit's v6 slots exactly as
+        // unattended as before.
+        let router = Arc::new(MultihopTunRouter::default());
+        let ip = Ipv4Addr::new(10, 66, 0, 36);
+        let ip6 = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 0x36);
+        let (tx_dead, _rx_dead) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx_live, _rx_live) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let quic_dead = FakePeer::new();
+        quic_dead
+            .closed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        for (tx, peer) in [(&tx_dead, quic_dead.clone()), (&tx_live, FakePeer::new())] {
+            let activity = Arc::new(AtomicU64::new(1));
+            router.register(ip, tx.clone());
+            router.attach_liveness(ip, tx, activity.clone(), Some(peer.clone()));
+            router.register_v6(ip6, tx.clone());
+            router.attach_liveness_v6(ip6, tx, activity, Some(peer));
+        }
+
+        tokio::spawn(patrol_stale_downlinks(router.clone()));
+        tokio::task::yield_now().await;
+        assert_eq!(
+            router.routes.0.lock().get(&ip).unwrap().senders.len(),
+            2,
+            "nothing may be evicted before the first round"
+        );
+
+        tokio::time::advance(PATROL_INTERVAL + Duration::from_millis(1)).await;
+        for _ in 0..16 {
+            if router.routes.0.lock().get(&ip).unwrap().senders.len() == 1
+                && router.routes_v6.0.lock().get(&ip6).unwrap().senders.len() == 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            router.routes.0.lock().get(&ip).unwrap().senders.len(),
+            1,
+            "the patrol must have swept the v4 slot"
+        );
+        assert_eq!(
+            router.routes_v6.0.lock().get(&ip6).unwrap().senders.len(),
+            1,
+            "and the v6 slot on the same round"
+        );
     }
 
     #[tokio::test(start_paused = true)]
