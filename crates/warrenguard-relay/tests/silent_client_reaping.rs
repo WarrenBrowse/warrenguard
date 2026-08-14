@@ -92,15 +92,25 @@ fn dummy_frame(exit_id: ExitId, seq: u64) -> Vec<u8> {
 /// Downlink the exit keeps pushing at the client, whatever the client does.
 const COVER: [u8; 64] = [0xEE; 64];
 
-/// Echoing exit on the production exit transport profile, which also pushes
-/// downlink of its own for the whole life of the connection: a vanished client
-/// is discovered while the relay is still busy forwarding traffic to it, which
-/// is the shape that matters (an idle session is the easy case) and the shape
-/// that catches a transport where an outgoing packet keeps restarting the idle
-/// timer. Reports how each accepted connection ended, so the test observes the
-/// exit side of the teardown rather than inferring it from the relay.
+/// What the exit is doing at the moment the client vanishes. The two shapes
+/// fail differently, so both are held to the same bound.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Downlink {
+    /// Nothing to send: the relay's discovery rests on the idle timeout alone,
+    /// which is what a periodic server-side PING silently extends.
+    Silent,
+    /// The exit keeps writing at a client that is already gone, the shape the
+    /// black-hole comes from, and the one that catches a transport where an
+    /// outgoing packet keeps restarting the idle timer.
+    Flowing,
+}
+
+/// Echoing exit on the production exit transport profile. Reports how each
+/// accepted connection ended, so the test observes the exit side of the
+/// teardown rather than inferring it from the relay.
 fn spawn_echo_exit(
     exit_key: &SigningKey,
+    downlink: Downlink,
     ended: tokio::sync::mpsc::Sender<quinn::ConnectionError>,
 ) -> SocketAddr {
     let mut server_cfg = make_server_config(exit_key, default_crypto_provider(), &[ALPN_H3])
@@ -130,15 +140,17 @@ fn spawn_echo_exit(
                         }
                     }
                 });
-                let cover = conn.clone();
-                tokio::spawn(async move {
-                    loop {
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                        if cover.send_datagram(Bytes::from_static(&COVER)).is_err() {
-                            break;
+                if downlink == Downlink::Flowing {
+                    let cover = conn.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            if cover.send_datagram(Bytes::from_static(&COVER)).is_err() {
+                                break;
+                            }
                         }
-                    }
-                });
+                    });
+                }
                 let _ = ended.send(conn.closed().await).await;
             });
         }
@@ -201,15 +213,16 @@ async fn spawn_blackholing_forwarder(upstream: SocketAddr) -> (SocketAddr, Arc<A
     (front_addr, blackholed)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_silently_vanished_client_has_its_exit_leg_reaped_within_the_bound() {
+/// A client whose network went away mid-session, with the exit in the given
+/// state at that moment. Asserts both legs are gone inside [`REAP_BOUND`].
+async fn assert_reaped_after_the_client_vanishes(downlink: Downlink) {
     let op_key = det_signing_key(0x42);
     let relay_key = det_signing_key(0x77);
     let exit_key = det_signing_key(0x55);
     let exit_id = ExitId::from_bytes([0xAA; 16]);
 
     let (ended_tx, mut ended_rx) = tokio::sync::mpsc::channel(4);
-    let exit_addr = spawn_echo_exit(&exit_key, ended_tx);
+    let exit_addr = spawn_echo_exit(&exit_key, downlink, ended_tx);
 
     let descriptor = signed_descriptor(&op_key, exit_id, pubkey_bytes(&exit_key), exit_addr);
     let cfg = Arc::new(RelayConfig {
@@ -304,6 +317,10 @@ async fn a_silently_vanished_client_has_its_exit_leg_reaped_within_the_bound() {
     .expect("the DATA path must be live before the client vanishes");
     assert!(echo_seen, "the round trip must complete on a live session");
 
+    // Let the session settle into the state under test, so what the relay last
+    // saw is a client packet rather than the DATA round trip above.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
     // The client vanishes: its process is still there, but nothing it sends
     // leaves and nothing the relay sends arrives. No close reaches the relay.
     blackholed.store(true, Ordering::Relaxed);
@@ -351,4 +368,14 @@ async fn a_silently_vanished_client_has_its_exit_leg_reaped_within_the_bound() {
         summary.client_to_exit >= 1,
         "the session must have carried DATA before the client vanished, got {summary:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_that_vanishes_from_a_quiet_session_is_reaped_within_the_bound() {
+    assert_reaped_after_the_client_vanishes(Downlink::Silent).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_that_vanishes_under_downlink_is_reaped_within_the_bound() {
+    assert_reaped_after_the_client_vanishes(Downlink::Flowing).await;
 }

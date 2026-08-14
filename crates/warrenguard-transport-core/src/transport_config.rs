@@ -472,6 +472,7 @@ pub fn warren_transport_config_exit_multihop_with_gso(enable_gso: bool) -> Arc<T
     cfg.datagram_send_buffer_size(datagram_send_buffer_size(QUIC_DATAGRAM_SEND_BUFFER_EXIT))
         .max_concurrent_bidi_streams(VarInt::from_u32(QUIC_MAX_CONCURRENT_BIDI_STREAMS_EXIT))
         .max_concurrent_uni_streams(VarInt::from_u32(0));
+    no_keep_alive_toward_clients(&mut cfg);
     Arc::new(cfg)
 }
 
@@ -506,7 +507,27 @@ pub fn warren_transport_config_relay_inbound_with_gso(enable_gso: bool) -> Arc<T
         // `warren_transport_config_exit` doc.
         .initial_crypto_first_fragment_size(Some(64))
         .initial_datagram_min_size(PADDED_INITIAL_MIN_SIZE);
+    no_keep_alive_toward_clients(&mut cfg);
     Arc::new(cfg)
+}
+
+/// Drops the periodic PING on a listener whose dialers all bring a liveness of
+/// their own: a client leg carries a 5 s keep-alive (or the idle-cover pump,
+/// when that beacon is deliberately traded for cover traffic), and a
+/// relay-to-exit leg is dialed with the relay-outbound profile's own keep-alive.
+/// This side never needs a PING to hold a connection up.
+///
+/// What it does need is to notice a peer that vanished without a close, and its
+/// own PING works against that: RFC 9000 section 10.1 restarts the idle timer on
+/// sending an ack-eliciting packet when none was outstanding since the last
+/// packet received, so a 20 s beacon pushes dead-peer detection out to
+/// beacon + idle timeout instead of the negotiated idle timeout. On the client
+/// leg every one of those extra seconds is a second the exit keeps a downlink
+/// sender registered for a client that is gone, writing its traffic into a hole.
+/// Removing the beacon also removes a fixed-period server-side signature from an
+/// otherwise silent connection.
+fn no_keep_alive_toward_clients(cfg: &mut TransportConfig) {
+    cfg.keep_alive_interval(None);
 }
 
 /// Warren **multi-hop relay inbound** `TransportConfig`: identical to
@@ -530,6 +551,7 @@ pub fn warren_transport_config_relay_inbound_multihop_with_gso(
     cfg.datagram_send_buffer_size(datagram_send_buffer_size(QUIC_DATAGRAM_SEND_BUFFER_EXIT))
         .max_concurrent_bidi_streams(VarInt::from_u32(QUIC_MAX_CONCURRENT_BIDI_STREAMS_EXIT))
         .max_concurrent_uni_streams(VarInt::from_u32(0));
+    no_keep_alive_toward_clients(&mut cfg);
     Arc::new(cfg)
 }
 
