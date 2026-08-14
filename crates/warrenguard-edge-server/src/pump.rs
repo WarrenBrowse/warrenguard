@@ -192,9 +192,9 @@ async fn shuttle_setup(
 /// per-direction counts. Never fails: a transport close is a normal end.
 ///
 /// Each direction runs on its own task (owning cheap `Connection` clones); the
-/// FIRST to finish closes both connections so the twin task's blocked
-/// `read_datagram` unblocks and cannot hang the session. This mirrors the
-/// relay's `forward_session` shutdown discipline.
+/// FIRST to finish closes the browser connection and aborts the twin, so its
+/// blocked `read_datagram` cannot hang the session. The exit connection is left
+/// untouched, for the reason given on [`pump_multihop_entry`].
 async fn pump_datagrams(browser: &Connection, exit: &Connection, session_id: u64) -> PumpSummary {
     let expected_qsid = quarter_stream_id(session_id);
     let mut set = tokio::task::JoinSet::new();
