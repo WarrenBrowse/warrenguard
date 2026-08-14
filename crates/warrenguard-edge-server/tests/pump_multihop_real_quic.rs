@@ -7,10 +7,8 @@
 //! both directions.
 //!
 //! This is the "necessary" datapath tier (a real in-process transport is a real
-//! transport). Real end-to-end validation needs the browser-side Warren
-//! WebTransport client (the extension edge-CONNECT tier), which does not exist
-//! yet, so the pump is not mounted on a production exit until that closes the
-//! loop.
+//! transport). Real end-to-end validation needs a browser-side Warren
+//! WebTransport client driving the same path; nothing here stands in for that.
 //!
 //! Loopback only.
 

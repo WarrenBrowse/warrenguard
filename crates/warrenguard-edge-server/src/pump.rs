@@ -31,9 +31,9 @@
 //!
 //! This is loopback-validated over real QUIC (a synthetic WebTransport client
 //! and a fake exit, see the crate integration tests): the "necessary" datapath
-//! tier. Real end-to-end validation needs the browser-side Warren WebTransport
-//! client (the extension edge-CONNECT tier), which does not exist yet, so the
-//! pump is NOT mounted on a production exit until that closes the loop.
+//! tier. No real browser has ever driven it, so a deployer that mounts this
+//! listener owns that half of the validation, and must not read the loopback
+//! tier as end-to-end proof.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
