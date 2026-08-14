@@ -2085,9 +2085,17 @@ impl<A: std::hash::Hash + Eq + Copy> Default for RouteTable<A> {
 impl<A: std::hash::Hash + Eq + Copy> RouteTable<A> {
     /// Adds `tx` to the slot for `ip`, creating the slot when absent.
     /// A channel already present (same sender) is not duplicated. At
-    /// capacity the OLDEST channel is evicted: on a sticky takeover the
-    /// stale generation's channels are the oldest, so the semantics
-    /// degrade to the historical replace-on-reconnect behavior.
+    /// capacity one channel is sacrificed: a channel whose connection has
+    /// closed if there is one, else the OLDEST, which on a sticky takeover
+    /// is the stale generation's, so the semantics degrade to the historical
+    /// replace-on-reconnect behavior.
+    ///
+    /// Preferring a closed one matters precisely when the cap is reached for
+    /// the wrong reason. A slot that filled up with dead senders makes the
+    /// one channel still serving the oldest, and oldest-first would then
+    /// take down the only live owner on the next registration. The scan
+    /// reads a QUIC connection under the map guard, which is why it is
+    /// reached only at the cap and never on the common path.
     fn register(&self, ip: A, tx: tokio::sync::mpsc::Sender<Vec<u8>>) {
         let mut routes = self.0.lock();
         let slot = routes
@@ -2097,7 +2105,12 @@ impl<A: std::hash::Hash + Eq + Copy> RouteTable<A> {
             return;
         }
         if slot.senders.len() >= MAX_SENDERS_PER_IP {
-            slot.senders.remove(0);
+            let victim = slot
+                .senders
+                .iter()
+                .position(|d| d.peer.as_ref().is_some_and(|p| p.is_closed()))
+                .unwrap_or(0);
+            slot.senders.remove(victim);
         }
         slot.senders.push(Downlink {
             tx,
@@ -6187,6 +6200,49 @@ mod tests {
     fn breathe(activity: &Arc<AtomicU64>, peer: &Arc<FakePeer>) {
         activity.fetch_add(1, Ordering::Relaxed);
         peer.packets.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[tokio::test]
+    async fn at_capacity_a_registration_sacrifices_a_closed_sender_before_the_oldest() {
+        // Oldest-first at the cap is a hazard exactly when the cap is
+        // reached for the wrong reason: a slot filled with dead senders
+        // makes the ONE live channel the oldest, so the next registration
+        // silently takes down the only owner that was still serving.
+        let router = MultihopTunRouter::default();
+        let ip = Ipv4Addr::new(10, 66, 0, 40);
+        let (tx_oldest, _rx_oldest) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        register_watched(
+            &router,
+            ip,
+            &tx_oldest,
+            &Arc::new(AtomicU64::new(1)),
+            &FakePeer::new(),
+        );
+        // Fill the rest of the slot with connections that have since closed.
+        let mut dead = Vec::new();
+        for _ in 1..MAX_SENDERS_PER_IP {
+            let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+            let quic = FakePeer::new();
+            quic.closed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            register_watched(&router, ip, &tx, &Arc::new(AtomicU64::new(1)), &quic);
+            dead.push((tx, rx));
+        }
+
+        let (tx_new, _rx_new) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        router.register(ip, tx_new.clone());
+
+        let routes = router.routes.0.lock();
+        let slot = routes.get(&ip).expect("the slot must still exist");
+        assert_eq!(
+            slot.senders.len(),
+            MAX_SENDERS_PER_IP,
+            "the slot must stay at its cap"
+        );
+        assert!(
+            slot.senders.iter().any(|s| s.tx.same_channel(&tx_oldest)),
+            "the live sender must survive the registration that hit the cap"
+        );
     }
 
     #[tokio::test]
