@@ -2262,3 +2262,52 @@ fn the_post_release_cooldown_does_not_block_the_tenants_own_next_address() {
     assert_eq!(granted.external_port, 52419);
     assert_eq!(granted.internal_ip, ALICE_SECOND_SESSION);
 }
+
+/// The budget a deployer answers with is per ADDRESS (it counts the credential
+/// slots that address presented), so a client that reconnects onto a new inner
+/// address reports a small budget while its own departed address still holds
+/// the tenant's ports. A reclaim acquires no new port number for the tenant,
+/// so it must be quota-free exactly like the companion-proto suggestion, and a
+/// refusal must never be what deletes the mapping's DNAT rule.
+#[test]
+fn a_reclaim_is_quota_free_for_a_tenant_already_at_its_budget() {
+    use std::sync::Arc;
+    use warrenguard_natpmp_server::allocator::PortBudget;
+
+    struct OnePortForTheNewAddress;
+    impl PortBudget for OnePortForTheNewAddress {
+        fn budget_for(&self, client_ip: Ipv4Addr) -> Option<usize> {
+            (client_ip == ALICE_SECOND_SESSION).then_some(1)
+        }
+    }
+
+    let alloc = Allocator::new();
+    assert!(alloc.set_quota_peers(Arc::new(AliceTenant)));
+    assert!(alloc.set_live_sessions(Arc::new(SessionsOn(vec![ALICE_SECOND_SESSION]))));
+    assert!(alloc.set_port_budget(Arc::new(OnePortForTheNewAddress)));
+    let now = Instant::now();
+    let dead = alloc
+        .allocate_at(ALICE, Proto::Tcp, 52419, 52419, 600, now)
+        .expect("the first session pins its port");
+    alloc
+        .allocate_at(ALICE, Proto::Tcp, 4242, 49300, 600, now)
+        .expect("the first session also holds a second port");
+
+    let outcome =
+        alloc.allocate_at_collecting(ALICE_SECOND_SESSION, Proto::Tcp, 52419, 52419, 600, now);
+
+    let granted = outcome
+        .result
+        .expect("a reclaim adds no port number, so the budget cannot refuse it");
+    assert_eq!(granted.external_port, 52419);
+    assert_eq!(granted.internal_ip, ALICE_SECOND_SESSION);
+    assert!(
+        outcome.evicted.contains(&dead),
+        "the predecessor's mapping must still be surfaced for DNAT teardown"
+    );
+    assert_eq!(
+        alloc.active_count(),
+        2,
+        "the tenant keeps the port it never gave up plus the reclaimed one"
+    );
+}

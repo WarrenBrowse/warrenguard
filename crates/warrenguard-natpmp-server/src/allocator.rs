@@ -582,10 +582,10 @@ impl Allocator {
         // confused users who pinned a port (it appeared to "work" on a
         // different port, then "fix itself" on the next renewal).
         //
-        // Checked BEFORE the refresh-reclaim mutates `active`, so a
-        // rejection leaves the client's current mapping (and its backend
-        // DNAT rule) untouched: a live port-change to an unavailable
-        // port fails cleanly and the existing mapping keeps working.
+        // Checked BEFORE anything mutates `active`, so a rejection leaves the
+        // client's current mapping (and its backend DNAT rule) untouched: a
+        // live port-change to an unavailable port fails cleanly and the
+        // existing mapping keeps working.
         // Port ownership is client-level: a port live-held by another
         // client is never grantable, whatever the proto; a port
         // live-held by THIS client grants its free proto slot (the
@@ -728,19 +728,6 @@ impl Allocator {
         // entry for the reclaimed port: the same client is the one
         // re-requesting, so penalising it would defeat the refresh.
         //
-        // Taking a pinned port back from the tenant's own departed address
-        // moves the WHOLE port: ownership is client-level, so leaving the
-        // companion proto on the dead address would split one port between
-        // two owners and leave its DNAT rule pointing at an address nothing
-        // routes to. Those entries ride `evicted` like any other reclaim, and
-        // the backend deletes before it adds.
-        if reclaim_from_departed_peer {
-            for slot in [Proto::Tcp, Proto::Udp] {
-                if let Some(removed) = g.active.remove(&(suggested, slot)) {
-                    evicted.push(removed);
-                }
-            }
-        }
         let stale_same_tuple: Vec<(u16, Proto)> = g
             .active
             .iter()
@@ -800,6 +787,28 @@ impl Allocator {
                 result: Err(NatPmpError::QuotaExceeded(client_ip)),
                 evicted,
             };
+        }
+
+        // Taking a pinned port back from the tenant's own departed address
+        // moves the WHOLE port: ownership is client-level, so leaving the
+        // companion proto on the dead address would split one port between
+        // two owners and leave its DNAT rule pointing at an address nothing
+        // routes to. Those entries ride `evicted` like any other reclaim, and
+        // the backend deletes before it adds.
+        //
+        // Done AFTER the last refusal path, and after the quota count that
+        // reads `active`. Removing first both destroyed the mapping on a
+        // request that then failed (the tenant lost its DNAT rule AND its
+        // port) and hid the port from `held_ports`, so a per-address budget
+        // smaller than what the tenant holds turned the reconnect the reclaim
+        // exists to serve into `QuotaExceeded`. A reclaim acquires no new port
+        // number for the tenant, so counting it is wrong in both directions.
+        if reclaim_from_departed_peer {
+            for slot in [Proto::Tcp, Proto::Udp] {
+                if let Some(removed) = g.active.remove(&(suggested, slot)) {
+                    evicted.push(removed);
+                }
+            }
         }
 
         // Port choice.
