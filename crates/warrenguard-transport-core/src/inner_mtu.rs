@@ -27,6 +27,8 @@ const TCP_MIN_HEADER: usize = 20;
 /// minimum-reassembly-derived floor would hurt flows that a tunnel this
 /// narrow cannot carry anyway.
 const MSS_FLOOR: u16 = 536;
+/// IPv6 next-header value of ICMPv6, which the pseudo-header checksum covers.
+const ICMPV6_NEXT_HEADER: u8 = 58;
 
 /// Largest TCP payload per segment that fits a `max_inner`-sized IP packet
 /// (IP header + TCP header subtracted; the sender's own TCP options are
@@ -37,8 +39,14 @@ pub fn effective_mss(max_inner: u16, v6: bool) -> u16 {
     max_inner.saturating_sub(hdrs).max(MSS_FLOOR)
 }
 
-/// RFC 1624 incremental internet-checksum update for one 16-bit word.
-fn incremental_checksum_update(ck: u16, old: u16, new: u16) -> u16 {
+/// RFC 1624 equation 3 incremental internet-checksum update for one 16-bit
+/// word: `ck` covers `old`, return the checksum covering `new` instead.
+///
+/// Equation 3 rather than RFC 1141's, which yields -0 (0xFFFF) where the
+/// correct answer is +0: a UDP checksum of 0xFFFF is legal but 0x0000 means
+/// "no checksum", so the two are not interchangeable.
+#[must_use]
+pub fn incremental_checksum_update(ck: u16, old: u16, new: u16) -> u16 {
     let mut sum = u32::from(!ck) + u32::from(!old) + u32::from(new);
     while sum >> 16 != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
@@ -46,9 +54,13 @@ fn incremental_checksum_update(ck: u16, old: u16, new: u16) -> u16 {
     !(sum as u16)
 }
 
-/// Ones-complement internet checksum over `data` (padded with a zero byte
-/// when the length is odd).
-pub(crate) fn internet_checksum(seed: u32, data: &[u8]) -> u16 {
+/// Ones-complement internet checksum (RFC 1071) over `data`, padded with a
+/// zero byte when the length is odd.
+///
+/// `seed` carries any prefix already accumulated, unfolded: a pseudo-header
+/// sum such as [`icmpv6_pseudo_sum`], or 0 for a bare buffer.
+#[must_use]
+pub fn internet_checksum(seed: u32, data: &[u8]) -> u16 {
     let mut sum = seed;
     let mut chunks = data.chunks_exact(2);
     for w in &mut chunks {
@@ -61,6 +73,26 @@ pub(crate) fn internet_checksum(seed: u32, data: &[u8]) -> u16 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
     !(sum as u16)
+}
+
+/// Unfolded ones-complement sum of the IPv6 pseudo-header (RFC 8200 section
+/// 8.1) for an ICMPv6 message of `icmp_len` bytes: the two addresses, the
+/// upper-layer length and next header 58. Feed it to [`internet_checksum`]
+/// as the seed, with the ICMPv6 message as the data.
+///
+/// The 32-bit length occupies two 16-bit words of the pseudo-header; adding
+/// it whole is equivalent because [`internet_checksum`] folds the carries.
+#[must_use]
+pub fn icmpv6_pseudo_sum(src: std::net::Ipv6Addr, dst: std::net::Ipv6Addr, icmp_len: u32) -> u32 {
+    let mut sum: u32 = 0;
+    for w in src
+        .octets()
+        .chunks_exact(2)
+        .chain(dst.octets().chunks_exact(2))
+    {
+        sum += u32::from(u16::from_be_bytes([w[0], w[1]]));
+    }
+    sum + icmp_len + u32::from(ICMPV6_NEXT_HEADER)
 }
 
 /// Locates the TCP header offset of a SYN-flagged, non-fragmented inner
@@ -357,13 +389,7 @@ pub fn build_frag_needed(
             pkt[icmp] = 2;
             pkt[icmp + 4..icmp + 8].copy_from_slice(&u32::from(effective_mtu).to_be_bytes());
             pkt[icmp + 8..icmp + 8 + quote_len].copy_from_slice(&dropped[..quote_len]);
-            // ICMPv6 checksum over the pseudo-header + ICMPv6 message.
-            let mut seed: u32 = 0;
-            for w in pkt[8..40].chunks_exact(2) {
-                seed += u32::from(u16::from_be_bytes([w[0], w[1]]));
-            }
-            seed += icmp_len as u32;
-            seed += 58;
+            let seed = icmpv6_pseudo_sum(gw_v6, src_ip, icmp_len as u32);
             let icmp_ck = internet_checksum(seed, &pkt[icmp..]);
             pkt[icmp + 2..icmp + 4].copy_from_slice(&icmp_ck.to_be_bytes());
             Some(pkt)
