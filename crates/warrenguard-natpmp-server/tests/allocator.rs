@@ -2410,3 +2410,30 @@ fn a_rate_limited_source_stops_reaching_the_deployer_callbacks() {
         "past the rate limit the refusal must cost no registry work at all"
     );
 }
+
+/// A port changing hands across two addresses of one payer is the event an
+/// operator watches to confirm the reconnect refusal is gone, and it is
+/// invisible inside the plain allocation count.
+#[test]
+fn a_reclaim_from_a_departed_peer_is_counted_for_the_operator() {
+    use std::sync::Arc;
+
+    let alloc = Allocator::new();
+    assert!(alloc.set_quota_peers(Arc::new(AliceTenant)));
+    assert!(alloc.set_live_sessions(Arc::new(SessionsOn(vec![ALICE_SECOND_SESSION]))));
+    let now = Instant::now();
+    alloc
+        .allocate_at(ALICE, Proto::Tcp, 52419, 52419, 600, now)
+        .expect("the first session pins its port");
+    assert_eq!(alloc.metrics().reclaimed_from_departed_peer_total, 0);
+
+    alloc
+        .allocate_at(ALICE_SECOND_SESSION, Proto::Tcp, 52419, 52419, 600, now)
+        .expect("the tenant takes its own port back");
+
+    assert_eq!(
+        alloc.metrics().reclaimed_from_departed_peer_total,
+        1,
+        "a cross-address takeover must be visible on its own counter"
+    );
+}

@@ -198,6 +198,7 @@ struct AllocatorCounters {
     rate_limited: AtomicU64,
     exhausted: AtomicU64,
     suggested_in_use: AtomicU64,
+    reclaimed_from_departed_peer: AtomicU64,
 }
 
 /// Snapshot of [`Allocator`] counters. Cheap to copy and stable
@@ -233,6 +234,12 @@ pub struct AllocatorMetrics {
     /// Warren's strict honour-or-error policy these are rejected with
     /// `SuggestedPortInUse` rather than silently reassigned.
     pub suggested_in_use_total: u64,
+    /// Pinned ports taken back by a tenant from another address of its own
+    /// whose session had departed. Counted apart from `allocations_total`
+    /// because it is the only event that moves a port between two addresses,
+    /// and an operator needs it to tell whether reconnects still lose their
+    /// forward.
+    pub reclaimed_from_departed_peer_total: u64,
 }
 
 struct Inner {
@@ -355,6 +362,10 @@ impl Allocator {
             rate_limited_total: self.counters.rate_limited.load(Ordering::Relaxed),
             exhausted_total: self.counters.exhausted.load(Ordering::Relaxed),
             suggested_in_use_total: self.counters.suggested_in_use.load(Ordering::Relaxed),
+            reclaimed_from_departed_peer_total: self
+                .counters
+                .reclaimed_from_departed_peer
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -843,6 +854,9 @@ impl Allocator {
         // exists to serve into `QuotaExceeded`. A reclaim acquires no new port
         // number for the tenant, so counting it is wrong in both directions.
         if reclaim_from_departed_peer {
+            self.counters
+                .reclaimed_from_departed_peer
+                .fetch_add(1, Ordering::Relaxed);
             for slot in [Proto::Tcp, Proto::Udp] {
                 if let Some(removed) = g.active.remove(&(suggested, slot)) {
                     evicted.push(removed);
