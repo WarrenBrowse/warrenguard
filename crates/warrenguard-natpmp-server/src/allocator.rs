@@ -38,6 +38,24 @@ pub trait QuotaPeers: Send + Sync {
     fn peer_addresses(&self, client_ip: Ipv4Addr) -> Vec<Ipv4Addr>;
 }
 
+/// Tells the allocator whether a tunnel address still holds a live session.
+///
+/// The allocator refuses a suggested port held by another address, which is
+/// what stops one client from taking a port another is actively serving. That
+/// same refusal hits a client whose own session died and came back on a new
+/// address, and its pinned port then stays dead for the whole cooldown. A
+/// deployer that already tracks live sessions (it must, to reap orphaned
+/// leases) can answer here, and the allocator then lets a tenant take a port
+/// back from its OWN departed address, never from a live holder.
+///
+/// Shaped like [`QuotaPeers`]: addresses in, a verdict out, no identity
+/// material. Unwired, the allocator cannot tell a departed holder from a live
+/// one and refuses both.
+pub trait LiveSessions: Send + Sync {
+    /// True when `client_ip` currently holds a live tunnel session.
+    fn has_live_session(&self, client_ip: Ipv4Addr) -> bool;
+}
+
 /// Tells the allocator how many ports one client may hold, when that is not
 /// one number for everybody.
 ///
@@ -158,6 +176,10 @@ pub struct Allocator {
     /// Per-client budget, when the deployer sells one. Unset means every
     /// client gets `quota_per_client`.
     port_budget: OnceLock<Arc<dyn PortBudget>>,
+    /// Tells a departed address from a live one, so a tenant may reclaim a
+    /// pinned port from its own dead session. Unset refuses both (see
+    /// [`LiveSessions`]).
+    live_sessions: OnceLock<Arc<dyn LiveSessions>>,
     counters: AllocatorCounters,
 }
 
@@ -276,6 +298,7 @@ impl Allocator {
             quota_per_client: config.quota_per_client,
             quota_peers: OnceLock::new(),
             port_budget: OnceLock::new(),
+            live_sessions: OnceLock::new(),
             counters: AllocatorCounters::default(),
         }
     }
@@ -304,6 +327,17 @@ impl Allocator {
     /// a budget.
     pub fn set_port_budget(&self, budget: Arc<dyn PortBudget>) -> bool {
         self.port_budget.set(budget).is_ok()
+    }
+
+    /// Read liveness from `sessions`, so a tenant may take a pinned port back
+    /// from an address of its own that no longer holds a session. See
+    /// [`LiveSessions`]; unwired, no such reclaim is ever granted.
+    ///
+    /// Wired once, at startup, like [`Self::set_quota_peers`]: a later call is
+    /// ignored and returns `false`, so a second wiring can never widen what a
+    /// client may take.
+    pub fn set_live_sessions(&self, sessions: Arc<dyn LiveSessions>) -> bool {
+        self.live_sessions.set(sessions).is_ok()
     }
 
     /// Snapshot of the monotonic event counters. Useful for ops
@@ -470,7 +504,7 @@ impl Allocator {
         // asks long after the lease lapsed would restart the cooldown clock and
         // be wrongly blocked. A long-dead entry whose cooldown already elapsed
         // adds nothing, so skip it. The owner can still reclaim its own port
-        // via an explicit suggestion (`port_eligible(allow_owner_reclaim=true)`),
+        // via an explicit suggestion (`port_eligible` with a reclaim group),
         // which is exactly the case the cooldown is NOT meant to block. A
         // dual-proto pair expiring together arms once per leg; keep the later
         // deadline.
@@ -508,6 +542,37 @@ impl Allocator {
             !log.is_empty()
         });
 
+        // The addresses that answer for one tenant, resolved once for this
+        // call: what is budgeted per address only bounds a payer through this
+        // grouping, and so does a port one of its own sessions left behind.
+        // The deployer holds the mapping; only addresses come back.
+        let tenant_addresses: HashSet<Ipv4Addr> = match self.quota_peers.get() {
+            Some(peers) => peers
+                .peer_addresses(client_ip)
+                .into_iter()
+                .chain(std::iter::once(client_ip))
+                .collect(),
+            None => std::iter::once(client_ip).collect(),
+        };
+
+        // A suggested port still held by ANOTHER address of the same tenant,
+        // whose session is gone: this is one payer reconnecting onto a new
+        // inner address, and refusing it kept a pinned forward dead for the
+        // whole reaper grace plus cooldown (2026-07-30). Gated on the holder
+        // having NO live session, which is the seam the orphan reaper already
+        // reads, so two live devices of one wallet still cannot take each
+        // other's port. Unwired liveness answers "unknown" and refuses, i.e.
+        // the behaviour every deployer had before.
+        let reclaim_from_departed_peer = suggested != 0
+            && port_owner(&g, suggested).is_some_and(|holder| {
+                holder != client_ip
+                    && tenant_addresses.contains(&holder)
+                    && self
+                        .live_sessions
+                        .get()
+                        .is_some_and(|sessions| !sessions.has_live_session(holder))
+            });
+
         // Strict honouring of an explicit suggestion. RFC 6886 §3.3
         // permits the server to grant a different port, but Warren's UX
         // pins the requested port: the user typed a specific public
@@ -527,20 +592,25 @@ impl Allocator {
         // dual-proto companion) or the same-tuple refresh.
         if suggested != 0 {
             let grantable = port_in_range(suggested, self.range)
-                && port_owner(&g, suggested).is_none_or(|owner| owner == client_ip)
+                && (reclaim_from_departed_peer
+                    || port_owner(&g, suggested).is_none_or(|owner| owner == client_ip))
                 && match g.active.get(&(suggested, proto)) {
                     // Live entry in this exact slot: only the owner's
-                    // same-tuple refresh may re-grant it.
-                    Some(a) => a.internal_ip == client_ip && a.internal_port == internal_port,
+                    // same-tuple refresh, or the tenant taking over its own
+                    // departed address, may re-grant it.
+                    Some(a) => {
+                        reclaim_from_departed_peer
+                            || (a.internal_ip == client_ip && a.internal_port == internal_port)
+                    }
                     // Slot free: fine when the client already owns the
                     // port through the other proto, else the port must
-                    // be fully eligible, allowing the owner to reclaim
+                    // be fully eligible, allowing the tenant to reclaim
                     // its OWN pinned port (the cooldown only guards
                     // against a *different* client inheriting residual
                     // traffic).
                     None => {
                         port_owner(&g, suggested).is_some()
-                            || port_eligible(&g, suggested, client_ip, now, true)
+                            || port_eligible(&g, suggested, client_ip, now, Some(&tenant_addresses))
                     }
                 };
             if !grantable {
@@ -657,6 +727,20 @@ impl Allocator {
         // We deliberately do NOT register a cooldown / anti-rotation
         // entry for the reclaimed port: the same client is the one
         // re-requesting, so penalising it would defeat the refresh.
+        //
+        // Taking a pinned port back from the tenant's own departed address
+        // moves the WHOLE port: ownership is client-level, so leaving the
+        // companion proto on the dead address would split one port between
+        // two owners and leave its DNAT rule pointing at an address nothing
+        // routes to. Those entries ride `evicted` like any other reclaim, and
+        // the backend deletes before it adds.
+        if reclaim_from_departed_peer {
+            for slot in [Proto::Tcp, Proto::Udp] {
+                if let Some(removed) = g.active.remove(&(suggested, slot)) {
+                    evicted.push(removed);
+                }
+            }
+        }
         let stale_same_tuple: Vec<(u16, Proto)> = g
             .active
             .iter()
@@ -693,20 +777,11 @@ impl Allocator {
         // once the client holds `NATPMP_QUOTA_PER_CLIENT_IP` (currently
         // 5) of them.
         // The budget belongs to whoever pays for it, which is the tenant
-        // behind the address, not the address. `peer_addresses` is what the
-        // deployer knows and the allocator does not.
-        let budget_addresses: HashSet<Ipv4Addr> = match self.quota_peers.get() {
-            Some(peers) => peers
-                .peer_addresses(client_ip)
-                .into_iter()
-                .chain(std::iter::once(client_ip))
-                .collect(),
-            None => std::iter::once(client_ip).collect(),
-        };
+        // behind the address, not the address.
         let held_ports: HashSet<u16> = g
             .active
             .iter()
-            .filter(|(_, a)| budget_addresses.contains(&a.internal_ip))
+            .filter(|(_, a)| tenant_addresses.contains(&a.internal_ip))
             .map(|(key, _)| key.0)
             .collect();
         let reuses_held_port = if suggested != 0 {
@@ -1142,31 +1217,33 @@ fn port_owner(g: &Inner, p: u16) -> Option<Ipv4Addr> {
 /// of a port the SAME client already owns is handled by the callers via
 /// [`port_owner`], not here.)
 ///
-/// `allow_owner_reclaim` distinguishes the two call paths:
-/// - `false` (no-preference random pick / refresh reuse): the port's own
+/// `reclaim` distinguishes the two call paths:
+/// - `None` (no-preference random pick / refresh reuse): the port's own
 ///   previous owner is ALSO steered away from its just-released port -
 ///   anti-predictable-rotation when the client expressed no preference.
-/// - `true` (EXPLICIT suggestion): the previous owner may reclaim its
+/// - `Some(tenant)` (EXPLICIT suggestion): the previous owner may reclaim its
 ///   OWN port immediately, bypassing only its own cooldown (a different
-///   client is still blocked). Routing an explicit suggestion through
-///   the `false` path was the bug behind "I pin port X but get a random
-///   port until the next renewal".
+///   tenant is still blocked). Routing an explicit suggestion through
+///   the `None` path was the bug behind "I pin port X but get a random
+///   port until the next renewal". `tenant` holds every address of the
+///   requester, so a client that reconnected onto a new address is not read
+///   as the "different client" the cooldown exists to block.
 fn port_eligible(
     g: &Inner,
     p: u16,
     client_ip: Ipv4Addr,
     now: Instant,
-    allow_owner_reclaim: bool,
+    reclaim: Option<&HashSet<Ipv4Addr>>,
 ) -> bool {
     if g.active.contains_key(&(p, Proto::Tcp)) || g.active.contains_key(&(p, Proto::Udp)) {
         return false;
     }
-    // Owner reclaiming its own recently-released port (explicit
-    // suggestion only): bypass its own cooldown.
-    if allow_owner_reclaim
+    // The tenant reclaiming a port it just released (explicit suggestion
+    // only): bypass its own cooldown.
+    if let Some(tenant) = reclaim
         && g.last_user_per_port
             .get(&p)
-            .is_some_and(|(prev_ip, expiry)| *prev_ip == client_ip && *expiry > now)
+            .is_some_and(|(prev_ip, expiry)| tenant.contains(prev_ip) && *expiry > now)
     {
         return true;
     }
@@ -1209,16 +1286,16 @@ fn pick_port(
     client_ip: Ipv4Addr,
     now: Instant,
 ) -> Option<u16> {
-    // `allow_owner_reclaim = false`: this is the no-preference path
-    // (random pick / refresh reuse), where anti-rotation steers a client
-    // away from its own recently-released port. Explicit suggestions are
-    // handled by the strict pre-check, not here. A port the client still
+    // No reclaim group: this is the no-preference path (random pick /
+    // refresh reuse), where anti-rotation steers a client away from its own
+    // recently-released port. Explicit suggestions are handled by the strict
+    // pre-check, not here. A port the client still
     // owns through the other proto's live leg bypasses `port_eligible`
     // (which requires a fully free port): the renewing leg must not hop
     // ports just because its sibling is mapped.
     if reuse != 0 && port_in_range(reuse, range) && !g.active.contains_key(&(reuse, proto)) {
         let owned_by_client = port_owner(g, reuse).is_some_and(|owner| owner == client_ip);
-        if owned_by_client || port_eligible(g, reuse, client_ip, now, false) {
+        if owned_by_client || port_eligible(g, reuse, client_ip, now, None) {
             return Some(reuse);
         }
     }
@@ -1235,12 +1312,12 @@ fn pick_port(
         // range.0 + offset <= u16::MAX (the addition fits in u32 and
         // the result fits in u16 since it is <= range.1).
         let p = range.0 + u16::try_from(offset).expect("offset < range_size <= 65536");
-        if port_eligible(g, p, client_ip, now, false) {
+        if port_eligible(g, p, client_ip, now, None) {
             return Some(p);
         }
     }
 
     // Linear fallback. Only reached when the pool is full enough that
     // 256 uniform draws hit no free port.
-    (range.0..=range.1).find(|&p| port_eligible(g, p, client_ip, now, false))
+    (range.0..=range.1).find(|&p| port_eligible(g, p, client_ip, now, None))
 }

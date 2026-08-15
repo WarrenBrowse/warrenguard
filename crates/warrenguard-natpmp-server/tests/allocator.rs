@@ -2085,3 +2085,180 @@ fn lazily_expired_port_rejects_foreign_suggestion_during_cooldown() {
         .expect_err("bob must not inherit the just-expired port by suggestion");
     assert!(matches!(err, NatPmpError::SuggestedPortInUse(50000)));
 }
+
+// ---------------------------------------------------------------------------
+// Reclaiming a pinned port from the tenant's own departed address
+// ---------------------------------------------------------------------------
+
+/// Groups ALICE's two session addresses, the way the exit's session registry
+/// answers for one account.
+struct AliceTenant;
+
+impl warrenguard_natpmp_server::allocator::QuotaPeers for AliceTenant {
+    fn peer_addresses(&self, client_ip: Ipv4Addr) -> Vec<Ipv4Addr> {
+        if client_ip == ALICE || client_ip == ALICE_SECOND_SESSION {
+            vec![ALICE, ALICE_SECOND_SESSION]
+        } else {
+            vec![client_ip]
+        }
+    }
+}
+
+/// The live-session view the exit already computes for the orphan reaper.
+struct SessionsOn(Vec<Ipv4Addr>);
+
+impl warrenguard_natpmp_server::allocator::LiveSessions for SessionsOn {
+    fn has_live_session(&self, client_ip: Ipv4Addr) -> bool {
+        self.0.contains(&client_ip)
+    }
+}
+
+/// A reconnect lands the client on a new inner address while its pinned port
+/// is still held by the address the dead session left behind. Refusing that
+/// left the forward down for up to nine minutes with no way back
+/// (2026-07-30, measured again on 2026-08-15). The predecessor holds no live
+/// session, so the port comes back to the same payer, and its stale mapping
+/// is handed to the caller for backend teardown.
+#[test]
+fn a_pinned_port_is_reclaimed_from_the_tenants_own_departed_address() {
+    use std::sync::Arc;
+
+    let alloc = Allocator::new();
+    assert!(alloc.set_quota_peers(Arc::new(AliceTenant)));
+    assert!(alloc.set_live_sessions(Arc::new(SessionsOn(vec![ALICE_SECOND_SESSION]))));
+    let now = Instant::now();
+    let dead = alloc
+        .allocate_at(ALICE, Proto::Tcp, 52419, 52419, 600, now)
+        .expect("the first session pins its port");
+
+    let outcome =
+        alloc.allocate_at_collecting(ALICE_SECOND_SESSION, Proto::Tcp, 52419, 52419, 600, now);
+
+    let granted = outcome.result.expect("the tenant takes its own port back");
+    assert_eq!(granted.external_port, 52419);
+    assert_eq!(granted.internal_ip, ALICE_SECOND_SESSION);
+    assert!(
+        outcome.evicted.contains(&dead),
+        "the predecessor's mapping must be surfaced so its DNAT rule is deleted"
+    );
+    assert_eq!(
+        alloc.active_count(),
+        1,
+        "the port must not end up owned by two addresses at once"
+    );
+}
+
+/// Both proto slots of one port belong to one address, so a takeover that
+/// left the companion leg on the dead predecessor would split the port
+/// between two owners and leave a DNAT rule pointing at a gone address.
+#[test]
+fn reclaiming_a_pinned_port_takes_over_the_companion_proto_too() {
+    use std::sync::Arc;
+
+    let alloc = Allocator::new();
+    assert!(alloc.set_quota_peers(Arc::new(AliceTenant)));
+    assert!(alloc.set_live_sessions(Arc::new(SessionsOn(vec![ALICE_SECOND_SESSION]))));
+    let now = Instant::now();
+    alloc
+        .allocate_at(ALICE, Proto::Tcp, 52419, 52419, 600, now)
+        .expect("the first session pins tcp");
+    let dead_udp = alloc
+        .allocate_at(ALICE, Proto::Udp, 52419, 52419, 600, now)
+        .expect("the first session pins udp");
+
+    let outcome =
+        alloc.allocate_at_collecting(ALICE_SECOND_SESSION, Proto::Tcp, 52419, 52419, 600, now);
+
+    outcome.result.expect("the tenant takes its own port back");
+    assert!(
+        outcome.evicted.contains(&dead_udp),
+        "the companion leg must be torn down with the port it belongs to"
+    );
+    assert_eq!(alloc.active_count(), 1, "only the new tcp leg stays live");
+}
+
+/// The objection that killed identity-keyed ownership in 2026-07-30: two live
+/// devices of one wallet must not steal each other's port. The exemption is
+/// gated on the holder having no live session, so a live holder is still
+/// refused whoever it is.
+#[test]
+fn a_pinned_port_held_by_a_live_session_of_the_same_tenant_stays_refused() {
+    use std::sync::Arc;
+
+    let alloc = Allocator::new();
+    assert!(alloc.set_quota_peers(Arc::new(AliceTenant)));
+    assert!(alloc.set_live_sessions(Arc::new(SessionsOn(vec![ALICE, ALICE_SECOND_SESSION]))));
+    let now = Instant::now();
+    let held = alloc
+        .allocate_at(ALICE, Proto::Tcp, 52419, 52419, 600, now)
+        .expect("the first device pins its port");
+
+    let res = alloc.allocate_at(ALICE_SECOND_SESSION, Proto::Tcp, 52419, 52419, 600, now);
+
+    assert!(
+        matches!(res, Err(NatPmpError::SuggestedPortInUse(p)) if p == 52419),
+        "a live holder keeps its port, same tenant or not, got {res:?}"
+    );
+    assert_eq!(
+        alloc.snapshot_active(),
+        vec![held],
+        "the refusal must leave the holder's mapping untouched"
+    );
+}
+
+/// The grouping never merges two tenants: a stranger's port stays refused
+/// even once the stranger is gone, which is the whole point of the per-port
+/// ownership check.
+#[test]
+fn a_pinned_port_held_by_a_departed_stranger_stays_refused() {
+    use std::sync::Arc;
+
+    let alloc = Allocator::new();
+    assert!(alloc.set_quota_peers(Arc::new(AliceTenant)));
+    assert!(alloc.set_live_sessions(Arc::new(SessionsOn(vec![ALICE]))));
+    let now = Instant::now();
+    alloc
+        .allocate_at(BOB, Proto::Tcp, 52419, 52419, 600, now)
+        .expect("bob pins the port first");
+
+    let res = alloc.allocate_at(ALICE, Proto::Tcp, 52419, 52419, 600, now);
+
+    assert!(
+        matches!(res, Err(NatPmpError::SuggestedPortInUse(p)) if p == 52419),
+        "another tenant's port is never grantable, dead holder or not, got {res:?}"
+    );
+}
+
+/// The post-release cooldown exists to keep a port away from a DIFFERENT
+/// client while residual inbound traffic may still arrive. The tenant's own
+/// next address is not a different client, so the port its predecessor just
+/// released is pinnable straight away, with no live-session view needed:
+/// nobody holds the port at all.
+#[test]
+fn the_post_release_cooldown_does_not_block_the_tenants_own_next_address() {
+    use std::sync::Arc;
+
+    let alloc = Allocator::new();
+    assert!(alloc.set_quota_peers(Arc::new(AliceTenant)));
+    let now = Instant::now();
+    alloc
+        .allocate_at(ALICE, Proto::Tcp, 52419, 52419, 600, now)
+        .expect("the first session pins its port");
+    alloc
+        .release_by_client_at(ALICE, 52419, Proto::Tcp, now)
+        .expect("the first session releases it");
+
+    let granted = alloc
+        .allocate_at(
+            ALICE_SECOND_SESSION,
+            Proto::Tcp,
+            52419,
+            52419,
+            600,
+            now + Duration::from_secs(60),
+        )
+        .expect("the same payer pins the port it just released");
+
+    assert_eq!(granted.external_port, 52419);
+    assert_eq!(granted.internal_ip, ALICE_SECOND_SESSION);
+}
