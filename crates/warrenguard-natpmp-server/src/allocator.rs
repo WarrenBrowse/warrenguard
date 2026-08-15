@@ -33,6 +33,11 @@ use crate::{Allocation, NatPmpError, Proto};
 ///
 /// Deliberately shaped as addresses in, addresses out: no identity material
 /// enters the engine, and the allocator cannot log or leak one.
+///
+/// The callback runs while the allocator holds its own internal lock, so an
+/// implementation must not call back into the [`Allocator`] and must not block
+/// on a lock that a caller of `allocate*` may already hold. Either deadlocks
+/// the exit's whole port-forward path.
 pub trait QuotaPeers: Send + Sync {
     /// Every address that shares `client_ip`'s port budget, `client_ip`
     /// included. An unknown address answers with just itself.
@@ -52,8 +57,21 @@ pub trait QuotaPeers: Send + Sync {
 /// Shaped like [`QuotaPeers`]: addresses in, a verdict out, no identity
 /// material. Unwired, the allocator cannot tell a departed holder from a live
 /// one and refuses both.
+///
+/// Like [`QuotaPeers`], the callback runs under the allocator's internal lock:
+/// never call back into the [`Allocator`], never block on a lock a caller of
+/// `allocate*` may hold.
 pub trait LiveSessions: Send + Sync {
     /// True when `client_ip` currently holds a live tunnel session.
+    ///
+    /// **Answer true whenever you are not certain the session is gone.** The
+    /// whole anti-theft property rests on this verdict: a false negative hands
+    /// one device's port to another device of the same account, and a device
+    /// that is merely between two datagrams looks gone to anything that is not
+    /// the exit's own liveness view. Feed it from the same view the deployer's
+    /// orphan reaper diffs against (in warrenguard, the live downlink routes
+    /// `warrenguard_multihop_server::ActiveTunnelIpv4s` exposes), so a port is
+    /// only ever reclaimed once that reaper would also have reclaimed it.
     fn has_live_session(&self, client_ip: Ipv4Addr) -> bool;
 }
 
@@ -1296,6 +1314,15 @@ fn port_owner(g: &Inner, p: u16) -> Option<Ipv4Addr> {
 /// still receive residual inbound traffic. (Granting the free proto slot
 /// of a port the SAME client already owns is handled by the callers via
 /// [`port_owner`], not here.)
+///
+/// "Different client" is read at the TENANT level, not the address level: a
+/// payer that reconnects onto a new inner address, or that runs a second
+/// device, bypasses the cooldown on a port one of its own addresses just
+/// released. The pinned-port UX is worth it (the alternative is a forward
+/// that stays dead for five minutes after every reconnect), and the traffic
+/// that can cross is residual inbound aimed at a port the same subscription
+/// gave up seconds earlier. A different tenant is still blocked, which is the
+/// case the cooldown was written for.
 ///
 /// `reclaim` distinguishes the two call paths:
 /// - `None` (no-preference random pick / refresh reuse): the port's own
