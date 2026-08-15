@@ -96,11 +96,31 @@ pub fn parse_getdnsservers(out: &str) -> DnsConfig {
             ips.push(ip);
         }
     }
-    if ips.is_empty() {
+    if ips.is_empty() || is_resolver_override(&ips) {
         DnsConfig::Dhcp
     } else {
         DnsConfig::Manual(ips)
     }
+}
+
+/// Whether a captured server list is a VPN daemon's own resolver override
+/// rather than a configuration that belongs to the user.
+///
+/// A tunnel resolver binds a non-canonical address in `127/8` and answers only
+/// while the daemon that bound it is alive. Restoring such a list on uninstall
+/// points the service at an address nothing listens on, which costs the host
+/// every name lookup: `networksetup` writes a *manual* override, so no reboot,
+/// network change or DHCP lease ever clears it. Reporting DHCP instead restores
+/// what the user had before any VPN touched the service, and a daemon still
+/// running re-applies its own override from its store watcher.
+///
+/// The canonical `127.0.0.1` is spared: that is where a user-run resolver
+/// (dnscrypt-proxy, Pi-hole) listens, and no tunnel resolver binds it.
+fn is_resolver_override(ips: &[Ipv4Addr]) -> bool {
+    !ips.is_empty()
+        && ips
+            .iter()
+            .all(|ip| ip.is_loopback() && *ip != Ipv4Addr::LOCALHOST)
 }
 
 /// Build the `networksetup -setdnsservers <service> <ip1> <ip2> ...`
@@ -375,6 +395,44 @@ Bluetooth PAN
         // caller. The DHCP fallback here is the safer choice.
         assert_eq!(parse_getdnsservers(""), DnsConfig::Dhcp);
         assert_eq!(parse_getdnsservers("   \n\n  "), DnsConfig::Dhcp);
+    }
+
+    #[test]
+    fn parse_getdnsservers_reads_a_resolver_override_as_dhcp() {
+        // A service pointing only at a non-canonical loopback address is
+        // carrying some VPN daemon's resolver override, not a DNS
+        // configuration anyone can restore: that address answers only
+        // while the daemon that bound it lives. Capturing it as the
+        // original is how uninstall strands the host with no name
+        // resolution at all, since a manual override survives every
+        // reboot and DHCP lease. Round-trip to DHCP instead.
+        assert_eq!(parse_getdnsservers("127.55.251.5\n"), DnsConfig::Dhcp);
+        assert_eq!(
+            parse_getdnsservers("127.30.203.97\n127.41.79.67\n"),
+            DnsConfig::Dhcp
+        );
+    }
+
+    #[test]
+    fn parse_getdnsservers_keeps_canonical_localhost() {
+        // A user-run resolver (dnscrypt-proxy, Pi-hole) binds 127.0.0.1,
+        // and no VPN resolver ever does. That is a real configuration and
+        // must round-trip verbatim.
+        assert_eq!(
+            parse_getdnsservers("127.0.0.1\n"),
+            DnsConfig::Manual(vec![ip("127.0.0.1")])
+        );
+    }
+
+    #[test]
+    fn parse_getdnsservers_keeps_a_list_mixing_loopback_and_real_servers() {
+        // Only an all-loopback list is a resolver override. A list that
+        // also names a reachable server is a deliberate configuration and
+        // is restored as it was found.
+        assert_eq!(
+            parse_getdnsservers("127.55.251.5\n1.1.1.1\n"),
+            DnsConfig::Manual(vec![ip("127.55.251.5"), ip("1.1.1.1")])
+        );
     }
 
     #[test]
