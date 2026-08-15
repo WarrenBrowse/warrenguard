@@ -31,8 +31,9 @@ use zeroize::Zeroizing;
 #[non_exhaustive]
 pub enum MnemonicError {
     /// Invalid BIP39 mnemonic (unexpected length, unknown word, bad
-    /// checksum, etc.).
-    #[error("invalid BIP39 mnemonic: {0}")]
+    /// checksum, etc.). The bip39 reason is attached as the source, never
+    /// interpolated, so a chained render prints it once.
+    #[error("invalid BIP39 mnemonic")]
     Invalid(#[from] bip39::Error),
 }
 
@@ -47,7 +48,7 @@ pub enum MnemonicLoadError {
     /// The file exists but does not contain a valid BIP39 mnemonic.
     /// We refuse to overwrite: it could be another valid mnemonic in
     /// a different encoding / language / for another project.
-    #[error("file does not contain a valid BIP39 mnemonic: {0}")]
+    #[error("file does not contain a valid BIP39 mnemonic")]
     InvalidContent(#[from] MnemonicError),
 }
 
@@ -278,6 +279,49 @@ pub fn derive_node_key(seed: &[u8; 32]) -> SigningKey {
 #[cfg(all(test, feature = "bip39"))]
 mod tests {
     use super::*;
+
+    /// A caller that renders the whole chain (anyhow's `{:#}`, a source walk)
+    /// must not read the BIP39 reason twice, so the source is attached and
+    /// never interpolated.
+    #[test]
+    fn mnemonic_error_attaches_its_source_without_rendering_it() {
+        use std::error::Error;
+
+        let err = seed_from_mnemonic("not a mnemonic at all").expect_err("rejected phrase");
+        let source = err
+            .source()
+            .expect("the bip39 error stays reachable")
+            .to_string();
+
+        assert!(!source.is_empty(), "the bip39 error carries the reason");
+        assert!(
+            !err.to_string().contains(&source),
+            "the source is rendered twice: {err}"
+        );
+    }
+
+    /// Same contract one level up: the on-disk loader wraps
+    /// [`MnemonicError`], whose own message is now constant, so repeating it
+    /// would say nothing and read as a stutter.
+    #[test]
+    fn invalid_file_content_error_attaches_its_source_without_rendering_it() {
+        use std::error::Error;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("warren.mnemonic");
+        std::fs::write(&path, "not a mnemonic at all").expect("write the file");
+
+        let err = load_or_create_mnemonic(&path).expect_err("rejected file");
+        let source = err
+            .source()
+            .expect("the mnemonic error stays reachable")
+            .to_string();
+
+        assert!(
+            !err.to_string().contains(&source),
+            "the source is rendered twice: {err}"
+        );
+    }
 
     /// Vector test: same seed → same key. Extend with an official
     /// vector once the exact mnemonic format is frozen.
