@@ -2437,3 +2437,46 @@ fn a_reclaim_from_a_departed_peer_is_counted_for_the_operator() {
         "a cross-address takeover must be visible on its own counter"
     );
 }
+
+/// The whole seam rests on refusing when it cannot tell a departed holder
+/// from a live one: a deployer that never wires liveness must keep the
+/// pre-seam behaviour, or an unwired exit would hand one device's port to
+/// another address of the same account.
+#[test]
+fn unwired_liveness_refuses_a_departed_holder_of_the_same_tenant() {
+    use std::sync::Arc;
+
+    let alloc = Allocator::new();
+    assert!(alloc.set_quota_peers(Arc::new(AliceTenant)));
+    let now = Instant::now();
+    let held = alloc
+        .allocate_at(ALICE, Proto::Tcp, 52419, 52419, 600, now)
+        .expect("the first session pins its port");
+
+    let res = alloc.allocate_at(ALICE_SECOND_SESSION, Proto::Tcp, 52419, 52419, 600, now);
+
+    assert!(
+        matches!(res, Err(NatPmpError::SuggestedPortInUse(p)) if p == 52419),
+        "no liveness view means no reclaim, got {res:?}"
+    );
+    assert_eq!(
+        alloc.snapshot_active(),
+        vec![held],
+        "the refusal must leave the holder's mapping untouched"
+    );
+}
+
+/// Rewiring liveness would let a later caller widen what every client may
+/// take by answering "departed" for addresses that are live, so only the
+/// first wiring counts.
+#[test]
+fn liveness_wiring_refuses_to_be_rewired() {
+    use std::sync::Arc;
+
+    let alloc = Allocator::new();
+    assert!(alloc.set_live_sessions(Arc::new(SessionsOn(vec![ALICE]))));
+    assert!(
+        !alloc.set_live_sessions(Arc::new(SessionsOn(vec![]))),
+        "a second wiring must be refused, not silently applied"
+    );
+}
