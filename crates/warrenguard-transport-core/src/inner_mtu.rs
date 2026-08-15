@@ -59,6 +59,15 @@ pub fn incremental_checksum_update(ck: u16, old: u16, new: u16) -> u16 {
 ///
 /// `seed` carries any prefix already accumulated, unfolded: a pseudo-header
 /// sum such as [`icmpv6_pseudo_sum`], or 0 for a bare buffer.
+///
+/// # Panics
+///
+/// Contracted for one IP packet at a time: `data` no longer than 65535 bytes,
+/// with a `seed` produced by [`icmpv6_pseudo_sum`] under its own bound. The
+/// 16-bit words accumulate in a `u32` folded once at the end, which covers
+/// that domain with room to spare and overflows past roughly 128 KB of data:
+/// a debug build panics there, a release build wraps and returns a wrong
+/// checksum. Fold in chunks if you need to checksum more than one packet.
 #[must_use]
 pub fn internet_checksum(seed: u32, data: &[u8]) -> u16 {
     let mut sum = seed;
@@ -82,6 +91,14 @@ pub fn internet_checksum(seed: u32, data: &[u8]) -> u16 {
 ///
 /// The 32-bit length occupies two 16-bit words of the pseudo-header; adding
 /// it whole is equivalent because [`internet_checksum`] folds the carries.
+///
+/// # Panics
+///
+/// Contracted for an RFC 8200 upper-layer length, so `icmp_len` at most
+/// 0xFFFF for a non-jumbogram. The addresses contribute at most 0x000F_FFF0
+/// to the unfolded `u32`, so a length within a few words of `u32::MAX`
+/// overflows it: a debug build panics there, a release build wraps and yields
+/// a wrong seed.
 #[must_use]
 pub fn icmpv6_pseudo_sum(src: std::net::Ipv6Addr, dst: std::net::Ipv6Addr, icmp_len: u32) -> u32 {
     let mut sum: u32 = 0;

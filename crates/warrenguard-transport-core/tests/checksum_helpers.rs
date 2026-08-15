@@ -49,3 +49,34 @@ fn icmpv6_pseudo_sum_checksums_a_known_echo_request() {
     msg[2..4].copy_from_slice(&checksum.to_be_bytes());
     assert_eq!(internet_checksum(seed, &msg), 0);
 }
+
+/// The published bound of both helpers is one IP packet: 65535 bytes of data
+/// and a non-jumbogram upper-layer length. The words accumulate in a `u32`
+/// folded once at the end, so that bound is what keeps the accumulator in
+/// range, and an external packet rewriter has no other way to know it. All
+/// octets 0xFF is the worst case for it.
+#[test]
+fn the_helpers_cover_a_full_size_ip_packet_without_overflowing() {
+    let src: Ipv6Addr = "fdcc:f:1::1".parse().expect("literal address");
+    let dst: Ipv6Addr = "2001:db8::1".parse().expect("literal address");
+    let packet = vec![0xFFu8; 65535];
+
+    let seed = icmpv6_pseudo_sum(src, dst, 0xFFFF);
+    let checksum = internet_checksum(seed, &packet);
+
+    // Independent oracle: the same ones-complement sum in an accumulator wide
+    // enough that the bound cannot matter.
+    let mut wide = u64::from(seed);
+    let mut chunks = packet.chunks_exact(2);
+    for w in &mut chunks {
+        wide += u64::from(u16::from_be_bytes([w[0], w[1]]));
+    }
+    if let [last] = chunks.remainder() {
+        wide += u64::from(u16::from_be_bytes([*last, 0]));
+    }
+    while wide >> 16 != 0 {
+        wide = (wide & 0xffff) + (wide >> 16);
+    }
+    let expected = !u16::try_from(wide).expect("the fold leaves at most 16 bits");
+    assert_eq!(checksum, expected);
+}
