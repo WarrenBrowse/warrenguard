@@ -3,6 +3,7 @@
 //!
 //! **No disk persistence**: reboot = full reset, by design no-log.
 
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -542,36 +543,27 @@ impl Allocator {
             !log.is_empty()
         });
 
-        // The addresses that answer for one tenant, resolved once for this
-        // call: what is budgeted per address only bounds a payer through this
-        // grouping, and so does a port one of its own sessions left behind.
-        // The deployer holds the mapping; only addresses come back.
-        let tenant_addresses: HashSet<Ipv4Addr> = match self.quota_peers.get() {
-            Some(peers) => peers
-                .peer_addresses(client_ip)
-                .into_iter()
-                .chain(std::iter::once(client_ip))
-                .collect(),
-            None => std::iter::once(client_ip).collect(),
+        // The addresses that answer for one tenant: what is budgeted per
+        // address only bounds a payer through this grouping, and so does a
+        // port one of its own sessions left behind. The deployer holds the
+        // mapping; only addresses come back.
+        //
+        // Resolved at most once per call, and only on the branches that need
+        // it: the answer costs the deployer a scan of its live sessions, and
+        // the requests that reach this function most often are the ones that
+        // need no grouping at all (a plain allocation, and the rejected
+        // suggestion that is a probe of another client's port).
+        let tenant_cell: OnceCell<HashSet<Ipv4Addr>> = OnceCell::new();
+        let tenant_addresses = || {
+            tenant_cell.get_or_init(|| match self.quota_peers.get() {
+                Some(peers) => peers
+                    .peer_addresses(client_ip)
+                    .into_iter()
+                    .chain(std::iter::once(client_ip))
+                    .collect(),
+                None => std::iter::once(client_ip).collect(),
+            })
         };
-
-        // A suggested port still held by ANOTHER address of the same tenant,
-        // whose session is gone: this is one payer reconnecting onto a new
-        // inner address, and refusing it kept a pinned forward dead for the
-        // whole reaper grace plus cooldown (2026-07-30). Gated on the holder
-        // having NO live session, which is the seam the orphan reaper already
-        // reads, so two live devices of one wallet still cannot take each
-        // other's port. Unwired liveness answers "unknown" and refuses, i.e.
-        // the behaviour every deployer had before.
-        let reclaim_from_departed_peer = suggested != 0
-            && port_owner(&g, suggested).is_some_and(|holder| {
-                holder != client_ip
-                    && tenant_addresses.contains(&holder)
-                    && self
-                        .live_sessions
-                        .get()
-                        .is_some_and(|sessions| !sessions.has_live_session(holder))
-            });
 
         // Strict honouring of an explicit suggestion. RFC 6886 §3.3
         // permits the server to grant a different port, but Warren's UX
@@ -590,29 +582,74 @@ impl Allocator {
         // client is never grantable, whatever the proto; a port
         // live-held by THIS client grants its free proto slot (the
         // dual-proto companion) or the same-tuple refresh.
+        let mut reclaim_from_departed_peer = false;
         if suggested != 0 {
-            let grantable = port_in_range(suggested, self.range)
-                && (reclaim_from_departed_peer
-                    || port_owner(&g, suggested).is_none_or(|owner| owner == client_ip))
+            // Everything decidable from the allocator's own maps, so the
+            // ordinary request never pays for a deployer callback.
+            let owner_allows = port_owner(&g, suggested).is_none_or(|owner| owner == client_ip);
+            let cheap_grantable = port_in_range(suggested, self.range)
+                && owner_allows
                 && match g.active.get(&(suggested, proto)) {
                     // Live entry in this exact slot: only the owner's
-                    // same-tuple refresh, or the tenant taking over its own
-                    // departed address, may re-grant it.
-                    Some(a) => {
-                        reclaim_from_departed_peer
-                            || (a.internal_ip == client_ip && a.internal_port == internal_port)
-                    }
+                    // same-tuple refresh may re-grant it.
+                    Some(a) => a.internal_ip == client_ip && a.internal_port == internal_port,
                     // Slot free: fine when the client already owns the
                     // port through the other proto, else the port must
                     // be fully eligible, allowing the tenant to reclaim
                     // its OWN pinned port (the cooldown only guards
                     // against a *different* client inheriting residual
-                    // traffic).
+                    // traffic). The tenant grouping is asked for only when
+                    // this port actually carries a live previous-user entry,
+                    // since that is the only clause it can change.
                     None => {
-                        port_owner(&g, suggested).is_some()
-                            || port_eligible(&g, suggested, client_ip, now, Some(&tenant_addresses))
+                        port_owner(&g, suggested).is_some() || {
+                            let group = g
+                                .last_user_per_port
+                                .get(&suggested)
+                                .is_some_and(|(_, expiry)| *expiry > now)
+                                .then(tenant_addresses);
+                            port_eligible(&g, suggested, client_ip, now, group)
+                        }
                     }
                 };
+
+            // A suggested port still held by ANOTHER address of the same
+            // tenant, whose session is gone: this is one payer reconnecting
+            // onto a new inner address, and refusing it kept a pinned forward
+            // dead for the whole reaper grace plus cooldown (2026-07-30).
+            // Gated on the holder having NO live session, so two live devices
+            // of one wallet still cannot take each other's port. Unwired
+            // liveness answers "unknown" and refuses, i.e. the behaviour every
+            // deployer had before.
+            //
+            // Both verdicts it needs are deployer callbacks that scan live
+            // sessions, and the request that reaches them is exactly the one
+            // an attacker replays to enumerate other tenants' ports. So the
+            // per-source budget is read first (not consumed): a source out of
+            // budget is refused below with `RateLimited` having cost the
+            // deployer nothing, which is what keeps the limiter in front of
+            // that work instead of behind it.
+            if !cheap_grantable
+                && port_in_range(suggested, self.range)
+                && let Some(holder) = port_owner(&g, suggested)
+                && holder != client_ip
+                && let Some(sessions) = self.live_sessions.get()
+                && within_rate_budget(
+                    &mut g,
+                    client_ip,
+                    now,
+                    self.rate_limit_window,
+                    self.rate_limit_max,
+                )
+            {
+                reclaim_from_departed_peer =
+                    !sessions.has_live_session(holder) && tenant_addresses().contains(&holder);
+            }
+
+            // A reclaimed port is actively allocated, hence in range, and its
+            // holder is another address: the two clauses `cheap_grantable`
+            // failed on are exactly the ones the reclaim overrides.
+            let grantable = cheap_grantable || reclaim_from_departed_peer;
             if !grantable {
                 // Throttle the suggested-port occupancy oracle: a rejected
                 // suggestion from a NON-owner (the owner's own refresh hits
@@ -765,12 +802,14 @@ impl Allocator {
         // 5) of them.
         // The budget belongs to whoever pays for it, which is the tenant
         // behind the address, not the address.
-        let held_ports: HashSet<u16> = g
-            .active
-            .iter()
-            .filter(|(_, a)| tenant_addresses.contains(&a.internal_ip))
-            .map(|(key, _)| key.0)
-            .collect();
+        let held_ports: HashSet<u16> = {
+            let tenant = tenant_addresses();
+            g.active
+                .iter()
+                .filter(|(_, a)| tenant.contains(&a.internal_ip))
+                .map(|(key, _)| key.0)
+                .collect()
+        };
         let reuses_held_port = if suggested != 0 {
             held_ports.contains(&suggested)
         } else {
@@ -1188,6 +1227,24 @@ impl Default for Allocator {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Whether `client_ip` still has a slot in its sliding rate-limit window,
+/// trimming the window on the way. Reads the budget WITHOUT consuming it: the
+/// caller uses it to decide whether a refusal may pay for a deployer callback,
+/// and the one place that charges a slot does so on its own.
+fn within_rate_budget(
+    g: &mut Inner,
+    client_ip: Ipv4Addr,
+    now: Instant,
+    window: Duration,
+    max: usize,
+) -> bool {
+    let log = g.rate_limit_log.entry(client_ip).or_default();
+    while log.front().is_some_and(|t| now.duration_since(*t) > window) {
+        log.pop_front();
+    }
+    log.len() < max
 }
 
 /// Clamps `requested_secs` to `[NATPMP_LIFETIME_MIN_SECS,

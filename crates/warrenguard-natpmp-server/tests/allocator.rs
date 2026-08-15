@@ -2311,3 +2311,102 @@ fn a_reclaim_is_quota_free_for_a_tenant_already_at_its_budget() {
         "the tenant keeps the port it never gave up plus the reclaimed one"
     );
 }
+
+/// The tenant grouping is a deployer callback that scans live sessions. A
+/// suggestion for a port another client holds is the probe the rate limiter
+/// exists to throttle, so it must not buy that scan: with no liveness view
+/// wired no reclaim can ever be granted, and the refusal must reach the
+/// registry not at all.
+#[test]
+fn a_refused_probe_of_another_clients_port_costs_no_tenant_lookup() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use warrenguard_natpmp_server::allocator::QuotaPeers;
+
+    struct CountingPeers(AtomicUsize);
+    impl QuotaPeers for CountingPeers {
+        fn peer_addresses(&self, client_ip: Ipv4Addr) -> Vec<Ipv4Addr> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            vec![client_ip]
+        }
+    }
+
+    let peers = Arc::new(CountingPeers(AtomicUsize::new(0)));
+    let alloc = Allocator::new();
+    assert!(alloc.set_quota_peers(peers.clone()));
+    let now = Instant::now();
+    alloc
+        .allocate_at(BOB, Proto::Tcp, 52419, 52419, 600, now)
+        .expect("bob pins the port first");
+    let before = peers.0.load(Ordering::Relaxed);
+
+    let res = alloc.allocate_at(ALICE, Proto::Tcp, 52419, 52419, 600, now);
+
+    assert!(
+        matches!(res, Err(NatPmpError::SuggestedPortInUse(p)) if p == 52419),
+        "a live holder's port stays refused, got {res:?}"
+    );
+    assert_eq!(
+        peers.0.load(Ordering::Relaxed),
+        before,
+        "a probe of another client's port must not reach the session registry"
+    );
+}
+
+/// The registry scan the reclaim needs sits behind the per-source rate limit,
+/// so a source that spends its budget probing cannot keep buying scans: past
+/// the limit the refusal is decided without asking the deployer anything.
+#[test]
+fn a_rate_limited_source_stops_reaching_the_deployer_callbacks() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use warrenguard_config::NATPMP_RATE_LIMIT_MAX_PER_WINDOW;
+    use warrenguard_natpmp_server::allocator::QuotaPeers;
+
+    struct CountingPeers(AtomicUsize);
+    impl QuotaPeers for CountingPeers {
+        fn peer_addresses(&self, client_ip: Ipv4Addr) -> Vec<Ipv4Addr> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            vec![client_ip]
+        }
+    }
+
+    let peers = Arc::new(CountingPeers(AtomicUsize::new(0)));
+    let alloc = Allocator::new();
+    assert!(alloc.set_quota_peers(peers.clone()));
+    // A departed holder, so the reclaim branch runs all the way to the
+    // grouping on every probe that still has budget.
+    assert!(alloc.set_live_sessions(Arc::new(SessionsOn(vec![ALICE]))));
+    let now = Instant::now();
+    alloc
+        .allocate_at(BOB, Proto::Tcp, 52419, 52419, 600, now)
+        .expect("bob pins the port first");
+    let before = peers.0.load(Ordering::Relaxed);
+
+    for _ in 0..NATPMP_RATE_LIMIT_MAX_PER_WINDOW {
+        let res = alloc.allocate_at(ALICE, Proto::Tcp, 52419, 52419, 600, now);
+        assert!(
+            matches!(res, Err(NatPmpError::SuggestedPortInUse(p)) if p == 52419),
+            "another tenant's port is never grantable, got {res:?}"
+        );
+    }
+    let spent = peers.0.load(Ordering::Relaxed);
+
+    for _ in 0..50 {
+        let res = alloc.allocate_at(ALICE, Proto::Tcp, 52419, 52419, 600, now);
+        assert!(
+            matches!(res, Err(NatPmpError::RateLimited { .. })),
+            "the source is out of budget, got {res:?}"
+        );
+    }
+
+    assert!(
+        spent > before,
+        "the in-budget probes did reach the registry"
+    );
+    assert_eq!(
+        peers.0.load(Ordering::Relaxed),
+        spent,
+        "past the rate limit the refusal must cost no registry work at all"
+    );
+}
