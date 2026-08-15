@@ -207,11 +207,20 @@ impl AsyncUdpSocket for TcpCarrierSocket {
                     count += 1;
                 }
                 // The stream closed (EOF or a dead task): the tunnel is gone.
-                // Surface it as a reset so quinn tears the connection down
-                // (fail-closed) rather than spinning on an empty socket.
+                // Surface it as a broken pipe so quinn tears the endpoint down
+                // (fail-closed) rather than spinning on a dead socket.
+                //
+                // The error kind is load-bearing, and `ConnectionReset` is the
+                // one kind that must never be used here: quinn's endpoint
+                // driver ignores it by design ("undefined in QUIC and may be
+                // injected by an attacker") and `continue`s its receive loop
+                // without registering a waker, skipping even the `recv_limiter`
+                // fairness break. A closed channel returns `Ready(None)`
+                // forever, so that loop never yields again: one abandoned
+                // carrier burns a whole core, silently, until the daemon exits.
                 Poll::Ready(None) => {
                     if count == 0 {
-                        return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
+                        return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
                     }
                     break;
                 }
@@ -419,11 +428,21 @@ mod tests {
         ([IoSliceMut::new(buf)], [RecvMeta::default()])
     }
 
-    /// The far end closing (EOF on the wire) must surface as a
-    /// `ConnectionReset`, not a `Pending` that spins quinn forever on a dead
-    /// tunnel: this is the fail-closed teardown path.
+    /// The far end closing (EOF on the wire) must surface as an error quinn
+    /// treats as FATAL, never `ConnectionReset`.
+    ///
+    /// quinn's endpoint driver deliberately swallows `ConnectionReset`
+    /// (`quinn/src/endpoint.rs`: "Ignore ECONNRESET as it's undefined in QUIC
+    /// and may be injected by an attacker") and `continue`s its receive loop,
+    /// skipping even the `recv_limiter` fairness break. On a real UDP socket
+    /// that is right, because the next poll yields a datagram or `Pending`. Our
+    /// inbound channel, once closed, returns `Ready(None)` forever, so
+    /// `ConnectionReset` makes that loop spin on a dead carrier at 100 % of a
+    /// core, silently and permanently. `BrokenPipe` reaches quinn's
+    /// `return Err(e)` arm and tears the endpoint down, which is what the
+    /// fail-closed teardown needs.
     #[tokio::test]
-    async fn poll_recv_surfaces_connection_reset_when_the_far_end_closes() {
+    async fn poll_recv_surfaces_a_fatal_error_when_the_far_end_closes() {
         let (carrier, observer) = tokio::io::duplex(64 * 1024);
         let socket = TcpCarrierSocket::new(carrier, peer());
         drop(observer); // the peer is gone: the reader task sees EOF
@@ -436,8 +455,36 @@ mod tests {
         )
         .await
         .expect("poll_recv must not hang on a closed carrier");
-        let err = result.expect_err("a closed carrier must surface as a reset, not a success");
-        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+        let err = result.expect_err("a closed carrier must surface as an error, not a success");
+        assert_ne!(
+            err.kind(),
+            io::ErrorKind::ConnectionReset,
+            "quinn ignores ConnectionReset and re-polls, which spins forever on a dead carrier"
+        );
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    /// The dead carrier stays dead: every later poll must keep reporting the
+    /// same fatal error. A single fatal poll followed by anything else would
+    /// let quinn's driver resume its loop.
+    #[tokio::test]
+    async fn poll_recv_keeps_reporting_the_fatal_error_on_every_later_poll() {
+        let (carrier, observer) = tokio::io::duplex(64 * 1024);
+        let socket = TcpCarrierSocket::new(carrier, peer());
+        drop(observer);
+
+        let mut buf = [0u8; 16];
+        let (mut bufs, mut meta) = one_buf(&mut buf);
+        for poll in 0..3 {
+            let err = tokio::time::timeout(
+                Duration::from_secs(2),
+                std::future::poll_fn(|cx| socket.poll_recv(cx, &mut bufs, &mut meta)),
+            )
+            .await
+            .expect("poll_recv must not hang on a closed carrier")
+            .expect_err("a closed carrier never becomes readable again");
+            assert_eq!(err.kind(), io::ErrorKind::BrokenPipe, "poll {poll}");
+        }
     }
 
     /// An inbound datagram bigger than the caller's buffer must be dropped
