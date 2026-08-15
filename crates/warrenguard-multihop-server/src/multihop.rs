@@ -2846,14 +2846,37 @@ impl ClosableConn for Connection {
     }
 }
 
+/// Worst case before a deployer's orphan reaper frees the NAT-PMP lease a
+/// departed client left behind (a 30 s grace polled every 10 s in the
+/// reference deployment). The port's post-release cooldown starts there, not
+/// at the departure, which is why the retention below has to cover both.
+const ORPHAN_LEASE_RECLAIM_WORST_CASE_SECS: u64 = 40;
+
 /// How long a departed client's tunnel-IP attribution is retained past its last
-/// connection. It must outlast the orphan reaper's worst-case reclaim of the
-/// NAT-PMP lease that same client leaves behind on this exit (cf.
-/// `warren-exit::natpmp_orphan_reaper`: grace 30s + check interval 10s), so the
-/// lingering lease is still attributed to its real owner instead of flipping to
-/// `unknown` on the old exit for the window right after a change. Bounded, so
+/// connection.
+///
+/// It bounds two things. The admin port-forward view, where the lingering
+/// lease must stay attributed to its real owner instead of flipping to
+/// `unknown` for the window right after an exit change. And, since
+/// [`MultihopSessionRegistry::addresses_sharing_owner`] is what tells the
+/// NAT-PMP allocator which addresses answer for one payer, the window in which
+/// a payer that reconnects onto a new inner address can take its own pinned
+/// port back.
+///
+/// The second one is the binding constraint, and it is far longer than the
+/// first: the reaper's release arms a `NATPMP_PORT_COOLDOWN_SECS` cooldown on
+/// the port, and only this grouping lifts it, so a retention that expires
+/// first leaves the payer refused for the rest of the cooldown. Bounded, so
 /// client churn cannot grow the map without end.
-const DEPARTED_ATTRIBUTION_RETENTION: Duration = Duration::from_secs(60);
+const DEPARTED_ATTRIBUTION_RETENTION: Duration = Duration::from_secs(360);
+
+// The reclaim window this grouping now gates must outlast what it has to lift.
+// Shortening the retention for the admin view alone would silently reintroduce
+// the reconnect refusal, with nothing to say so.
+const _: () = assert!(
+    DEPARTED_ATTRIBUTION_RETENTION.as_secs()
+        > ORPHAN_LEASE_RECLAIM_WORST_CASE_SECS + warrenguard_config::NATPMP_PORT_COOLDOWN_SECS
+);
 
 /// One tunnel-IP attribution entry for the admin port-forward view.
 struct Ipv4Owner {
@@ -2985,7 +3008,18 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
     /// occupies the account's budget.
     #[must_use]
     pub fn addresses_sharing_owner(&self, ip: Ipv4Addr) -> Vec<Ipv4Addr> {
-        let map = self.ipv4_to_pubkey.lock();
+        self.addresses_sharing_owner_at(ip, Instant::now())
+    }
+
+    /// `now`-injected core of [`Self::addresses_sharing_owner`]. It sweeps the
+    /// elapsed tombstones like the admin snapshot does, so the map is bounded
+    /// by the retention even for a deployer that reads the grouping and never
+    /// opens the admin view, and so the reclaim window is the retention rather
+    /// than "the retention plus however long until someone looks".
+    #[must_use]
+    fn addresses_sharing_owner_at(&self, ip: Ipv4Addr, now: Instant) -> Vec<Ipv4Addr> {
+        let mut map = self.ipv4_to_pubkey.lock();
+        map.retain(|_, owner| owner.departed_deadline.is_none_or(|d| now < d));
         let Some(owner) = map.get(&ip).map(|o| o.pubkey) else {
             return vec![ip];
         };
@@ -5094,6 +5128,64 @@ mod tests {
         let registry: MultihopSessionRegistry<FakeConn> = MultihopSessionRegistry::default();
         let unknown = Ipv4Addr::new(10, 66, 0, 9);
         assert_eq!(registry.addresses_sharing_owner(unknown), vec![unknown]);
+    }
+
+    /// The allocator reads this grouping to decide whether a pinned port
+    /// belongs to the tenant asking for it, and the refusal it lifts outlasts
+    /// the reaper: releasing the orphan lease arms a `NATPMP_PORT_COOLDOWN_SECS`
+    /// cooldown on that port which only the grouping can bypass. A retention
+    /// that expires first leaves the payer refused for the rest of the
+    /// cooldown, which is the reconnect this whole path exists to serve (a
+    /// laptop that slept, a long outage, a slow redial).
+    #[test]
+    fn registry_group_outlives_the_port_cooldown_it_gates() {
+        let registry: MultihopSessionRegistry<FakeConn> = MultihopSessionRegistry::default();
+        let departed = Ipv4Addr::new(10, 66, 0, 5);
+        let reconnected = Ipv4Addr::new(10, 66, 0, 6);
+        registry.register(reg_pk(1), 100, FakeConn::new());
+        registry.record_assigned_ipv4(departed, reg_pk(1));
+        registry.unregister(&reg_pk(1), 100);
+        let departure = Instant::now();
+
+        registry.register(reg_pk(1), 101, FakeConn::new());
+        registry.record_assigned_ipv4(reconnected, reg_pk(1));
+
+        let after_cooldown = departure
+            + Duration::from_secs(
+                ORPHAN_LEASE_RECLAIM_WORST_CASE_SECS
+                    + warrenguard_config::NATPMP_PORT_COOLDOWN_SECS,
+            );
+        let mut group = registry.addresses_sharing_owner_at(reconnected, after_cooldown);
+        group.sort();
+        assert_eq!(
+            group,
+            vec![departed, reconnected],
+            "the payer must still reach its own pinned port for the whole cooldown"
+        );
+    }
+
+    /// The grouping is what the map is swept by on the NAT-PMP path, so a
+    /// deployer that never opens the admin view still cannot grow it without
+    /// end: past the retention a departed address is gone from the group.
+    #[test]
+    fn registry_group_drops_a_departed_address_once_its_retention_elapses() {
+        let registry: MultihopSessionRegistry<FakeConn> = MultihopSessionRegistry::default();
+        let departed = Ipv4Addr::new(10, 66, 0, 5);
+        let reconnected = Ipv4Addr::new(10, 66, 0, 6);
+        registry.register(reg_pk(1), 100, FakeConn::new());
+        registry.record_assigned_ipv4(departed, reg_pk(1));
+        registry.unregister(&reg_pk(1), 100);
+        let departure = Instant::now();
+        registry.register(reg_pk(1), 101, FakeConn::new());
+        registry.record_assigned_ipv4(reconnected, reg_pk(1));
+
+        let expired = departure + DEPARTED_ATTRIBUTION_RETENTION + Duration::from_secs(1);
+
+        assert_eq!(
+            registry.addresses_sharing_owner_at(reconnected, expired),
+            vec![reconnected],
+            "the tombstone must be swept by the path that reads the group"
+        );
     }
 
     #[test]
