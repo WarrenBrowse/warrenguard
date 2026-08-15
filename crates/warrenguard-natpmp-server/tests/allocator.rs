@@ -2480,3 +2480,48 @@ fn liveness_wiring_refuses_to_be_rewired() {
         "a second wiring must be refused, not silently applied"
     );
 }
+
+/// A renewal drops the client's own live mapping before the quota is counted,
+/// so the port it is renewing is invisible in that count. When the budget the
+/// deployer answers with is smaller than what is held (it counts what THIS
+/// address presented, while the count is tenant-wide), the renewal is refused
+/// and the mapping is already gone: the client loses the forward it was only
+/// trying to keep, on a request it will repeat every renewal cycle. A renewal
+/// acquires no new port number, so it is quota-free whatever the budget says.
+#[test]
+fn a_renewal_is_quota_free_when_the_budget_is_smaller_than_what_is_held() {
+    use std::sync::Arc;
+    use warrenguard_natpmp_server::allocator::PortBudget;
+
+    struct OnePort;
+    impl PortBudget for OnePort {
+        fn budget_for(&self, _client_ip: Ipv4Addr) -> Option<usize> {
+            Some(1)
+        }
+    }
+
+    let alloc = Allocator::new();
+    let now = Instant::now();
+    alloc
+        .allocate_at(ALICE, Proto::Tcp, 4242, 49300, 600, now)
+        .expect("the first port is pinned before the budget shrinks");
+    alloc
+        .allocate_at(ALICE, Proto::Tcp, 4243, 49301, 600, now)
+        .expect("and a second one");
+    assert!(alloc.set_port_budget(Arc::new(OnePort)));
+
+    let outcome = alloc.allocate_at_collecting(ALICE, Proto::Tcp, 4242, 0, 600, now);
+
+    let granted = outcome
+        .result
+        .expect("a renewal adds no port number, so the budget cannot refuse it");
+    assert_eq!(
+        granted.external_port, 49300,
+        "the renewal must keep the public port the service is reachable on"
+    );
+    assert_eq!(
+        alloc.active_count(),
+        2,
+        "the client must not lose the mapping it was renewing"
+    );
+}

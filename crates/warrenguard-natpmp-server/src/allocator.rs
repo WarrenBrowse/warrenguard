@@ -839,10 +839,19 @@ impl Allocator {
                 .map(|(key, _)| key.0)
                 .collect()
         };
+        // A request landing on a port the tenant already held before this call
+        // acquires none, so it is quota-free: the dual-proto companion
+        // suggestion, and the renewal whose own mapping this call dropped a
+        // few lines above, which is exactly why `held_ports` no longer shows
+        // it. Reading only `held_ports` missed that second case, so a renewal
+        // failed with `QuotaExceeded` whenever the answered budget was
+        // smaller than what the tenant holds, having already dropped the
+        // mapping it was renewing: the client lost the forward on the request
+        // meant to keep it, every cycle.
         let reuses_held_port = if suggested != 0 {
-            held_ports.contains(&suggested)
+            held_ports.contains(&suggested) || previously_held == Some(suggested)
         } else {
-            previously_held.is_some_and(|p| held_ports.contains(&p))
+            previously_held.is_some()
         };
         let budget = self
             .port_budget
