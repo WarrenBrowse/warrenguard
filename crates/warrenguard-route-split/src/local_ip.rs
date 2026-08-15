@@ -7,6 +7,11 @@
 //! host has both Ethernet and Wi-Fi up and the routing table would
 //! otherwise pick the wrong default).
 //!
+//! The same lookup, run with the datapath's carrier bypass installed
+//! ([`detect_local_ip_with_bypass`]), is also how a caller tells a carrier
+//! that escaped the tunnel from one being routed back into it: the escape
+//! itself leaves no trace a sender can read.
+//!
 //! ## Mechanism
 //!
 //! Create a `UdpSocket` bound on the unspecified address of the
@@ -29,12 +34,49 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV
 /// to the destination exists (e.g. IPv6-only host asked for an IPv4
 /// outbound).
 pub fn detect_default_local_ip(exit_addr: SocketAddr) -> io::Result<SocketAddr> {
-    let bind: SocketAddr = match exit_addr {
+    detect_local_ip_with_bypass(exit_addr, None)
+}
+
+/// [`detect_default_local_ip`] with the datapath's own carrier bypass
+/// installed on the probe socket first.
+///
+/// # Why (a black-holed carrier is not observable any other way)
+///
+/// The carrier socket's escape from the tunnel it carries (an `IP_BOUND_IF`
+/// bind on macOS, a fwmark on Linux, `IP_UNICAST_IF` on Windows) leaves no
+/// trace a sender can read: `sendmsg` returns `Ok` whether the packet left the
+/// NIC or was swallowed by a route pointing back into the tunnel, and the QUIC
+/// stack's own counters climb either way. UDP `connect` performs the same route
+/// lookup the send would and emits nothing; `local_addr` then reports the
+/// source address the kernel picked for it. Comparing that source against the
+/// tunnel's own address answers the question a dead carrier poses and that no
+/// counter can: did the escape hold, or is the carrier being routed into the
+/// tunnel it carries.
+///
+/// Faithful to the routing decision, not to the socket: the datapath's carrier
+/// is a wildcard-bound socket that re-derives its source per send, so this
+/// probes the lookup rather than replaying that socket's history.
+///
+/// # Errors
+///
+/// The bind at [`UdpSocket::bind`] or the route lookup at `connect` (typically
+/// no route to the destination), plus, when `bypass` is `Some`, its install:
+/// **a bypass the kernel refuses fails the probe** rather than reporting an
+/// unbypassed source, because a source measured without the bypass answers a
+/// different question than the caller asked.
+pub fn detect_local_ip_with_bypass(
+    dest: SocketAddr,
+    bypass: Option<warrenguard_tun_core::SocketBypass>,
+) -> io::Result<SocketAddr> {
+    let bind: SocketAddr = match dest {
         SocketAddr::V4(_) => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
         SocketAddr::V6(_) => SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0)),
     };
     let sock = UdpSocket::bind(bind)?;
-    sock.connect(exit_addr)?;
+    if let Some(bypass) = bypass {
+        warrenguard_socket_bypass::apply(&sock, bypass)?;
+    }
+    sock.connect(dest)?;
     let mut local = sock.local_addr()?;
     local.set_port(0);
     Ok(local)
@@ -207,6 +249,43 @@ mod tests {
     fn for_any_empty_input_errors() {
         let err = detect_default_local_ip_for_any(std::iter::empty()).expect_err("empty must err");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// A `None` bypass must probe exactly what the plain helper probes:
+    /// same source, same family, same stripped port. This is what lets a
+    /// caller run the pair (bypassed, unbypassed) and read the DIFFERENCE
+    /// as the effect of the bypass rather than of two unrelated code paths.
+    #[test]
+    fn a_none_bypass_probes_exactly_what_the_plain_helper_probes() {
+        let target = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7001));
+        assert_eq!(
+            detect_local_ip_with_bypass(target, None).expect("loopback v4 reachable"),
+            detect_default_local_ip(target).expect("loopback v4 reachable"),
+        );
+    }
+
+    /// A bypass that cannot be installed must FAIL the probe, never report a
+    /// source. Reporting one would answer the unbypassed question while the
+    /// caller reads it as the bypassed one, which is the exact confusion the
+    /// probe exists to remove.
+    ///
+    /// macOS only: `IP_BOUND_IF` is the bypass whose install can be refused by
+    /// the kernel on a bad index. The Linux fwmark needs `CAP_NET_ADMIN`, so it
+    /// would fail here for a reason unrelated to the property under test.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_bypass_the_kernel_refuses_fails_the_probe_instead_of_reporting_a_source() {
+        let target = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7002));
+        let err = detect_local_ip_with_bypass(
+            target,
+            Some(warrenguard_tun_core::SocketBypass::BoundIf(u32::MAX)),
+        )
+        .expect_err("an interface index that cannot exist must fail the bind");
+        assert_ne!(
+            err.kind(),
+            io::ErrorKind::AddrNotAvailable,
+            "the failure must come from the refused bind, not from address selection"
+        );
     }
 
     /// `pins_a_specific_interface`: `0.0.0.0` and `[::]` must return

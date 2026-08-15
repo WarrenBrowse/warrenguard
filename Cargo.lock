@@ -3768,6 +3768,7 @@ dependencies = [
  "tokio",
  "tracing",
  "warrenguard-killswitch-os",
+ "warrenguard-socket-bypass",
  "warrenguard-tun-core",
  "warrenguard-winroute",
  "warrenguard-wire",

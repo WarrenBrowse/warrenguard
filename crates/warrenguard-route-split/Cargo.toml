@@ -18,6 +18,10 @@ warrenguard-killswitch-os = { path = "../warrenguard-killswitch-os" }
 # routes send the marked carrier socket out `main` instead of pinning the exit
 # IP by a /32 host route (Port Fail / TunnelCrack ServerIP fix). Zero-dep crate.
 warrenguard-tun-core = { path = "../warrenguard-tun-core" }
+# `detect_local_ip_with_bypass` installs the same per-OS carrier bypass the
+# datapath uses before probing the route, so the probe answers the question the
+# carrier socket actually poses rather than the unbypassed one.
+warrenguard-socket-bypass = { path = "../warrenguard-socket-bypass" }
 warrenguard-wire = { path = "../warrenguard-wire" }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
