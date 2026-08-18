@@ -52,12 +52,13 @@ use warrenguard_pump::DAITA_DUMMY_FIRST_BYTE;
 use warrenguard_ratelimit::{RateOverride, RatePolicyHandle, RateSpec};
 use warrenguard_server::{AllowlistHandle, SessionTokenAdmitter};
 use warrenguard_transport_core::PacketDevice;
+use warrenguard_transport_core::ip_parse::TunnelPool;
 use warrenguard_wire::WarrenPubkey;
 
 use crate::datapath::{
-    DOWNLINK_CHANNEL_BOUND, DaitaSink, FLOW_TABLE_CAP_PER_IP, FlowNoter, RateLimited, RxReport,
-    SpoofGate, TunWrite, TunWriter, TxReport, UplinkKind, canonical_flow_key, clamp_uplink_syn,
-    classify_uplink, dst_ipv4, next_sealable, send_sealed, src_ipv4,
+    DOWNLINK_CHANNEL_BOUND, DaitaSink, FLOW_TABLE_CAP_PER_IP, FlowNoter, PoolGate, RateLimited,
+    RxReport, SpoofGate, TunWrite, TunWriter, TxReport, UplinkKind, canonical_flow_key,
+    clamp_uplink_syn, classify_uplink, dst_ipv4, next_sealable, send_sealed, src_ipv4,
 };
 use crate::ip_pool::{ConnId, IpAllocator, IpAllocatorV6, SessionIntent, SessionIntentV6};
 use crate::metrics::EvictReason;
@@ -3762,6 +3763,24 @@ pub async fn terminate_connection<T>(
     }
 }
 
+/// The pool the exit allocates from, as the destination gate needs it. Read
+/// from the allocators themselves rather than from a constant, so a deployer
+/// running the engine on its own subnet gets its own pool policy and the
+/// engine carries no address literal.
+fn tunnel_pool(v4: &Arc<Mutex<IpAllocator>>, v6: Option<&Arc<Mutex<IpAllocatorV6>>>) -> TunnelPool {
+    let pool = {
+        let alloc = v4.lock();
+        TunnelPool::new(alloc.network(), alloc.prefix_len(), alloc.gateway())
+    };
+    match v6 {
+        None => pool,
+        Some(alloc6) => {
+            let alloc6 = alloc6.lock();
+            pool.with_v6(alloc6.network(), alloc6.gateway())
+        }
+    }
+}
+
 /// Attach this connection's inbound-activity counter to its freshly
 /// registered downlink route(s), and if it took over an inner IP already
 /// held by other connection(s) (a sticky reconnect or a same-pubkey
@@ -3989,6 +4008,11 @@ async fn serve_terminating_connection<T>(
     else {
         return;
     };
+    // The pool this exit hands addresses out of, read once here and carried
+    // by value into both pumps: the destination gate must cost no lock on
+    // the datapath.
+    let pool = tunnel_pool(&ip_allocator, ip_allocator_v6.as_ref());
+
     // When compiled without `pq-hpke`, `SetupOutcome` has only the `V1`
     // variant, so this reads as a single-arm destructure; the `V2` arm exists
     // only under the feature.
@@ -4013,6 +4037,7 @@ async fn serve_terminating_connection<T>(
                     pq,
                     reverse_seq,
                     rate,
+                    pool,
                 )
                 .await;
             }
@@ -4073,6 +4098,7 @@ async fn serve_terminating_connection<T>(
     let rate_rx = rate.clone();
     let mut tun_writer = TunWriter::new(tun.clone(), LABEL);
     let mut spoof_gate = SpoofGate::new(assigned_ip, assigned_ip_v6, LABEL);
+    let mut pool_gate = PoolGate::new(pool, LABEL);
     let rx_task = tokio::spawn(async move {
         let mut report = RxReport::new(LABEL);
         let mut flows = FlowNoter::new();
@@ -4168,6 +4194,16 @@ async fn serve_terminating_connection<T>(
                 }
             }
             if !spoof_gate.admits(&plaintext) {
+                report.maybe_emit(spoof_gate.tally());
+                continue;
+            }
+            // Inner-destination policy: an uplink packet addressed into the
+            // exit's own client pool never reaches the TUN, whatever the
+            // node's firewall does with it. Placed with the anti-spoof gate
+            // and ahead of the flow noter, so a refused packet also never
+            // claims a downlink route.
+            if !pool_gate.admits(&plaintext) {
+                report.pool_drops = pool_gate.drops();
                 report.maybe_emit(spoof_gate.tally());
                 continue;
             }
@@ -4354,6 +4390,7 @@ async fn serve_pq_datagram_pump<T>(
     // (epoch 0, seq 0)"; ordinary clients just lose one datagram).
     reverse_seq: Arc<AtomicU64>,
     rate: Option<(SessionRatePolicy, SessionRateKey)>,
+    pool: TunnelPool,
 ) where
     T: PacketDevice + Clone,
 {
@@ -4394,6 +4431,7 @@ async fn serve_pq_datagram_pump<T>(
     let rate_rx = rate.clone();
     let mut tun_writer = TunWriter::new(tun.clone(), LABEL);
     let mut spoof_gate = SpoofGate::new(assigned_ip, assigned_ip_v6, LABEL);
+    let mut pool_gate = PoolGate::new(pool, LABEL);
     let rx_task = tokio::spawn(async move {
         let mut report = RxReport::new(LABEL);
         let mut flows = FlowNoter::new();
@@ -4487,6 +4525,16 @@ async fn serve_pq_datagram_pump<T>(
                 }
             }
             if !spoof_gate.admits(&plaintext) {
+                report.maybe_emit(spoof_gate.tally());
+                continue;
+            }
+            // Inner-destination policy: an uplink packet addressed into the
+            // exit's own client pool never reaches the TUN, whatever the
+            // node's firewall does with it. Placed with the anti-spoof gate
+            // and ahead of the flow noter, so a refused packet also never
+            // claims a downlink route.
+            if !pool_gate.admits(&plaintext) {
+                report.pool_drops = pool_gate.drops();
                 report.maybe_emit(spoof_gate.tally());
                 continue;
             }

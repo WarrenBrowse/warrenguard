@@ -22,7 +22,9 @@ use quinn::{Connection, DatagramClass, SendDatagramError};
 use warrenguard_daita::daita::{DaitaEvent, DaitaMetrics, DaitaState};
 use warrenguard_pump::is_daita_dummy;
 use warrenguard_transport_core::PacketDevice;
-use warrenguard_transport_core::ip_parse::{SpoofRefusal, classify_source};
+use warrenguard_transport_core::ip_parse::{
+    PoolRefusal, SpoofRefusal, TunnelPool, classify_destination, classify_source,
+};
 use warrenguard_transport_core::{build_frag_needed, clamp_syn_mss, is_tcp_syn};
 
 /// Bound on each connection's downlink channel. Full ⇒ the router drops
@@ -537,6 +539,72 @@ impl SpoofGate {
     }
 }
 
+/// Inner-destination policy gate: a decrypted uplink packet may not be
+/// addressed into the exit's own client pool, the gateway address excepted.
+///
+/// Defence in depth above the exit's nftables rule, which is what actually
+/// forwards or drops a tunnel-to-tunnel packet. The kernel rule was missing
+/// for months and nothing on our side of the wire noticed, because nothing
+/// on our side looked at the destination at all
+/// (`incidents/2026-08-16-two-sessions-on-one-exit-reach-each-other-s-pool-addresses.md`).
+/// With this gate armed, an exit whose ruleset is wrong, missing or replaced
+/// still keeps two sessions off one L3 segment, and the refusal is counted
+/// where an operator can see it rather than being invisible in a firewall
+/// counter nobody scrapes.
+///
+/// No-log discipline: the refusal CLASS, the packet length and a count are
+/// reported. Neither the destination that failed the policy nor the pool it
+/// fell in ever is.
+pub struct PoolGate {
+    pub(crate) pool: TunnelPool,
+    pub(crate) drops: u64,
+    /// One rate limiter per class, same rationale as [`SpoofGate`]: a
+    /// shared one hides every class behind the first that fires.
+    pub(crate) logs: [RateLimited; 2],
+    pub(crate) label: &'static str,
+}
+
+impl PoolGate {
+    /// Arm the gate on the pool this exit allocates its clients from.
+    #[must_use]
+    pub fn new(pool: TunnelPool, label: &'static str) -> Self {
+        Self {
+            pool,
+            drops: 0,
+            logs: [const { RateLimited::new(10_000) }; 2],
+            label,
+        }
+    }
+
+    /// `false` when the packet must be dropped, counting the refusal.
+    pub fn admits(&mut self, plaintext: &[u8]) -> bool {
+        let Some(refusal) = classify_destination(plaintext, &self.pool) else {
+            return true;
+        };
+        self.drops += 1;
+        let (class, slot) = match refusal {
+            PoolRefusal::V4Peer => ("v4_peer", 0),
+            PoolRefusal::V6Peer => ("v6_peer", 1),
+        };
+        if self.logs[slot].hit() {
+            tracing::warn!(
+                refusal = class,
+                len = plaintext.len(),
+                drops = self.drops,
+                pump = self.label,
+                "rx_task: dropped an uplink packet addressed into the exit's own client pool"
+            );
+        }
+        false
+    }
+
+    /// Every refusal this gate has counted: the quantity the node-wide
+    /// `pool_destination` series carries.
+    pub(crate) const fn drops(&self) -> u64 {
+        self.drops
+    }
+}
+
 /// Lock-free per-connection memo of the flows already announced to the
 /// downlink router. The owner of a flow is set once (first-writer-wins), so
 /// the router lock is only ever taken on a flow's FIRST uplink packet, never
@@ -601,6 +669,11 @@ pub(crate) struct RxCounters {
     /// log, this side owns the accounting). Its total is the `spoofed_source`
     /// drop reason, so the classes sum to that series by construction.
     pub(crate) spoof: SpoofTally,
+    /// Refused by the destination gate: addressed into the exit's own
+    /// client pool. Its own reason rather than a spoof class, because a
+    /// client claiming an address it was not given and a client aiming at
+    /// a neighbour are different facts.
+    pub(crate) pool_drops: u64,
     pub(crate) rate_drops: u64,
     /// The TUN write itself failed and swallowed the packet.
     pub(crate) tun_write_errs: u64,
@@ -627,6 +700,7 @@ pub(crate) struct RxReport {
     pub(crate) control_frames: u64,
     pub(crate) to_tun: u64,
     pub(crate) replays: u64,
+    pub(crate) pool_drops: u64,
     pub(crate) rate_drops: u64,
     pub(crate) tun_write_errs: u64,
     /// What this pump has already folded into the node-wide block, so a
@@ -653,6 +727,7 @@ impl RxReport {
             control_frames: 0,
             to_tun: 0,
             replays: 0,
+            pool_drops: 0,
             rate_drops: 0,
             tun_write_errs: 0,
             published: RxCounters::default(),
@@ -675,6 +750,7 @@ impl RxReport {
             control_frames: self.control_frames,
             dummies: self.dummies,
             spoof: self.spoof,
+            pool_drops: self.pool_drops,
             rate_drops: self.rate_drops,
             tun_write_errs: self.tun_write_errs,
         }
@@ -716,6 +792,7 @@ impl RxReport {
             control_frames = self.control_frames,
             to_tun = self.to_tun,
             replays = self.replays,
+            pool_drops = self.pool_drops,
             rate_drops = self.rate_drops,
             tun_write_errs = self.tun_write_errs,
             spoofed_drops = spoof.total(),
@@ -768,6 +845,7 @@ impl Drop for RxReport {
                 session_errs = self.session_errs,
                 open_errs = self.open_errs,
                 replays = self.replays,
+                pool_drops = self.pool_drops,
                 rate_drops = self.rate_drops,
                 tun_write_errs = self.tun_write_errs,
                 dummies = self.dummies,
@@ -1183,6 +1261,61 @@ pub(crate) mod tests {
             "the classes must account for every refusal, or the breakdown \
              would not sum to the spoofed_source series it refines"
         );
+    }
+
+    /// The pool every synthetic client in these tests is allocated from,
+    /// matching the fleet's `10.66.0.0/16` with its gateway at `.1`.
+    fn test_pool() -> TunnelPool {
+        TunnelPool::new(Ipv4Addr::new(10, 66, 0, 0), 16, Ipv4Addr::new(10, 66, 0, 1))
+    }
+
+    #[test]
+    fn the_pool_gate_refuses_a_packet_aimed_at_a_neighbour_and_counts_it() {
+        // The defect of 2026-08-16: one session addressing another
+        // session's assigned tunnel address on the same exit. The kernel
+        // rule drops it now; this gate is the same policy above the
+        // firewall, so an exit whose ruleset is wrong still holds.
+        let mut gate = PoolGate::new(test_pool(), "test");
+        let pkt = ipv4_tcp_full(
+            Ipv4Addr::new(10, 66, 3, 7),
+            Ipv4Addr::new(10, 66, 9, 12),
+            51_000,
+            22,
+        );
+        assert!(!gate.admits(&pkt));
+        assert_eq!(gate.drops(), 1, "a refusal must be counted");
+    }
+
+    #[test]
+    fn the_pool_gate_lets_the_gateway_through_at_every_port() {
+        // The resolver answers on :53 there and the NAT-PMP server on
+        // :5351, so an exception scoped to one port black-holes every port
+        // mapping a client asks for.
+        let mut gate = PoolGate::new(test_pool(), "test");
+        let client = Ipv4Addr::new(10, 66, 3, 7);
+        let gw = Ipv4Addr::new(10, 66, 0, 1);
+        assert!(gate.admits(&ipv4_tcp_full(client, gw, 51_000, 53)));
+        assert!(gate.admits(&ipv4_tcp_full(client, gw, 51_001, 5351)));
+        assert_eq!(gate.drops(), 0);
+    }
+
+    #[test]
+    fn the_pool_gate_leaves_internet_bound_traffic_alone() {
+        let mut gate = PoolGate::new(test_pool(), "test");
+        let pkt = ipv4_tcp_full(Ipv4Addr::new(10, 66, 3, 7), PEER, 51_000, 443);
+        assert!(gate.admits(&pkt));
+        assert_eq!(
+            gate.drops(),
+            0,
+            "the gate must cost the ordinary datapath nothing"
+        );
+    }
+
+    #[test]
+    fn the_pool_gate_admits_cover_traffic_which_carries_no_destination() {
+        let mut gate = PoolGate::new(test_pool(), "test");
+        let dummy = vec![warrenguard_pump::DAITA_DUMMY_FIRST_BYTE; 1280];
+        assert!(gate.admits(&dummy));
     }
 
     #[test]

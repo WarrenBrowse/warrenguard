@@ -50,11 +50,17 @@ pub struct UplinkMetrics {
     dropped_control_frame: AtomicU64,
     dropped_daita_dummy: AtomicU64,
     dropped_spoofed_source: AtomicU64,
+    /// Refused by the inner-destination policy: addressed into the exit's
+    /// own client pool. Its own reason, never merged into
+    /// `spoofed_source`: one is a client claiming an address it was not
+    /// given, the other a client aiming at a neighbour it must not reach,
+    /// and an operator responds differently to each.
+    dropped_pool_destination: AtomicU64,
     dropped_rate_limit: AtomicU64,
     dropped_tun_write: AtomicU64,
     /// Refinement of `dropped_spoofed_source`, in [`crate::datapath::SpoofTally::CLASSES`]
     /// order. Kept a separate series rather than five more `reason` values
-    /// so the closed ten-reason set, and the invariant that it sums to
+    /// so the closed reason set, and the invariant that it sums to
     /// `received - forwarded`, both stay exactly as they are.
     spoofed_by_class: [AtomicU64; 5],
 }
@@ -96,6 +102,7 @@ impl UplinkMetrics {
             dropped_control_frame: AtomicU64::new(0),
             dropped_daita_dummy: AtomicU64::new(0),
             dropped_spoofed_source: AtomicU64::new(0),
+            dropped_pool_destination: AtomicU64::new(0),
             dropped_rate_limit: AtomicU64::new(0),
             dropped_tun_write: AtomicU64::new(0),
             spoofed_by_class: [const { AtomicU64::new(0) }; 5],
@@ -154,6 +161,11 @@ impl UplinkMetrics {
             add(slot, now_classes[i], published_classes[i]);
         }
         add(
+            &self.dropped_pool_destination,
+            now.pool_drops,
+            published.pool_drops,
+        );
+        add(
             &self.dropped_rate_limit,
             now.rate_drops,
             published.rate_drops,
@@ -182,6 +194,7 @@ impl UplinkMetrics {
             dropped_control_frame: self.dropped_control_frame.load(Ordering::Relaxed),
             dropped_daita_dummy: self.dropped_daita_dummy.load(Ordering::Relaxed),
             dropped_spoofed_source: self.dropped_spoofed_source.load(Ordering::Relaxed),
+            dropped_pool_destination: self.dropped_pool_destination.load(Ordering::Relaxed),
             dropped_rate_limit: self.dropped_rate_limit.load(Ordering::Relaxed),
             dropped_tun_write: self.dropped_tun_write.load(Ordering::Relaxed),
             spoofed_by_class: std::array::from_fn(|i| {
@@ -467,6 +480,9 @@ pub struct UplinkSnapshot {
     /// The inner source address was not the one this connection was
     /// assigned: the anti-spoof gate refused it.
     pub dropped_spoofed_source: u64,
+    /// Addressed into the exit's own client pool, at anything but the
+    /// gateway: the inner-destination policy refused it.
+    pub dropped_pool_destination: u64,
     /// Over the session's uplink budget.
     pub dropped_rate_limit: u64,
     /// The TUN write itself failed (kernel queue pressure, device gone).
@@ -493,7 +509,7 @@ impl UplinkSnapshot {
     /// cannot drift from the gates that produce the counts, and the array
     /// is exhaustive: the counts sum to [`Self::dropped`].
     #[must_use]
-    pub const fn dropped_by_reason(&self) -> [(&'static str, u64); 10] {
+    pub const fn dropped_by_reason(&self) -> [(&'static str, u64); 11] {
         [
             ("decode", self.dropped_decode),
             ("exit_id", self.dropped_exit_id),
@@ -503,6 +519,7 @@ impl UplinkSnapshot {
             ("control_frame", self.dropped_control_frame),
             ("daita_dummy", self.dropped_daita_dummy),
             ("spoofed_source", self.dropped_spoofed_source),
+            ("pool_destination", self.dropped_pool_destination),
             ("rate_limit", self.dropped_rate_limit),
             ("tun_write", self.dropped_tun_write),
         ]
@@ -555,6 +572,7 @@ mod tests {
                 v6_unallocated: 1,
                 v6_mismatch: 1,
             },
+            pool_drops: 11,
             rate_drops: 9,
             tun_write_errs: 10,
         }
@@ -577,6 +595,7 @@ mod tests {
         assert_eq!(s.dropped_control_frame, 6);
         assert_eq!(s.dropped_daita_dummy, 7);
         assert_eq!(s.dropped_spoofed_source, 8);
+        assert_eq!(s.dropped_pool_destination, 11);
         assert_eq!(s.dropped_rate_limit, 9);
         assert_eq!(s.dropped_tun_write, 10);
     }
@@ -588,7 +607,7 @@ mod tests {
         // one reason. A gate added without a counter breaks this.
         let m = UplinkMetrics::new();
         let now = RxCounters {
-            datagrams: 55,
+            datagrams: 66,
             to_tun: 0,
             ..distinct()
         };

@@ -153,9 +153,222 @@ pub fn extract_dst_ipv6(pkt: &[u8]) -> Option<Ipv6Addr> {
     Some(Ipv6Addr::from(octets))
 }
 
+/// The inner subnet an exit allocates its clients from, and the gateway
+/// address inside it. Carried by value into a pump, so the destination gate
+/// reads no lock and no allocator on the datapath.
+///
+/// Generic on purpose: the engine holds no Warren address literal. A
+/// deployer's own pool is whatever its allocator was built with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TunnelPool {
+    v4_network: Ipv4Addr,
+    v4_prefix_len: u8,
+    v4_gateway: Ipv4Addr,
+    /// `/64` prefix and its gateway, on a dual-stack exit.
+    v6: Option<(Ipv6Addr, Ipv6Addr)>,
+}
+
+impl TunnelPool {
+    /// The v4 half, which every exit has: the network the allocator hands
+    /// addresses out of, its prefix length, and the gateway address the
+    /// exit-side TUN owns.
+    #[must_use]
+    pub const fn new(v4_network: Ipv4Addr, v4_prefix_len: u8, v4_gateway: Ipv4Addr) -> Self {
+        Self {
+            v4_network,
+            v4_prefix_len,
+            v4_gateway,
+            v6: None,
+        }
+    }
+
+    /// Add the `/64` half of a dual-stack exit.
+    #[must_use]
+    pub const fn with_v6(mut self, network: Ipv6Addr, gateway: Ipv6Addr) -> Self {
+        self.v6 = Some((network, gateway));
+        self
+    }
+
+    /// `true` when `addr` is inside the v4 pool prefix.
+    fn holds_v4(&self, addr: Ipv4Addr) -> bool {
+        // A shift of 32 is undefined, so a /0 pool is answered directly
+        // rather than by masking.
+        if self.v4_prefix_len == 0 {
+            return true;
+        }
+        if self.v4_prefix_len > 32 {
+            return false;
+        }
+        let mask = u32::MAX << (32 - self.v4_prefix_len);
+        (u32::from(addr) & mask) == (u32::from(self.v4_network) & mask)
+    }
+}
+
+/// Why the destination gate refused an uplink packet. The set is closed and
+/// carries no `_` escape, same reason as [`SpoofRefusal`]: the exit's drop
+/// accounting matches on it exhaustively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolRefusal {
+    /// An IPv4 packet addressed into the pool, at something other than the
+    /// gateway: another client's assigned address, or an address no client
+    /// holds yet.
+    V4Peer,
+    /// The same, on the `/64` of a dual-stack exit.
+    V6Peer,
+}
+
+/// Destination policy on the exit's uplink write path: an inner packet
+/// addressed into the exit's own client pool never reaches the TUN, except
+/// at the gateway address.
+///
+/// `None` admits the packet, `Some(refusal)` names why it cannot be
+/// admitted.
+///
+/// The kernel already refuses tunnel-to-tunnel forwarding through an
+/// nftables rule on the exit; this is the same policy on our own side of
+/// the wire, so an exit whose ruleset is wrong, missing or replaced still
+/// keeps two sessions off one L3 segment
+/// (`incidents/2026-08-16-two-sessions-on-one-exit-reach-each-other-s-pool-addresses.md`).
+///
+/// The exception is the GATEWAY ADDRESS, not a port: the resolver answers
+/// on `:53` there and the NAT-PMP server on `:5351`, so a port-scoped
+/// exception would black-hole every port mapping a client asks for.
+///
+/// A packet the gate cannot read a destination out of is refused rather
+/// than admitted: a truncated IPv4 or IPv6 header has nothing this policy
+/// could clear. Non-IP payloads (DAITA dummies) pass through, they are
+/// classified before this gate ever runs.
+#[must_use]
+pub fn classify_destination(pkt: &[u8], pool: &TunnelPool) -> Option<PoolRefusal> {
+    match pkt.first().map(|b| b >> 4) {
+        Some(4) => match extract_dst_ipv4(pkt) {
+            None => Some(PoolRefusal::V4Peer),
+            Some(dst) if dst == pool.v4_gateway => None,
+            Some(dst) if pool.holds_v4(dst) => Some(PoolRefusal::V4Peer),
+            Some(_) => None,
+        },
+        Some(6) => {
+            let (network, gateway) = pool.v6?;
+            match extract_dst_ipv6(pkt) {
+                None => Some(PoolRefusal::V6Peer),
+                Some(dst) if dst == gateway => None,
+                // The v6 pool is always a `/64`: the allocator masks the
+                // low 64 bits off its network and hands out interface IDs
+                // inside it.
+                Some(dst) if (u128::from(dst) >> 64) == (u128::from(network) >> 64) => {
+                    Some(PoolRefusal::V6Peer)
+                }
+                Some(_) => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const POOL_NET: Ipv4Addr = Ipv4Addr::new(10, 66, 0, 0);
+    const POOL_GW: Ipv4Addr = Ipv4Addr::new(10, 66, 0, 1);
+    const POOL6_NET: Ipv6Addr = Ipv6Addr::new(0xfdcc, 0xf, 1, 0, 0, 0, 0, 0);
+    const POOL6_GW: Ipv6Addr = Ipv6Addr::new(0xfdcc, 0xf, 1, 0, 0, 0, 0, 1);
+
+    fn pool() -> TunnelPool {
+        TunnelPool::new(POOL_NET, 16, POOL_GW).with_v6(POOL6_NET, POOL6_GW)
+    }
+
+    #[test]
+    fn a_packet_addressed_to_a_neighbour_of_the_pool_is_refused() {
+        let pkt = make_ipv4_packet([10, 66, 3, 7], [10, 66, 9, 12]);
+        assert_eq!(
+            classify_destination(&pkt, &pool()),
+            Some(PoolRefusal::V4Peer),
+            "one client must not address another client's assigned tunnel IP"
+        );
+    }
+
+    #[test]
+    fn the_gateway_stays_addressable_because_the_resolver_and_natpmp_live_there() {
+        let pkt = make_ipv4_packet([10, 66, 3, 7], [10, 66, 0, 1]);
+        assert_eq!(
+            classify_destination(&pkt, &pool()),
+            None,
+            "every client legitimately talks to the gateway address"
+        );
+    }
+
+    #[test]
+    fn an_internet_destination_is_admitted() {
+        let pkt = make_ipv4_packet([10, 66, 3, 7], [1, 1, 1, 1]);
+        assert_eq!(classify_destination(&pkt, &pool()), None);
+    }
+
+    #[test]
+    fn a_destination_just_outside_the_prefix_is_admitted() {
+        // 10.67.0.0 differs from the pool in the second octet, so a gate
+        // masking the wrong number of bits refuses it and black-holes a
+        // legitimate private destination.
+        let pkt = make_ipv4_packet([10, 66, 3, 7], [10, 67, 0, 5]);
+        assert_eq!(classify_destination(&pkt, &pool()), None);
+    }
+
+    #[test]
+    fn a_v6_packet_addressed_into_the_pool_prefix_is_refused() {
+        let mut dst = POOL6_NET.octets();
+        dst[15] = 9;
+        let pkt = make_ipv6_packet(POOL6_NET.octets(), dst);
+        assert_eq!(
+            classify_destination(&pkt, &pool()),
+            Some(PoolRefusal::V6Peer)
+        );
+    }
+
+    #[test]
+    fn the_v6_gateway_stays_addressable() {
+        let pkt = make_ipv6_packet(POOL6_NET.octets(), POOL6_GW.octets());
+        assert_eq!(classify_destination(&pkt, &pool()), None);
+    }
+
+    #[test]
+    fn a_v6_packet_is_admitted_on_a_pool_that_has_no_v6_half() {
+        // A v4-only exit has nothing to compare a v6 destination against,
+        // and the source gate already refuses an unallocated v6 source.
+        let mut dst = POOL6_NET.octets();
+        dst[15] = 9;
+        let pkt = make_ipv6_packet(POOL6_NET.octets(), dst);
+        let v4_only = TunnelPool::new(POOL_NET, 16, POOL_GW);
+        assert_eq!(classify_destination(&pkt, &v4_only), None);
+    }
+
+    #[test]
+    fn a_non_ip_payload_is_admitted_because_another_gate_owns_it() {
+        // DAITA dummies are classified before this gate ever runs.
+        assert_eq!(classify_destination(&[0xFFu8; 40], &pool()), None);
+        assert_eq!(classify_destination(&[], &pool()), None);
+    }
+
+    #[test]
+    fn a_truncated_ipv4_header_is_refused_rather_than_admitted_unread() {
+        // Too short to carry a destination, so the gate cannot clear it.
+        let mut pkt = vec![0u8; 19];
+        pkt[0] = 0x45;
+        assert_eq!(
+            classify_destination(&pkt, &pool()),
+            Some(PoolRefusal::V4Peer),
+            "a header the gate cannot read must not pass it"
+        );
+    }
+
+    #[test]
+    fn a_prefix_of_zero_covers_every_destination() {
+        // Degenerate but arithmetically real: shifting by 32 is undefined
+        // in C and panics in debug Rust, so the mask must be computed
+        // without an unguarded shift.
+        let all = TunnelPool::new(Ipv4Addr::UNSPECIFIED, 0, POOL_GW);
+        let pkt = make_ipv4_packet([10, 66, 3, 7], [1, 1, 1, 1]);
+        assert_eq!(classify_destination(&pkt, &all), Some(PoolRefusal::V4Peer));
+    }
 
     fn make_ipv4_packet(src: [u8; 4], dst: [u8; 4]) -> Vec<u8> {
         let mut pkt = vec![0u8; 40];
