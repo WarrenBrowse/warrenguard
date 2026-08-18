@@ -227,8 +227,20 @@ pub enum PoolRefusal {
 /// The kernel already refuses tunnel-to-tunnel forwarding through an
 /// nftables rule on the exit; this is the same policy on our own side of
 /// the wire, so an exit whose ruleset is wrong, missing or replaced still
-/// keeps two sessions off one L3 segment
+/// keeps two sessions off each other's assigned addresses
 /// (`incidents/2026-08-16-two-sessions-on-one-exit-reach-each-other-s-pool-addresses.md`).
+///
+/// **Scope: the pool, not the segment.** The pool is what the allocator
+/// hands out, which is the set of addresses a session can actually hold. The
+/// exit's TUN may sit on a wider on-link subnet than that (the Warren fleet
+/// runs a `/24` allocator on a `/16` interface), and a destination inside
+/// that wider subnet but outside the pool is admitted here and left to the
+/// kernel rule. Measured on the DE exit, 2026-08-18: three packets aimed
+/// inside the pool moved this gate's counter by 27 with the nftables counter
+/// unmoved, while four aimed at the same segment outside the pool moved the
+/// nftables counter and not this one. Nothing is reachable out there, since
+/// no session is ever assigned an address outside the pool, so what the gap
+/// costs is scanning empty space.
 ///
 /// The exception is the GATEWAY ADDRESS, not a port: the resolver answers
 /// on `:53` there and the NAT-PMP server on `:5351`, so a port-scoped

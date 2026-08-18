@@ -548,9 +548,11 @@ impl SpoofGate {
 /// on our side looked at the destination at all
 /// (`incidents/2026-08-16-two-sessions-on-one-exit-reach-each-other-s-pool-addresses.md`).
 /// With this gate armed, an exit whose ruleset is wrong, missing or replaced
-/// still keeps two sessions off one L3 segment, and the refusal is counted
-/// where an operator can see it rather than being invisible in a firewall
-/// counter nobody scrapes.
+/// still keeps two sessions off each other's assigned addresses, and the
+/// refusal is counted where an operator can see it rather than being
+/// invisible in a firewall counter nobody scrapes. It covers the ALLOCATOR's
+/// pool rather than the whole on-link subnet; see [`classify_destination`]
+/// for what that leaves to the kernel rule.
 ///
 /// No-log discipline: the refusal CLASS, the packet length and a count are
 /// reported. Neither the destination that failed the policy nor the pool it
