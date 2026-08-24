@@ -6744,6 +6744,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_last_sender_left_is_served_even_while_it_reads_stale() {
+        // Demotion must never be able to empty the serving set. The patrol
+        // only ever visits shared slots, so it cannot mark a sole owner, but
+        // a slot CAN fall back to one sender after its sibling departs while
+        // the survivor still carries the flag from when the slot was shared.
+        // Serving it anyway is what keeps that client routable instead of
+        // turning every packet into a `no_route` drop.
+        let router = MultihopTunRouter::default();
+        let ip = Ipv4Addr::new(10, 66, 0, 93);
+        let peer = Ipv4Addr::new(1, 1, 1, 1);
+        let (tx_quiet, mut rx_quiet) = tokio::sync::mpsc::channel::<Vec<u8>>(128);
+        let (tx_live, rx_live) = tokio::sync::mpsc::channel::<Vec<u8>>(128);
+        let act_quiet = Arc::new(AtomicU64::new(3));
+        let act_live = Arc::new(AtomicU64::new(0));
+        let quic_quiet = FakePeer::new();
+        let quic_live = FakePeer::new();
+        register_watched(&router, ip, &tx_quiet, &act_quiet, &quic_quiet);
+        register_watched(&router, ip, &tx_live, &act_live, &quic_live);
+
+        let mut state = HashMap::new();
+        for _ in 1..=(PATROL_STALE_ROUNDS + 1) {
+            quic_quiet.packets.fetch_add(1, Ordering::Relaxed);
+            breathe(&act_live, &quic_live);
+            router.routes.patrol_round(&mut state);
+        }
+
+        // The live sibling leaves; the demoted one is all that is left.
+        drop(rx_live);
+        router.unregister_if_owner(ip, &tx_live);
+
+        for src_port in 40000..40016u16 {
+            router.dispatch(&ipv4_tcp_full(peer, ip, 443, src_port));
+        }
+        let mut got = 0;
+        while rx_quiet.try_recv().is_ok() {
+            got += 1;
+        }
+        assert_eq!(
+            got, 16,
+            "the only sender left must serve, stale flag or not"
+        );
+    }
+
+    #[tokio::test]
     async fn the_patrol_leaves_a_sole_owner_alone() {
         // A sender alone under its address owns nothing anyone else could
         // serve, so evicting it would only turn a recoverable route into
