@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::ops::ControlFlow;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::SigningKey;
@@ -1895,6 +1895,19 @@ struct Downlink {
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     activity: Option<Arc<AtomicU64>>,
     peer: Option<Arc<dyn PeerLiveness>>,
+    /// Set by the patrol once this sender has carried no application
+    /// traffic for a whole stale window, cleared as soon as it carries
+    /// some again. A stale sender keeps its registration (convicting a
+    /// live-but-idle client is the 2026-08-02 black-hole) but stops
+    /// taking a share of the downlink hash, because its channel is open
+    /// and would swallow every flow that landed on it.
+    stale: Arc<AtomicBool>,
+}
+
+impl Downlink {
+    fn is_stale(&self) -> bool {
+        self.stale.load(Ordering::Relaxed)
+    }
 }
 
 /// One assigned IP's downlink fan-out: every live connection of the
@@ -1920,6 +1933,7 @@ impl<A> RouteSlot<A> {
                 tx,
                 activity: None,
                 peer: None,
+                stale: Arc::new(AtomicBool::new(false)),
             }],
             rr: std::sync::atomic::AtomicUsize::new(0),
             flows: HashMap::new(),
@@ -1970,6 +1984,9 @@ struct PatrolCandidate {
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     activity: Arc<AtomicU64>,
     peer: Arc<dyn PeerLiveness>,
+    /// Shared with the live [`Downlink`], so publishing the verdict costs
+    /// no second pass over the map.
+    stale: Arc<AtomicBool>,
 }
 
 /// What the patrol remembers about one downlink sender between two rounds.
@@ -2117,6 +2134,7 @@ impl<A: std::hash::Hash + Eq + Copy> RouteTable<A> {
             tx,
             activity: None,
             peer: None,
+            stale: Arc::new(AtomicBool::new(false)),
         });
         tracing::info!(
             senders = slot.senders.len(),
@@ -2249,6 +2267,7 @@ impl<A: std::hash::Hash + Eq + Copy> RouteTable<A> {
                                 tx: d.tx.clone(),
                                 activity: d.activity.clone()?,
                                 peer: d.peer.clone()?,
+                                stale: d.stale.clone(),
                             })
                         })
                         .collect();
@@ -2288,7 +2307,13 @@ impl<A: std::hash::Hash + Eq + Copy> RouteTable<A> {
                         round.evicted.note(reason);
                     }
                     None => {
-                        if watch.app_silent_rounds >= PATROL_STALE_ROUNDS {
+                        // Publishing the verdict is what takes the sender out
+                        // of the downlink hash. Counting it and leaving it in
+                        // the fan-out is what black-holed a share of every
+                        // reconnecting client's flows (2026-08-24).
+                        let stale = watch.app_silent_rounds >= PATROL_STALE_ROUNDS;
+                        watch.who.stale.store(stale, Ordering::Relaxed);
+                        if stale {
                             round.stale += 1;
                         }
                         kept.push(watch);
@@ -2358,21 +2383,49 @@ impl<A: std::hash::Hash + Eq + Copy> RouteTable<A> {
                     crate::metrics::downlink_metrics().inc_no_route();
                     return;
                 }
+                // Senders the patrol reported stale stay registered but
+                // must serve nothing: their channel is open, so a packet
+                // handed to one is swallowed with no `Closed` to trigger a
+                // re-route. Falling back to the whole fan-out when every
+                // sender is stale keeps a quiet client routable rather than
+                // turning it into `no_route` drops.
+                let serving = slot.senders.iter().filter(|d| !d.is_stale()).count();
+                let use_all = serving == 0;
+                let pool = if use_all { n } else { serving };
                 // Prefer the flow's learned owner, but only while it is
-                // still a live sender under this IP; otherwise fall back to
-                // the hash so a departed owner never black-holes the flow.
+                // still a serving sender under this IP; otherwise fall back
+                // to the hash so a departed or stale owner never
+                // black-holes the flow.
                 let owned = flow_key
                     .and_then(|k| slot.flows.get(&k))
-                    .filter(|owner| slot.senders.iter().any(|s| s.tx.same_channel(owner)))
+                    .filter(|owner| {
+                        slot.senders
+                            .iter()
+                            .any(|s| s.tx.same_channel(owner) && (use_all || !s.is_stale()))
+                    })
                     .cloned();
                 match owned {
                     Some(owner) => owner,
                     None => {
                         let idx = match warrenguard_transport_core::flow_hash_5tuple(pkt) {
-                            Some(h) => (h as usize) % n,
-                            None => slot.rr.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % n,
+                            Some(h) => (h as usize) % pool,
+                            None => {
+                                slot.rr.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % pool
+                            }
                         };
-                        slot.senders[idx].tx.clone()
+                        match slot
+                            .senders
+                            .iter()
+                            .filter(|d| use_all || !d.is_stale())
+                            .nth(idx)
+                        {
+                            Some(d) => d.tx.clone(),
+                            // Unreachable: `idx < pool`, which is the length
+                            // of the sequence just filtered. Serving the whole
+                            // fan-out keeps a selection bug from becoming the
+                            // black hole this code exists to prevent.
+                            None => slot.senders[idx % n].tx.clone(),
+                        }
                     }
                 }
             };
@@ -6567,6 +6620,126 @@ mod tests {
         assert_eq!(
             r.stale, 1,
             "past the threshold the app-silent sender must be reported"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sender_reported_stale_takes_no_share_of_the_downlink_hash() {
+        // Measured 2026-08-24 on exit-fi-hel1: the patrol recognises a sender
+        // that has carried no application traffic for the whole stale window
+        // and counts it into `stale_senders`, but is deliberately not allowed
+        // to convict it (a live-but-idle client must keep its route,
+        // 2026-08-02). It stayed a FULL member of the fan-out, so `dispatch`
+        // kept hashing flows onto it and every flow that landed there
+        // black-holed in silence: the predecessor's mpsc channel is still
+        // open, so `try_send` returns Ok and the packet is swallowed with no
+        // `Closed` to trigger a re-route. On the wire that is a tunnel
+        // reporting every leg healthy while a share of the flows never come
+        // back. Being reported stale must therefore mean "no flow is hashed
+        // here any more", without evicting: the sender stays registered and
+        // serves again the moment it carries traffic.
+        let router = MultihopTunRouter::default();
+        let ip = Ipv4Addr::new(10, 66, 0, 91);
+        let peer = Ipv4Addr::new(1, 1, 1, 1);
+        let (tx_stale, mut rx_stale) = tokio::sync::mpsc::channel::<Vec<u8>>(128);
+        let (tx_live, mut rx_live) = tokio::sync::mpsc::channel::<Vec<u8>>(128);
+        let act_stale = Arc::new(AtomicU64::new(3)); // frozen from here on
+        let act_live = Arc::new(AtomicU64::new(0));
+        let quic_stale = FakePeer::new();
+        let quic_live = FakePeer::new();
+        register_watched(&router, ip, &tx_stale, &act_stale, &quic_stale);
+        register_watched(&router, ip, &tx_live, &act_live, &quic_live);
+
+        // Drive the patrol past the stale window. The idle sender's QUIC peer
+        // keeps speaking (keep-alives, exit-side idle cover), which is exactly
+        // what makes it un-convictable, so only the application counter can
+        // tell it apart.
+        let mut state = HashMap::new();
+        let mut reported = 0;
+        for _ in 1..=(PATROL_STALE_ROUNDS + 1) {
+            quic_stale.packets.fetch_add(1, Ordering::Relaxed);
+            breathe(&act_live, &quic_live);
+            reported = router.routes.patrol_round(&mut state).stale;
+        }
+        assert_eq!(reported, 1, "precondition: the patrol reports it stale");
+
+        // Enough distinct 5-tuples that both halves of a two-way hash would be
+        // exercised many times over.
+        let flows = 64u16;
+        for src_port in 40000..40000 + flows {
+            router.dispatch(&ipv4_tcp_full(peer, ip, 443, src_port));
+        }
+
+        let mut on_stale = 0;
+        while rx_stale.try_recv().is_ok() {
+            on_stale += 1;
+        }
+        let mut on_live = 0;
+        while rx_live.try_recv().is_ok() {
+            on_live += 1;
+        }
+        assert_eq!(
+            on_stale, 0,
+            "a sender the patrol reported stale must take no share of the hash"
+        );
+        assert_eq!(
+            on_live,
+            usize::from(flows),
+            "every flow must reach the sender that is still serving"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_sender_that_speaks_again_is_served_again() {
+        // The other half of the net, and the reason the fix demotes instead
+        // of evicting: a live client that simply had nothing to send for two
+        // minutes is indistinguishable from a dead one by the application
+        // counter alone. Convicting it took its route away for the rest of
+        // its life (2026-08-02). Demotion has to be reversible on the very
+        // next round that sees traffic.
+        let router = MultihopTunRouter::default();
+        let ip = Ipv4Addr::new(10, 66, 0, 92);
+        let peer = Ipv4Addr::new(1, 1, 1, 1);
+        let (tx_quiet, mut rx_quiet) = tokio::sync::mpsc::channel::<Vec<u8>>(128);
+        let (tx_live, mut rx_live) = tokio::sync::mpsc::channel::<Vec<u8>>(128);
+        let act_quiet = Arc::new(AtomicU64::new(3));
+        let act_live = Arc::new(AtomicU64::new(0));
+        let quic_quiet = FakePeer::new();
+        let quic_live = FakePeer::new();
+        register_watched(&router, ip, &tx_quiet, &act_quiet, &quic_quiet);
+        register_watched(&router, ip, &tx_live, &act_live, &quic_live);
+
+        let mut state = HashMap::new();
+        for _ in 1..=(PATROL_STALE_ROUNDS + 1) {
+            quic_quiet.packets.fetch_add(1, Ordering::Relaxed);
+            breathe(&act_live, &quic_live);
+            router.routes.patrol_round(&mut state);
+        }
+        for src_port in 40000..40064u16 {
+            router.dispatch(&ipv4_tcp_full(peer, ip, 443, src_port));
+        }
+        let mut while_stale = 0;
+        while rx_quiet.try_recv().is_ok() {
+            while_stale += 1;
+        }
+        assert_eq!(while_stale, 0, "precondition: demoted while app-silent");
+        while rx_live.try_recv().is_ok() {}
+
+        // One round in which it carries application traffic again.
+        breathe(&act_quiet, &quic_quiet);
+        breathe(&act_live, &quic_live);
+        router.routes.patrol_round(&mut state);
+
+        for src_port in 40000..40064u16 {
+            router.dispatch(&ipv4_tcp_full(peer, ip, 443, src_port));
+        }
+        let mut after = 0;
+        while rx_quiet.try_recv().is_ok() {
+            after += 1;
+        }
+        assert!(
+            after > 0,
+            "a sender that speaks again must take its share of the hash back"
         );
     }
 
