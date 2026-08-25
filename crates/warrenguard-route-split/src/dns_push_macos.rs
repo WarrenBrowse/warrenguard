@@ -8,9 +8,13 @@
 //! macOS does not consult `/etc/resolv.conf` from `mDNSResponder` (the
 //! system resolver daemon) on modern releases - patching that file is
 //! a no-op for `getaddrinfo`. The canonical control plane is the
-//! `networksetup` CLI: per-network-service DNS overrides land in the
-//! `State:/Network/Service/<id>/DNS` SCDynamicStore key, which
-//! `mDNSResponder` reads.
+//! `networksetup` CLI: per-network-service DNS overrides are written to
+//! the network preferences, which configd mirrors into the
+//! `Setup:/Network/Service/<id>/DNS` SCDynamicStore key and ranks only for
+//! a service that has address state; `mDNSResponder` reads the result.
+//! Nothing here writes a `State:` key, so a restore for a service that is
+//! down cannot publish a dead resolver (the failure the app's monitor had,
+//! `incidents/2026-08-25-macos-disconnect-restores-a-stopped-vpn-s-orphan-dns-key.md`).
 //!
 //! ## Strategy
 //!
