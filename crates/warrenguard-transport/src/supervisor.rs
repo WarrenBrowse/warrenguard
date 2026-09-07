@@ -825,6 +825,11 @@ impl MultiHopSupervisor {
             self.notify_on_reconnect(first_session);
             self.notify_path_rtt(session_relay, bundle.quinn_stats().path.rtt);
             first_session = false;
+            // Establishment instant of the session currently served: its
+            // lifetime at close is what tells a post-handshake kill (a censor
+            // passing the handshake and dropping the flow) from an ordinary
+            // loss, and feeds the carrier-first dial verdict.
+            let mut session_established = Instant::now();
 
             // Inner serve loop. The current session serves until it dies (cold
             // path -> break to the outer cold dial with a brief gap) OR a
@@ -955,6 +960,7 @@ impl MultiHopSupervisor {
                                 bundle = new_bundle;
                                 primary = new_primary;
                                 session_relay = new_relay;
+                                session_established = Instant::now();
                                 self.notify_path_rtt(session_relay, bundle.quinn_stats().path.rtt);
                                 continue;
                             }
@@ -980,6 +986,16 @@ impl MultiHopSupervisor {
                     let _ = self.tx.send(None);
                     return Err(MultiHopError::Rejected(reason));
                 }
+
+                // Feed the carrier-first verdict: a UDP session that a watchdog
+                // killed within a minute of establishing is one post-handshake
+                // kill, and enough of them in a row make the next dial try the
+                // TLS-over-TCP carrier before racing it.
+                crate::udp_hostility::record_session_end(
+                    bundle.is_over_carrier(),
+                    session_established.elapsed(),
+                    watchdog_forced,
+                );
 
                 // Dead-datapath escalation: a session whose whole life carried
                 // zero application downlink AND that a watchdog had to kill is
@@ -2524,6 +2540,129 @@ mod run_tests {
             result.is_ok(),
             "no receivers left must be a clean Ok(()), not an error"
         );
+    }
+
+    /// A UDP relay in the middle of the loopback path that can be told to
+    /// swallow every packet, both ways. This is what a censor does to a flow it
+    /// has classified: the handshake went through, then nothing does.
+    struct UdpBlackhole {
+        addr: std::net::SocketAddr,
+        drop_all: Arc<std::sync::atomic::AtomicBool>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    async fn spawn_udp_blackhole(upstream: std::net::SocketAddr) -> UdpBlackhole {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let socket = Arc::new(
+            tokio::net::UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("blackhole relay binds"),
+        );
+        let addr = socket.local_addr().expect("blackhole addr");
+        let drop_all = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn({
+            let socket = socket.clone();
+            let drop_all = drop_all.clone();
+            async move {
+                let mut buf = vec![0u8; 65_535];
+                let mut client: Option<std::net::SocketAddr> = None;
+                loop {
+                    let Ok((n, from)) = socket.recv_from(&mut buf).await else {
+                        return;
+                    };
+                    if drop_all.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    if from == upstream {
+                        if let Some(client) = client {
+                            let _ = socket.send_to(&buf[..n], client).await;
+                        }
+                    } else {
+                        client = Some(from);
+                        let _ = socket.send_to(&buf[..n], upstream).await;
+                    }
+                }
+            }
+        });
+        UdpBlackhole {
+            addr,
+            drop_all,
+            task,
+        }
+    }
+
+    /// The 2026-09-07 Kaliningrad pattern seen from the supervisor: the QUIC
+    /// handshake passes, the session is published, and seconds later the
+    /// network swallows the flow, so the dead-path watch has to kill it. Two of
+    /// those in a row must arm the carrier-first dial verdict for the whole
+    /// process. Real time, on purpose: the dead-path window is what the field
+    /// failure runs on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_sessions_killed_by_the_dead_path_watch_arm_carrier_first() {
+        use std::sync::atomic::Ordering;
+
+        use warrenguard_tcp_fallback::DialPreference;
+
+        let operational_key = SigningKey::from_bytes(&[0x44; 32]);
+        let exit_id = ExitId::from_bytes([0x53; 16]);
+        let exit = spawn_fake_multihop_exit(&operational_key, exit_id);
+        let blackhole = spawn_udp_blackhole(exit.relay.endpoint).await;
+        let mut config = config_with_fake_exit(&exit, &operational_key);
+        // The descriptor signature covers the relay id and key, never the
+        // endpoint, so the dial can be routed through the blackhole verbatim.
+        config.relay = Arc::new(RelayDescriptorSigned {
+            endpoint: blackhole.addr,
+            ..(*exit.relay).clone()
+        });
+        let (supervisor, mut rx) = MultiHopSupervisor::new(config);
+        // The tracker is process-wide and other tests in this binary end
+        // sessions too: a long healthy UDP session is the documented reset, so
+        // the streak counted below starts from zero whatever ran before.
+        crate::udp_hostility::record_session_end(false, Duration::from_secs(3600), false);
+        let task = tokio::spawn(supervisor.run());
+
+        async fn wait_for(
+            rx: &mut watch::Receiver<Option<Arc<MultiHopBundle>>>,
+            want_session: bool,
+            budget: Duration,
+        ) {
+            tokio::time::timeout(budget, async {
+                loop {
+                    if rx.borrow_and_update().is_some() == want_session {
+                        return;
+                    }
+                    rx.changed().await.expect("watch alive");
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!("session state never became published={want_session} within {budget:?}")
+            });
+        }
+
+        // Two kills: the single-kill tolerance is pinned at the tracker's own
+        // unit tests, and a concurrent test ending a session of its own could
+        // add a kill here, so only the arming after two is asserted.
+        for _kill in 0..2 {
+            wait_for(&mut rx, true, Duration::from_secs(10)).await;
+            // Let the session live a moment, then swallow the flow: the RX
+            // silence watch (15 s at the default) must kill it.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            blackhole.drop_all.store(true, Ordering::Relaxed);
+            wait_for(&mut rx, false, Duration::from_secs(40)).await;
+            blackhole.drop_all.store(false, Ordering::Relaxed);
+        }
+
+        assert_eq!(
+            crate::udp_hostility::preference(),
+            DialPreference::CarrierFirst,
+            "two UDP sessions killed within a minute of establishing must make the next dial try the carrier first"
+        );
+
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        blackhole.task.abort();
     }
 
     #[tokio::test]

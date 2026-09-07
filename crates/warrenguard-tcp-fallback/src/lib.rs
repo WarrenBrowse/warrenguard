@@ -58,6 +58,7 @@
 
 mod activation;
 mod client;
+pub mod hostility;
 mod policy;
 mod terminator;
 pub mod tls;
@@ -67,6 +68,7 @@ pub use activation::{
     connect_with_fallback,
 };
 pub use client::{TcpCarrierSocket, build_carrier_client_endpoint};
+pub use hostility::{Carrier, DialPreference, SessionEnd, UdpHostilityTracker};
 pub use policy::{COVER_TCP_ALPN, COVER_TCP_PORT, CoverTls, resolve_fallback_policy};
 pub use terminator::{TerminatorConfig, serve_carrier, terminate_carrier};
 

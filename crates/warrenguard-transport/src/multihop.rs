@@ -298,6 +298,12 @@ fn cover_trust_anchors() -> Option<Vec<Vec<u8>>> {
     }
 }
 
+/// Budget for the carrier-first attempt (TCP connect, cover TLS, inner QUIC
+/// handshake) before the ordinary UDP race takes over. Equal to the race's own
+/// UDP deadline so preferring the carrier never makes a dial slower than a
+/// UDP-blocked race would have been.
+const CARRIER_FIRST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The `:443/tcp` cover endpoint the carrier dials: the relay's advertised IP
 /// on the fixed cover HTTPS port. A `#[cfg(test)]` seam redirects it to a
 /// loopback terminator, since a test cannot bind `:443`.
@@ -1113,16 +1119,32 @@ impl MultiHopClient {
         // relay). The winning path's endpoint is carried out and kept alive for
         // the connection.
         let (endpoint, conn, over_carrier) = match carrier_client_cfg {
-            Some(inner_cfg) => {
-                Self::dial_relay_with_carrier(
-                    relay,
-                    endpoint,
-                    &server_name,
-                    inner_cfg,
-                    socket_bypass,
-                )
-                .await?
-            }
+            // A process that has watched UDP sessions establish and die right
+            // after the handshake (or a deployer who knows the network) tries
+            // the carrier before racing it: the race alone never reaches the
+            // carrier when the handshake itself passes.
+            Some(inner_cfg) => match crate::udp_hostility::preference() {
+                warrenguard_tcp_fallback::DialPreference::CarrierFirst => {
+                    Self::dial_relay_carrier_first(
+                        relay,
+                        endpoint,
+                        &server_name,
+                        inner_cfg,
+                        socket_bypass,
+                    )
+                    .await?
+                }
+                warrenguard_tcp_fallback::DialPreference::Race => {
+                    Self::dial_relay_with_carrier(
+                        relay,
+                        endpoint,
+                        &server_name,
+                        inner_cfg,
+                        socket_bypass,
+                    )
+                    .await?
+                }
+            },
             None => {
                 let conn = endpoint
                     .connect(relay.endpoint, &server_name)?
@@ -1143,6 +1165,115 @@ impl MultiHopClient {
         let relay_auth_pubkey = relay.cover_domain.is_some().then_some(relay_pubkey);
 
         Ok((endpoint, conn, relay_auth_pubkey, over_carrier))
+    }
+
+    /// Resolves what one carrier dial needs from the relay descriptor: the
+    /// synthetic quinn peer (the relay's UDP endpoint, so quinn routes the
+    /// carrier's inbound datagrams to this connection's path), the `:443/tcp`
+    /// cover endpoint, the cover-domain SNI and the WebPKI client config.
+    /// Resolved once per relay dial so the carrier-first attempt and the
+    /// fallback race dial the identical target.
+    fn carrier_dial_plan(
+        relay: &RelayDescriptorSigned,
+    ) -> Result<(SocketAddr, SocketAddr, String, Arc<rustls::ClientConfig>), MultiHopError> {
+        let target = relay.endpoint;
+        // `carrier_armed` guaranteed a cover domain; an empty SNI would only
+        // fail the TLS name parse (an honest error), never panic.
+        let cover_domain = relay.cover_domain.as_deref().unwrap_or_default().to_owned();
+        // Production trusts the Mozilla program; a `#[cfg(test)]` seam injects a
+        // throwaway CA. A build failure disarms the carrier, surfaced only if
+        // UDP also fails.
+        let cover_config =
+            build_cover_client_config(cover_trust_anchors().as_deref()).map_err(|_| {
+                MultiHopError::TcpFallback(std::io::Error::other(
+                    "cover TLS client config build failed",
+                ))
+            })?;
+        Ok((
+            target,
+            carrier_cover_endpoint(target),
+            cover_domain,
+            cover_config,
+        ))
+    }
+
+    /// One TLS-over-TCP carrier dial: TCP to the cover endpoint, the cover
+    /// WebPKI handshake, then the relay's inner QUIC handshake over the carrier
+    /// socket with the IDENTICAL `inner_cfg` and `server_name` as the UDP dial,
+    /// so the QUIC state machine and the X.509 identity check are unchanged.
+    /// Errors are opaque `io::Error`s on purpose: no address, no identity.
+    async fn dial_carrier_once(
+        target: SocketAddr,
+        carrier_endpoint: SocketAddr,
+        cover_domain: String,
+        cover_config: Arc<rustls::ClientConfig>,
+        inner_cfg: quinn::ClientConfig,
+        server_name: String,
+        socket_bypass: Option<SocketBypass>,
+    ) -> std::io::Result<(Endpoint, Connection)> {
+        // Under a full-tunnel system VPN the carrier's TCP socket must be
+        // pinned to the physical link (like the UDP endpoint), or it loops
+        // into the TUN. With no bypass (userland proxy) this is the plain
+        // connect, verbatim.
+        let tcp = connect_tcp_carrier(carrier_endpoint, socket_bypass).await?;
+        let stream = connect_cover_tls(&cover_domain, tcp, cover_config)
+            .await
+            .map_err(|_| std::io::Error::other("cover-domain tls handshake failed"))?;
+        let socket = TcpCarrierSocket::new(stream, target);
+        let carrier_ep = build_carrier_client_endpoint(socket, inner_cfg)
+            .map_err(|_| std::io::Error::other("carrier quic endpoint build failed"))?;
+        let conn = carrier_ep
+            .connect(target, &server_name)
+            .map_err(|_| std::io::Error::other("carrier quic connect setup failed"))?
+            .await
+            .map_err(|_| std::io::Error::other("carrier quic handshake failed"))?;
+        Ok((carrier_ep, conn))
+    }
+
+    /// Dials the TLS-over-TCP carrier FIRST, and only if that fails runs the
+    /// ordinary UDP-versus-carrier race ([`Self::dial_relay_with_carrier`]).
+    /// Reached when [`crate::udp_hostility`] has seen consecutive UDP sessions
+    /// establish and die within seconds, the signature of a censor that passes
+    /// the QUIC handshake and kills the flow: on such a network the race alone
+    /// never dials the carrier, because the handshake it races completes.
+    ///
+    /// # Errors
+    /// Those of [`Self::dial_relay_with_carrier`]: a failed carrier-first
+    /// attempt is recorded and never surfaced, the race's verdict is.
+    async fn dial_relay_carrier_first(
+        relay: &RelayDescriptorSigned,
+        endpoint: Endpoint,
+        server_name: &str,
+        inner_cfg: quinn::ClientConfig,
+        socket_bypass: Option<SocketBypass>,
+    ) -> Result<(Endpoint, Connection, bool), MultiHopError> {
+        let (target, carrier_endpoint, cover_domain, cover_config) =
+            Self::carrier_dial_plan(relay)?;
+        let attempt = tokio::time::timeout(
+            CARRIER_FIRST_DEADLINE,
+            Self::dial_carrier_once(
+                target,
+                carrier_endpoint,
+                cover_domain,
+                cover_config,
+                inner_cfg.clone(),
+                server_name.to_owned(),
+                socket_bypass,
+            ),
+        )
+        .await;
+        match attempt {
+            Ok(Ok((carrier_ep, conn))) => {
+                crate::udp_hostility::record_carrier_dial_succeeded();
+                tracing::info!("carrier-first dial: session rides the TLS-over-TCP carrier");
+                return Ok((carrier_ep, conn, true));
+            }
+            Ok(Err(_)) | Err(_) => {
+                crate::udp_hostility::record_carrier_dial_failed();
+                tracing::info!("carrier-first dial failed; falling back to the UDP race");
+            }
+        }
+        Self::dial_relay_with_carrier(relay, endpoint, server_name, inner_cfg, socket_bypass).await
     }
 
     /// Races the relay's UDP QUIC dial (on the already-bound `endpoint`)
@@ -1171,22 +1302,9 @@ impl MultiHopClient {
         // fix); `None` keeps the plain connect (userland proxy).
         socket_bypass: Option<SocketBypass>,
     ) -> Result<(Endpoint, Connection, bool), MultiHopError> {
-        // The synthetic quinn peer and both dials target the relay's advertised
-        // QUIC endpoint; only the socket beneath differs between the arms.
-        let target = relay.endpoint;
-        // `carrier_armed` guaranteed a cover domain; an empty SNI would only
-        // fail the TLS name parse (an honest error), never panic.
-        let cover_domain = relay.cover_domain.as_deref().unwrap_or_default().to_owned();
-        // Production trusts the Mozilla program; a `#[cfg(test)]` seam injects a
-        // throwaway CA. A build failure disarms the carrier, surfaced only if
-        // UDP also fails (below).
-        let cover_config =
-            build_cover_client_config(cover_trust_anchors().as_deref()).map_err(|_| {
-                MultiHopError::TcpFallback(std::io::Error::other(
-                    "cover TLS client config build failed",
-                ))
-            })?;
-        let carrier_endpoint = carrier_cover_endpoint(target);
+        let (target, carrier_endpoint, cover_domain, cover_config) =
+            Self::carrier_dial_plan(relay)?;
+        let server_name = server_name.to_owned();
 
         // The UDP error is only surfaced by the engine when the fallback is
         // disabled, which cannot happen on this (armed) path, so it is mapped
@@ -1195,33 +1313,26 @@ impl MultiHopClient {
         // The trailing `bool` marks which arm won: `false` for the native UDP
         // dial, `true` for the TLS-over-TCP carrier, so the caller can cap the
         // carrier session's inner MTU (its DPLPMTUD is off, see `over_carrier`).
+        let udp_server_name = server_name.clone();
         let udp = async {
             let conn = endpoint
-                .connect(target, server_name)
+                .connect(target, &udp_server_name)
                 .map_err(|_| std::io::Error::other("udp quic connect setup failed"))?
                 .await
                 .map_err(|_| std::io::Error::other("udp quic handshake failed"))?;
             Ok::<(Endpoint, Connection, bool), std::io::Error>((endpoint, conn, false))
         };
         let tcp = || async move {
-            // Under a full-tunnel system VPN the carrier's TCP socket must be
-            // pinned to the physical link (like the UDP endpoint), or it loops
-            // into the TUN. With no bypass (userland proxy) this is the plain
-            // connect, verbatim.
-            let tcp = connect_tcp_carrier(carrier_endpoint, socket_bypass).await?;
-            let stream = connect_cover_tls(&cover_domain, tcp, cover_config)
-                .await
-                .map_err(|_| std::io::Error::other("cover-domain tls handshake failed"))?;
-            // The synthetic quinn peer MUST equal the connect target so quinn
-            // routes the carrier's inbound datagrams to this connection's path.
-            let socket = TcpCarrierSocket::new(stream, target);
-            let carrier_ep = build_carrier_client_endpoint(socket, inner_cfg)
-                .map_err(|_| std::io::Error::other("carrier quic endpoint build failed"))?;
-            let conn = carrier_ep
-                .connect(target, server_name)
-                .map_err(|_| std::io::Error::other("carrier quic connect setup failed"))?
-                .await
-                .map_err(|_| std::io::Error::other("carrier quic handshake failed"))?;
+            let (carrier_ep, conn) = Self::dial_carrier_once(
+                target,
+                carrier_endpoint,
+                cover_domain,
+                cover_config,
+                inner_cfg,
+                server_name,
+                socket_bypass,
+            )
+            .await?;
             Ok::<(Endpoint, Connection, bool), std::io::Error>((carrier_ep, conn, true))
         };
 
@@ -3396,6 +3507,122 @@ mod tests {
         // carrier; drop it and the sockets/tasks after the assertion.
         drop(client);
         drop(dead_udp);
+        relay_accept.abort();
+        term_task.abort();
+    }
+
+    /// The 2026-09-07 Kaliningrad pattern: the UDP handshake passes and the
+    /// flow is killed afterwards, so the handshake race alone never reaches the
+    /// carrier. Once the process has earned the carrier-first verdict, a relay
+    /// whose UDP endpoint answers perfectly well must still be dialled over the
+    /// TLS-over-TCP carrier.
+    #[tokio::test]
+    async fn carrier_first_verdict_dials_the_carrier_even_when_udp_answers() {
+        use std::net::Ipv4Addr;
+
+        use ed25519_dalek::Signer;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        use tokio::net::TcpListener;
+        use warrenguard_multihop::relay_descriptor_signing_payload;
+        use warrenguard_multihop::test_support::{derive_exit_keypair, pubkey_to_bytes};
+        use warrenguard_tcp_fallback::DialPreference;
+        use warrenguard_tcp_fallback::terminate_carrier;
+        use warrenguard_tcp_fallback::tls::cover_tls_acceptor;
+        use warrenguard_transport_core::warren_transport_config_client_multihop_with_gso;
+
+        let cover_domain = "cover.warrenguard.test";
+        let (ca_der, leaf_der, leaf_key_der) = mint_cover_ca_and_leaf(cover_domain);
+        let transport = warren_transport_config_client_multihop_with_gso(false);
+
+        let inner_chain = vec![CertificateDer::from(leaf_der.clone())];
+        let inner_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key_der.clone()));
+        let mut relay_server_cfg = warrenguard_tls::make_server_config_x509(
+            inner_chain,
+            inner_key,
+            default_crypto_provider(),
+            &[ALPN_H3],
+        )
+        .expect("inner relay x509 server config");
+        relay_server_cfg.transport_config(transport.clone());
+        let relay_ep = Endpoint::server(relay_server_cfg, (Ipv4Addr::LOCALHOST, 0).into())
+            .expect("inner relay quinn server binds");
+        // The descriptor's UDP endpoint IS the live relay: a plain UDP dial
+        // would complete in well under the race delay.
+        let dispatcher = relay_ep.local_addr().expect("inner relay addr");
+        let accept_ep = relay_ep.clone();
+        let relay_accept = tokio::spawn(async move {
+            while let Some(incoming) = accept_ep.accept().await {
+                if let Ok(conn) = incoming.await {
+                    tokio::spawn(async move { conn.closed().await });
+                }
+            }
+        });
+
+        let cover_chain = vec![CertificateDer::from(leaf_der)];
+        let cover_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key_der));
+        let cover_server_cfg = Arc::new(
+            warrenguard_tls::build_server_rustls_config_x509(
+                cover_chain,
+                cover_key,
+                default_crypto_provider(),
+                crate::tcp_fallback::COVER_TCP_ALPN,
+            )
+            .expect("cover-TLS server config"),
+        );
+        let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("carrier TCP listener binds");
+        let carrier_addr = tcp_listener.local_addr().expect("carrier TCP addr");
+        let term_task = tokio::spawn(async move {
+            if let Ok((tcp, _peer)) = tcp_listener.accept().await
+                && let Ok(tls) = cover_tls_acceptor(cover_server_cfg).accept(tcp).await
+            {
+                let _ = terminate_carrier(tls, dispatcher).await;
+            }
+        });
+
+        arm_test_carrier(vec![ca_der], carrier_addr);
+        crate::udp_hostility::tests::force_preference(Some(DialPreference::CarrierFirst));
+
+        let operational = SigningKey::from_bytes(&[0x42; 32]);
+        let relay_id = [0xAC; 16];
+        let relay_pubkey = [0x12u8; 32];
+        let signature = operational
+            .sign(&relay_descriptor_signing_payload(&relay_id, &relay_pubkey))
+            .to_bytes();
+        let relay = RelayDescriptorSigned {
+            relay_id,
+            relay_ed25519_pubkey: relay_pubkey,
+            endpoint: dispatcher,
+            cover_domain: Some(cover_domain.to_owned()),
+            tcp_fallback: true,
+            signature,
+        };
+
+        let (_exit_priv, exit_pub) = derive_exit_keypair(&[0x99; 32]);
+        let exit_x25519 = pubkey_to_bytes(&exit_pub);
+        let client_signing = SigningKey::from_bytes(&[0x88; 32]);
+
+        let client = MultiHopClient::connect_with_transport_config(
+            &relay,
+            ExitId::from_bytes([0u8; 16]),
+            &exit_x25519,
+            &operational.verifying_key(),
+            &client_signing,
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            transport,
+            None,
+        )
+        .await
+        .expect("the carrier-first dial must complete the relay QUIC handshake");
+        crate::udp_hostility::tests::force_preference(None);
+
+        assert!(
+            client.is_over_carrier(),
+            "with the carrier-first verdict the session must ride the TCP carrier even though UDP answers"
+        );
+
+        drop(client);
         relay_accept.abort();
         term_task.abort();
     }

@@ -293,6 +293,14 @@ pub const REGISTRY: &[KnobMeta] = &[
         effect: "head start the UDP handshake gets before the armed TCP carrier is dialled in parallel; first successful handshake wins (the 5s UDP deadline is the overall guard)",
         home: "warrenguard-transport/src/multihop.rs (dial_relay_with_carrier)",
     },
+    KnobMeta {
+        name: "WARREN_TCP_FALLBACK_PREFER",
+        kind: "bool",
+        default: "off",
+        clamp: "\"1\"/\"true\" enables, else off",
+        effect: "dial the TLS-over-TCP carrier FIRST on every relay dial (the UDP race runs only if the carrier fails), regardless of what the process has observed; the automatic version of this arms itself after consecutive UDP sessions that establish and die within 60 s",
+        home: "warrenguard-transport/src/multihop.rs (dial_relay_carrier_first) and warrenguard-transport/src/udp_hostility.rs",
+    },
 ];
 
 // ---------------------------------------------------------------------
@@ -522,6 +530,21 @@ pub fn tcp_fallback_race_delay() -> std::time::Duration {
         parse_race_delay_ms(std::env::var("WARREN_TCP_FALLBACK_RACE_MS").ok().as_deref())
     });
     std::time::Duration::from_millis(ms)
+}
+
+/// `WARREN_TCP_FALLBACK_PREFER`: dial the TLS-over-TCP carrier first on every
+/// relay dial. OFF by default; `"1"`/`"true"` enables it. The carrier must still
+/// be armed (`WARREN_ENABLE_TCP_FALLBACK`, the descriptor's advert and cover
+/// domain), otherwise the dial stays plain UDP. Read once.
+#[must_use]
+pub fn tcp_fallback_prefer() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        parse_bool_flag(
+            std::env::var("WARREN_TCP_FALLBACK_PREFER").ok().as_deref(),
+            false,
+        )
+    })
 }
 
 /// `WARREN_INITIAL_WINDOW`: optional positive congestion-controller

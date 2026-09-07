@@ -51,6 +51,7 @@ pub mod supervisor;
 mod tcp_fallback;
 #[cfg(test)]
 mod test_support;
+mod udp_hostility;
 
 #[cfg(target_os = "android")]
 pub use android_tun::AndroidTun;
