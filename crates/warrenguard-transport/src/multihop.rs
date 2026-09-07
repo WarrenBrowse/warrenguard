@@ -53,7 +53,8 @@ use warrenguard_multihop::{
 use warrenguard_socket_bypass::SocketBypass;
 use warrenguard_tcp_fallback::tls::connect_cover_tls;
 use warrenguard_tcp_fallback::{
-    FallbackPolicy, TcpCarrierSocket, build_carrier_client_endpoint, connect_with_fallback,
+    CarrierFirstAttempt, FallbackPolicy, TcpCarrierSocket, build_carrier_client_endpoint,
+    connect_carrier_first, connect_with_fallback,
 };
 use warrenguard_tls::{
     WarrenTlsError, channel_binding, default_crypto_provider, make_client_config,
@@ -297,12 +298,6 @@ fn cover_trust_anchors() -> Option<Vec<Vec<u8>>> {
         None
     }
 }
-
-/// Budget for the carrier-first attempt (TCP connect, cover TLS, inner QUIC
-/// handshake) before the ordinary UDP race takes over. Equal to the race's own
-/// UDP deadline so preferring the carrier never makes a dial slower than a
-/// UDP-blocked race would have been.
-const CARRIER_FIRST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The `:443/tcp` cover endpoint the carrier dials: the relay's advertised IP
 /// on the fixed cover HTTPS port. A `#[cfg(test)]` seam redirects it to a
@@ -1239,7 +1234,9 @@ impl MultiHopClient {
     ///
     /// # Errors
     /// Those of [`Self::dial_relay_with_carrier`]: a failed carrier-first
-    /// attempt is recorded and never surfaced, the race's verdict is.
+    /// attempt is recorded and never surfaced, the race's verdict is. The
+    /// attempt itself is bounded by the race's UDP deadline
+    /// ([`warrenguard_tcp_fallback::connect_carrier_first`]).
     async fn dial_relay_carrier_first(
         relay: &RelayDescriptorSigned,
         endpoint: Endpoint,
@@ -1249,31 +1246,53 @@ impl MultiHopClient {
     ) -> Result<(Endpoint, Connection, bool), MultiHopError> {
         let (target, carrier_endpoint, cover_domain, cover_config) =
             Self::carrier_dial_plan(relay)?;
-        let attempt = tokio::time::timeout(
-            CARRIER_FIRST_DEADLINE,
-            Self::dial_carrier_once(
-                target,
-                carrier_endpoint,
-                cover_domain,
-                cover_config,
-                inner_cfg.clone(),
-                server_name.to_owned(),
-                socket_bypass,
-            ),
-        )
-        .await;
+        let server_name = server_name.to_owned();
+        let udp_server_name = server_name.clone();
+        let udp = async {
+            let conn = endpoint
+                .connect(target, &udp_server_name)
+                .map_err(|_| std::io::Error::other("udp quic connect setup failed"))?
+                .await
+                .map_err(|_| std::io::Error::other("udp quic handshake failed"))?;
+            Ok::<(Endpoint, Connection, bool), std::io::Error>((endpoint, conn, false))
+        };
+        // Called for the carrier-first attempt and again by the race if that
+        // attempt fails, so everything it needs is cloned per call.
+        let tcp = || {
+            let cover_domain = cover_domain.clone();
+            let cover_config = cover_config.clone();
+            let inner_cfg = inner_cfg.clone();
+            let server_name = server_name.clone();
+            async move {
+                let (carrier_ep, conn) = Self::dial_carrier_once(
+                    target,
+                    carrier_endpoint,
+                    cover_domain,
+                    cover_config,
+                    inner_cfg,
+                    server_name,
+                    socket_bypass,
+                )
+                .await?;
+                Ok::<(Endpoint, Connection, bool), std::io::Error>((carrier_ep, conn, true))
+            }
+        };
+        let policy = FallbackPolicy {
+            tcp_race_delay: warrenguard_config::knobs::tcp_fallback_race_delay(),
+            ..FallbackPolicy::enabled()
+        };
+        let (dialed, attempt) = connect_carrier_first(&policy, udp, tcp).await;
         match attempt {
-            Ok(Ok((carrier_ep, conn))) => {
+            CarrierFirstAttempt::Won => {
                 crate::udp_hostility::record_carrier_dial_succeeded();
                 tracing::info!("carrier-first dial: session rides the TLS-over-TCP carrier");
-                return Ok((carrier_ep, conn, true));
             }
-            Ok(Err(_)) | Err(_) => {
+            CarrierFirstAttempt::Failed => {
                 crate::udp_hostility::record_carrier_dial_failed();
-                tracing::info!("carrier-first dial failed; falling back to the UDP race");
+                tracing::info!("carrier-first dial failed; the UDP race decided instead");
             }
         }
-        Self::dial_relay_with_carrier(relay, endpoint, server_name, inner_cfg, socket_bypass).await
+        dialed.map_err(|source| MultiHopError::TcpFallback(std::io::Error::other(source)))
     }
 
     /// Races the relay's UDP QUIC dial (on the already-bound `endpoint`)

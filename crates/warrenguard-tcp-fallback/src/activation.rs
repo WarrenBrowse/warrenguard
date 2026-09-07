@@ -186,6 +186,47 @@ where
     }
 }
 
+/// What became of the carrier-first attempt inside [`connect_carrier_first`],
+/// so the caller can feed its UDP-hostility memory without the primitive
+/// knowing that memory exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CarrierFirstAttempt {
+    /// The carrier produced the connection; the UDP path was never dialled.
+    Won,
+    /// The carrier failed or timed out inside the UDP deadline; the ordinary
+    /// race then ran and its verdict is the result.
+    Failed,
+}
+
+/// Dials the TCP carrier FIRST, bounded by [`FallbackPolicy::udp_handshake_timeout`],
+/// and only if that fails runs [`connect_with_fallback`] with the same `policy`.
+/// For a network that lets the UDP handshake through and kills the flow
+/// afterwards: there the race alone never reaches the carrier, because the
+/// handshake it races completes. `tcp` is called at most twice (the attempt,
+/// then the race's own arm), which is why it is `Fn` and not `FnOnce`.
+///
+/// # Errors
+/// Those of [`connect_with_fallback`]: the carrier-first failure is reported in
+/// the [`CarrierFirstAttempt`], never as the error.
+pub async fn connect_carrier_first<C, U, T, TFut>(
+    policy: &FallbackPolicy,
+    udp: U,
+    tcp: T,
+) -> (Result<C, FallbackError>, CarrierFirstAttempt)
+where
+    U: Future<Output = io::Result<C>>,
+    T: Fn() -> TFut,
+    TFut: Future<Output = io::Result<C>>,
+{
+    if let Ok(Ok(connection)) = tokio::time::timeout(policy.udp_handshake_timeout, tcp()).await {
+        return (Ok(connection), CarrierFirstAttempt::Won);
+    }
+    (
+        connect_with_fallback(policy, udp, tcp).await,
+        CarrierFirstAttempt::Failed,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::future::pending;
@@ -421,5 +462,45 @@ mod tests {
         })
         .await;
         assert!(matches!(result, Err(FallbackError::TcpFallbackFailed(_))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn carrier_first_takes_the_carrier_even_when_udp_would_win() {
+        let udp = async { Ok::<u8, io::Error>(1) };
+        let tcp = || async { Ok::<u8, io::Error>(2) };
+        let (won, attempt) = connect_carrier_first(&FallbackPolicy::enabled(), udp, tcp).await;
+        assert_eq!(
+            won.expect("carrier connects"),
+            2,
+            "the carrier's connection is returned"
+        );
+        assert_eq!(attempt, CarrierFirstAttempt::Won);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_carrier_first_attempt_falls_back_to_the_race() {
+        let udp = async { Ok::<u8, io::Error>(1) };
+        let tcp = || async { Err::<u8, io::Error>(io::Error::other("cover tls refused")) };
+        let (won, attempt) = connect_carrier_first(&FallbackPolicy::enabled(), udp, tcp).await;
+        assert_eq!(won.expect("the race still connects over udp"), 1);
+        assert_eq!(attempt, CarrierFirstAttempt::Failed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_carrier_first_attempt_is_bounded_by_the_udp_deadline() {
+        let udp = async { Ok::<u8, io::Error>(1) };
+        let tcp = || pending::<io::Result<u8>>();
+        let policy = FallbackPolicy {
+            udp_handshake_timeout: Duration::from_secs(2),
+            ..FallbackPolicy::enabled()
+        };
+        let started = tokio::time::Instant::now();
+        let (won, attempt) = connect_carrier_first(&policy, udp, tcp).await;
+        assert_eq!(won.expect("udp wins the race after the stalled attempt"), 1);
+        assert_eq!(attempt, CarrierFirstAttempt::Failed);
+        assert!(
+            started.elapsed() >= Duration::from_secs(2),
+            "the carrier attempt must be given the whole deadline before the race starts"
+        );
     }
 }

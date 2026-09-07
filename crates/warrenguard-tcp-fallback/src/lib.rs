@@ -64,8 +64,8 @@ mod terminator;
 pub mod tls;
 
 pub use activation::{
-    DEFAULT_TCP_FALLBACK_RACE, DEFAULT_UDP_HANDSHAKE_TIMEOUT, FallbackError, FallbackPolicy,
-    connect_with_fallback,
+    CarrierFirstAttempt, DEFAULT_TCP_FALLBACK_RACE, DEFAULT_UDP_HANDSHAKE_TIMEOUT, FallbackError,
+    FallbackPolicy, connect_carrier_first, connect_with_fallback,
 };
 pub use client::{TcpCarrierSocket, build_carrier_client_endpoint};
 pub use hostility::{Carrier, DialPreference, SessionEnd, UdpHostilityTracker};

@@ -38,7 +38,9 @@ pub const COVER_TCP_ALPN: &[&[u8]] = &[b"h2", b"http/1.1"];
 
 /// The cover-domain TLS target of the fallback carrier for one dial: the exit's
 /// `:443/tcp` address, the cover-domain SNI to present, and the WebPKI client
-/// config that validates the cover certificate.
+/// config that validates the cover certificate. `Clone` so a carrier-first
+/// attempt and the race that follows it can each take their own copy.
+#[derive(Clone)]
 pub struct CoverTls<'a> {
     /// The exit's `:443/tcp` endpoint the carrier connects to.
     pub addr: SocketAddr,
