@@ -3,7 +3,9 @@
 //! The pure logic is [`UdpHostilityTracker`] in `warrenguard-tcp-fallback`.
 //! This module owns the one instance a client process needs: the supervisor
 //! records how each session ended, and every relay dial asks which transport to
-//! try first. It is process-wide on purpose. A client app tears its supervisor
+//! try first. It is public so a deployer with its own supervisor and dial (the
+//! userland SDK datapath) feeds and reads the SAME memory as the engine's
+//! supervisor in the same process. It is process-wide on purpose. A client app tears its supervisor
 //! down and builds a new one on every reconnect, and the pattern this exists to
 //! catch (a censor that passes the QUIC handshake and kills the flow seconds
 //! later) only shows across several of those sessions.
@@ -28,7 +30,7 @@ fn with_tracker<R>(f: impl FnOnce(&mut UdpHostilityTracker, Instant) -> R) -> R 
 /// Record a closed session: which socket carried it, how long it lived after
 /// establishment, and whether a dead-path watch forced the close. Logs the
 /// verdict only when it changes, so a stable network stays silent.
-pub(crate) fn record_session_end(over_carrier: bool, lifetime: Duration, watchdog_forced: bool) {
+pub fn record_session_end(over_carrier: bool, lifetime: Duration, watchdog_forced: bool) {
     let carrier = if over_carrier {
         Carrier::Tcp
     } else {
@@ -58,12 +60,12 @@ pub(crate) fn record_session_end(over_carrier: bool, lifetime: Duration, watchdo
 }
 
 /// A carrier-first dial that did not produce a session.
-pub(crate) fn record_carrier_dial_failed() {
+pub fn record_carrier_dial_failed() {
     with_tracker(|tracker, now| tracker.record_carrier_dial_failed(now));
 }
 
 /// A carrier-first dial that produced a live session.
-pub(crate) fn record_carrier_dial_succeeded() {
+pub fn record_carrier_dial_succeeded() {
     with_tracker(|tracker, _now| tracker.record_carrier_dial_succeeded());
 }
 
@@ -72,7 +74,7 @@ pub(crate) fn record_carrier_dial_succeeded() {
 /// the tracker has seen (a UDP-hostile network known in advance, or a real
 /// network validation of the carrier path).
 #[must_use]
-pub(crate) fn preference() -> DialPreference {
+pub fn preference() -> DialPreference {
     #[cfg(test)]
     if let Some(forced) = tests::forced_preference() {
         return forced;
