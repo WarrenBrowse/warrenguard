@@ -203,8 +203,22 @@ fn apply_bdp_buffer(cfg: &mut TransportConfig, default_floor: usize) {
         cfg,
         warrenguard_config::knobs::dg_bdp_buf_enabled(),
         warrenguard_config::knobs::dg_bdp_mult(),
-        warrenguard_config::knobs::dg_bdp_floor_override().unwrap_or(default_floor),
+        effective_bdp_floor(
+            warrenguard_config::knobs::dg_bdp_floor_override(),
+            default_floor,
+        ),
     );
+}
+
+/// One knob, both sides: an operator debugging a path pins the floor without
+/// having to know which side of the tunnel picked which default, and absent an
+/// override each side keeps its own.
+///
+/// Its own function rather than an inline `unwrap_or` so the rule is testable
+/// without the process environment, which the per-side defaults are not.
+#[must_use]
+fn effective_bdp_floor(override_floor: Option<usize>, default_floor: usize) -> usize {
+    override_floor.unwrap_or(default_floor)
 }
 
 /// Lower bound of the adaptive send buffer on a **client**, whose uplink is
@@ -920,11 +934,26 @@ mod tests {
 
     #[test]
     fn the_operator_override_still_wins_on_both_sides() {
-        // One knob, both sides: an operator debugging a path must be able to
-        // pin the floor without having to know which side of the tunnel picked
-        // which default.
+        // One knob, both sides. Absent an override each side keeps its own
+        // default, which is the whole reason the knob became an Option.
+        assert_eq!(
+            effective_bdp_floor(None, CLIENT_DATAGRAM_BDP_FLOOR),
+            CLIENT_DATAGRAM_BDP_FLOOR
+        );
+        assert_eq!(
+            effective_bdp_floor(None, SERVER_DATAGRAM_BDP_FLOOR),
+            SERVER_DATAGRAM_BDP_FLOOR
+        );
+        // An explicit value overrides whichever side asked.
+        for default_floor in [CLIENT_DATAGRAM_BDP_FLOOR, SERVER_DATAGRAM_BDP_FLOOR] {
+            assert_eq!(
+                effective_bdp_floor(Some(256 * 1024), default_floor),
+                256 * 1024
+            );
+        }
+        // And it reaches the transport config rather than stopping at the seam.
         let mut cfg = TransportConfig::default();
-        apply_bdp_buffer_values(&mut cfg, true, 4, 256 * 1024);
+        apply_bdp_buffer_values(&mut cfg, true, 4, effective_bdp_floor(Some(256 * 1024), 0));
         let rendered = format!("{cfg:?}");
         assert!(
             rendered.contains("floor: 262144"),

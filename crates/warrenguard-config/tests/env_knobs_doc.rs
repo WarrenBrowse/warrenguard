@@ -32,6 +32,39 @@ fn every_registry_knob_is_documented() {
 }
 
 #[test]
+fn every_documented_knob_carries_the_registry_default_and_clamp() {
+    // Checking the NAME alone lets a value drift silently, which is the failure
+    // this file exists to prevent one level down: `WARREN_DG_BDP_FLOOR` kept
+    // advertising a 1 MiB default to operators for as long as a name check was
+    // all that stood between the registry and the doc. An operator reads the
+    // doc and tunes from it, so the doc's numbers are what must match.
+    let doc = doc_contents();
+    let mut drifted = Vec::new();
+    for meta in REGISTRY {
+        let Some(row) = doc
+            .lines()
+            .find(|line| line.contains(&format!("`{}`", meta.name)) && line.starts_with('|'))
+        else {
+            continue; // absence is the other test's verdict, not this one's
+        };
+        for (field, value) in [("default", meta.default), ("clamp", meta.clamp)] {
+            if !row.contains(value) {
+                drifted.push(format!(
+                    "{}: doc row lacks the registry {field} {value:?}",
+                    meta.name
+                ));
+            }
+        }
+    }
+    assert!(
+        drifted.is_empty(),
+        "the doc and the registry disagree; the registry is the source of truth \
+         (warrenguard-config/src/knobs.rs), so fix the doc rows:\n  {}",
+        drifted.join("\n  ")
+    );
+}
+
+#[test]
 fn doc_lists_no_unknown_registry_only_marker() {
     // Sanity: the registry is non-empty and the doc mentions the module.
     assert!(!REGISTRY.is_empty(), "REGISTRY must not be empty");
