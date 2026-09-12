@@ -128,9 +128,9 @@ pub const REGISTRY: &[KnobMeta] = &[
     KnobMeta {
         name: "WARREN_DG_BDP_FLOOR",
         kind: "usize (bytes)",
-        default: "1048576 (1 MiB)",
-        clamp: "clamped to [16384, 64 MiB]; unparsable -> default",
-        effect: "lower bound of the adaptive send buffer (ramp-up and tiny-BDP guard)",
+        default: "per side: 131072 (128 KiB) on a client, 1048576 (1 MiB) on an exit or relay",
+        clamp: "clamped to [16384, 64 MiB]; unparsable -> the side's own default",
+        effect: "lower bound of the adaptive send buffer (ramp-up and tiny-BDP guard); it is what sizes the buffer on any path whose BDP times the multiple stays under it, so on a narrow last mile the floor IS the buffer",
         home: "warrenguard-transport-core/src/transport_config.rs",
     },
     KnobMeta {
@@ -387,10 +387,17 @@ pub fn parse_positive_u64_opt(name: &str, raw: Option<&str>) -> Option<u64> {
 /// `WARREN_UPLINK_BATCH_MAX` and `WARREN_WORKER_THREADS`.
 #[must_use]
 pub fn parse_usize_clamped(raw: Option<&str>, min: usize, max: usize, default: usize) -> usize {
+    parse_usize_clamped_opt(raw, min, max).unwrap_or(default)
+}
+
+/// [`parse_usize_clamped`] without a default: `None` when the knob is absent,
+/// unparsable or below `min`, so a caller that has no single right default (one
+/// per side of the tunnel) can supply its own.
+#[must_use]
+pub fn parse_usize_clamped_opt(raw: Option<&str>, min: usize, max: usize) -> Option<usize> {
     raw.and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= min)
         .map(|n| n.min(max))
-        .unwrap_or(default)
 }
 
 /// Parses a positive `usize` byte-size knob clamped at `max`. Absent,
@@ -692,8 +699,15 @@ pub fn dg_bdp_buf_enabled() -> bool {
     *CACHE.get_or_init(|| parse_bool_default_on(std::env::var("WARREN_DG_BDP_BUF").ok().as_deref()))
 }
 
+/// Shipped multiple of the smoothed BDP estimate the adaptive send buffer aims
+/// at. Named because the buffer floor is only inert while `DG_BDP_MULT_DEFAULT x
+/// BDP` stays under it, so the two numbers decide together which link class the
+/// adaptation actually reaches.
+pub const DG_BDP_MULT_DEFAULT: u64 = 4;
+
 /// `WARREN_DG_BDP_MULT`: adaptive send-buffer size as a multiple of the
-/// smoothed BDP estimate. Clamped to `[1, 64]`, default `4`.
+/// smoothed BDP estimate. Clamped to `[1, 64]`, default
+/// [`DG_BDP_MULT_DEFAULT`].
 #[must_use]
 pub fn dg_bdp_mult() -> u64 {
     static CACHE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -702,22 +716,27 @@ pub fn dg_bdp_mult() -> u64 {
             std::env::var("WARREN_DG_BDP_MULT").ok().as_deref(),
             1,
             64,
-            4,
+            DG_BDP_MULT_DEFAULT as usize,
         ) as u64
     })
 }
 
-/// `WARREN_DG_BDP_FLOOR`: lower bound of the adaptive send buffer in bytes.
-/// Clamped to `[16 KiB, 64 MiB]`, default `1048576` (1 MiB).
+/// `WARREN_DG_BDP_FLOOR`: operator override for the lower bound of the adaptive
+/// send buffer, in bytes. Clamped to `[16 KiB, 64 MiB]`.
+///
+/// `None` when unset or unparsable, which leaves each side of the tunnel on its
+/// own default: a client's last mile and a server's uplink do not want the same
+/// floor, and a single shared number necessarily fits only one of them. The
+/// defaults live with the transport profiles that pick them
+/// (`warrenguard-transport-core/src/transport_config.rs`).
 #[must_use]
-pub fn dg_bdp_floor() -> usize {
-    static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+pub fn dg_bdp_floor_override() -> Option<usize> {
+    static CACHE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
-        parse_usize_clamped(
+        parse_usize_clamped_opt(
             std::env::var("WARREN_DG_BDP_FLOOR").ok().as_deref(),
             16 * 1024,
             64 * 1024 * 1024,
-            1024 * 1024,
         )
     })
 }
@@ -1137,6 +1156,38 @@ pub fn log_effective_overrides() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_absent_or_rejected_bdp_floor_leaves_the_side_to_choose() {
+        // `None` is what lets a client and an exit keep different defaults, so
+        // it must be the answer for every shape of "the operator said nothing
+        // usable": absent, unparsable, and below the clamp floor.
+        assert_eq!(
+            parse_usize_clamped_opt(None, 16 * 1024, 64 * 1024 * 1024),
+            None
+        );
+        assert_eq!(
+            parse_usize_clamped_opt(Some("nope"), 16 * 1024, 64 * 1024 * 1024),
+            None
+        );
+        assert_eq!(
+            parse_usize_clamped_opt(Some("1024"), 16 * 1024, 64 * 1024 * 1024),
+            None,
+            "under the clamp floor is a typo, not an instruction"
+        );
+        // An explicit, in-range value is an instruction and overrides both sides.
+        assert_eq!(
+            parse_usize_clamped_opt(Some("262144"), 16 * 1024, 64 * 1024 * 1024),
+            Some(256 * 1024)
+        );
+        // Above the ceiling is clamped down rather than refused.
+        assert_eq!(
+            parse_usize_clamped_opt(Some("999999999"), 16 * 1024, 64 * 1024 * 1024),
+            Some(64 * 1024 * 1024)
+        );
+        // And the defaulting wrapper keeps behaving exactly as it did.
+        assert_eq!(parse_usize_clamped(None, 16 * 1024, 64 * 1024 * 1024, 7), 7);
+    }
 
     #[test]
     fn client_initial_mtu_clamps_into_the_quic_valid_range() {

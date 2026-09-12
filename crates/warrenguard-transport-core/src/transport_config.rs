@@ -198,14 +198,38 @@ fn apply_datagram_aqm_values(
 /// so the queue the AQM polices stays shallow by construction. `WARREN_DG_BDP_BUF=0`
 /// is the production kill switch (fixed sizing restored, WARREN_DG_SEND_BUF
 /// stays the manual override/cap either way).
-fn apply_bdp_buffer(cfg: &mut TransportConfig) {
+fn apply_bdp_buffer(cfg: &mut TransportConfig, default_floor: usize) {
     apply_bdp_buffer_values(
         cfg,
         warrenguard_config::knobs::dg_bdp_buf_enabled(),
         warrenguard_config::knobs::dg_bdp_mult(),
-        warrenguard_config::knobs::dg_bdp_floor(),
+        warrenguard_config::knobs::dg_bdp_floor_override().unwrap_or(default_floor),
     );
 }
+
+/// Lower bound of the adaptive send buffer on a **client**, whose uplink is
+/// whatever the member's line happens to be.
+///
+/// The adaptation aims at `WARREN_DG_BDP_MULT` times the measured BDP and may
+/// never go under the floor, so the floor decides the buffer outright on every
+/// path narrow enough that the target lands below it. The shared 1 MiB was that
+/// on a ~1 Mbit/s uplink: roughly nine seconds of standing queue, which is the
+/// bufferbloat the adaptation exists to remove, left in place on precisely the
+/// link class it was written for (`incidents/2026-07-19-vpn-bufferbloat-lossy-lastmile.md`,
+/// reproduced on a member's line in `incidents/2026-09-12-bufferbloat-fixed-probe-budget-reconnect-storm.md`).
+///
+/// 128 KiB is about a second on that line and still ~90 full datagrams, and it
+/// only ever DECIDES anything below `128 KiB / mult` = 32 KiB of BDP, which a
+/// 10 Mbit/s path passes at a 26 ms round trip. Everything faster keeps the
+/// sizing it already had.
+pub const CLIENT_DATAGRAM_BDP_FLOOR: usize = 128 * 1024;
+
+/// Lower bound of the adaptive send buffer on an **exit or relay**.
+///
+/// A server egresses from a datacentre, where `mult x BDP` is always the larger
+/// of the two, so this floor never decides a buffer size and stays where it has
+/// been measured.
+pub const SERVER_DATAGRAM_BDP_FLOOR: usize = 1024 * 1024;
 
 /// Pure seam of [`apply_bdp_buffer`], testable without the process
 /// environment.
@@ -223,7 +247,9 @@ fn warren_transport_config_base_with_pad(enable_gso: bool, pad_to_mtu: bool) -> 
     let mut cfg = TransportConfig::default();
     apply_congestion_controller(&mut cfg);
     apply_datagram_aqm(&mut cfg);
-    apply_bdp_buffer(&mut cfg);
+    // The base serves every profile, so it takes the server floor and the two
+    // client entry points lower it for their own side.
+    apply_bdp_buffer(&mut cfg, SERVER_DATAGRAM_BDP_FLOOR);
     cfg.initial_mtu(TUNNEL_INITIAL_MTU)
         .min_mtu(TUNNEL_MIN_MTU)
         .mtu_discovery_config(Some(MtuDiscoveryConfig::default()))
@@ -382,6 +408,7 @@ fn warren_transport_config_client_full_with_mtu(
     initial_mtu: u16,
 ) -> Arc<TransportConfig> {
     let mut cfg = warren_transport_config_base_with_pad(enable_gso, pad_to_mtu);
+    apply_bdp_buffer(&mut cfg, CLIENT_DATAGRAM_BDP_FLOOR);
     apply_client_liveness(&mut cfg, idle_cover);
     cfg.initial_mtu(initial_mtu)
         .max_concurrent_bidi_streams(VarInt::from_u32(QUIC_MAX_CONCURRENT_BIDI_STREAMS_CLIENT))
@@ -637,6 +664,7 @@ fn warren_transport_config_client_multihop_with_mtu(
     initial_mtu: u16,
 ) -> Arc<TransportConfig> {
     let mut cfg = warren_transport_config_base(enable_gso);
+    apply_bdp_buffer(&mut cfg, CLIENT_DATAGRAM_BDP_FLOOR);
     apply_client_liveness(&mut cfg, idle_cover);
     cfg.initial_mtu(initial_mtu)
         .max_concurrent_bidi_streams(VarInt::from_u32(QUIC_MAX_CONCURRENT_BIDI_STREAMS_CLIENT))
@@ -821,6 +849,86 @@ mod tests {
         assert!(
             rendered.contains("multiple: 2.0") && rendered.contains("floor: 131072"),
             "tuned BDP-buffer values must reach the transport config, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_client_send_buffer_floor_sits_far_below_the_server_one() {
+        // The floor is what the adaptive sizing may never shrink past, so on a
+        // narrow last mile the floor IS the buffer and the adaptation is inert.
+        // A 1 MiB floor on a 1 Mbit/s uplink is about nine seconds of standing
+        // queue for the CoDel AQM to fight, on the exact link class the
+        // adaptation was built for. A server egresses from a datacentre, where
+        // four times the measured BDP is always the larger of the two, so the
+        // floor there never decides anything and is left alone.
+        let client = format!("{:?}", warren_transport_config_client());
+        assert!(
+            client.contains("floor: 131072"),
+            "the client floor must be the narrow-last-mile one, got: {client}"
+        );
+        for cfg in [
+            warren_transport_config_exit(),
+            warren_transport_config_relay_inbound(),
+            warren_transport_config_relay_outbound(),
+        ] {
+            let rendered = format!("{cfg:?}");
+            assert!(
+                rendered.contains("floor: 1048576"),
+                "a server-side floor must be unchanged, got: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_client_profile_takes_the_narrow_last_mile_floor() {
+        // Both client entry points funnel through their own `_with_mtu` builder,
+        // and a variant that kept the server floor would leave whichever tier
+        // uses it on the old sizing with nothing to show for it.
+        for cfg in [
+            warren_transport_config_client(),
+            warren_transport_config_client_with_idle_cover(true, true),
+            warren_transport_config_client_full(true, true, false),
+            warren_transport_config_client_multihop_with_gso(true),
+            warren_transport_config_client_multihop_with_idle_cover(true, true),
+        ] {
+            let rendered = format!("{cfg:?}");
+            assert!(
+                rendered.contains("floor: 131072"),
+                "every client profile must carry the client floor, got: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_client_floor_stops_deciding_above_a_narrow_last_mile() {
+        // The blast radius of the lower floor, stated as a number instead of a
+        // hope: the floor only decides the buffer while `multiple x BDP` sits
+        // under it, so every path with a larger BDP keeps exactly the sizing it
+        // has today. At the shipped multiple that crossover is 32 KiB of BDP,
+        // which a 10 Mbit/s path passes at a 26 ms round trip.
+        let crossover =
+            CLIENT_DATAGRAM_BDP_FLOOR as u64 / warrenguard_config::knobs::DG_BDP_MULT_DEFAULT;
+        assert_eq!(crossover, 32 * 1024);
+        // And the server side keeps a floor a datacentre BDP always clears, so
+        // the two numbers stay the way round the profiles assume.
+        assert_eq!(
+            SERVER_DATAGRAM_BDP_FLOOR / CLIENT_DATAGRAM_BDP_FLOOR,
+            8,
+            "the client floor must stay the far lower of the two"
+        );
+    }
+
+    #[test]
+    fn the_operator_override_still_wins_on_both_sides() {
+        // One knob, both sides: an operator debugging a path must be able to
+        // pin the floor without having to know which side of the tunnel picked
+        // which default.
+        let mut cfg = TransportConfig::default();
+        apply_bdp_buffer_values(&mut cfg, true, 4, 256 * 1024);
+        let rendered = format!("{cfg:?}");
+        assert!(
+            rendered.contains("floor: 262144"),
+            "an explicit floor must reach the config, got: {rendered}"
         );
     }
 
