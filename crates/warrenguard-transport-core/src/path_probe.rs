@@ -3,8 +3,8 @@
 //!
 //! A healthy path logs a heartbeat every
 //! [`PATH_PROBE_HEARTBEAT_TICKS`] intervals; an interval that carries
-//! a pathology (loss, congestion, a send-queue drop, ECN CE) logs
-//! immediately. The old every-tick INFO line was 8 lines every 5 s on
+//! a pathology (loss, congestion, a send-queue drop, ECN CE, a
+//! black-hole detection) logs immediately. The old every-tick INFO line was 8 lines every 5 s on
 //! a multihop session, about 1.4 MB per hour, and it crowded out
 //! everything else: a real beta problem report was 98.9% path-probe
 //! bytes and covered only 7 minutes of history. Set
@@ -29,6 +29,11 @@
 //!   by `send_datagram` never reached the wire (buffer overflow).
 //! - `udp_gso`: average datagrams per UDP I/O (GSO/sendmmsg
 //!   efficiency).
+//! - `black_holes`: QUIC black-hole detections this interval. A
+//!   shrinking `mtu=` alone cannot say whether the DPLPMTUD search
+//!   walked its bound down or the detector reset the MTU to the floor;
+//!   this counter is the discriminator, and its absence is what made
+//!   the 2026-09-12 field report guess.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -100,6 +105,13 @@ pub struct PathProbeDelta {
     pub ecn_ect1: u64,
     /// Enqueued inner packets classified CE.
     pub ecn_ce: u64,
+    /// Times the QUIC black-hole detector reset the path MTU to the floor.
+    ///
+    /// Distinct from a PMTU that DROPPED: the binary search walking its upper
+    /// bound down and the detector slamming the MTU to `min_mtu` both show up
+    /// as a smaller `mtu=`, and they have different causes. This counter is
+    /// what tells them apart in a problem report.
+    pub black_holes: u64,
 }
 
 impl PathProbeDelta {
@@ -141,6 +153,10 @@ impl PathProbeDelta {
                 .datagram_tx
                 .ecn_ce
                 .saturating_sub(prev.datagram_tx.ecn_ce),
+            black_holes: cur
+                .path
+                .black_holes_detected
+                .saturating_sub(prev.path.black_holes_detected),
         }
     }
 
@@ -164,6 +180,7 @@ impl PathProbeDelta {
             || self.dg_dropped_aqm > 0
             || self.dg_dropped_overflow > 0
             || self.ecn_ce > 0
+            || self.black_holes > 0
     }
 
     /// Average UDP datagrams per I/O operation (GSO/sendmmsg batching
@@ -268,6 +285,7 @@ pub fn spawn_path_probe(
                         ecn_ect0 = delta.ecn_ect0,
                         ecn_ect1 = delta.ecn_ect1,
                         ecn_ce = delta.ecn_ce,
+                        black_holes = delta.black_holes,
                         udp_gso = format_args!("{:.1}", delta.udp_gso_ratio()),
                         app_tx,
                         app_rx,
@@ -291,6 +309,7 @@ pub fn spawn_path_probe(
                         ecn_ect0 = delta.ecn_ect0,
                         ecn_ect1 = delta.ecn_ect1,
                         ecn_ce = delta.ecn_ce,
+                        black_holes = delta.black_holes,
                         udp_gso = format_args!("{:.1}", delta.udp_gso_ratio()),
                         "path probe"
                     ),
@@ -454,12 +473,35 @@ mod tests {
                     ..healthy
                 },
             ),
+            (
+                "black hole",
+                PathProbeDelta {
+                    black_holes: 1,
+                    ..healthy
+                },
+            ),
         ] {
             assert!(
                 delta.is_noteworthy(),
                 "{name} is exactly what this probe exists to catch"
             );
         }
+    }
+
+    #[test]
+    fn black_hole_detections_are_counted_and_saturate() {
+        // The 2026-09-12 field report had to infer a collapsed PMTU from the
+        // `mtu=` field alone, which cannot say whether the search walked down
+        // or the black-hole detector reset it to the floor. They have
+        // different causes and different fixes, so the counter is logged.
+        let mut prev = ConnectionStats::default();
+        prev.path.black_holes_detected = 3;
+        let mut cur = ConnectionStats::default();
+        cur.path.black_holes_detected = 11;
+        assert_eq!(PathProbeDelta::between(&prev, &cur).black_holes, 8);
+
+        // A path migration resets the counters; the delta must not underflow.
+        assert_eq!(PathProbeDelta::between(&cur, &prev).black_holes, 0);
     }
 
     #[test]
