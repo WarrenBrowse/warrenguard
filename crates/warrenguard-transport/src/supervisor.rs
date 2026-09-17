@@ -574,6 +574,31 @@ enum Established {
         primary: Arc<MultiHopClient>,
     },
     Rejected(RejectionReason),
+    /// The setup round-trip got nothing back before
+    /// [`SETUP_ROUND_TRIP_TIMEOUT`].
+    SetupTimedOut,
+}
+
+/// Ceiling on the setup round-trip, measured from a completed handshake.
+///
+/// Every other leg of the connect path is bounded (the UDP handshake at
+/// `DEFAULT_UDP_HANDSHAKE_TIMEOUT`, the relay-auth proof at
+/// `RELAY_PROOF_TIMEOUT`), and this one was not: `read_to_end` on the setup
+/// stream waited for QUIC's own idle timeout. On a network that passes the
+/// handshake and then cuts the flow, that turned every dial into a single
+/// multi-second stall, and a client whose deployer bounds a connect attempt
+/// (Android gives it 20 s) never got a second try inside its own window.
+/// Sized so three dials fit in that window.
+const SETUP_ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// What one setup round-trip produced.
+enum SetupOutcome {
+    /// The exit answered; `Some` when the reply carried an `IpAssign`.
+    Assigned(Option<IpAssignSpec>),
+    /// The exit refused the session. A redial hits the same refusal.
+    Rejected(RejectionReason),
+    /// Nothing came back within [`SETUP_ROUND_TRIP_TIMEOUT`].
+    TimedOut,
 }
 
 impl MultiHopSupervisor {
@@ -789,11 +814,24 @@ impl MultiHopSupervisor {
                 .setup_primary(&primary, session_tokens.as_deref())
                 .await
             {
-                Ok(assign) => assign,
-                Err(reason) => {
+                SetupOutcome::Assigned(assign) => assign,
+                SetupOutcome::Rejected(reason) => {
                     let _ = self.fatal_tx.send(Some(reason));
                     tracing::warn!(%reason, "multi-hop session rejected by exit at setup; surfacing fatal");
                     return Err(MultiHopError::Rejected(reason));
+                }
+                SetupOutcome::TimedOut => {
+                    // The censor shape: the handshake passed, the request went
+                    // out, nothing came back. No session is born, so the
+                    // session-death path below never runs and this is the only
+                    // place the carrier-first memory can learn about it.
+                    crate::udp_hostility::record_setup_timeout(primary.is_over_carrier());
+                    tracing::warn!(
+                        timeout_secs = SETUP_ROUND_TRIP_TIMEOUT.as_secs(),
+                        "multi-hop setup round-trip answered nothing; redialling"
+                    );
+                    drop(primary);
+                    continue;
                 }
             };
             let mut bundle = MultiHopBundle::new_unsealed(vec![primary.clone()]);
@@ -1145,6 +1183,25 @@ impl MultiHopSupervisor {
         &self,
         primary: &Arc<MultiHopClient>,
         session_tokens: Option<&[SessionToken]>,
+    ) -> SetupOutcome {
+        match tokio::time::timeout(
+            SETUP_ROUND_TRIP_TIMEOUT,
+            self.setup_primary_unbounded(primary, session_tokens),
+        )
+        .await
+        {
+            Ok(Ok(assign)) => SetupOutcome::Assigned(assign),
+            Ok(Err(reason)) => SetupOutcome::Rejected(reason),
+            Err(_) => SetupOutcome::TimedOut,
+        }
+    }
+
+    /// [`Self::setup_primary`] without the deadline. Split out so the timeout
+    /// is stated once and cannot be forgotten at a call site.
+    async fn setup_primary_unbounded(
+        &self,
+        primary: &Arc<MultiHopClient>,
+        session_tokens: Option<&[SessionToken]>,
     ) -> Result<Option<IpAssignSpec>, RejectionReason> {
         // The first multi-hop frame carries the HPKE `encapsulated_key`; on a
         // warming path the first datagram is frequently lost, so the SETUP
@@ -1337,8 +1394,9 @@ impl MultiHopSupervisor {
             .setup_primary(&primary, session_tokens.as_deref())
             .await
         {
-            Ok(assign) => assign,
-            Err(reason) => return Established::Rejected(reason),
+            SetupOutcome::Assigned(assign) => assign,
+            SetupOutcome::Rejected(reason) => return Established::Rejected(reason),
+            SetupOutcome::TimedOut => return Established::SetupTimedOut,
         };
 
         // Bonded secondaries: best-effort extra connections under the same
@@ -1399,6 +1457,14 @@ impl MultiHopSupervisor {
             Established::Session { bundle, primary } => Some((bundle, primary, relay_pubkey)),
             Established::Rejected(reason) => {
                 tracing::warn!(%reason, "overlap dial rejected by exit; keeping the current session");
+                None
+            }
+            // Deliberately NOT recorded as a censor signature: an overlap runs
+            // while a session is serving fine, so the network is demonstrably
+            // carrying traffic and a stalled warm dial says much less than the
+            // same stall on a cold one.
+            Established::SetupTimedOut => {
+                tracing::warn!("overlap dial setup answered nothing; keeping the current session");
                 None
             }
         }
@@ -2663,6 +2729,61 @@ mod run_tests {
         drop(rx);
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
         blackhole.task.abort();
+    }
+
+    /// The 2026-09-10 Kaliningrad pattern, one layer deeper than the test
+    /// above: the handshake passes, the exit RECEIVES the setup request, and
+    /// the reply never travels. The client used to park in an untimed
+    /// `read_to_end` for the whole of the app's 20 s grace, so it made ONE
+    /// attempt per window, never redialled inside it, and taught the
+    /// carrier-first memory nothing (that memory is fed by session DEATHS, and
+    /// no session is ever born here). Real time, on purpose.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_setup_that_never_answers_is_abandoned_and_arms_carrier_first() {
+        use std::sync::atomic::Ordering;
+
+        use warrenguard_tcp_fallback::DialPreference;
+
+        let operational_key = SigningKey::from_bytes(&[0x47; 32]);
+        let exit_id = ExitId::from_bytes([0x57; 16]);
+        let exit = spawn_fake_multihop_exit(&operational_key, exit_id);
+        exit.swallow_setup.store(true, Ordering::Relaxed);
+        let config = config_with_fake_exit(&exit, &operational_key);
+        let (supervisor, rx) = MultiHopSupervisor::new(config);
+        // The tracker is process-wide and other tests in this binary feed it:
+        // a long healthy UDP session is the documented reset, so what is
+        // asserted below is this test's own doing.
+        crate::udp_hostility::record_session_end(false, Duration::from_secs(3600), false);
+        let task = tokio::spawn(supervisor.run());
+
+        // Absolute on purpose, not derived from the constant under test: a
+        // budget that tracks the ceiling would stretch with it and this test
+        // could never go red by raising it. Generous because the whole crate's
+        // suite runs in this process and the dials here are real ones.
+        let budget = Duration::from_secs(60);
+        tokio::time::timeout(budget, async {
+            while exit.accepted.load(Ordering::Relaxed) < 2 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "a setup that never answers must be abandoned and redialled within {budget:?}; \
+                 the exit accepted {} connection(s)",
+                exit.accepted.load(Ordering::Relaxed)
+            )
+        });
+
+        assert_eq!(
+            crate::udp_hostility::preference(),
+            DialPreference::CarrierFirst,
+            "a handshake that passes and a setup that answers nothing must send \
+             the next dial over the TLS-over-TCP carrier"
+        );
+
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
 
     #[tokio::test]

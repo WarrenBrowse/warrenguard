@@ -123,6 +123,27 @@ impl UdpHostilityTracker {
         }
     }
 
+    /// Record a setup round-trip that timed out on a connection whose handshake
+    /// had already completed.
+    ///
+    /// One is enough to arm carrier-first, where a session death needs
+    /// [`KILLS_BEFORE_CARRIER_FIRST`]: that threshold exists so a single radio
+    /// drop cannot flip the transport, and this is not a radio drop. The setup
+    /// request rides a reliable stream that retransmits, on a connection the
+    /// peer has just answered, so seconds of total silence in that window means
+    /// the flow was cut rather than a packet lost. Observed on a Russian mobile
+    /// operator on 2026-09-10: 60 dials in 51 minutes, every one abandoned with
+    /// no `IpAssign`, while HTTPS to the same operator's uplink kept working.
+    pub fn record_setup_timeout(&mut self, carrier: Carrier, now: Instant) {
+        match carrier {
+            Carrier::Udp => {
+                self.young_udp_kills = self.young_udp_kills.saturating_add(1);
+                self.carrier_first_until = Some(now + CARRIER_FIRST_TTL);
+            }
+            Carrier::Tcp => self.note_carrier_failure(now),
+        }
+    }
+
     /// Record a carrier-first dial that failed (TCP connect, cover TLS or the
     /// inner QUIC handshake). The caller then runs the ordinary race.
     pub fn record_carrier_dial_failed(&mut self, now: Instant) {
@@ -334,6 +355,55 @@ mod tests {
             );
         }
         assert_eq!(tracker.preference(now), DialPreference::Race);
+    }
+
+    #[test]
+    fn one_setup_timeout_over_udp_arms_carrier_first_on_its_own() {
+        let mut tracker = UdpHostilityTracker::default();
+        let now = t0();
+        tracker.record_setup_timeout(Carrier::Udp, now);
+        assert_eq!(
+            tracker.preference(now + Duration::from_secs(1)),
+            DialPreference::CarrierFirst,
+            "a handshake that completes and then answers nothing on its setup \
+             stream is the censor signature, not an unlucky radio drop"
+        );
+    }
+
+    #[test]
+    fn a_udp_session_that_outlives_the_window_clears_a_setup_timeout_streak() {
+        let mut tracker = UdpHostilityTracker::default();
+        let now = t0();
+        tracker.record_setup_timeout(Carrier::Udp, now);
+        tracker.record_session_end(
+            SessionEnd {
+                carrier: Carrier::Udp,
+                lifetime: Duration::from_secs(120),
+                watchdog_forced: true,
+            },
+            now + Duration::from_secs(200),
+        );
+        assert_eq!(
+            tracker.preference(now + Duration::from_secs(201)),
+            DialPreference::Race,
+            "one healthy session proves the UDP path usable again"
+        );
+    }
+
+    #[test]
+    fn a_setup_timeout_over_the_carrier_counts_as_a_carrier_failure() {
+        let mut tracker = UdpHostilityTracker::default();
+        let now = t0();
+        tracker.record_setup_timeout(Carrier::Udp, now);
+        for i in 0..CARRIER_FAILURES_BEFORE_COOLDOWN {
+            tracker.record_setup_timeout(Carrier::Tcp, now + Duration::from_secs(u64::from(i)));
+        }
+        assert_eq!(
+            tracker.preference(now + Duration::from_secs(10)),
+            DialPreference::Race,
+            "a network that swallows the setup over both transports must not \
+             pay an extra TCP dial on every redial"
+        );
     }
 
     #[test]

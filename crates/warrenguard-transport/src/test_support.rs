@@ -415,6 +415,10 @@ pub(crate) struct FakeMultihopExit {
     /// `reject_banned` is set, so a test can assert the code reaches the
     /// client's `RejectionReason::Banned` intact.
     pub(crate) ban_reason_code: Arc<AtomicU8>,
+    /// When set, the setup request is read and NEVER answered, and the
+    /// connection is held open. The censor shape reported from Russia on
+    /// 2026-09-10: the handshake passes, the setup reply never comes back.
+    pub(crate) swallow_setup: Arc<AtomicBool>,
     _server_ep: Endpoint,
 }
 
@@ -429,6 +433,7 @@ async fn serve_one_fake_exit_connection(
     reject: Arc<AtomicBool>,
     reject_banned: Arc<AtomicBool>,
     ban_reason_code: Arc<AtomicU8>,
+    swallow_setup: Arc<AtomicBool>,
 ) {
     let Ok((mut send, mut recv)) = conn.accept_bi().await else {
         return;
@@ -436,6 +441,14 @@ async fn serve_one_fake_exit_connection(
     let Ok(bytes) = recv.read_to_end(64 * 1024).await else {
         return;
     };
+    // The censored shape: the handshake completed and the request arrived, and
+    // the reply never travels. Holding the connection open (rather than
+    // closing it) is what the client sees on such a network, so the client
+    // stalls in its own read instead of taking a connection error.
+    if swallow_setup.load(Ordering::Relaxed) {
+        conn.closed().await;
+        return;
+    }
     let Ok(frame) = decode_frame(&bytes) else {
         return;
     };
@@ -533,12 +546,14 @@ pub(crate) fn spawn_fake_multihop_exit(
     let reject = Arc::new(AtomicBool::new(false));
     let reject_banned = Arc::new(AtomicBool::new(false));
     let ban_reason_code = Arc::new(AtomicU8::new(0));
+    let swallow_setup = Arc::new(AtomicBool::new(false));
 
     let accept_loop_ep = server_ep.clone();
     let accept_loop_accepted = accepted.clone();
     let accept_loop_reject = reject.clone();
     let accept_loop_reject_banned = reject_banned.clone();
     let accept_loop_ban_reason_code = ban_reason_code.clone();
+    let accept_loop_swallow_setup = swallow_setup.clone();
     tokio::spawn(async move {
         loop {
             let Some(incoming) = accept_loop_ep.accept().await else {
@@ -548,14 +563,23 @@ pub(crate) fn spawn_fake_multihop_exit(
                 continue;
             };
             accept_loop_accepted.fetch_add(1, Ordering::Relaxed);
-            serve_one_fake_exit_connection(
+            let swallow = accept_loop_swallow_setup.clone();
+            let served = serve_one_fake_exit_connection(
                 conn,
                 exit_id,
                 accept_loop_reject.clone(),
                 accept_loop_reject_banned.clone(),
                 accept_loop_ban_reason_code.clone(),
-            )
-            .await;
+                swallow.clone(),
+            );
+            // A swallowed setup holds its connection open until the client
+            // gives up, so serving it inline would stall the accept loop and
+            // the client's next dial would never be answered.
+            if swallow.load(Ordering::Relaxed) {
+                tokio::spawn(served);
+            } else {
+                served.await;
+            }
         }
     });
 
@@ -567,6 +591,7 @@ pub(crate) fn spawn_fake_multihop_exit(
         reject,
         reject_banned,
         ban_reason_code,
+        swallow_setup,
         _server_ep: server_ep,
     }
 }

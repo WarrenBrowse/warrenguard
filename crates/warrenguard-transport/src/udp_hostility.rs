@@ -59,6 +59,31 @@ pub fn record_session_end(over_carrier: bool, lifetime: Duration, watchdog_force
     }
 }
 
+/// Record a setup round-trip abandoned on a timeout, on a connection whose
+/// handshake had already completed. One of these arms carrier-first on its own;
+/// see [`UdpHostilityTracker::record_setup_timeout`] for why the session-death
+/// threshold does not apply to it.
+pub fn record_setup_timeout(over_carrier: bool) {
+    let carrier = if over_carrier {
+        Carrier::Tcp
+    } else {
+        Carrier::Udp
+    };
+    let (before, after) = with_tracker(|tracker, now| {
+        let before = tracker.preference(now);
+        tracker.record_setup_timeout(carrier, now);
+        (before, tracker.preference(now))
+    });
+    if before != after {
+        tracing::info!(
+            ?after,
+            over_carrier,
+            "dial preference changed: the handshake passes and the setup \
+             round-trip gets nothing back"
+        );
+    }
+}
+
 /// A carrier-first dial that did not produce a session.
 pub fn record_carrier_dial_failed() {
     with_tracker(|tracker, now| tracker.record_carrier_dial_failed(now));
