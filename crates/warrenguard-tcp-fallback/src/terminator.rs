@@ -97,6 +97,15 @@ where
                 if let Some(datagram) = deframer.next_datagram() {
                     break Some(datagram);
                 }
+                // The verdict is already in as soon as the datagram's first byte
+                // has arrived: a carrier's is a QUIC long header, so anything
+                // else can never complete into one. Deciding here rather than on
+                // a complete frame is what lets a request/response protocol
+                // share this port: an HTTP request line would otherwise be read
+                // as a 17231-byte length prefix and sit out the whole timeout.
+                if !can_still_be_a_carrier(&consumed) {
+                    break None;
+                }
             }
             Ok(Err(error)) => return Err(error),
             // No complete frame in time: not a carrier, serve the decoy.
@@ -125,6 +134,16 @@ where
 /// happens in-band at the QUIC layer, untouched by this heuristic.
 fn is_quic_long_header(datagram: &[u8]) -> bool {
     matches!(datagram.first(), Some(byte) if byte & 0xc0 == 0xc0)
+}
+
+/// Whether the bytes read so far could still complete into a carrier's first
+/// frame. Undecided (`true`) until the byte after the 2-byte length prefix has
+/// arrived; from then on it is exactly [`is_quic_long_header`] on that byte.
+fn can_still_be_a_carrier(consumed: &[u8]) -> bool {
+    match consumed.get(LEN_PREFIX_BYTES) {
+        None => true,
+        Some(&byte) => is_quic_long_header(&[byte]),
+    }
 }
 
 /// Binds a fresh UDP socket on an ephemeral port (the per-connection 5-tuple

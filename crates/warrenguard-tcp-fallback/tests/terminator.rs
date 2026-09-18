@@ -409,3 +409,55 @@ async fn serve_carrier_times_out_to_decoy_when_no_frame() {
         "a silent peer past the timeout must be handed to the decoy"
     );
 }
+
+/// A peer whose bytes cannot be a carrier frame reaches the decoy AT ONCE,
+/// without waiting out the first-frame timeout.
+///
+/// This is what makes a shared `:443` usable by a request/response protocol: an
+/// HTTP CONNECT opens with `43 4f 4e ...`, whose third byte is the first byte of
+/// the would-be datagram and is not a QUIC long header, so the classification is
+/// already decided. Waiting the full timeout would put ten seconds in front of
+/// every browser request.
+#[tokio::test]
+async fn serve_carrier_hands_a_non_quic_opening_to_the_decoy_without_waiting() {
+    let (dispatcher, mut rx) = spawn_dispatcher().await;
+    let cfg = TerminatorConfig {
+        dispatcher,
+        // Long enough that a timeout-driven fallback would blow the assertion.
+        first_frame_timeout: Duration::from_secs(30),
+    };
+
+    let (mut client, term) = tokio::io::duplex(64 * 1024);
+    let decoy_called = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&decoy_called);
+    let served = tokio::spawn(async move {
+        serve_carrier(term, &cfg, move |mut stream, prefix| async move {
+            flag.store(true, Ordering::SeqCst);
+            assert_eq!(
+                &prefix[..7],
+                b"CONNECT",
+                "the decoy needs the bytes already read to answer the request"
+            );
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await;
+            Ok(())
+        })
+        .await
+    });
+
+    client
+        .write_all(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n")
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), served)
+        .await
+        .expect("the classification must not wait for the first-frame timeout")
+        .expect("task ok")
+        .expect("serve_carrier ok");
+
+    assert!(decoy_called.load(Ordering::SeqCst), "decoy must be invoked");
+    assert!(
+        rx.try_recv().is_err(),
+        "an HTTP request must never reach the QUIC dispatcher"
+    );
+}
