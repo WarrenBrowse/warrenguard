@@ -3515,6 +3515,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "warrenguard-connect-proxy"
+version = "0.1.0"
+dependencies = [
+ "data-encoding",
+ "thiserror",
+ "tokio",
+ "warrenguard-server",
+ "warrenguard-wire",
+ "zeroize",
+]
+
+[[package]]
 name = "warrenguard-daita"
 version = "0.1.0"
 dependencies = [

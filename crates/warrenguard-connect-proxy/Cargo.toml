@@ -1,0 +1,29 @@
+# WarrenGuard engine crate: HTTP CONNECT proxy ingress.
+# A browser configured with a remote HTTPS proxy speaks ordinary HTTP CONNECT
+# once its TLS to the proxy is up. This crate owns that exchange (request head,
+# the 407 challenge, the byte pipe) with the admission check and the dialer
+# injected, so the engine carries no product policy and no destination logging.
+[package]
+name = "warrenguard-connect-proxy"
+description = "HTTP CONNECT proxy ingress for browser clients (WarrenGuard engine)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+data-encoding = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+warrenguard-server = { path = "../warrenguard-server" }
+warrenguard-wire = { path = "../warrenguard-wire" }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true
