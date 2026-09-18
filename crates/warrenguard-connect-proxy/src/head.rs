@@ -239,10 +239,14 @@ fn parse_basic_credential(value: &str) -> Result<ProxyCredential, HeadError> {
 
 /// The `407` that asks the client for a credential. A browser answers it by
 /// asking its extension, then retries the CONNECT with the credential.
+///
+/// The realm is deliberately generic. It is a plaintext string any peer that
+/// sends a CONNECT can read, so a deployer's name there would identify the
+/// service to an unauthenticated prober.
 #[must_use]
 pub fn challenge_response() -> &'static [u8] {
     b"HTTP/1.1 407 Proxy Authentication Required\r\n\
-      Proxy-Authenticate: Basic realm=\"warren\"\r\n\
+      Proxy-Authenticate: Basic realm=\"proxy\"\r\n\
       Content-Length: 0\r\n\
       Connection: keep-alive\r\n\r\n"
 }
@@ -268,13 +272,23 @@ pub fn method_not_allowed_response() -> &'static [u8] {
       Connection: close\r\n\r\n"
 }
 
-/// Whether `first` could open an HTTP request line. Used by a shared listener to
-/// route a connection to this ingress rather than to a binary protocol: every
-/// HTTP method starts with an ASCII uppercase letter, and the framings this
-/// ingress shares a port with start with a small length prefix.
+/// Whether `first` could still open a CONNECT request line.
+///
+/// This is the routing test for a shared listener, and it is deliberately
+/// narrower than "looks like HTTP": a node that answered every HTTP request
+/// identifies itself as a proxy to anyone who sends a plain `GET`, which is
+/// exactly what a cover listener must not do. Anything that is not on its way to
+/// being a CONNECT belongs to the deployer's decoy instead.
+///
+/// True while `first` is a prefix of `CONNECT ` (the head can arrive in pieces)
+/// and once it starts with it.
 #[must_use]
-pub fn looks_like_http_request(first: &[u8]) -> bool {
-    matches!(first.first(), Some(b) if b.is_ascii_uppercase())
+pub fn looks_like_connect_request(first: &[u8]) -> bool {
+    const METHOD: &[u8] = b"CONNECT ";
+    if first.len() >= METHOD.len() {
+        return first.starts_with(METHOD);
+    }
+    METHOD.starts_with(first) && !first.is_empty()
 }
 
 #[cfg(test)]
@@ -485,11 +499,30 @@ mod tests {
     }
 
     #[test]
-    fn routes_an_http_method_to_this_ingress_and_a_length_prefix_away_from_it() {
-        assert!(looks_like_http_request(b"CONNECT "));
-        assert!(looks_like_http_request(b"GET /"));
+    fn routes_only_a_connect_to_this_ingress() {
+        assert!(looks_like_connect_request(
+            b"CONNECT example.com:443 HTTP/1.1"
+        ));
+        // A head can arrive in pieces, so an incomplete method is undecided.
+        assert!(looks_like_connect_request(b"CON"));
+        assert!(looks_like_connect_request(b"CONNECT "));
+        // An ordinary request must reach the deployer's decoy: answering it
+        // would identify the node as a proxy to any unauthenticated prober.
+        assert!(!looks_like_connect_request(b"GET / HTTP/1.1"));
+        assert!(!looks_like_connect_request(b"POST /x"));
         // A carrier frame opens with the high byte of a length prefix.
-        assert!(!looks_like_http_request(&[0x04, 0xb0]));
-        assert!(!looks_like_http_request(&[]));
+        assert!(!looks_like_connect_request(&[0x04, 0xb0]));
+        assert!(!looks_like_connect_request(&[]));
+    }
+
+    #[test]
+    fn the_challenge_names_no_deployer() {
+        let challenge = String::from_utf8_lossy(challenge_response()).to_lowercase();
+
+        assert!(challenge.contains("realm=\"proxy\""));
+        assert!(
+            !challenge.contains("warren"),
+            "the realm is plaintext to anyone who sends a CONNECT"
+        );
     }
 }

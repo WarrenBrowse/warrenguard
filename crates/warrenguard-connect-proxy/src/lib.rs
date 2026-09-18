@@ -37,8 +37,8 @@ mod serve;
 
 pub use head::{
     Authority, CREDENTIAL_USERNAME, ConnectHead, HeadError, MAX_HEAD_BYTES, ProxyCredential,
-    challenge_response, established_response, looks_like_http_request, method_not_allowed_response,
-    parse_connect_head, refused_response,
+    challenge_response, established_response, looks_like_connect_request,
+    method_not_allowed_response, parse_connect_head, refused_response,
 };
 pub use serve::{
     ConnectDialer, ConnectProxyConfig, EgressPolicy, ProxyOutcome, ProxyRefusal, serve_connect,
