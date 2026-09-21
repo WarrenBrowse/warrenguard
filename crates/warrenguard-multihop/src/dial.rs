@@ -32,19 +32,30 @@ pub enum Reachability {
     Unknown,
 }
 
-/// The relay's endpoints in dial order: the published primary first, then the
-/// second family when the descriptor carries one. A second address of the SAME
-/// family as the primary is dropped: it names no new family, and the only
-/// reason this list exists is the family choice.
+/// The endpoints in dial order: the published primary first, then the second
+/// family when there is one. A second address of the SAME family as the
+/// primary is dropped: it names no new family, and the only reason this list
+/// exists is the family choice.
+///
+/// Takes the addresses rather than a descriptor so both datapaths can call it:
+/// the engine's client holds a [`RelayDescriptorSigned`], a deployer's
+/// transport holds whatever its own directory view projected
+/// (see [`candidates`] for the descriptor-shaped convenience).
 #[must_use]
-pub fn candidates(relay: &RelayDescriptorSigned) -> Vec<SocketAddr> {
-    let mut out = vec![relay.endpoint];
-    if let Some(alt) = relay.endpoint_v6
-        && alt.is_ipv6() != relay.endpoint.is_ipv6()
+pub fn candidates_of(primary: SocketAddr, alt: Option<SocketAddr>) -> Vec<SocketAddr> {
+    let mut out = vec![primary];
+    if let Some(alt) = alt
+        && alt.is_ipv6() != primary.is_ipv6()
     {
         out.push(alt);
     }
     out
+}
+
+/// [`candidates_of`] for a relay descriptor.
+#[must_use]
+pub fn candidates(relay: &RelayDescriptorSigned) -> Vec<SocketAddr> {
+    candidates_of(relay.endpoint, relay.endpoint_v6)
 }
 
 /// The address to bind in order to dial `target`.
@@ -73,18 +84,21 @@ fn bind_can_reach(requested: SocketAddr, target: SocketAddr) -> bool {
     requested.ip().is_unspecified() || requested.is_ipv6() == target.is_ipv6()
 }
 
-/// The endpoint to dial, or `None` when this host can reach none of them.
+/// The endpoint to dial among `candidates`, or `None` when this host can reach
+/// none of them.
 ///
-/// `probe` is injected so the decision is testable without a network; the
-/// production caller passes [`local_route`].
+/// `probe` is injected: each datapath binds its sockets differently, and a
+/// probe has to carry the same tunnel escape as the dial it predicts, so the
+/// reachability answer belongs to the caller while the decision belongs here.
 #[must_use]
-pub fn select(
-    relay: &RelayDescriptorSigned,
+pub fn select_from(
+    candidates: &[SocketAddr],
     requested_bind: SocketAddr,
     probe: impl Fn(SocketAddr) -> Reachability,
 ) -> Option<SocketAddr> {
-    let eligible: Vec<SocketAddr> = candidates(relay)
-        .into_iter()
+    let eligible: Vec<SocketAddr> = candidates
+        .iter()
+        .copied()
         .filter(|target| bind_can_reach(requested_bind, *target))
         .collect();
     // When every eligible candidate is refused by the kernel this yields
@@ -95,6 +109,16 @@ pub fn select(
         .iter()
         .find(|target| probe(**target) != Reachability::Refused)
         .copied()
+}
+
+/// [`select_from`] for a relay descriptor.
+#[must_use]
+pub fn select(
+    relay: &RelayDescriptorSigned,
+    requested_bind: SocketAddr,
+    probe: impl Fn(SocketAddr) -> Reachability,
+) -> Option<SocketAddr> {
+    select_from(&candidates(relay), requested_bind, probe)
 }
 
 #[cfg(test)]
@@ -133,6 +157,30 @@ mod tests {
             candidates(&relay(V4, Some(V6))),
             vec![addr(V4), addr(V6)],
             "the published primary is dialed first, so a dual-stack host keeps its current path"
+        );
+    }
+
+    #[test]
+    fn the_address_shaped_entry_point_answers_like_the_descriptor_one() {
+        // A deployer's own transport holds two addresses, never a descriptor,
+        // and must not have to reimplement the decision to use it.
+        assert_eq!(
+            candidates_of(addr(V4), Some(addr(V6))),
+            candidates(&relay(V4, Some(V6)))
+        );
+        assert_eq!(
+            select_from(
+                &candidates_of(addr(V4), Some(addr(V6))),
+                addr(WILDCARD_V4),
+                |t| {
+                    if t.is_ipv6() {
+                        Reachability::Routed
+                    } else {
+                        Reachability::Refused
+                    }
+                }
+            ),
+            Some(addr(V6))
         );
     }
 
