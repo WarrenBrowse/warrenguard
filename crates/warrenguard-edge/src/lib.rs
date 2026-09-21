@@ -13,7 +13,9 @@
 //!    ([`http3::parse_settings`]), and
 //! 2. classify the request-stream HEADERS as a WebTransport extended-CONNECT
 //!    (RFC 9220) and extract the Privacy Pass token it presents
-//!    ([`classify_request`]).
+//!    ([`classify_request`]), or as a proxy CONNECT / CONNECT-UDP
+//!    ([`classify_proxy_request`]) with the HTTP Datagram framing a UDP tunnel
+//!    needs (RFC 9297, RFC 9298).
 //!
 //! The async plumbing (accepting the streams off a `quinn::Connection`, wiring
 //! the accepted session as a multi-hop entry, spending the token) lives in the
@@ -27,6 +29,7 @@
 mod http3;
 mod huffman;
 mod ingress;
+mod masque;
 mod qpack;
 mod server;
 mod varint;
@@ -42,7 +45,18 @@ pub use ingress::{
     EdgeRequest, WebTransportConnect, classify_request, classify_request_stream,
     parse_private_token_header,
 };
-pub use server::{control_stream_prelude, webtransport_accept_response};
+pub use masque::{
+    CAPSULE_DATAGRAM, CONNECT_UDP_CONTEXT_ID, CONNECT_UDP_CREDENTIAL_PARAM,
+    CONNECT_UDP_PATH_PREFIX, ConnectUdpTarget, ProxyAuthorization, ProxyConnect, ProxyConnectUdp,
+    ProxyRequest, classify_proxy_request, encode_datagram as encode_masque_datagram,
+    parse_connect_udp_target, read_datagram as read_masque_datagram,
+};
+pub use qpack::{Field, decode_field_section, encode_field_section};
+pub use server::{
+    connect_established_response, connect_udp_established_response, control_stream_prelude,
+    encode_response_headers, masque_control_stream_prelude, proxy_challenge_response,
+    webtransport_accept_response,
+};
 pub use varint::{decode as decode_varint, encode as encode_varint};
 pub use webtransport::{
     WEBTRANSPORT_STREAM_BIDI, WEBTRANSPORT_STREAM_UNI, encode_bidi_stream_header,

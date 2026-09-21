@@ -10,6 +10,10 @@
 //! [`crate::huffman`], since real browsers Huffman-code their header names and
 //! values; a literal that fails to Huffman-decode is
 //! [`EdgeError::InvalidHuffman`].
+//!
+//! The encoder ([`encode_field_section`]) is the mirror image for the responses
+//! the edge writes: static-only, never Huffman, so a peer that disabled its own
+//! dynamic table (every peer, given our SETTINGS) decodes it with no state.
 
 use crate::EdgeError;
 
@@ -38,6 +42,23 @@ const STATIC_TABLE: &[(u64, &[u8], &[u8])] = &[
     (21, b":method", b"PUT"),
     (22, b":scheme", b"http"),
     (23, b":scheme", b"https"),
+    // Response status lines, used by the encoder: a status in this list is one
+    // indexed byte, any other status is a literal against the `:status` name.
+    (24, b":status", b"103"),
+    (25, b":status", b"200"),
+    (26, b":status", b"304"),
+    (27, b":status", b"404"),
+    (28, b":status", b"503"),
+    (52, b"content-type", b"text/html; charset=utf-8"),
+    (63, b":status", b"100"),
+    (64, b":status", b"204"),
+    (65, b":status", b"206"),
+    (66, b":status", b"302"),
+    (67, b":status", b"400"),
+    (68, b":status", b"403"),
+    (69, b":status", b"421"),
+    (70, b":status", b"425"),
+    (71, b":status", b"500"),
     // `authorization` (name only; value is always a literal in practice).
     (84, b"authorization", b""),
 ];
@@ -164,6 +185,59 @@ pub fn decode_field_section(input: &[u8]) -> Result<Vec<Field>, EdgeError> {
         }
     }
     Ok(fields)
+}
+
+/// Appends a QPACK prefixed integer (RFC 7541 section 5.1): `flags` carries the
+/// representation bits above the `prefix_bits`-wide prefix of the first byte.
+fn write_prefixed_int(out: &mut Vec<u8>, flags: u8, prefix_bits: u32, value: u64) {
+    let max = (1u64 << prefix_bits) - 1;
+    if value < max {
+        out.push(flags | value as u8);
+        return;
+    }
+    out.push(flags | max as u8);
+    let mut rest = value - max;
+    while rest >= 0x80 {
+        out.push((rest as u8 & 0x7f) | 0x80);
+        rest >>= 7;
+    }
+    out.push(rest as u8);
+}
+
+/// Appends a raw (non-Huffman) string literal with a 7-bit length prefix.
+fn write_string(out: &mut Vec<u8>, bytes: &[u8]) {
+    write_prefixed_int(out, 0x00, 7, bytes.len() as u64);
+    out.extend_from_slice(bytes);
+}
+
+/// Encodes `fields` as a static-only QPACK field section: the two-byte prefix
+/// (RIC=0, Base=0), then one field line per entry. A `(name, value)` pair that
+/// is in the static table is an indexed line; a name that is in it is a literal
+/// with a name reference; anything else is a literal with a literal name.
+/// Strings are never Huffman-coded, so the output needs no decoder table and no
+/// dynamic state on the peer.
+#[must_use]
+pub fn encode_field_section(fields: &[(&[u8], &[u8])]) -> Vec<u8> {
+    let mut out = vec![0x00, 0x00];
+    for &(name, value) in fields {
+        if let Some((index, _, _)) = STATIC_TABLE
+            .iter()
+            .find(|(_, n, v)| *n == name && *v == value)
+        {
+            // Indexed field line: 1 T=1 index(6+).
+            write_prefixed_int(&mut out, 0xc0, 6, *index);
+        } else if let Some((index, _, _)) = STATIC_TABLE.iter().find(|(_, n, _)| *n == name) {
+            // Literal with name reference: 01 N=0 T=1 index(4+), then the value.
+            write_prefixed_int(&mut out, 0x50, 4, *index);
+            write_string(&mut out, value);
+        } else {
+            // Literal with literal name: 001 N=0 H=0 namelen(3+), name, value.
+            write_prefixed_int(&mut out, 0x20, 3, name.len() as u64);
+            out.extend_from_slice(name);
+            write_string(&mut out, value);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -334,5 +408,67 @@ mod tests {
         // 1337 - 127 = 1210 = 0x4BA -> 0xBA(with cont) , 0x09
         let (v, used) = read_prefixed_int(&[0x7f, 0xba, 0x09], 7).expect("int");
         assert_eq!((v, used), (1337, 3));
+    }
+    /// Coerces array literals to the slice pair the encoder takes.
+    fn field<'a>(name: &'a [u8], value: &'a [u8]) -> (&'a [u8], &'a [u8]) {
+        (name, value)
+    }
+
+    #[test]
+    fn encodes_a_static_pair_as_one_indexed_line() {
+        // `:status 200` is static index 25: 0xc0 | 25 = 0xd9, after the prefix.
+        assert_eq!(
+            encode_field_section(&[field(b":status", b"200")]),
+            vec![0x00, 0x00, 0xd9]
+        );
+    }
+
+    #[test]
+    fn encodes_a_static_index_past_the_six_bit_prefix() {
+        // `:status 403` is index 68: prefix all-ones (63) then 68 - 63 = 5.
+        assert_eq!(
+            encode_field_section(&[field(b":status", b"403")]),
+            vec![0x00, 0x00, 0xff, 0x05]
+        );
+    }
+
+    #[test]
+    fn encodes_an_unlisted_value_as_a_literal_with_a_name_reference() {
+        // `:status 407` is not in the table, `:status` is (index 24): 01 N=0 T=1
+        // index=24 needs the 4-bit continuation (15, then 9), then the value.
+        let encoded = encode_field_section(&[field(b":status", b"407")]);
+        assert_eq!(&encoded[..2], &[0x00, 0x00]);
+        assert_eq!(&encoded[2..4], &[0x5f, 0x09]);
+        assert_eq!(&encoded[4..], &[0x03, b'4', b'0', b'7']);
+    }
+
+    #[test]
+    fn encodes_an_unlisted_name_as_a_literal_name_and_round_trips() {
+        // The field lines the MASQUE ingress writes decode through our own
+        // request-side decoder, which pins the representation bits.
+        let encoded = encode_field_section(&[
+            field(b":status", b"200"),
+            field(b"capsule-protocol", b"?1"),
+            field(b"proxy-authenticate", b"Basic realm=\"proxy\""),
+        ]);
+        let fields = decode_field_section(&encoded).expect("our own encoding decodes");
+        assert_eq!(fields[0].name, b":status");
+        assert_eq!(fields[0].value, b"200");
+        assert_eq!(fields[1].name, b"capsule-protocol");
+        assert_eq!(fields[1].value, b"?1");
+        assert_eq!(fields[2].name, b"proxy-authenticate");
+        assert_eq!(fields[2].value, b"Basic realm=\"proxy\"");
+    }
+
+    #[test]
+    fn encodes_a_long_literal_with_the_seven_bit_continuation() {
+        // A 200-byte value overflows the 7-bit length prefix: 127, then 73.
+        let value = vec![b'x'; 200];
+        let encoded = encode_field_section(&[field(b"x-long", &value)]);
+        let fields = decode_field_section(&encoded).expect("decodes");
+        assert_eq!(fields[0].value, value);
+        // 0x20 | 6 (name len), name, then 0x7f 0x49 (200 - 127 = 73).
+        assert_eq!(&encoded[2..3], &[0x26]);
+        assert_eq!(&encoded[9..11], &[0x7f, 0x49]);
     }
 }

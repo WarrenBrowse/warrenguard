@@ -8,11 +8,16 @@
 //! - `serve`  - bind a multi-hop exit (the datapath the Warren desktop app
 //!   dials), admit every peer that completes the handshake (no control-plane),
 //!   allocate one tunnel IP per connection, and serve until interrupted.
+//! - `masque-forward` - forward local TCP and UDP through an HTTP/3 proxy
+//!   ingress (`warrenguard-masque`), the way a browser handed that proxy does.
 //!
 //! The identity layer is pulled with `default-features = false` (no BIP39): keys
 //! are raw seeds, so a deployer can source them from a file / KMS / `keygen`.
 
+mod masque_forward;
+
 use std::net::{Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
@@ -79,6 +84,31 @@ enum Command {
         /// Gateway address (the exit-side TUN host) inside `--multihop-subnet`.
         #[arg(long = "multihop-gateway", value_name = "IP", default_value = DEFAULT_MULTIHOP_GATEWAY)]
         multihop_gateway: Ipv4Addr,
+    },
+    /// Forward local TCP and UDP through an HTTP/3 proxy ingress: each local
+    /// TCP connection becomes a CONNECT tunnel, each local UDP source a
+    /// CONNECT-UDP tunnel, on one QUIC connection to the proxy.
+    MasqueForward {
+        /// The proxy, `host:port`; the host is validated against WebPKI.
+        #[arg(long, value_name = "HOST:PORT")]
+        proxy: String,
+        /// Dial this address instead of resolving the proxy host, keeping the
+        /// certificate validation on the host name (a node not yet in DNS).
+        #[arg(long, value_name = "IP:PORT")]
+        proxy_addr: Option<SocketAddr>,
+        /// The credential presented as the Basic password (the browser-proxy
+        /// token, base64url).
+        #[arg(long, value_name = "TOKEN")]
+        credential: String,
+        /// A TCP mapping `local:port=host:port`; repeatable.
+        #[arg(long = "tcp", value_name = "LOCAL=TARGET")]
+        tcp: Vec<masque_forward::Mapping>,
+        /// A UDP mapping `local:port=host:port`; repeatable.
+        #[arg(long = "udp", value_name = "LOCAL=TARGET")]
+        udp: Vec<masque_forward::Mapping>,
+        /// A PEM bundle to trust instead of the Mozilla roots (a test CA).
+        #[arg(long, value_name = "FILE")]
+        ca: Option<PathBuf>,
     },
 }
 
@@ -253,6 +283,17 @@ async fn main() -> Result<()> {
             // in-process buffer is zeroized on drop.
             println!("seed       {}", hex::encode(*seed));
             println!("public key {}", format_pubkey(&pubkey));
+        }
+
+        Command::MasqueForward {
+            proxy,
+            proxy_addr,
+            credential,
+            tcp,
+            udp,
+            ca,
+        } => {
+            masque_forward::run(proxy, proxy_addr, credential, tcp, udp, ca).await?;
         }
 
         Command::Serve {

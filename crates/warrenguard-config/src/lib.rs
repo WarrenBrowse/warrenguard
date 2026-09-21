@@ -395,6 +395,15 @@ pub const QUIC_MAX_CONCURRENT_BIDI_STREAMS_EXIT: u32 = 100;
 /// the client side we only expect one control stream + 1-2 RPC.
 pub const QUIC_MAX_CONCURRENT_BIDI_STREAMS_CLIENT: u32 = 10;
 
+/// Max unidirectional streams a peer may open against the exit's `:443`
+/// endpoint. A Warren client opens none. An HTTP/3 client MUST open three at
+/// the start of its connection (control, QPACK encoder, QPACK decoder; RFC
+/// 9114 section 6.2) and some open a GREASE stream too, so this is what lets
+/// a browser reach the endpoint's HTTP/3 branch at all. Each stream a peer
+/// opens and the exit never reads holds at most its stream receive window,
+/// so the cost of the credit is bounded per connection.
+pub const QUIC_MAX_CONCURRENT_UNI_STREAMS_EXIT: u32 = 8;
+
 #[cfg(test)]
 mod tests {
     use super::*;

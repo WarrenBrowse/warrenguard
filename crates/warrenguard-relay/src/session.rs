@@ -235,10 +235,44 @@ pub enum DispatchFrame {
         /// Bytes already read off that stream (the prober's request).
         bytes: Bytes,
     },
+    /// The peer opened a unidirectional stream. No Warren client ever does
+    /// (every client profile is dialed with zero uni-stream credit toward the
+    /// node, and none opens one), while a conformant HTTP/3 client MUST open
+    /// its control stream at the start of the connection (RFC 9114 section
+    /// 6.2.1). This is therefore an HTTP/3 peer: a browser, or a prober that
+    /// speaks real HTTP/3. The connection is left OPEN and its streams are
+    /// handed back untouched so an HTTP/3 server can take it over.
+    Http3(Http3Peer),
     /// The peer never opened a usable setup stream (it stayed silent, or the
     /// connection died, or the stream broke mid-read). There is nothing to
     /// route and nothing a decoy could answer; the caller closes.
     NoStream,
+}
+
+/// The streams of an HTTP/3 peer, accepted while [`read_dispatch_frame_or_unauth`]
+/// was looking for a Warren setup frame.
+#[derive(Debug)]
+pub struct Http3Peer {
+    /// The first unidirectional stream the peer opened, with no byte read off
+    /// it: whether it is the control stream or a QPACK stream is for the HTTP/3
+    /// server to find out, and a critical stream must never be dropped.
+    pub uni: RecvStream,
+    /// The peer's first bidi stream when it had already arrived, with the
+    /// bytes read off it so far. An HTTP/3 request stream stays open until its
+    /// response is consumed, so it cannot be read to its end here; the HTTP/3
+    /// server resumes reading it after these bytes.
+    pub request: Option<PendingBidi>,
+}
+
+/// A bidi stream accepted and partly read before the peer was classified.
+#[derive(Debug)]
+pub struct PendingBidi {
+    /// Send half of the stream.
+    pub send: SendStream,
+    /// Receive half, positioned after `bytes`.
+    pub recv: RecvStream,
+    /// The bytes already read off the stream.
+    pub bytes: Bytes,
 }
 
 /// Non-closing sibling of [`read_dispatch_frame`]. Accepts the peer's first
@@ -254,27 +288,61 @@ pub enum DispatchFrame {
 /// is therefore emitted by the caller ONLY after this returns [`DispatchFrame::Routed`],
 /// never to a peer that turns out to be a prober.
 pub async fn read_dispatch_frame_or_unauth(conn: &Connection) -> DispatchFrame {
-    let (send, mut recv) = match conn.accept_bi().await {
-        Ok(pair) => pair,
-        // No stream and no Warren-shaped signal sent: a bare prober or a dead
-        // connection. Nothing to decoy; let the caller close.
-        Err(_) => return DispatchFrame::NoStream,
-    };
-
-    let bytes = match recv.read_to_end(MAX_MULTIHOP_SETUP_FRAME_BYTES).await {
-        Ok(b) => Bytes::from(b),
-        Err(_) => return DispatchFrame::NoStream,
-    };
-
-    match decode_dispatch_exit_id(&bytes) {
-        Ok(exit_id) => DispatchFrame::Routed {
-            send,
-            bytes,
-            exit_id,
+    // A peer's first unidirectional stream classifies it as HTTP/3 the moment
+    // it arrives, whether before or during its first bidi stream: an HTTP/3
+    // request stream is never finished by the client until it has consumed the
+    // response, so waiting for its end would stall a browser's CONNECT until
+    // the setup deadline. The bidi stream is therefore read chunk by chunk,
+    // and the Warren decision is taken only at its finish.
+    let (send, mut recv) = tokio::select! {
+        uni = conn.accept_uni() => {
+            return match uni {
+                Ok(uni) => DispatchFrame::Http3(Http3Peer { uni, request: None }),
+                Err(_) => DispatchFrame::NoStream,
+            };
+        }
+        bi = conn.accept_bi() => match bi {
+            Ok(pair) => pair,
+            // No stream and no Warren-shaped signal sent: a bare prober or
+            // a dead connection. Nothing to decoy; let the caller close.
+            Err(_) => return DispatchFrame::NoStream,
         },
-        // Handshake completed and a stream arrived, but it is not Warren: a
-        // decoy candidate. Hand the live stream + request bytes back unclosed.
-        Err(_) => DispatchFrame::Unauthenticated { send, bytes },
+    };
+
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        tokio::select! {
+            uni = conn.accept_uni() => {
+                return match uni {
+                    Ok(uni) => DispatchFrame::Http3(Http3Peer {
+                        uni,
+                        request: Some(PendingBidi { send, recv, bytes: Bytes::from(buf) }),
+                    }),
+                    Err(_) => DispatchFrame::NoStream,
+                };
+            }
+            chunk = recv.read_chunk(MAX_MULTIHOP_SETUP_FRAME_BYTES, true) => match chunk {
+                Ok(Some(chunk)) => {
+                    buf.extend_from_slice(&chunk.bytes);
+                    // Same bound as the finish-delimited read: a peer cannot
+                    // make the node buffer more than one setup frame's worth.
+                    if buf.len() > MAX_MULTIHOP_SETUP_FRAME_BYTES {
+                        return DispatchFrame::NoStream;
+                    }
+                }
+                Ok(None) => {
+                    let bytes = Bytes::from(buf);
+                    return match decode_dispatch_exit_id(&bytes) {
+                        Ok(exit_id) => DispatchFrame::Routed { send, bytes, exit_id },
+                        // Handshake completed and a stream arrived, but it is
+                        // not Warren: a decoy candidate. Hand the live stream +
+                        // request bytes back unclosed.
+                        Err(_) => DispatchFrame::Unauthenticated { send, bytes },
+                    };
+                }
+                Err(_) => return DispatchFrame::NoStream,
+            },
+        }
     }
 }
 

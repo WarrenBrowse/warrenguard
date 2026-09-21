@@ -33,8 +33,8 @@ use warrenguard_config::{
     PADDED_INITIAL_MIN_SIZE, QUIC_DATAGRAM_RECV_BUFFER, QUIC_DATAGRAM_SEND_BUFFER,
     QUIC_DATAGRAM_SEND_BUFFER_EXIT, QUIC_KEEP_ALIVE_INTERVAL_SECS,
     QUIC_MAX_CONCURRENT_BIDI_STREAMS_CLIENT, QUIC_MAX_CONCURRENT_BIDI_STREAMS_EXIT,
-    QUIC_MAX_IDLE_TIMEOUT_SECS, QUIC_RECV_WINDOW, QUIC_SEND_WINDOW, QUIC_STREAM_RECV_WINDOW,
-    TUNNEL_INITIAL_MTU, TUNNEL_MIN_MTU,
+    QUIC_MAX_CONCURRENT_UNI_STREAMS_EXIT, QUIC_MAX_IDLE_TIMEOUT_SECS, QUIC_RECV_WINDOW,
+    QUIC_SEND_WINDOW, QUIC_STREAM_RECV_WINDOW, TUNNEL_INITIAL_MTU, TUNNEL_MIN_MTU,
 };
 
 /// Common base for the client + exit transport configs. Applies BBR,
@@ -507,12 +507,19 @@ pub fn warren_transport_config_exit_full(
 /// where the padded ServerHello datagram is silently dropped and the
 /// handshake never completes. The exit listener kept the padding by
 /// oversight while the two dialer profiles already dropped it.
+///
+/// This is also the endpoint a browser reaches for the HTTP/3 proxy branch,
+/// so unlike the other inbound profiles it grants the peer the unidirectional
+/// stream credit an HTTP/3 client needs at the start of its connection
+/// (`QUIC_MAX_CONCURRENT_UNI_STREAMS_EXIT`). Bench-gated 2026-09-21: the credit
+/// is a transport parameter a Warren client never uses, and the interleaved
+/// A/B on two Hetzner boxes showed the native tunnel within noise.
 #[must_use]
 pub fn warren_transport_config_exit_multihop_with_gso(enable_gso: bool) -> Arc<TransportConfig> {
     let mut cfg = warren_transport_config_base(enable_gso);
     cfg.datagram_send_buffer_size(datagram_send_buffer_size(QUIC_DATAGRAM_SEND_BUFFER_EXIT))
         .max_concurrent_bidi_streams(VarInt::from_u32(QUIC_MAX_CONCURRENT_BIDI_STREAMS_EXIT))
-        .max_concurrent_uni_streams(VarInt::from_u32(0));
+        .max_concurrent_uni_streams(VarInt::from_u32(QUIC_MAX_CONCURRENT_UNI_STREAMS_EXIT));
     no_keep_alive_toward_clients(&mut cfg);
     Arc::new(cfg)
 }
@@ -583,7 +590,9 @@ fn no_keep_alive_toward_clients(cfg: &mut TransportConfig) {
 /// all can stall the handshake on a low-PMTU intercontinental relay-to-exit hop,
 /// which the relay-facing leg can hit on a real network path. Mirror of the
 /// exit-side
-/// [`warren_transport_config_exit_multihop_with_gso`] reasoning.
+/// [`warren_transport_config_exit_multihop_with_gso`] reasoning, and the same
+/// unidirectional stream credit, since the unified `:443` dispatcher serves
+/// one profile to both roles.
 #[must_use]
 pub fn warren_transport_config_relay_inbound_multihop_with_gso(
     enable_gso: bool,
@@ -591,7 +600,7 @@ pub fn warren_transport_config_relay_inbound_multihop_with_gso(
     let mut cfg = warren_transport_config_base(enable_gso);
     cfg.datagram_send_buffer_size(datagram_send_buffer_size(QUIC_DATAGRAM_SEND_BUFFER_EXIT))
         .max_concurrent_bidi_streams(VarInt::from_u32(QUIC_MAX_CONCURRENT_BIDI_STREAMS_EXIT))
-        .max_concurrent_uni_streams(VarInt::from_u32(0));
+        .max_concurrent_uni_streams(VarInt::from_u32(QUIC_MAX_CONCURRENT_UNI_STREAMS_EXIT));
     no_keep_alive_toward_clients(&mut cfg);
     Arc::new(cfg)
 }
@@ -1036,4 +1045,26 @@ mod tests {
     // The exit-vs-client send-buffer sizing invariants are enforced at
     // compile time next to the const definitions in `warren-config`
     // (`const _: () = assert!(...)` guards).
+    #[test]
+    fn unified_dispatcher_profile_grants_the_uni_stream_credit_an_http3_client_needs() {
+        // The `:443` inbound profile is the one a browser reaches for the
+        // HTTP/3 proxy branch: it must let the peer open its control and QPACK
+        // streams. Every other inbound profile keeps the credit at zero.
+        let rendered = format!(
+            "{:?}",
+            warren_transport_config_exit_multihop_with_gso(false)
+        );
+        assert!(
+            rendered.contains("max_concurrent_uni_streams: 8"),
+            "got: {rendered}"
+        );
+        let relay = format!(
+            "{:?}",
+            warren_transport_config_relay_inbound_with_gso(false)
+        );
+        assert!(
+            relay.contains("max_concurrent_uni_streams: 0"),
+            "got: {relay}"
+        );
+    }
 }

@@ -25,6 +25,18 @@ pub trait ConnectDialer: Send + Sync {
     ) -> impl std::future::Future<Output = std::io::Result<Self::Upstream>> + Send;
 }
 
+/// A shared dialer dials like the dialer it shares.
+impl<T: ConnectDialer> ConnectDialer for std::sync::Arc<T> {
+    type Upstream = T::Upstream;
+
+    fn dial(
+        &self,
+        target: &Authority,
+    ) -> impl std::future::Future<Output = std::io::Result<Self::Upstream>> + Send {
+        T::dial(self, target)
+    }
+}
+
 /// Whether a destination may be dialed at all. Runs BEFORE the credential is
 /// examined, so a refused destination costs no token verification and reveals
 /// nothing about the credential.
@@ -138,7 +150,7 @@ where
         return Ok(ProxyOutcome::Refused(ProxyRefusal::Challenged));
     };
 
-    match admit(admitter, &credential).await {
+    match admit_credential(admitter, &credential).await {
         TokenAdmission::Admit { .. } => {}
         TokenAdmission::Reject => {
             // Challenge rather than refuse: a stale credential is the ordinary
@@ -182,8 +194,9 @@ where
 /// The password half of a Basic credential travels through a browser as a
 /// string, so it carries the token base64url-encoded rather than raw. A
 /// credential that does not decode to exactly one token is rejected here, before
-/// any crypto runs.
-async fn admit<A>(admitter: &A, credential: &ProxyCredential) -> TokenAdmission
+/// any crypto runs. Shared with the HTTP/3 ingress so one credential shape
+/// admits on both dialects.
+pub async fn admit_credential<A>(admitter: &A, credential: &ProxyCredential) -> TokenAdmission
 where
     A: SessionTokenAdmitter + ?Sized,
 {

@@ -3032,7 +3032,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -3464,7 +3464,7 @@ dependencies = [
  "parking_lot",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3495,7 +3495,9 @@ dependencies = [
  "tracing-subscriber",
  "warren-quinn",
  "warrenguard-config",
+ "warrenguard-connect-proxy",
  "warrenguard-identity",
+ "warrenguard-masque",
  "warrenguard-multihop",
  "warrenguard-multihop-server",
  "warrenguard-server",
@@ -3503,6 +3505,7 @@ dependencies = [
  "warrenguard-transport",
  "warrenguard-transport-core",
  "warrenguard-wire",
+ "webpki-roots",
  "zeroize",
 ]
 
@@ -3544,6 +3547,7 @@ dependencies = [
  "hex",
  "thiserror",
  "warrenguard-token",
+ "zeroize",
 ]
 
 [[package]]
@@ -3626,6 +3630,24 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "warrenguard-masque"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "rcgen",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "warren-quinn",
+ "warrenguard-connect-proxy",
+ "warrenguard-edge",
+ "warrenguard-server",
+ "warrenguard-tls",
+ "warrenguard-wire",
 ]
 
 [[package]]
@@ -4056,6 +4078,15 @@ name = "webpki-root-certs"
 version = "1.0.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d46a5a140e6f7afeccd8eae97eff335163939eac8b929834875168b29b3d267"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
 dependencies = [
  "rustls-pki-types",
 ]

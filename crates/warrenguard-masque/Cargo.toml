@@ -1,0 +1,37 @@
+# WarrenGuard engine crate: the HTTP/3 proxy ingress (MASQUE). A browser that
+# is handed an HTTP/3 proxy opens one QUIC connection to it and tunnels every
+# destination inside: plain CONNECT streams for TCP (RFC 9114) and CONNECT-UDP
+# streams with HTTP Datagrams for UDP (RFC 9297, RFC 9298). This crate drives
+# that over a quinn connection with the admission check, the egress policy and
+# both dialers injected, so the engine carries no product policy and logs no
+# destination.
+[package]
+name = "warrenguard-masque"
+description = "HTTP/3 CONNECT and CONNECT-UDP (MASQUE) proxy ingress for browser clients (WarrenGuard engine)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+quinn = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+warrenguard-connect-proxy = { path = "../warrenguard-connect-proxy" }
+warrenguard-edge = { path = "../warrenguard-edge" }
+warrenguard-server = { path = "../warrenguard-server" }
+
+[dev-dependencies]
+data-encoding = { workspace = true }
+rcgen = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+warrenguard-tls = { path = "../warrenguard-tls" }
+warrenguard-wire = { path = "../warrenguard-wire" }
+
+[lints]
+workspace = true

@@ -18,6 +18,7 @@ publish.workspace = true
 [dependencies]
 warrenguard-token = { path = "../warrenguard-token" }
 thiserror = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 hex = { workspace = true }

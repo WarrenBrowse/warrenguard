@@ -551,3 +551,30 @@ async fn rejects_a_credential_that_is_not_a_session_token() {
         "a credential of the wrong shape must be refused before any crypto runs"
     );
 }
+
+#[tokio::test]
+async fn admit_credential_decodes_the_base64url_token_before_the_admitter_sees_it() {
+    use warrenguard_connect_proxy::{admit_credential, parse_proxy_authorization};
+    let admitter = StubAdmitter::admitting();
+    let token = [3u8; SESSION_TOKEN_LEN];
+    let value = format!(
+        "Basic {}",
+        BASE64.encode(format!("warren:{}", BASE64URL_NOPAD.encode(&token)).as_bytes())
+    );
+    let credential = parse_proxy_authorization(&value).expect("parses");
+
+    let verdict = admit_credential(&admitter, &credential).await;
+
+    assert!(matches!(verdict, TokenAdmission::Admit { .. }));
+    assert_eq!(admitter.seen.lock().unwrap().as_slice(), &[token]);
+
+    // A password that is not one whole token never reaches the admitter.
+    let junk =
+        parse_proxy_authorization(&format!("Basic {}", BASE64.encode(b"warren:not-a-token")))
+            .expect("parses as a credential");
+    assert!(matches!(
+        admit_credential(&admitter, &junk).await,
+        TokenAdmission::Reject
+    ));
+    assert_eq!(admitter.calls.load(Ordering::SeqCst), 1);
+}

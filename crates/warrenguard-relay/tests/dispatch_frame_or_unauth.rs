@@ -152,3 +152,139 @@ async fn non_warren_stream_is_unauthenticated_and_connection_stays_open() {
         "the prober's request bytes are handed back verbatim for the decoy"
     );
 }
+
+/// The bytes a conformant HTTP/3 client writes first on its control stream.
+fn h3_control_stream() -> Vec<u8> {
+    // Stream type 0x00 (control) then an empty SETTINGS frame (type 0x04).
+    vec![0x00, 0x04, 0x00]
+}
+
+/// An HTTP/3 HEADERS frame (type 0x01) with an opaque field section; a request
+/// stream carries it and stays OPEN until the response has been consumed.
+fn h3_request_frame() -> Vec<u8> {
+    vec![0x01, 0x03, 0x00, 0x00, 0xcf]
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_opening_a_uni_stream_is_http3_and_its_streams_are_handed_back() {
+    let (ep, addr, pubkey) = server_endpoint();
+    let server = tokio::spawn(async move {
+        let conn = ep
+            .accept()
+            .await
+            .expect("incoming")
+            .await
+            .expect("server handshake");
+        let outcome = read_dispatch_frame_or_unauth(&conn).await;
+        let DispatchFrame::Http3(mut peer) = outcome else {
+            panic!("expected Http3, got {outcome:?}");
+        };
+        // The uni stream is handed back with nothing consumed: the HTTP/3
+        // server reads the control prelude itself.
+        let control = tokio::time::timeout(Duration::from_secs(5), peer.uni.read_to_end(64))
+            .await
+            .expect("control stream readable")
+            .expect("control stream read");
+        // The request stream, whether it was already accepted here or is still
+        // pending on the connection, is readable by the HTTP/3 server without
+        // waiting for a finish the client never sends.
+        let (mut send, mut recv, prefix) = match peer.request {
+            Some(pending) => (pending.send, pending.recv, pending.bytes.to_vec()),
+            None => {
+                let (send, recv) = conn.accept_bi().await.expect("request stream");
+                (send, recv, Vec::new())
+            }
+        };
+        let mut request = prefix;
+        while request.len() < h3_request_frame().len() {
+            let mut chunk = [0u8; 64];
+            let n = tokio::time::timeout(Duration::from_secs(5), recv.read(&mut chunk))
+                .await
+                .expect("request bytes arrive")
+                .expect("read")
+                .expect("stream open");
+            request.extend_from_slice(&chunk[..n]);
+        }
+        // And the connection is alive: the server answers on the request stream.
+        send.write_all(b"200").await.expect("response writes");
+        send.finish().expect("response finishes");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        (control, request)
+    });
+
+    let conn = dial(addr, pubkey).await;
+    let mut ctrl = conn.open_uni().await.expect("open control uni");
+    ctrl.write_all(&h3_control_stream())
+        .await
+        .expect("write control prelude");
+    ctrl.finish().expect("finish control (test only)");
+    let (mut send, mut recv) = conn.open_bi().await.expect("open request bidi");
+    send.write_all(&h3_request_frame())
+        .await
+        .expect("write request HEADERS");
+    // Deliberately no finish: a CONNECT request stream lives on.
+    let reply = tokio::time::timeout(Duration::from_secs(5), recv.read_to_end(64))
+        .await
+        .expect("reply arrives")
+        .expect("reply read");
+    assert_eq!(reply, b"200");
+
+    let (control, request) = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server completes")
+        .expect("server task ok");
+    assert_eq!(
+        control,
+        h3_control_stream(),
+        "the control stream is untouched"
+    );
+    assert_eq!(
+        request,
+        h3_request_frame(),
+        "the request bytes are all there"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unfinished_request_stream_before_the_control_stream_is_still_http3() {
+    let (ep, addr, pubkey) = server_endpoint();
+    let server = tokio::spawn(async move {
+        let conn = ep
+            .accept()
+            .await
+            .expect("incoming")
+            .await
+            .expect("server handshake");
+        read_dispatch_frame_or_unauth(&conn).await
+    });
+
+    let conn = dial(addr, pubkey).await;
+    // The request arrives first and is left open; only later does the client
+    // open its control stream. A finish-delimited read would have stalled on
+    // the request until the setup deadline.
+    let (mut send, _recv) = conn.open_bi().await.expect("open request bidi");
+    send.write_all(&h3_request_frame())
+        .await
+        .expect("write request HEADERS");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut ctrl = conn.open_uni().await.expect("open control uni");
+    ctrl.write_all(&h3_control_stream())
+        .await
+        .expect("write control prelude");
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server completes")
+        .expect("server task ok");
+    let DispatchFrame::Http3(peer) = outcome else {
+        panic!("expected Http3, got {outcome:?}");
+    };
+    let pending = peer
+        .request
+        .expect("the already-read request is handed back");
+    assert_eq!(
+        pending.bytes.as_ref(),
+        h3_request_frame().as_slice(),
+        "the bytes read before classification travel with the stream"
+    );
+}

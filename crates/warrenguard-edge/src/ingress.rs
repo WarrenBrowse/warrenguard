@@ -36,7 +36,7 @@ pub enum EdgeRequest {
     OtherHttp3,
 }
 
-fn header<'a>(fields: &'a [Field], name: &[u8]) -> Option<&'a [u8]> {
+pub(crate) fn header<'a>(fields: &'a [Field], name: &[u8]) -> Option<&'a [u8]> {
     fields
         .iter()
         .find(|f| f.name == name)

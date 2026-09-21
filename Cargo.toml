@@ -19,6 +19,9 @@ rust-version = "1.89"
 publish = false
 
 [workspace.dependencies]
+# Mozilla's CA bundle, for a client of the engine that dials a public-CA cover
+# domain (the MASQUE forwarder) without a system trust store.
+webpki-roots = "1"
 # QUIC backend: the warren-quinn fork (renamed crates, lib names unchanged so
 # `use quinn` stays). Carries the GSO transmit constants, the
 # Initial-fragmentation knobs (`initial_datagram_min_size` /

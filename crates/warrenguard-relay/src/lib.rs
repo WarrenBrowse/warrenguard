@@ -33,10 +33,11 @@ pub use metrics::{RelayMetrics, RelayMetricsSnapshot, record_forward_summary};
 pub use pki::{PkiError, exit_descriptor_signing_payload, verify_exit_descriptor};
 pub use server::{RelayServer, ServerError};
 pub use session::{
-    DispatchFrame, DispatchedExit, MAX_MULTIHOP_SETUP_FRAME_BYTES, SessionError,
-    WARREN_VARINT_INVALID_FRAME, WARREN_VARINT_NO_FIRST_DATAGRAM, WARREN_VARINT_UNKNOWN_EXIT,
-    extract_dispatched_exit, extract_dispatched_exit_with_deadline, read_dispatch_frame,
-    read_dispatch_frame_or_unauth, shuttle_setup_to_exit, shuttle_setup_to_exit_with_timeout,
+    DispatchFrame, DispatchedExit, Http3Peer, MAX_MULTIHOP_SETUP_FRAME_BYTES, PendingBidi,
+    SessionError, WARREN_VARINT_INVALID_FRAME, WARREN_VARINT_NO_FIRST_DATAGRAM,
+    WARREN_VARINT_UNKNOWN_EXIT, extract_dispatched_exit, extract_dispatched_exit_with_deadline,
+    read_dispatch_frame, read_dispatch_frame_or_unauth, shuttle_setup_to_exit,
+    shuttle_setup_to_exit_with_timeout,
 };
 
 /// Returns the package version string declared in `Cargo.toml`. Used by

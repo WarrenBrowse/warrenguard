@@ -118,6 +118,14 @@ impl Authority {
 pub struct ProxyCredential(Vec<u8>);
 
 impl ProxyCredential {
+    /// A credential from its password half alone, for a dialect that carries
+    /// the token outside a `Proxy-Authorization` header (the HTTP/3 ingress
+    /// reads it from the CONNECT-UDP path when a browser sends no header).
+    #[must_use]
+    pub fn from_password(password: &[u8]) -> Self {
+        Self(password.to_vec())
+    }
+
     /// The credential bytes, for the admitter that knows how to read them.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
@@ -199,7 +207,7 @@ pub fn parse_connect_head(buf: &[u8]) -> Result<Option<ConnectHead>, HeadError> 
         if credential.is_some() {
             return Err(HeadError::DuplicateCredential);
         }
-        credential = Some(parse_basic_credential(value.trim())?);
+        credential = Some(parse_proxy_authorization(value.trim())?);
     }
 
     Ok(Some(ConnectHead {
@@ -214,8 +222,16 @@ fn find_head_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-/// Decodes `Basic <base64(user:pass)>` into the password half.
-fn parse_basic_credential(value: &str) -> Result<ProxyCredential, HeadError> {
+/// Decodes a `Proxy-Authorization` value, `Basic <base64(user:pass)>`, into the
+/// password half: the client's anonymous credential. Shared by the HTTP/1.1
+/// head parser and the HTTP/3 ingress, so both dialects read one credential
+/// shape.
+///
+/// # Errors
+/// [`HeadError::UnsupportedAuthScheme`] for a scheme other than `Basic`,
+/// [`HeadError::MalformedCredential`] when the value does not decode or holds
+/// no password.
+pub fn parse_proxy_authorization(value: &str) -> Result<ProxyCredential, HeadError> {
     let (scheme, encoded) = value
         .split_once(' ')
         .ok_or(HeadError::UnsupportedAuthScheme)?;
@@ -523,6 +539,28 @@ mod tests {
         assert!(
             !challenge.contains("warren"),
             "the realm is plaintext to anyone who sends a CONNECT"
+        );
+    }
+    #[test]
+    fn a_credential_from_its_password_half_reads_the_same_bytes() {
+        let from_header =
+            parse_proxy_authorization(&format!("Basic {}", basic("warren", "tok"))).expect("ok");
+        let from_password = ProxyCredential::from_password(b"tok");
+        assert_eq!(from_password.as_bytes(), from_header.as_bytes());
+    }
+
+    #[test]
+    fn parse_proxy_authorization_yields_the_password_half() {
+        let credential = parse_proxy_authorization(&format!("Basic {}", basic("warren", "tok")))
+            .expect("accepted");
+        assert_eq!(credential.as_bytes(), b"tok");
+        assert_eq!(
+            parse_proxy_authorization("Bearer abc").expect_err("refused"),
+            HeadError::UnsupportedAuthScheme
+        );
+        assert_eq!(
+            parse_proxy_authorization("Basic !!!").expect_err("refused"),
+            HeadError::MalformedCredential
         );
     }
 }
