@@ -1013,11 +1013,11 @@ impl MultiHopClient {
         // unreachable at the first syscall, and every retry repeats it
         // (`incidents/2026-09-20-an-ipv6-only-mobile-network-*`). The bind then
         // follows the address that was chosen.
-        let target = crate::dial_target::select(relay, bind_addr, |candidate| {
+        let target = warrenguard_multihop::dial::select(relay, bind_addr, |candidate| {
             crate::dial_target::local_route(candidate, socket_bypass)
         })
         .ok_or(MultiHopError::NoRouteToRelay)?;
-        let bind_addr = crate::dial_target::bind_for(bind_addr, target);
+        let bind_addr = warrenguard_multihop::dial::bind_for(bind_addr, target);
 
         // In X.509 cover-domain mode the relay presents an ordinary
         // public-CA certificate the client validates via WebPKI (Mozilla roots),

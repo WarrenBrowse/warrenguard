@@ -36,6 +36,10 @@
 
 mod close_codes;
 mod control;
+// Public: the address-family decision every datapath makes before dialing a
+// relay, shared so the engine's client and a deployer's own transport cannot
+// answer it differently.
+pub mod dial;
 mod errors;
 mod exit_descriptor;
 mod node_attestation;
