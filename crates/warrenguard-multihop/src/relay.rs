@@ -47,10 +47,10 @@
 //! `WARREN_PKI_OPERATIONAL_RELAY_V1 || relay_id (16 B) || relay_ed25519_pubkey (32 B)`.
 //! Total length 42 + 16 + 32 = 90 bytes. This constant tuple is frozen for
 //! all `/v1` deployments. Any breaking change must bump to `/v2`
-//! (CLAUDE.md § 3). The `cover_domain` and `tcp_fallback` fields are additive
-//! and UNSIGNED, so they do not alter this payload: a descriptor with or
-//! without them verifies under the same `/v1` signature, and a legacy
-//! descriptor (both absent/false) round-trips byte-for-byte.
+//! (CLAUDE.md § 3). The `cover_domain`, `tcp_fallback` and `endpoint_v6`
+//! fields are additive and UNSIGNED, so they do not alter this payload: a
+//! descriptor with or without them verifies under the same `/v1` signature,
+//! and a legacy descriptor (all absent/false) round-trips byte-for-byte.
 
 use std::net::SocketAddr;
 
@@ -85,6 +85,23 @@ pub struct RelayDescriptorSigned {
     /// QUIC endpoint the client dials. Outside the signature on purpose
     /// (cf. module docs).
     pub endpoint: SocketAddr,
+    /// The same relay's QUIC endpoint on the OTHER address family, when it
+    /// binds one. [`Self::endpoint`] carries the IPv4 address (and is the only
+    /// endpoint a legacy directory has), so this is the IPv6 one; a client
+    /// whose network hands out no IPv4 has nothing else to dial, and an
+    /// IPv4-only client ignores it. Which family an address belongs to is read
+    /// from the address itself, never from this field's name, so a relay whose
+    /// primary is v6 simply leaves this `None`.
+    ///
+    /// Outside the signature on purpose, exactly like `endpoint`,
+    /// `cover_domain` and `tcp_fallback`: an address cannot admit a foreign
+    /// relay (the RPK pin, or the in-band relay-auth proof bound to the
+    /// channel binding, is what binds identity), so a second address needs no
+    /// operational re-sign and a deployer's control plane may overlay it from
+    /// the node's own heartbeat. `skip_serializing_if` keeps a v4-only
+    /// descriptor byte-for-byte the legacy `/v1` shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_v6: Option<SocketAddr>,
     /// X.509 cover-domain SNI. `None` = RPK mode (the historical
     /// default); `Some(domain)` = the client dials this domain as the TLS SNI,
     /// validates the relay's certificate via WebPKI, and then verifies the
@@ -298,6 +315,7 @@ mod tests {
             relay_id,
             relay_ed25519_pubkey: relay_pubkey,
             endpoint: "192.0.2.10:443".parse().expect("static addr parses"),
+            endpoint_v6: None,
             cover_domain: None,
             tcp_fallback: false,
             signature: sig.to_bytes(),
@@ -318,6 +336,7 @@ mod tests {
             relay_id,
             relay_ed25519_pubkey: relay_pubkey,
             endpoint: "192.0.2.10:443".parse().expect("static addr parses"),
+            endpoint_v6: None,
             cover_domain: None,
             tcp_fallback: false,
             signature: sig.to_bytes(),
@@ -345,6 +364,7 @@ mod tests {
             relay_id,
             relay_ed25519_pubkey: relay_pubkey,
             endpoint: "192.0.2.10:443".parse().expect("static addr parses"),
+            endpoint_v6: None,
             cover_domain: None,
             tcp_fallback: false,
             signature: sig.to_bytes(),
@@ -373,6 +393,7 @@ mod tests {
             relay_id: [0x11; 16],
             relay_ed25519_pubkey: [0x22; 32],
             endpoint: "192.0.2.10:443".parse().expect("static addr parses"),
+            endpoint_v6: None,
             cover_domain: None,
             tcp_fallback: false,
             signature: [0x33; 64],
@@ -392,6 +413,7 @@ mod tests {
             relay_id: [0x11; 16],
             relay_ed25519_pubkey: [0x22; 32],
             endpoint: "192.0.2.10:443".parse().expect("static addr parses"),
+            endpoint_v6: None,
             cover_domain: Some("nl1.edge.example.com".to_owned()),
             tcp_fallback: false,
             signature: [0x33; 64],
@@ -420,6 +442,7 @@ mod tests {
             relay_id,
             relay_ed25519_pubkey: relay_pubkey,
             endpoint: "192.0.2.10:443".parse().expect("static addr parses"),
+            endpoint_v6: None,
             cover_domain: None,
             tcp_fallback: false,
             signature: sig.to_bytes(),
@@ -444,6 +467,7 @@ mod tests {
             relay_id: [0x11; 16],
             relay_ed25519_pubkey: [0x22; 32],
             endpoint: "192.0.2.10:443".parse().expect("static addr parses"),
+            endpoint_v6: None,
             cover_domain: None,
             tcp_fallback: false,
             signature: [0x33; 64],
@@ -463,6 +487,7 @@ mod tests {
             relay_id: [0x11; 16],
             relay_ed25519_pubkey: [0x22; 32],
             endpoint: "192.0.2.10:443".parse().expect("static addr parses"),
+            endpoint_v6: None,
             cover_domain: Some("nl1.edge.example.com".to_owned()),
             tcp_fallback: true,
             signature: [0x33; 64],
@@ -474,6 +499,83 @@ mod tests {
         );
         let back: RelayDescriptorSigned = serde_json::from_str(&json).expect("round-trip");
         assert!(back.tcp_fallback);
+        assert_eq!(back, descriptor);
+    }
+
+    #[test]
+    fn signature_verifies_regardless_of_endpoint_v6_value() {
+        // The second address is UNSIGNED, like every other routing field: an
+        // operator adds a v6 listener to a node without re-signing the pool,
+        // and a client that never learned about the field verifies the same
+        // descriptor.
+        let op = det_signing_key(7);
+        let relay_id = [0x11; 16];
+        let relay_pubkey = [0x22; 32];
+        let signature = op
+            .sign(&relay_descriptor_signing_payload(&relay_id, &relay_pubkey))
+            .to_bytes();
+        let base = RelayDescriptorSigned {
+            relay_id,
+            relay_ed25519_pubkey: relay_pubkey,
+            endpoint: "192.0.2.10:443".parse().expect("static addr parses"),
+            endpoint_v6: None,
+            cover_domain: None,
+            tcp_fallback: false,
+            signature,
+        };
+        for endpoint_v6 in [
+            None,
+            Some("[2001:db8::10]:443".parse().expect("static addr parses")),
+        ] {
+            let descriptor = RelayDescriptorSigned {
+                endpoint_v6,
+                ..base.clone()
+            };
+            verify_relay_descriptor(&op.verifying_key(), &descriptor)
+                .expect("the /v1 signature must verify whatever the second address is");
+        }
+    }
+
+    #[test]
+    fn legacy_descriptor_omits_endpoint_v6_in_serialized_form() {
+        // Backward-compat: a v4-only descriptor must serialize WITHOUT the key,
+        // so every directory already signed by a server envelope round-trips
+        // byte-for-byte and its envelope signature still verifies.
+        let descriptor = RelayDescriptorSigned {
+            relay_id: [0x11; 16],
+            relay_ed25519_pubkey: [0x22; 32],
+            endpoint: "192.0.2.10:443".parse().expect("static addr parses"),
+            endpoint_v6: None,
+            cover_domain: None,
+            tcp_fallback: false,
+            signature: [0x33; 64],
+        };
+        let json = serde_json::to_string(&descriptor).expect("serialize");
+        assert!(
+            !json.contains("endpoint_v6"),
+            "a v4-only descriptor must omit endpoint_v6 entirely, got: {json}"
+        );
+        let back: RelayDescriptorSigned = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(back, descriptor);
+    }
+
+    #[test]
+    fn dual_stack_descriptor_round_trips_endpoint_v6() {
+        let descriptor = RelayDescriptorSigned {
+            relay_id: [0x11; 16],
+            relay_ed25519_pubkey: [0x22; 32],
+            endpoint: "192.0.2.10:443".parse().expect("static addr parses"),
+            endpoint_v6: Some("[2001:db8::10]:443".parse().expect("static addr parses")),
+            cover_domain: Some("nl1.edge.example.com".to_owned()),
+            tcp_fallback: true,
+            signature: [0x33; 64],
+        };
+        let json = serde_json::to_string(&descriptor).expect("serialize");
+        assert!(
+            json.contains("\"endpoint_v6\":\"[2001:db8::10]:443\""),
+            "a dual-stack descriptor must carry its v6 address, got: {json}"
+        );
+        let back: RelayDescriptorSigned = serde_json::from_str(&json).expect("round-trip");
         assert_eq!(back, descriptor);
     }
 

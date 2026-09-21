@@ -510,6 +510,24 @@ pub(crate) fn spawn_fake_multihop_exit(
     operational_key: &SigningKey,
     exit_id: ExitId,
 ) -> FakeMultihopExit {
+    spawn_fake_multihop_exit_on(
+        operational_key,
+        exit_id,
+        "127.0.0.1:0".parse().expect("static addr parses"),
+    )
+    .expect("the v4 loopback always binds")
+}
+
+/// [`spawn_fake_multihop_exit`] on a caller-chosen address, so a test can put
+/// the relay on the IPv6 loopback and exercise the family decision end to end.
+/// Returns `None` when the host cannot bind there at all (a build environment
+/// with no IPv6 loopback), which the caller reports as a skip rather than a
+/// failure: the engine is not what is missing.
+pub(crate) fn spawn_fake_multihop_exit_on(
+    operational_key: &SigningKey,
+    exit_id: ExitId,
+    bind: std::net::SocketAddr,
+) -> Option<FakeMultihopExit> {
     let relay_tls_key = SigningKey::from_bytes(&[0x66; 32]);
     let relay_id = [0xAA; 16];
     let relay_pubkey = relay_tls_key.verifying_key().to_bytes();
@@ -523,17 +541,14 @@ pub(crate) fn spawn_fake_multihop_exit(
         &[warrenguard_config::ALPN_H3],
     )
     .expect("server cfg");
-    let server_ep = Endpoint::server(
-        server_cfg,
-        "127.0.0.1:0".parse().expect("static addr parses"),
-    )
-    .expect("server bind");
+    let server_ep = Endpoint::server(server_cfg, bind).ok()?;
     let addr = server_ep.local_addr().expect("local addr");
 
     let relay = Arc::new(RelayDescriptorSigned {
         relay_id,
         relay_ed25519_pubkey: relay_pubkey,
         endpoint: addr,
+        endpoint_v6: None,
         cover_domain: None,
         tcp_fallback: false,
         signature,
@@ -583,7 +598,7 @@ pub(crate) fn spawn_fake_multihop_exit(
         }
     });
 
-    FakeMultihopExit {
+    Some(FakeMultihopExit {
         relay,
         exit_id,
         exit_x25519_pubkey,
@@ -593,5 +608,5 @@ pub(crate) fn spawn_fake_multihop_exit(
         ban_reason_code,
         swallow_setup,
         _server_ep: server_ep,
-    }
+    })
 }

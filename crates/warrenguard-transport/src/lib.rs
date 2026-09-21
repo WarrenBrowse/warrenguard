@@ -16,6 +16,9 @@ pub mod bundle;
 // the advisory type plus the jitter/cooldown/avoid-TTL decisions every client
 // tier consumes instead of re-deciding its own constants.
 pub mod drain_policy;
+// Single home of the address-family decision: which of a relay's published
+// endpoints this host can actually reach, and what to bind for it.
+mod dial_target;
 pub mod egress_probe;
 pub mod ip_assign;
 // `ios_tun` is portable (pure tokio + mpsc) so it compiles on every target for

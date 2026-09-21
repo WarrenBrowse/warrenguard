@@ -178,14 +178,14 @@ mod tests {
     // their single home (`warrenguard_tcp_fallback::policy`); the tests below
     // cover the transport-owned cover-config builder and carrier dial.
 
-    /// The socket protector is process-wide with no uninstall, and it decides
-    /// whether a dial succeeds, so every carrier-dial test below serializes on
-    /// it: one running concurrently with the protector test would otherwise
-    /// inherit that test's verdict. An async mutex because the guard is held
-    /// across the dial's awaits.
+    /// The protector is process-wide with no uninstall, so every test that
+    /// installs one or takes a path that calls it serializes on the same lock,
+    /// which lives beside the protector itself
+    /// ([`crate::socket_protect::TEST_PROTECT_LOCK`]) rather than here: the
+    /// route probe in `dial_target` protects its socket too, and a private
+    /// lock in this module could not cover it.
     #[cfg(unix)]
-    static PROTECT_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+    use crate::socket_protect::TEST_PROTECT_LOCK as PROTECT_LOCK;
 
     #[test]
     fn cover_config_with_no_valid_der_root_fails_closed() {

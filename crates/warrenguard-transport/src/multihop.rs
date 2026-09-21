@@ -97,6 +97,14 @@ pub enum MultiHopError {
         #[source]
         source: std::io::Error,
     },
+    /// This host holds no route to ANY address family the relay publishes:
+    /// the kernel refuses every candidate before a packet is built (an
+    /// IPv6-only network against a v4-only relay, or the reverse). Distinct
+    /// from a handshake failure on purpose: retrying changes nothing until the
+    /// host moves to another network, and the client surfaces it to the user
+    /// instead of dialing forever. Carries no address (no-log discipline).
+    #[error("no route to the relay on any published address family")]
+    NoRouteToRelay,
     /// `Endpoint::connect` rejected the dial parameters (bad endpoint
     /// shape, missing default client config, etc.).
     #[error("QUIC connect setup failed: {0}")]
@@ -1000,6 +1008,17 @@ impl MultiHopClient {
         let _ = socket_bypass;
         verify_relay_descriptor(operational_pubkey, relay)?;
 
+        // Decide the address family BEFORE anything is built: on a network
+        // carrying one family only, the other one is not slow, it is
+        // unreachable at the first syscall, and every retry repeats it
+        // (`incidents/2026-09-20-an-ipv6-only-mobile-network-*`). The bind then
+        // follows the address that was chosen.
+        let target = crate::dial_target::select(relay, bind_addr, |candidate| {
+            crate::dial_target::local_route(candidate, socket_bypass)
+        })
+        .ok_or(MultiHopError::NoRouteToRelay)?;
+        let bind_addr = crate::dial_target::bind_for(bind_addr, target);
+
         // In X.509 cover-domain mode the relay presents an ordinary
         // public-CA certificate the client validates via WebPKI (Mozilla roots),
         // dialing the cover domain as the SNI. The relay's Warren identity is
@@ -1122,6 +1141,7 @@ impl MultiHopClient {
                 warrenguard_tcp_fallback::DialPreference::CarrierFirst => {
                     Self::dial_relay_carrier_first(
                         relay,
+                        target,
                         endpoint,
                         &server_name,
                         inner_cfg,
@@ -1132,6 +1152,7 @@ impl MultiHopClient {
                 warrenguard_tcp_fallback::DialPreference::Race => {
                     Self::dial_relay_with_carrier(
                         relay,
+                        target,
                         endpoint,
                         &server_name,
                         inner_cfg,
@@ -1142,7 +1163,7 @@ impl MultiHopClient {
             },
             None => {
                 let conn = endpoint
-                    .connect(relay.endpoint, &server_name)?
+                    .connect(target, &server_name)?
                     .await
                     .map_err(MultiHopError::Handshake)?;
                 (endpoint, conn, false)
@@ -1170,8 +1191,10 @@ impl MultiHopClient {
     /// fallback race dial the identical target.
     fn carrier_dial_plan(
         relay: &RelayDescriptorSigned,
+        // The address the family decision settled on, so the carrier and the
+        // UDP dial always ride the same one.
+        target: SocketAddr,
     ) -> Result<(SocketAddr, SocketAddr, String, Arc<rustls::ClientConfig>), MultiHopError> {
-        let target = relay.endpoint;
         // `carrier_armed` guaranteed a cover domain; an empty SNI would only
         // fail the TLS name parse (an honest error), never panic.
         let cover_domain = relay.cover_domain.as_deref().unwrap_or_default().to_owned();
@@ -1239,13 +1262,14 @@ impl MultiHopClient {
     /// ([`warrenguard_tcp_fallback::connect_carrier_first`]).
     async fn dial_relay_carrier_first(
         relay: &RelayDescriptorSigned,
+        target: SocketAddr,
         endpoint: Endpoint,
         server_name: &str,
         inner_cfg: quinn::ClientConfig,
         socket_bypass: Option<SocketBypass>,
     ) -> Result<(Endpoint, Connection, bool), MultiHopError> {
         let (target, carrier_endpoint, cover_domain, cover_config) =
-            Self::carrier_dial_plan(relay)?;
+            Self::carrier_dial_plan(relay, target)?;
         let server_name = server_name.to_owned();
         let udp_server_name = server_name.clone();
         let udp = async {
@@ -1313,6 +1337,7 @@ impl MultiHopClient {
     /// identity material is rendered.
     async fn dial_relay_with_carrier(
         relay: &RelayDescriptorSigned,
+        target: SocketAddr,
         endpoint: Endpoint,
         server_name: &str,
         inner_cfg: quinn::ClientConfig,
@@ -1322,7 +1347,7 @@ impl MultiHopClient {
         socket_bypass: Option<SocketBypass>,
     ) -> Result<(Endpoint, Connection, bool), MultiHopError> {
         let (target, carrier_endpoint, cover_domain, cover_config) =
-            Self::carrier_dial_plan(relay)?;
+            Self::carrier_dial_plan(relay, target)?;
         let server_name = server_name.to_owned();
 
         // The UDP error is only surfaced by the engine when the fallback is
@@ -3353,6 +3378,7 @@ mod tests {
             relay_id: [0u8; 16],
             relay_ed25519_pubkey: [0u8; 32],
             endpoint: "127.0.0.1:1".parse().expect("static addr parses"),
+            endpoint_v6: None,
             cover_domain: cover_domain.map(str::to_owned),
             tcp_fallback,
             signature: [0u8; 64],
@@ -3500,6 +3526,7 @@ mod tests {
             relay_id,
             relay_ed25519_pubkey: relay_pubkey,
             endpoint: dead_addr,
+            endpoint_v6: None,
             cover_domain: Some(cover_domain.to_owned()),
             tcp_fallback: true,
             signature,
@@ -3613,6 +3640,7 @@ mod tests {
             relay_id,
             relay_ed25519_pubkey: relay_pubkey,
             endpoint: dispatcher,
+            endpoint_v6: None,
             cover_domain: Some(cover_domain.to_owned()),
             tcp_fallback: true,
             signature,
@@ -3663,6 +3691,7 @@ mod tests {
             relay_id: [0u8; 16],
             relay_ed25519_pubkey: [0u8; 32],
             endpoint: "127.0.0.1:1".parse().expect("static addr parses"),
+            endpoint_v6: None,
             cover_domain: None,
             tcp_fallback: false,
             signature: [0u8; 64],

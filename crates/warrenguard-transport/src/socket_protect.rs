@@ -48,6 +48,15 @@ pub(crate) fn is_armed() -> bool {
         .is_some()
 }
 
+/// Serializes every test that installs a protector or runs a code path that
+/// calls [`protect`]. The protector is process-wide with no uninstall, and the
+/// tests that install one assert on what IT saw, so a concurrent test dialing
+/// (or probing a route) would both inherit that verdict and pollute the
+/// recorded fd. Async because the guards are held across dial awaits.
+#[cfg(test)]
+pub(crate) static TEST_PROTECT_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 /// Protects `fd` via the registered protector. Returns `true` when no
 /// protector is registered (non-VpnService hosts, e.g. the CLI client and
 /// tests, where there is no VPN to bypass) so those paths are unaffected.

@@ -1982,6 +1982,7 @@ mod tests {
                 relay_id: [0u8; 16],
                 relay_ed25519_pubkey: [0u8; 32],
                 endpoint: "127.0.0.1:1".parse().expect("static addr parses"),
+                endpoint_v6: None,
                 cover_domain: None,
                 tcp_fallback: false,
                 signature: [0u8; 64],
@@ -2412,6 +2413,7 @@ mod tests {
             relay_id: [0xAB; 16],
             relay_ed25519_pubkey: [0u8; 32],
             endpoint: "127.0.0.1:1".parse().expect("static addr parses"),
+            endpoint_v6: None,
             cover_domain: None,
             tcp_fallback: false,
             signature: [0u8; 64],
@@ -2658,6 +2660,53 @@ mod run_tests {
         }
     }
 
+    /// A relay reachable only over IPv6, dialed by a client that asks for the
+    /// IPv4 wildcard bind every Warren client passes today. The whole family
+    /// decision runs for real here: the route probe, the bind moving to
+    /// `[::]:0`, and the genuine QUIC handshake plus HPKE setup against the
+    /// fake exit. Before the bind followed the endpoint, this could only ever
+    /// answer `ENETUNREACH`, which is the incident of 2026-09-20 in miniature.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dials_a_v6_only_relay_from_the_v4_wildcard_bind() {
+        let operational_key = SigningKey::from_bytes(&[0x45; 32]);
+        let exit_id = ExitId::from_bytes([0x54; 16]);
+        let Some(exit) = crate::test_support::spawn_fake_multihop_exit_on(
+            &operational_key,
+            exit_id,
+            "[::1]:0".parse().expect("static addr parses"),
+        ) else {
+            eprintln!("skipped: this host has no IPv6 loopback to put the fake relay on");
+            return;
+        };
+        let mut config = config_with_fake_exit(&exit, &operational_key);
+        // What every client passes: quinn's historical v4 wildcard.
+        config.bind_addr = "0.0.0.0:0".parse().expect("static addr parses");
+        let (supervisor, mut rx) = MultiHopSupervisor::new(config);
+        let task = tokio::spawn(supervisor.run());
+
+        let bundle = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(b) = rx.borrow_and_update().clone() {
+                    return b;
+                }
+                if rx.changed().await.is_err() {
+                    panic!("watch closed before a session was ever published");
+                }
+            }
+        })
+        .await
+        .expect("the v6 relay must accept the dial within 5s");
+        assert!(bundle.num_connections() >= 1);
+        assert_eq!(
+            exit.accepted.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the dial must have reached the relay over IPv6"
+        );
+        drop(bundle);
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
     /// The 2026-09-07 Kaliningrad pattern seen from the supervisor: the QUIC
     /// handshake passes, the session is published, and seconds later the
     /// network swallows the flow, so the dead-path watch has to kill it. Two of
@@ -2679,6 +2728,7 @@ mod run_tests {
         // endpoint, so the dial can be routed through the blackhole verbatim.
         config.relay = Arc::new(RelayDescriptorSigned {
             endpoint: blackhole.addr,
+            endpoint_v6: None,
             ..(*exit.relay).clone()
         });
         let (supervisor, mut rx) = MultiHopSupervisor::new(config);
