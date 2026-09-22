@@ -104,10 +104,12 @@ after any change to the rule set.
   be the path of the process that owns the carrier socket. A supervisor that
   relaunches the daemon from another path invalidates the scope and the tunnel
   will not connect (fail-closed, not a leak).
-- The guard stays armed until a teardown has actually completed: a cancelled or
-  failed uninstall still re-enables the operator's rules and restores the captured
-  profile settings from `Drop`, which cannot await and therefore uses a bounded
-  synchronous path.
+- The guard stays armed until a teardown has actually completed, and it is armed
+  BEFORE the first mutation. A cancelled install, a cancelled or failed uninstall,
+  and a rollback that only partly applied are all cases where `Drop` (which cannot
+  await, so it uses a bounded synchronous path) still re-enables the operator's
+  rules and restores the captured profile settings. A rollback that completed
+  cleanly disarms the guard, since there is then nothing left to restore.
 
 ## macOS: states are part of the policy
 
@@ -136,8 +138,20 @@ rule is the same in both directions: killing the carrier's state unconditionally
 would drop the tunnel's own transport for no confidentiality gain, and preserving
 an unattributable state would leave a flow the scoped rule refuses.
 
-The table is then re-read and the install FAILS if a bypass state survived. A
-failure of the purge, or of the anchor flush that precedes the rule load, is
+The two decisions differ on purpose, and the difference is what keeps an install
+from failing on its own transport:
+
+- the PURGE kills every state whose flow it cannot prove the policy passes, so an
+  unattributable interface-scoped flow does not survive it;
+- the CONFIRMATION read fails only on a surviving state that NO pass rule covers.
+  Once the purge has completed, a state matching a pass rule can only have been
+  created by a rule that passed its first packet, and the only rules that pass
+  those flows are the anchor's own, interface scope included. Failing on an
+  unattributable survivor instead would fail the install every time the transport
+  recreated its state between the kill and the read, and the rollback would then
+  remove the blocking rules.
+
+A failure of the purge, or of the anchor flush that precedes the rule load, is
 fatal: a host still carrying off-tunnel traffic must not be reported as protected.
 
 An operator with root can confirm the purge by hand: with a physical connection
@@ -169,9 +183,9 @@ only for compatibility; see `crates/warrenguard-cli/README.md` for the migration
 | Windows: a pre-existing allow rule cannot keep its egress; the tunnel, the carrier and the optional LAN and DHCP flows still pass | Model-driven install tests in `src/windows.rs` (documented precedence, including the bypass rule and the block-beats-allow rule), with mutation-checked RED for each property |
 | Windows: the policy keeps holding for the whole session | A test that adds an allow rule AFTER the install and asserts the traffic stays blocked, with the block-rule removal mutation making it fail |
 | Windows: the install is not reported done unless the active policy confirms it | `check_effective_state` unit tests (profiles enabled, default block, local rules honoured, override flag present on exceptions and absent on the block rule, rule conditions, no leftover rule of ours, no foreign enabled allow rule) plus lifecycle tests against a policy that keeps a profile off, ignores local rules, pins an allow rule, leaves a leftover, or drops the override flag |
-| Windows: partial failure and cancellation roll back | Lifecycle test with an injected command failure, and guard tests for a completed, a failed and a cancelled uninstall (the last two assert the synchronous `Drop` teardown still restores the operator's rules and the captured profiles) |
+| Windows: partial failure and cancellation roll back | Lifecycle test with an injected command failure, and guard tests for a completed, a failed and a cancelled uninstall plus a CANCELLED install (the last three assert the synchronous `Drop` teardown still restores the operator's rules and the captured profiles, which the install path gets by arming the guard before its first mutation) |
 | Windows: the generated commands and the four read-back queries | Golden tests pinning the exact text, so the surface a non-Windows reviewer inspects cannot drift silently |
 | Windows host behaviour, cmdlet and property behaviour, and the `-OverrideBlockRules` reading | NOT verified here. Run `scripts/windows/killswitch-policy-smoke.ps1` on a throwaway Windows host: it reproduces the leak, confirms the block rule, confirms the override exception, confirms that a rule created later cannot reopen the egress, checks the read-back filters, and checks the categorical foreign-allow query |
-| macOS: the anchor-block bypass through pre-existing states, without killing the flows the policy passes | Purge lifecycle tests, the pure permitted-flow predicate (including the interface-scoping refusal) and the wiring test that the set handed to the purge follows `KillswitchOpts`, all mutation-checked |
+| macOS: the anchor-block bypass through pre-existing states, without killing the flows the policy passes, and without failing on a state the transport recreates mid-install | Purge lifecycle tests, the pure permitted-flow predicate (the interface-scoping refusal on the purge side, the recreation tolerance on the confirmation side) and the wiring test that the set handed to the purge follows `KillswitchOpts`, all mutation-checked |
 | macOS host behaviour, `/dev/pf` purge | NOT verified here (no root). The manual `pfctl -s states` procedure above is the check. |
 | CLI: a reachable open exit is refused without the explicit flag; a secret file with group or other access is refused; no secret reaches a `Debug` rendering or an error | Unit tests in `crates/warrenguard-cli` (RED proven by mutation for each guard) |
