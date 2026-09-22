@@ -88,6 +88,14 @@
 //!   future dropped between two PowerShell invocations still runs the synchronous
 //!   teardown from `Drop`. A rollback that completed cleanly disarms it, and a
 //!   partial one leaves it armed to retry.
+//! - Cancellation, second half: every command runs to completion on a blocking
+//!   task that holds a gate, and the teardown takes that gate before its first
+//!   command, so the restoration starts only once the in-flight command has
+//!   finished and its writes are the last ones. Termination timing is deliberately
+//!   not relied on: tokio leaves a spawned child running when its output future is
+//!   dropped, and on Windows `TerminateProcess` may return before the process is
+//!   actually gone. The wait is bounded (a teardown that can hang process exit for
+//!   ever is the worse failure) and an expired bound is logged as the race it is.
 //!
 //! ## What the tests here cover, and what they cannot
 //!
@@ -1254,9 +1262,13 @@ impl WindowsKillswitch {
     ///   read-back does not confirm the policy.
     pub async fn install(opts: &KillswitchOpts) -> Result<Self, KillswitchError> {
         let daemon_exe_path = resolve_daemon_exe_path()?;
-        KillswitchGuard::install(opts, Arc::new(PowershellRunner), &daemon_exe_path)
-            .await
-            .map(Self)
+        KillswitchGuard::install(
+            opts,
+            Arc::new(PowershellRunner::default()),
+            &daemon_exe_path,
+        )
+        .await
+        .map(Self)
     }
 
     /// Remove our rules, re-enable the rules we disabled, then restore the
@@ -1283,15 +1295,19 @@ fn resolve_daemon_exe_path() -> Result<String, KillswitchError> {
 }
 
 /// Production [`FirewallRunner`]: renders each operation to PowerShell and runs
-/// it, and answers the read-back queries with the same shell.
+/// it, and answers the read-back queries with the same shell. Every command goes
+/// through [`CommandGate`], so the guard's synchronous teardown cannot start while
+/// one is still applying.
 #[cfg(target_os = "windows")]
 #[derive(Debug, Default)]
-struct PowershellRunner;
+struct PowershellRunner {
+    gate: CommandGate,
+}
 
 #[cfg(target_os = "windows")]
 impl FirewallRunner for PowershellRunner {
     async fn snapshot(&self) -> Result<FirewallSnapshot, KillswitchError> {
-        let out = run_powershell_capture(QUERY_PROFILES_LOCAL).await?;
+        let out = run_powershell_capture(self.gate.clone(), QUERY_PROFILES_LOCAL).await?;
         let settings = parse_profile_settings(&out);
         let mut profiles = Vec::with_capacity(FIREWALL_PROFILES.len());
         for name in FIREWALL_PROFILES {
@@ -1322,8 +1338,9 @@ impl FirewallRunner for PowershellRunner {
             });
         }
 
-        let foreign =
-            parse_foreign_rows(&run_powershell_capture(&query_foreign_allows_command()).await?);
+        let foreign = parse_foreign_rows(
+            &run_powershell_capture(self.gate.clone(), &query_foreign_allows_command()).await?,
+        );
         Ok(FirewallSnapshot {
             profiles,
             foreign_allows: foreign.into_iter().map(|r| r.name).collect(),
@@ -1331,10 +1348,22 @@ impl FirewallRunner for PowershellRunner {
     }
 
     async fn apply(&self, op: &FirewallOp) -> Result<(), KillswitchError> {
-        run_powershell(&render_op(op)).await
+        run_powershell(self.gate.clone(), &render_op(op)).await
     }
 
     fn sync_teardown(&self, snapshot: &FirewallSnapshot) {
+        // The restoration must not start while a command is still applying: the gate
+        // is what makes that an ordering guarantee rather than a hope about how
+        // quickly a termination request lands. It is bounded, because a teardown that
+        // can hang process exit for ever is the worse failure.
+        if self.gate.take_blocking(SYNC_CLEANUP_TIMEOUT).is_none() {
+            tracing::error!(
+                timeout = ?SYNC_CLEANUP_TIMEOUT,
+                "a firewall command was still running when the guard restored: the \
+                 restoration ran after the bound and a late command may have applied \
+                 a change after it"
+            );
+        }
         for cmd in uninstall_ops(snapshot).iter().map(render_op) {
             if run_sync_bounded("powershell.exe", &cmd, SYNC_CLEANUP_TIMEOUT).is_none() {
                 tracing::warn!(
@@ -1346,55 +1375,120 @@ impl FirewallRunner for PowershellRunner {
     }
 
     async fn verify(&self, rules: &[RuleSpec]) -> Result<(), KillswitchError> {
-        let profiles = run_powershell_capture(QUERY_PROFILES_EFFECTIVE).await?;
-        let ours = run_powershell_capture(&query_our_rules_command()).await?;
-        let foreign = run_powershell_capture(&query_foreign_allows_command()).await?;
+        let profiles = run_powershell_capture(self.gate.clone(), QUERY_PROFILES_EFFECTIVE).await?;
+        let ours = run_powershell_capture(self.gate.clone(), &query_our_rules_command()).await?;
+        let foreign =
+            run_powershell_capture(self.gate.clone(), &query_foreign_allows_command()).await?;
         check_effective_state(&profiles, &ours, &foreign, rules)
     }
 }
 
-/// Builds a child command with `kill_on_drop` requested.
+/// Serializes an in-flight PowerShell command with the guard's synchronous
+/// teardown.
 ///
-/// Tokio leaves a spawned child RUNNING when its output future is dropped, and the
-/// guard restores the firewall from `Drop`: without this, a command that was still
-/// in flight when the install was cancelled could apply its profile change or rule
-/// creation AFTER that restoration, leaving the host in a state nobody owns. The
-/// kill is requested when the command is built, so it happens as the future is
-/// dropped, before the guard's own synchronous teardown starts.
+/// Tokio leaves a spawned child running when its output future is dropped, and
+/// `kill_on_drop` only *requests* termination: on Windows `TerminateProcess` may
+/// return before the process is actually gone, so the guard's restoration could
+/// still race a command that has not finished applying its change. Instead of
+/// depending on termination timing, every command runs to completion on a blocking
+/// task that holds this gate (a blocking task is not cancelled when the future
+/// waiting on it is dropped), and the teardown takes the gate before its first
+/// command. The restoration therefore starts only once the in-flight command has
+/// finished, and its writes are the last ones.
 #[cfg(any(target_os = "windows", test))]
-fn child_command(program: &str, args: &[&str]) -> tokio::process::Command {
-    let mut command = tokio::process::Command::new(program);
-    command.args(args).kill_on_drop(true);
-    command
+#[derive(Debug, Default, Clone)]
+struct CommandGate {
+    gate: Arc<std::sync::Mutex<()>>,
 }
 
-/// Runs `program args...` and returns its stdout.
 #[cfg(any(target_os = "windows", test))]
-async fn run_command_capture(program: &str, args: &[&str]) -> Result<String, KillswitchError> {
-    let out = child_command(program, args)
-        .output()
-        .await
-        .map_err(|e| KillswitchError::Windows(format!("spawn {program}: {e}")))?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(KillswitchError::Windows(format!(
-            "{program} failed: {}",
-            stderr.trim()
-        )));
+impl CommandGate {
+    /// Runs `f` while holding the gate. Blocking; the production callers run it on
+    /// a blocking task.
+    fn run<T>(&self, f: impl FnOnce() -> T) -> T {
+        // A poisoned gate means another command panicked; the ordering guarantee is
+        // what matters, not the panic, so the guard is taken either way.
+        let _held = self
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f()
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+
+    /// Takes the gate, waiting at most `timeout` for an in-flight command.
+    ///
+    /// `None` means the wait expired: the caller proceeds anyway (a teardown that
+    /// can hang process exit forever is worse than a logged race) and says so.
+    fn take_blocking(&self, timeout: Duration) -> Option<std::sync::MutexGuard<'_, ()>> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut poll = Duration::from_millis(1);
+        loop {
+            match self.gate.try_lock() {
+                Ok(held) => return Some(held),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    return Some(poisoned.into_inner());
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(poll);
+            poll = (poll * 2).min(Duration::from_millis(64));
+        }
+    }
 }
 
-/// Runs one PowerShell command and returns its stdout.
+/// Runs `program args...` with the gate held, on a blocking task.
+///
+/// The command runs to completion and its child is reaped before the gate is
+/// released, so a dropped future leaves the ordering guarantee intact: whatever
+/// the command applied is visible to the teardown that follows it.
+#[cfg(any(target_os = "windows", test))]
+async fn run_gated_command(
+    gate: CommandGate,
+    program: &'static str,
+    args: Vec<String>,
+) -> Result<String, KillswitchError> {
+    tokio::task::spawn_blocking(move || {
+        gate.run(|| {
+            let str_args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let out = std::process::Command::new(program)
+                .args(&str_args)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .map_err(|e| KillswitchError::Windows(format!("spawn {program}: {e}")))?;
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                return Err(KillswitchError::Windows(format!(
+                    "{program} failed: {}",
+                    stderr.trim()
+                )));
+            }
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        })
+    })
+    .await
+    .map_err(|e| KillswitchError::Windows(format!("join the {program} task: {e}")))?
+}
+
+/// Runs one PowerShell command through the gate and returns its stdout.
 #[cfg(target_os = "windows")]
-async fn run_powershell_capture(command: &str) -> Result<String, KillswitchError> {
-    run_command_capture("powershell.exe", &["-NoProfile", "-Command", command]).await
+async fn run_powershell_capture(
+    gate: CommandGate,
+    command: &str,
+) -> Result<String, KillswitchError> {
+    run_gated_command(
+        gate,
+        "powershell.exe",
+        vec!["-NoProfile".into(), "-Command".into(), command.to_owned()],
+    )
+    .await
 }
 
 #[cfg(target_os = "windows")]
-async fn run_powershell(args: &[String]) -> Result<(), KillswitchError> {
-    let str_args: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_command_capture("powershell.exe", &str_args)
+async fn run_powershell(gate: CommandGate, args: &[String]) -> Result<(), KillswitchError> {
+    run_gated_command(gate, "powershell.exe", args.to_vec())
         .await
         .map(|_| ())
 }
@@ -3335,37 +3429,77 @@ AllowLocalFirewallRules    : True
         );
     }
 
-    // ---- a cancelled command must not outlive its future ---------------
+    // ---- an in-flight command and the restoration cannot overlap ---------
     //
-    // The guard restores the firewall from `Drop`, which cannot await, so an
-    // in-flight command has to be gone before that restoration starts. Tokio leaves
-    // a spawned child running when its output future is dropped, so the kill is
-    // requested when the command is built; the marker below is written only by a
-    // shell that survives long enough to reach it.
+    // The guard restores the firewall from `Drop`, which cannot await, so the
+    // restoration must not start while a command is still applying. The gate is
+    // what guarantees the order: the command runs to completion on a blocking task
+    // that holds it (a blocking task is not cancelled with the future waiting on
+    // it), and the teardown takes it before its first command. Termination timing is
+    // deliberately out of the picture: on Windows `TerminateProcess` may return
+    // before the process is gone.
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_cancelled_command_does_not_outlive_its_future() {
+    async fn a_cancelled_command_still_holds_the_gate_until_it_finishes() {
+        let gate = CommandGate::default();
         let marker =
-            std::env::temp_dir().join(format!("warren-kill-on-drop-{}", std::process::id()));
+            std::env::temp_dir().join(format!("warren-gate-ordering-{}", std::process::id()));
         let _ = std::fs::remove_file(&marker);
         let script = format!("sleep 1; : > {}", marker.display());
 
+        // The future is cancelled, the command is not: the blocking task keeps
+        // running and keeps holding the gate.
         let cancelled = tokio::time::timeout(
             Duration::from_millis(100),
-            run_command_capture("/bin/sh", &["-c", &script]),
+            run_gated_command(gate.clone(), "/bin/sh", vec!["-c".to_owned(), script]),
         )
         .await;
         assert!(cancelled.is_err(), "the command was meant to be cancelled");
 
-        // Give a shell that was NOT killed time to reach the marker.
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let held = gate
+            .take_blocking(Duration::from_secs(10))
+            .expect("the gate is released once the command exits");
         assert!(
-            !marker.exists(),
-            "a cancelled command must not outlive its future: {} was written",
+            marker.exists(),
+            "the restoration must not start before the cancelled command finished: {} \
+             was not written yet",
             marker.display()
         );
+        drop(held);
         let _ = std::fs::remove_file(&marker);
+    }
+
+    #[test]
+    fn the_teardown_gives_up_after_the_bound() {
+        // A wedged command must not hang process exit for ever: the teardown takes
+        // the gate with a bound and reports the race instead.
+        let gate = CommandGate::default();
+        let holder = gate.clone();
+        let (acquired, holding) = std::sync::mpsc::channel::<()>();
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            holder.run(|| {
+                let _ = acquired.send(());
+                let _ = hold.recv();
+            });
+        });
+        // Wait until the command really holds the gate, or the test would take it
+        // first and measure nothing.
+        holding.recv().expect("the holder acquired the gate");
+
+        let started = std::time::Instant::now();
+        assert!(
+            gate.take_blocking(Duration::from_millis(100)).is_none(),
+            "a command that outlives the bound must not block the teardown"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the bound must cap the wait, took {:?}",
+            started.elapsed()
+        );
+        let _ = release.send(());
+        worker.join().expect("the holder thread joins");
     }
 
     // ---- portable bounded-wait helper (exercised on every host; its only
