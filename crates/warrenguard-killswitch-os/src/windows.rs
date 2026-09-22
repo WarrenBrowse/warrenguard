@@ -1353,44 +1353,50 @@ impl FirewallRunner for PowershellRunner {
     }
 }
 
-/// Runs `command` through `powershell.exe` and returns its stdout.
-#[cfg(target_os = "windows")]
-async fn run_powershell_capture(command: &str) -> Result<String, KillswitchError> {
-    use tokio::process::Command;
+/// Builds a child command with `kill_on_drop` requested.
+///
+/// Tokio leaves a spawned child RUNNING when its output future is dropped, and the
+/// guard restores the firewall from `Drop`: without this, a command that was still
+/// in flight when the install was cancelled could apply its profile change or rule
+/// creation AFTER that restoration, leaving the host in a state nobody owns. The
+/// kill is requested when the command is built, so it happens as the future is
+/// dropped, before the guard's own synchronous teardown starts.
+#[cfg(any(target_os = "windows", test))]
+fn child_command(program: &str, args: &[&str]) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(program);
+    command.args(args).kill_on_drop(true);
+    command
+}
 
-    let out = Command::new("powershell.exe")
-        .args(["-NoProfile", "-Command", command])
+/// Runs `program args...` and returns its stdout.
+#[cfg(any(target_os = "windows", test))]
+async fn run_command_capture(program: &str, args: &[&str]) -> Result<String, KillswitchError> {
+    let out = child_command(program, args)
         .output()
         .await
-        .map_err(|e| KillswitchError::Windows(format!("spawn powershell.exe: {e}")))?;
+        .map_err(|e| KillswitchError::Windows(format!("spawn {program}: {e}")))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(KillswitchError::Windows(format!(
-            "powershell.exe failed: {}",
+            "{program} failed: {}",
             stderr.trim()
         )));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Runs one PowerShell command and returns its stdout.
+#[cfg(target_os = "windows")]
+async fn run_powershell_capture(command: &str) -> Result<String, KillswitchError> {
+    run_command_capture("powershell.exe", &["-NoProfile", "-Command", command]).await
+}
+
 #[cfg(target_os = "windows")]
 async fn run_powershell(args: &[String]) -> Result<(), KillswitchError> {
-    use tokio::process::Command;
-
     let str_args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = Command::new("powershell.exe")
-        .args(&str_args)
-        .output()
+    run_command_capture("powershell.exe", &str_args)
         .await
-        .map_err(|e| KillswitchError::Windows(format!("spawn powershell.exe: {e}")))?;
-    if out.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    Err(KillswitchError::Windows(format!(
-        "powershell.exe failed: {}",
-        stderr.trim()
-    )))
+        .map(|_| ())
 }
 
 /// Upper bound on a single synchronous cleanup command run from [`Drop`].
@@ -3327,6 +3333,39 @@ AllowLocalFirewallRules    : True
             OutboundAction::Allow,
             "and the captured profile settings restored"
         );
+    }
+
+    // ---- a cancelled command must not outlive its future ---------------
+    //
+    // The guard restores the firewall from `Drop`, which cannot await, so an
+    // in-flight command has to be gone before that restoration starts. Tokio leaves
+    // a spawned child running when its output future is dropped, so the kill is
+    // requested when the command is built; the marker below is written only by a
+    // shell that survives long enough to reach it.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancelled_command_does_not_outlive_its_future() {
+        let marker =
+            std::env::temp_dir().join(format!("warren-kill-on-drop-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let script = format!("sleep 1; : > {}", marker.display());
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(100),
+            run_command_capture("/bin/sh", &["-c", &script]),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the command was meant to be cancelled");
+
+        // Give a shell that was NOT killed time to reach the marker.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            !marker.exists(),
+            "a cancelled command must not outlive its future: {} was written",
+            marker.display()
+        );
+        let _ = std::fs::remove_file(&marker);
     }
 
     // ---- portable bounded-wait helper (exercised on every host; its only
