@@ -15,12 +15,13 @@
 //!
 //! - Linux: nftables ([`build_linux_ruleset`] + [`LinuxKillswitch`]).
 //! - macOS: pf ([`build_macos_pf_ruleset`] + [`MacosKillswitch`]).
-//! - Windows: PowerShell `New-NetFirewallRule` (= Windows Filtering
-//!   Platform via user-space surface), implemented in [`mod@windows`].
-//!   A native WFP-API binding (no PowerShell shell-out) is a
-//!   follow-up hardening
-//!   item; the PowerShell path is the same approach WireGuard /
-//!   OpenVPN / Mullvad ship today and is production-grade.
+//! - Windows: the Windows Firewall (WFP's user-space surface), driven through
+//!   PowerShell `New-NetFirewallRule` by [`WindowsKillswitch`]. The policy is an
+//!   explicit outbound *Block* rule (which outranks the pre-existing allow rules
+//!   that a default-block profile setting leaves alone) plus exceptions created
+//!   with `-OverrideBlockRules`, and the install reads the active policy back
+//!   before it reports success. A native WFP-API binding (no PowerShell
+//!   shell-out, our own sub-layer and weights) is the follow-up hardening item.
 //!
 //! ## Strategy
 //!
@@ -71,20 +72,18 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::{MacosKillswitch, PF_ANCHOR_PATH, build_pf_rules};
 
-// Windows module is left non-gated so its pure command builders + tests
-// compile on every host. The runtime exec type (`WindowsKillswitch`) is
-// itself `cfg(target_os = "windows")` inside the module.
+// Windows module is left non-gated so its pure policy builders, its read-back
+// verification and its lifecycle state machine compile and are driven on every
+// host. The runtime exec type (`WindowsKillswitch`) is itself
+// `cfg(target_os = "windows")` inside the module.
 mod windows;
 
 #[cfg(target_os = "windows")]
 pub use windows::WindowsKillswitch;
 pub use windows::{
-    FIREWALL_PROFILES as WINDOWS_FIREWALL_PROFILES, PsCommandRunner,
-    RULE_PREFIX as WINDOWS_RULE_PREFIX, build_install_commands as build_windows_install_commands,
-    build_uninstall_commands as build_windows_uninstall_commands,
+    FIREWALL_PROFILES as WINDOWS_FIREWALL_PROFILES, RULE_PREFIX as WINDOWS_RULE_PREFIX,
+    build_install_commands as build_windows_install_commands,
     format_install_log as format_windows_install_log,
-    parse_default_outbound_actions as parse_windows_default_outbound_actions,
-    run_install_with_rollback as run_windows_install_with_rollback,
 };
 
 /// Configuration options for a Warren killswitch.
