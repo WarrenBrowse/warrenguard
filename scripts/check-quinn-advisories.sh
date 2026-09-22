@@ -12,11 +12,31 @@
 # inside an affected range, or when an advisory cannot be parsed (conservative:
 # unparseable is a failure, never a silent skip).
 #
-# Reviewed-and-accepted advisories can be ignored via
-# scripts/quinn-advisories-ignore.txt (one RUSTSEC id per line, rationale
-# mandatory as a comment).
+# Reviewed-and-accepted advisories can be ignored via the ignore file (one
+# RUSTSEC id per line, rationale mandatory as a comment).
 #
-# Requirements: git, python3 with tomllib (3.11+) or the `tomli` backport.
+# Environment overrides (they let scripts/ci/test-check-quinn-advisories.sh drive
+# this script hermetically, without network access):
+#   QUINN_ADVISORY_DB_DIR       already-checked-out RustSec advisory DB; used
+#                               as-is and the clone is skipped. Must contain a
+#                               `crates` directory, else exit 2.
+#   QUINN_ADVISORY_LOCK         Cargo.lock to read the fork base versions from
+#                               (default: $REPO_ROOT/Cargo.lock, exit 2 when the
+#                               file does not exist).
+#   QUINN_ADVISORY_IGNORE_FILE  ignore file (default:
+#                               scripts/quinn-advisories-ignore.txt).
+#
+# An expected upstream crate with NO `crates/<name>` directory in the DB is a
+# FAILURE (exit 1), never a skip: a crate silently dropped from the evaluation is
+# exactly the blind spot this script exists to close. The single exception is an
+# upstream crate the RustSec DB has never filed an advisory against (upstream
+# quinn-udp today): there the absent directory is the real state of the DB, so it
+# is reported explicitly instead of failing. Filing an advisory creates the
+# directory, which is then evaluated like any other, so the exception cannot hide
+# one. See FORK_UPSTREAM_WITHOUT_ADVISORIES below.
+#
+# Requirements: git (only when QUINN_ADVISORY_DB_DIR is unset), python3 with
+# tomllib (3.11+) or the `tomli` backport.
 #
 # Exit codes:
 #   0  every advisory against the fork crates is covered (or explicitly ignored)
@@ -27,20 +47,33 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-LOCK="$REPO_ROOT/Cargo.lock"
-IGNORE_FILE="$SCRIPT_DIR/quinn-advisories-ignore.txt"
+LOCK="${QUINN_ADVISORY_LOCK:-$REPO_ROOT/Cargo.lock}"
+IGNORE_FILE="${QUINN_ADVISORY_IGNORE_FILE:-$SCRIPT_DIR/quinn-advisories-ignore.txt}"
 ADVISORY_DB_URL="https://github.com/rustsec/advisory-db.git"
 
 if [[ ! -f "$LOCK" ]]; then
-    echo "ERROR: $LOCK not found (run from a resolved warrenguard workspace)" >&2
+    echo "ERROR: $LOCK not found (run from a resolved warrenguard workspace, or set QUINN_ADVISORY_LOCK)" >&2
     exit 2
 fi
 
-DB_DIR="$(mktemp -d -t rustsec-advisory-db.XXXXXX)"
-trap 'rm -rf "$DB_DIR"' EXIT INT TERM
+if [[ -n "${QUINN_ADVISORY_DB_DIR:-}" ]]; then
+    DB_DIR="$QUINN_ADVISORY_DB_DIR"
+    if [[ ! -d "$DB_DIR/crates" ]]; then
+        echo "ERROR: QUINN_ADVISORY_DB_DIR=$DB_DIR is not a RustSec advisory DB (no crates/ directory)" >&2
+        exit 2
+    fi
+    echo "==> Using pre-checked-out advisory DB at $DB_DIR (QUINN_ADVISORY_DB_DIR)"
+    CLEANUP_DB_DIR=""
+else
+    DB_DIR="$(mktemp -d -t rustsec-advisory-db.XXXXXX)"
+    CLEANUP_DB_DIR="$DB_DIR"
+    echo "==> Cloning rustsec/advisory-db (shallow) into $DB_DIR"
+fi
+trap 'if [[ -n "$CLEANUP_DB_DIR" ]]; then rm -rf "$CLEANUP_DB_DIR"; fi' EXIT INT TERM
 
-echo "==> Cloning rustsec/advisory-db (shallow) into $DB_DIR"
-git clone --quiet --depth 1 "$ADVISORY_DB_URL" "$DB_DIR"
+if [[ -n "$CLEANUP_DB_DIR" ]]; then
+    git clone --quiet --depth 1 "$ADVISORY_DB_URL" "$DB_DIR"
+fi
 
 DB_DIR="$DB_DIR" LOCK="$LOCK" IGNORE_FILE="$IGNORE_FILE" python3 - <<'PYEOF'
 import os
@@ -70,6 +103,15 @@ FORK_TO_UPSTREAM = {
     "warren-quinn-proto": "quinn-proto",
     "warren-quinn-udp": "quinn-udp",
 }
+
+# Upstream crates the RustSec DB has never filed an advisory against, so the DB
+# legitimately carries no crates/<name> directory for them. Verified against the
+# live DB: it ships crates/quinn and crates/quinn-proto, and no quinn-udp entry
+# anywhere. Without this, an absent directory would have to mean "the DB is
+# incomplete" for every expected crate, and the watch would fail on every run,
+# including on a pristine clone. The exemption cannot hide an advisory: filing
+# one creates the directory, which the loop below then evaluates like any other.
+FORK_UPSTREAM_WITHOUT_ADVISORIES = frozenset({"quinn-udp"})
 
 
 def parse_version(s):
@@ -144,6 +186,16 @@ for crate, base_str in crates.items():
     base = parse_version(base_str)
     crate_dir = DB / "crates" / crate
     if not crate_dir.is_dir():
+        if crate in FORK_UPSTREAM_WITHOUT_ADVISORIES:
+            print(
+                f"NO-ADVISORIES {crate}: no crates/{crate} in the advisory DB "
+                "(upstream has filed none), nothing to evaluate"
+            )
+            continue
+        failures.append(
+            f"{crate} ({base_str}): no {crate_dir} in the advisory DB, so its "
+            "advisories cannot be evaluated"
+        )
         continue
     for adv_path in sorted(crate_dir.glob("RUSTSEC-*.md")):
         adv_id = adv_path.stem

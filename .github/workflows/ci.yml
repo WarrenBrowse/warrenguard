@@ -140,3 +140,34 @@ jobs:
         with:
           tool: cargo-deny
       - run: cargo deny check
+
+  quinn-advisory-watch:
+    # cargo-audit and cargo-deny match advisories by (crate name, version), and
+    # the fork ships RENAMED crates, so a quinn/quinn-proto/quinn-udp advisory
+    # never matches this lockfile. Without this gate a fork base version that
+    # goes advisory-affected between two nightly runs reaches main unseen.
+    name: warren-quinn fork advisory watch
+    runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure a TOML parser for python < 3.11
+        # The runner is Debian bullseye (python 3.9, no tomllib); install the
+        # pure-python tomli backport. No-op when tomllib or tomli is already
+        # present. The container image ships python3 WITHOUT pip ("No module
+        # named pip"), so bootstrap pip through apt first (the runner has
+        # NOPASSWD sudo scoped to apt) instead of assuming it exists.
+        run: |
+          python3 -c "import tomllib" 2>/dev/null && exit 0
+          python3 -c "import tomli" 2>/dev/null && exit 0
+          if ! python3 -m pip --version >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq python3-pip
+          fi
+          python3 -m pip install --user --quiet tomli
+      # Hermetic first: the fixture test proves the watch actually fails on an
+      # affected base version, on a missing upstream crate directory and on an
+      # unparseable advisory, so a green real run below means something.
+      - name: Hermetic fixture test for the advisory watch
+        run: bash scripts/ci/test-check-quinn-advisories.sh
+      - name: Check the quinn fork base versions against the RustSec advisory DB
+        run: ./scripts/check-quinn-advisories.sh
