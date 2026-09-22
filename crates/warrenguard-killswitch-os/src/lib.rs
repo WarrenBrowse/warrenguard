@@ -16,12 +16,14 @@
 //! - Linux: nftables ([`build_linux_ruleset`] + [`LinuxKillswitch`]).
 //! - macOS: pf ([`build_macos_pf_ruleset`] + [`MacosKillswitch`]).
 //! - Windows: the Windows Firewall (WFP's user-space surface), driven through
-//!   PowerShell `New-NetFirewallRule` by [`WindowsKillswitch`]. The policy is an
-//!   explicit outbound *Block* rule (which outranks the pre-existing allow rules
-//!   that a default-block profile setting leaves alone) plus exceptions created
-//!   with `-OverrideBlockRules`, and the install reads the active policy back
-//!   before it reports success. A native WFP-API binding (no PowerShell
-//!   shell-out, our own sub-layer and weights) is the follow-up hardening item.
+//!   PowerShell by [`WindowsKillswitch`]. The policy is the profile default
+//!   block plus ordinary Allow exceptions, with every OTHER enabled outbound
+//!   allow rule disabled for the duration (a default block alone does not
+//!   outrank the pre-existing allow rules; see the module doc for why the
+//!   `-OverrideBlockRules` alternative is not used). The install reads the
+//!   active policy back, conditions included, before it reports success. A
+//!   native WFP-API binding (no PowerShell shell-out, our own sub-layer and
+//!   weights) is the follow-up hardening item.
 //!
 //! ## Strategy
 //!
@@ -82,7 +84,6 @@ mod windows;
 pub use windows::WindowsKillswitch;
 pub use windows::{
     FIREWALL_PROFILES as WINDOWS_FIREWALL_PROFILES, RULE_PREFIX as WINDOWS_RULE_PREFIX,
-    build_install_commands as build_windows_install_commands,
     format_install_log as format_windows_install_log,
 };
 
