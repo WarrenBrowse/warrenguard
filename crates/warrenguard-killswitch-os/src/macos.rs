@@ -52,17 +52,14 @@
 //!    [`KillswitchError::UnconfirmedStates`] and must leave the pf rules and the
 //!    enable state untouched: `sudo pfctl -a com.apple/250.warrenguard_killswitch_os
 //!    -s rules` shows the previous ruleset unchanged.
-//! 4. The real `/dev/pf` path has an ignored test a root operator runs once:
-//!
-//!    `sudo WARREN_KILLSWITCH_ROOT_TEST=1 ./scripts/dev/cargo-test-nofw.sh test
-//!    -p warrenguard-killswitch-os -- --ignored --nocapture
-//!    real_pf_install_and_uninstall_cycle`
-//!
-//!    It enables pf, registers the anchor, loads the rules, purges the state table,
-//!    confirms it and restores, then asserts pf's enable state is exactly what it
-//!    found. It purges every off-policy connection on the host it runs on, which is
-//!    why it is ignored by default, gated on that environment variable, and meant
-//!    for an idle or disposable Mac.
+//! 4. The real `/dev/pf` path has an ignored test a root operator runs once, through
+//!    `scripts/dev/run-root-killswitch-test.sh`: it builds as the invoking user and
+//!    elevates only the compiled test binary, because cargo run as root would leave
+//!    root-owned artifacts in `target/`. It enables pf, registers the anchor, loads
+//!    the rules, purges the state table, confirms it and restores, then asserts pf's
+//!    enable state is exactly what it found. It purges every off-policy connection
+//!    on the host it runs on, which is why it is ignored by default, gated on
+//!    `WARREN_KILLSWITCH_ROOT_TEST=1`, and meant for an idle or disposable Mac.
 //! 4. `sudo pfctl -s rules` must show the anchor rules under
 //!    [`PF_ANCHOR_PATH`].
 

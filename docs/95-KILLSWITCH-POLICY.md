@@ -166,14 +166,15 @@ enables pf, loads the anchor, purges the state table, confirms it, restores, and
 asserts pf's enable state is exactly what it found:
 
 ```sh
-sudo WARREN_KILLSWITCH_ROOT_TEST=1 \
-  ./scripts/dev/cargo-test-nofw.sh test -p warrenguard-killswitch-os -- \
-  --ignored --nocapture real_pf_install_and_uninstall_cycle
+scripts/dev/run-root-killswitch-test.sh
 ```
 
-It purges every off-policy connection on the host it runs on, which is why it is
-ignored by default, gated on that variable, and meant for an idle or disposable
-Mac.
+The wrapper builds as the invoking user and elevates only the compiled test binary:
+`cargo` run as root would leave root-owned artifacts in `target/` and break the next
+normal build. It purges every off-policy connection on the host it runs on, which is
+why it is ignored by default, gated on `WARREN_KILLSWITCH_ROOT_TEST=1`, and meant for
+an idle or disposable Mac. `--print-only` shows the elevated command without running
+it, and the log lands in `target/root-killswitch-test.log`.
 
 ## Linux: unchanged
 
