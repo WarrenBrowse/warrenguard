@@ -52,6 +52,17 @@
 //!    [`KillswitchError::UnconfirmedStates`] and must leave the pf rules and the
 //!    enable state untouched: `sudo pfctl -a com.apple/250.warrenguard_killswitch_os
 //!    -s rules` shows the previous ruleset unchanged.
+//! 4. The real `/dev/pf` path has an ignored test a root operator runs once:
+//!
+//!    `sudo WARREN_KILLSWITCH_ROOT_TEST=1 ./scripts/dev/cargo-test-nofw.sh test
+//!    -p warrenguard-killswitch-os -- --ignored --nocapture
+//!    real_pf_install_and_uninstall_cycle`
+//!
+//!    It enables pf, registers the anchor, loads the rules, purges the state table,
+//!    confirms it and restores, then asserts pf's enable state is exactly what it
+//!    found. It purges every off-policy connection on the host it runs on, which is
+//!    why it is ignored by default, gated on that environment variable, and meant
+//!    for an idle or disposable Mac.
 //! 4. `sudo pfctl -s rules` must show the anchor rules under
 //!    [`PF_ANCHOR_PATH`].
 
@@ -1793,6 +1804,72 @@ mod tests {
             1,
             "the install must stop after its pre-flight purge and before the \
              confirmation purge; ops: {ops:?}"
+        );
+    } // ---- the real /dev/pf path (root, ignored by default) --------------
+    //
+    // Everything else in this crate talks to the injected [`PfOps`] seam. This test
+    // is the one that opens `/dev/pf` for real: it enables pf, registers the anchor,
+    // loads the rules, purges the state table, confirms it, and restores. It is
+    // ignored by default and gated on an explicit opt-in because a killswitch
+    // install PURGES every connection the policy does not pass, on the host it runs
+    // on. Run it on an idle or disposable Mac, as root:
+    //
+    //   sudo WARREN_KILLSWITCH_ROOT_TEST=1 \
+    //     ./scripts/dev/cargo-test-nofw.sh test -p warrenguard-killswitch-os -- \
+    //     --ignored --nocapture real_pf_install_and_uninstall_cycle
+    //
+    // The policy is deliberately inert: the exit address is TEST-NET-3 (RFC 5737,
+    // 203.0.113.0/24) and the tunnel interface does not exist, so the only traffic it
+    // excepts is loopback, the LAN and DHCP. The host's pf enable state is captured
+    // and asserted unchanged afterwards, which is what makes a failure recoverable.
+    #[cfg(target_os = "macos")]
+    #[ignore = "needs root and purges off-policy connections: see the doc comment"]
+    #[tokio::test]
+    async fn real_pf_install_and_uninstall_cycle() {
+        if std::env::var("WARREN_KILLSWITCH_ROOT_TEST").as_deref() != Ok("1") {
+            eprintln!(
+                "refusing to run: this test purges the state table of the host it runs on. \
+                 Set WARREN_KILLSWITCH_ROOT_TEST=1 (and run it as root) to proceed."
+            );
+            return;
+        }
+
+        let real = RealPfOps;
+        let was_enabled = real
+            .is_enabled()
+            .expect("open /dev/pf as root (or grant the binary access)");
+
+        let opts = KillswitchOpts {
+            exit_addrs: vec!["203.0.113.7".parse().expect("a TEST-NET-3 address")],
+            tun_name: "warren-tst0".into(),
+            allow_lan: true,
+            allow_dhcp: true,
+            socket_mark: None,
+            phys_iface: None,
+        };
+
+        match MacosKillswitch::install(&opts).await {
+            Ok(guard) => {
+                eprintln!("installed; the anchor is loaded and the state table was purged");
+                guard
+                    .uninstall()
+                    .await
+                    .expect("the real uninstall flushes the anchor and restores pf");
+            }
+            Err(KillswitchError::UnconfirmedStates(message)) => {
+                // A busy host: a live flow the policy cannot account for keeps coming
+                // back, so the pre-flight refused before mutating. That is the
+                // designed outcome, and the point of this branch is that it left the
+                // host alone.
+                eprintln!("refused before mutating, as designed: {message}");
+            }
+            Err(other) => panic!("the real install failed for another reason: {other:?}"),
+        }
+
+        assert_eq!(
+            real.is_enabled().expect("read pf's enable state again"),
+            was_enabled,
+            "the test must leave pf's enable state exactly as it found it"
         );
     }
 }

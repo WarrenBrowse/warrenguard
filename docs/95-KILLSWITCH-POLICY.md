@@ -161,6 +161,20 @@ open, `sudo pfctl -s states` before the install and again after it must show the
 entries that are neither loopback nor a passed flow gone, while the carrier (with
 an unscoped carrier pass) and any state the policy passes may remain.
 
+The real `/dev/pf` path also has an ignored test a root operator runs once, which
+enables pf, loads the anchor, purges the state table, confirms it, restores, and
+asserts pf's enable state is exactly what it found:
+
+```sh
+sudo WARREN_KILLSWITCH_ROOT_TEST=1 \
+  ./scripts/dev/cargo-test-nofw.sh test -p warrenguard-killswitch-os -- \
+  --ignored --nocapture real_pf_install_and_uninstall_cycle
+```
+
+It purges every off-policy connection on the host it runs on, which is why it is
+ignored by default, gated on that variable, and meant for an idle or disposable
+Mac.
+
 ## Linux: unchanged
 
 The nftables table `inet warrenguard_killswitch_os` uses an `output` chain with
@@ -189,5 +203,5 @@ only for compatibility; see `crates/warrenguard-cli/README.md` for the migration
 | Windows: the generated commands and the four read-back queries | Golden tests pinning the exact text, so the surface a non-Windows reviewer inspects cannot drift silently |
 | Windows host behaviour, cmdlet and property behaviour, and the `-OverrideBlockRules` reading | NOT verified here. Run `scripts/windows/killswitch-policy-smoke.ps1` on a throwaway Windows host: it reproduces the leak, confirms the block rule, confirms the override exception, confirms that a rule created later cannot reopen the egress, checks the read-back filters, and checks the categorical foreign-allow query |
 | macOS: the anchor-block bypass through pre-existing states, without killing the flows the policy provably passes, and without ever accepting an interface-scoped entry as a recreation | Purge lifecycle tests, the pure permitted-flow predicate (an interface-scoped pass is unprovable on both sides), a pre-flight refusal test asserting nothing was mutated, a post-load failure test asserting the rollback, and the wiring test that the set handed to the purge follows `KillswitchOpts`, all mutation-checked |
-| macOS host behaviour, `/dev/pf` purge | NOT verified here (no root). The manual `pfctl -s states` procedure above is the check. |
+| macOS host behaviour, `/dev/pf` purge | NOT verified here: the dev sudo alias deliberately withholds `pfctl`, and `sudo -n` needs a password in this environment. Two operator gates exist: the manual `pfctl -s states` procedure above, and the ignored root test above (`real_pf_install_and_uninstall_cycle`), which was compiled and whose guard was exercised, but not executed as root. |
 | CLI: a reachable open exit is refused without the explicit flag; a secret file with group or other access is refused; no secret reaches a `Debug` rendering or an error | Unit tests in `crates/warrenguard-cli` (RED proven by mutation for each guard) |
