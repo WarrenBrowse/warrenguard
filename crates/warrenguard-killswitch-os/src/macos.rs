@@ -21,6 +21,19 @@
 //! [`PfOps::purge_bypass_states`] for the decision rule and
 //! [`MacosKillswitch::install`] for the failure semantics.
 //!
+//! Those two decisions differ on purpose, and the difference is what keeps the
+//! install from failing on its own transport:
+//!
+//! - the PURGE kills every state whose flow it cannot prove the policy passes, so
+//!   an unattributable interface-scoped flow does not survive it;
+//! - the CONFIRMATION read fails only on a surviving state that NO pass rule
+//!   covers. A state present once the purge has completed can only have been
+//!   created by a rule that passed its first packet, and the only rules that pass
+//!   those flows are the anchor's own, interface scope included. Failing instead
+//!   on an unattributable survivor would fail the install every time the transport
+//!   recreated its state between the kill and the read, and the rollback would then
+//!   remove the blocking rules, which is the worse outcome for a killswitch.
+//!
 //! ## Manual verification on a real Mac
 //!
 //! Automated tests cannot cover this: `/dev/pf` needs root and CI has no
@@ -204,13 +217,13 @@ pub fn build_pf_rules(opts: &KillswitchOpts) -> Result<Vec<FilterRule>, Killswit
 /// cannot be shown to match the scoped pass: refusing to preserve what cannot be
 /// established is the fail-closed direction, and the cost is one re-established
 /// carrier connection.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct PermittedFlows {
     rules: Vec<PermittedFlow>,
 }
 
 /// One destination-scoped pass rule of the anchor.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PermittedFlow {
     /// The rule is protocol-scoped to UDP (`pf_rule_specs` sets this on the exit
     /// carrier and the DHCP passes).
@@ -228,19 +241,28 @@ struct PermittedFlow {
 }
 
 impl PermittedFlow {
-    /// Whether this rule would pass a flow with this protocol and remote
-    /// endpoint, from what a state entry records.
+    /// Whether this rule passes a flow with this protocol and remote endpoint,
+    /// IGNORING its interface scope.
     ///
-    /// An interface-scoped rule never matches here: see [`PermittedFlows`].
+    /// Sound only once the anchor is the ruleset that created the state: a state
+    /// present after the purge can only have been created by a rule that passed
+    /// its first packet, and the only rules that pass these flows are the
+    /// anchor's own, interface scope included.
     fn matches(&self, proto: Proto, remote: SocketAddr) -> bool {
-        !self.iface_scoped
-            && (!self.v6_only || remote.is_ipv6())
+        (!self.v6_only || remote.is_ipv6())
             && (!self.udp_only || proto == Proto::Udp)
             && self
                 .dest
                 .as_ref()
                 .is_none_or(|net| net.contains(remote.ip()))
             && self.dest_port.is_none_or(|port| port == remote.port())
+    }
+
+    /// Whether this rule provably passes such a flow from what a state entry
+    /// records, which for an interface-scoped rule it cannot: pfctl-rs exposes no
+    /// interface name, so the scope cannot be established.
+    fn matches_provably(&self, proto: Proto, remote: SocketAddr) -> bool {
+        !self.iface_scoped && self.matches(proto, remote)
     }
 }
 
@@ -275,67 +297,124 @@ impl PermittedFlows {
     }
 
     /// Whether the new policy passes a flow with this protocol and remote
-    /// endpoint.
+    /// endpoint, ignoring an interface scope the state cannot establish.
     fn permits(&self, proto: Proto, remote: SocketAddr) -> bool {
         self.rules.iter().any(|rule| rule.matches(proto, remote))
     }
+
+    /// Whether the new policy PROVABLY passes such a flow.
+    fn permits_provably(&self, proto: Proto, remote: SocketAddr) -> bool {
+        self.rules
+            .iter()
+            .any(|rule| rule.matches_provably(proto, remote))
+    }
 }
 
-/// Whether a pf state entry can carry traffic past the newly loaded anchor
-/// block.
-///
-/// `true` means the state must be killed. Two classes are preserved, because the
-/// anchor itself passes them:
-///
-/// - loopback-to-loopback: local IPC (the resolver, a same-host RPC). It cannot
-///   leave the host, and the anchor's `on lo0` pass is not expressible as a state
-///   predicate because a state carries no interface name.
-/// - a flow whose remote endpoint matches one of the anchor's destination-scoped
-///   passes, evaluated with the protocol the state records.
-///
-/// Everything else is a connection that would egress off-tunnel without an
-/// exception: pf answers it from the state table before it re-evaluates the
-/// anchor, so it is the bypass this purge exists to close.
-///
-/// The recorded direction is deliberately NOT an input: pf keeps an entry per
-/// direction for one connection, and the endpoints are what decide whether the
-/// flow leaves the host. Narrowing on the direction would preserve a surviving
-/// entry of a real connection, which is the leak.
-///
-/// Interface-scoped clearing was rejected as the mechanism. pfctl(8) offers
-/// `-i <iface>` ("restrict the operation to the given interface") and this crate
-/// exposes `PfCtl::clear_interface_states(Interface)`, but the OS interface list
-/// is not readable from pfctl-rs: it would need `getifaddrs` (unsafe, forbidden
-/// here) or a shell-out, and `pfctl::State` exposes no interface name, so a state
-/// on an interface the caller did not name would survive. Enumerating the table
-/// and deciding per state needs no interface list at all.
-fn state_can_bypass(
+/// The fields of a pf state entry the purge decisions need, extracted once so
+/// the decisions are testable without a live pf (a `pfctl::State` can only be
+/// built by the ioctl binding).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StateView {
     local: SocketAddr,
     remote: SocketAddr,
     proto: Proto,
-    permitted: &PermittedFlows,
-) -> bool {
-    if local.ip().is_loopback() && remote.ip().is_loopback() {
-        return false;
-    }
-    !permitted.permits(proto, remote)
 }
 
-/// Whether one pf state table entry must be killed.
-///
-/// An entry whose addresses cannot be read cannot be shown to be permitted, so it
-/// is killed: the purge fails closed, and `kill_state` works from the raw entry,
-/// so an unreadable state is still removable. A protocol pfctl-rs does not name is
-/// treated as `Any`, which no `udp_only` pass accepts, so such a state is killed
-/// too.
-fn state_must_be_killed(state: &pfctl::State, permitted: &PermittedFlows) -> bool {
-    match (state.local_address(), state.remote_address()) {
-        (Ok(local), Ok(remote)) => {
-            let proto = state.proto().unwrap_or(Proto::Any);
-            state_can_bypass(local, remote, proto, permitted)
-        }
-        _ => true,
+impl StateView {
+    /// Whether the flow is confined to the host: local IPC that cannot leave.
+    fn is_loopback_only(&self) -> bool {
+        self.local.ip().is_loopback() && self.remote.ip().is_loopback()
     }
+}
+
+/// Reads one pf state entry, or `None` when an accessor failed. An unreadable
+/// entry is never assumed harmless.
+fn state_view(state: &pfctl::State) -> Option<StateView> {
+    Some(StateView {
+        local: state.local_address().ok()?,
+        remote: state.remote_address().ok()?,
+        // A protocol pfctl-rs does not name is treated as `Any`, which no
+        // `udp_only` pass accepts, so such a state is not provably permitted.
+        proto: state.proto().unwrap_or(Proto::Any),
+    })
+}
+
+/// Whether the purge must kill this state.
+///
+/// `true` unless the new policy PROVABLY passes the flow: loopback-to-loopback is
+/// local IPC the anchor's `on lo0` pass covers, and every other flow must match a
+/// destination-scoped pass. An interface-scoped pass is not provable (a state
+/// entry carries no interface name), so a state it might cover is killed rather
+/// than preserved. That is the fail-closed direction: pf answers a surviving
+/// state without re-evaluating the ruleset, so a state on an interface the scoped
+/// rule refuses would keep flowing off-tunnel.
+fn state_must_be_killed(view: &StateView, permitted: &PermittedFlows) -> bool {
+    !view.is_loopback_only() && !permitted.permits_provably(view.proto, view.remote)
+}
+
+/// One state entry that was still in the table when the purge re-read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Survivor {
+    /// The entry was readable, so the decision can be taken on its fields.
+    Read(StateView),
+    /// An accessor failed, so nothing about the entry can be established.
+    Unreadable,
+}
+
+/// What one purge pass observed.
+#[derive(Debug, Default)]
+struct PurgeReport {
+    /// Number of states killed, for the log line.
+    killed: u32,
+    /// States still present when the table was re-read afterwards.
+    survivors: Vec<Survivor>,
+}
+
+/// Whether a state the purge could not remove is a bypass.
+///
+/// Deliberately weaker than [`state_must_be_killed`], and the asymmetry is the
+/// point. The purge refuses to PRESERVE an interface-scoped flow it cannot
+/// attribute, but the confirmation read only fails on a flow no pass rule covers
+/// at all, because a state present once the purge has completed can only have
+/// been created by a rule that passed its first packet, and the only rules that
+/// pass these flows are the anchor's own. The typical survivor is the transport's
+/// own next packet recreating its carrier state between the kill and the
+/// confirmation read; treating that as a bypass would fail the install every time
+/// the tunnel is up during one, and the rollback would then remove the blocking
+/// rules, which is the worse outcome for a killswitch.
+fn survivor_is_a_bypass(survivor: &Survivor, permitted: &PermittedFlows) -> bool {
+    match survivor {
+        Survivor::Read(view) => {
+            !view.is_loopback_only() && !permitted.permits(view.proto, view.remote)
+        }
+        // Nothing can be established about it, so it cannot be called harmless.
+        Survivor::Unreadable => true,
+    }
+}
+
+/// The verdict on a purge report.
+///
+/// Fatal only when a state NO pass rule covers survived: such a state cannot have
+/// been created by the anchor, so it is a pre-existing connection that kept its
+/// entry. A survivor that a pass rule covers is a flow the anchor itself passes,
+/// which in practice is the transport's next packet recreating its state between
+/// the kill and this confirmation read; failing on it would fail the install every
+/// time the tunnel is up during one, and the rollback would remove the blocking
+/// rules, the worse outcome for a killswitch.
+fn verify_purge(report: &PurgeReport, permitted: &PermittedFlows) -> Result<(), KillswitchError> {
+    let bypasses = report
+        .survivors
+        .iter()
+        .filter(|survivor| survivor_is_a_bypass(survivor, permitted))
+        .count();
+    if bypasses > 0 {
+        return Err(KillswitchError::Pf(format!(
+            "{bypasses} surviving connection state(s) are covered by no pass rule of \
+             the new policy. Off-tunnel traffic would keep flowing through them past \
+             the block."
+        )));
+    }
+    Ok(())
 }
 
 /// Seam over the pf operations the killswitch lifecycle performs.
@@ -362,24 +441,28 @@ trait PfOps: Send + Sync + std::fmt::Debug {
     fn flush_rules(&self) -> Result<(), KillswitchError>;
     /// Append one filter rule to the Warren anchor.
     fn add_rule(&self, rule: &FilterRule) -> Result<(), KillswitchError>;
-    /// Kill every pf connection state that could carry traffic past the
-    /// newly loaded anchor rules, verify the table is clean, and return the
-    /// number of states killed.
+    /// Kill every pf connection state the new policy does not provably pass,
+    /// then re-read the table and report what is still there.
     ///
-    /// Must run AFTER [`Self::add_rule`]: pf consults the state table before
-    /// it re-evaluates the ruleset, so a connection opened before the
-    /// install (by macOS's default `pass all`, for example) keeps flowing
-    /// off-tunnel until its state entry is gone. See
-    /// [`state_can_bypass`] for the per-state decision.
+    /// Must run AFTER [`Self::add_rule`]: pf consults the state table before it
+    /// re-evaluates the ruleset, so a connection opened before the install (by
+    /// macOS's default `pass all`, for example) keeps flowing off-tunnel until
+    /// its state entry is gone. See [`state_must_be_killed`] for the per-state
+    /// decision.
+    ///
+    /// The report is data, not a verdict: whether a survivor is a bypass is
+    /// [`survivor_is_a_bypass`]'s decision, which the lifecycle takes so it can be
+    /// tested without `/dev/pf`.
     ///
     /// # Errors
     ///
-    /// [`KillswitchError::Pf`] when the table cannot be read, a state
-    /// cannot be killed, or bypass states are still present when the table
-    /// is re-read. The last case is a failure and NOT a warning: an install
-    /// that reports success while a bypass state survives claims
-    /// protection it has not confirmed.
-    fn purge_bypass_states(&self, permitted: &PermittedFlows) -> Result<u32, KillswitchError>;
+    /// [`KillswitchError::Pf`] when the table cannot be read or a state cannot be
+    /// killed. A killed state is confirmed by the re-read, so a kill that did not
+    /// take effect shows up as a survivor rather than being silently assumed.
+    fn purge_bypass_states(
+        &self,
+        permitted: &PermittedFlows,
+    ) -> Result<PurgeReport, KillswitchError>;
 }
 
 /// Production [`PfOps`] backed by `pfctl-rs` against `/dev/pf`.
@@ -429,12 +512,15 @@ impl PfOps for RealPfOps {
             .map_err(|e| KillswitchError::Pf(format!("add rule: {e}")))
     }
 
-    fn purge_bypass_states(&self, permitted: &PermittedFlows) -> Result<u32, KillswitchError> {
-        // `PfCtl::clear_states(PF_ANCHOR_PATH, ..)` is NOT usable here: it
-        // kills only states whose `anchor` field equals our anchor's rule
-        // number, and the anchor was registered moments ago, so it kills
-        // nothing and would leave every pre-install state in place. The
-        // table has to be enumerated and filtered per state instead.
+    fn purge_bypass_states(
+        &self,
+        permitted: &PermittedFlows,
+    ) -> Result<PurgeReport, KillswitchError> {
+        // `PfCtl::clear_states(PF_ANCHOR_PATH, ..)` is NOT usable here: it kills
+        // only states whose `anchor` field equals our anchor's rule number, and
+        // the anchor was registered moments ago, so it kills nothing and would
+        // leave every pre-install state in place. The table has to be enumerated
+        // and filtered per state instead.
         let mut pf = Self::pf()?;
         let states = pf
             .get_states()
@@ -442,7 +528,14 @@ impl PfOps for RealPfOps {
 
         let mut killed = 0u32;
         for state in &states {
-            if !state_must_be_killed(state, permitted) {
+            let view = state_view(state);
+            // An entry whose fields cannot be read cannot be shown to be
+            // permitted, so it is killed too: the purge fails closed, and
+            // `kill_state` works from the raw entry.
+            let kill = view
+                .as_ref()
+                .is_none_or(|view| state_must_be_killed(view, permitted));
+            if !kill {
                 continue;
             }
             // No addresses in the error: this crate's no-log rule forbids putting
@@ -453,27 +546,21 @@ impl PfOps for RealPfOps {
             killed = killed.saturating_add(1);
         }
 
-        // Verification is the point of this function: re-read the table and
-        // refuse the install if any bypass state is still there. pf exposes
-        // no atomic "kill and confirm", and a partially applied kill must
-        // never be reported as protection. Only the count is reported, for
-        // the same no-log reason as above.
+        // Re-read rather than assume the kills took effect: pf exposes no atomic
+        // "kill and confirm", and a partially applied kill must never be reported
+        // as protection. Only counts and classified views leave this function, so
+        // the address-free logging rule holds.
         let survivors = pf
             .get_states()
             .map_err(|e| KillswitchError::Pf(format!("re-read states after purge: {e}")))?
             .iter()
-            .filter(|state| state_must_be_killed(state, permitted))
-            .count();
+            .map(|state| match state_view(state) {
+                Some(view) => Survivor::Read(view),
+                None => Survivor::Unreadable,
+            })
+            .collect();
 
-        if survivors > 0 {
-            return Err(KillswitchError::Pf(format!(
-                "{survivors} bypass state(s) survived the purge after the \
-                 killswitch rules were loaded. Off-tunnel traffic would keep \
-                 flowing through them past the block."
-            )));
-        }
-
-        Ok(killed)
+        Ok(PurgeReport { killed, survivors })
     }
 }
 
@@ -508,6 +595,40 @@ fn apply_rules(ops: &dyn PfOps, rules: &[FilterRule]) -> Result<(), KillswitchEr
         }
     }
     Ok(())
+}
+
+/// Best-effort rollback of a partially applied install: drop the anchor rules,
+/// then put pf's original enable state back. Mirrors `uninstall`.
+async fn roll_back_install(ops: &std::sync::Arc<dyn PfOps>, pf_was_enabled: bool) {
+    let rollback_ops = ops.clone();
+    if let Err(fe) = tokio::task::spawn_blocking(move || rollback_ops.flush_rules())
+        .await
+        .map_err(|je| KillswitchError::Pf(format!("spawn_blocking flush: {je}")))
+        .and_then(|inner| inner)
+    {
+        tracing::error!(
+            error = %fe,
+            "pf rollback flush failed after a failed install - the anchor may keep \
+             blocking. Run `sudo pfctl -a {PF_ANCHOR_PATH} -F rules` manually to \
+             recover internet"
+        );
+    }
+    if pf_was_enabled {
+        return;
+    }
+    let enabled_ops = ops.clone();
+    if let Err(de) = tokio::task::spawn_blocking(move || enabled_ops.disable())
+        .await
+        .map_err(|je| KillswitchError::Pf(format!("spawn_blocking disable: {je}")))
+        .and_then(|inner| inner)
+    {
+        tracing::error!(
+            error = %de,
+            "could not restore pf's original disabled state after the failed \
+             install - run `sudo pfctl -d` manually if this host had pf off before \
+             Warren ran"
+        );
+    }
 }
 
 /// pf-based macOS killswitch via pfctl-rs type-safe bindings.
@@ -574,47 +695,35 @@ impl MacosKillswitch {
         // returning a guard would announce a protection that is not
         // actually in place.
         let states_ops = ops.clone();
-        let purge = tokio::task::spawn_blocking(move || states_ops.purge_bypass_states(&permitted))
-            .await
-            .map_err(|e| KillswitchError::Pf(format!("spawn_blocking states: {e}")));
-        let killed_states = match purge.and_then(|inner| inner) {
-            Ok(killed) => killed,
+        let purge_permitted = permitted.clone();
+        let purge =
+            tokio::task::spawn_blocking(move || states_ops.purge_bypass_states(&purge_permitted))
+                .await
+                .map_err(|e| KillswitchError::Pf(format!("spawn_blocking states: {e}")));
+        // Both the failure to purge and the verdict on what survived roll the
+        // anchor back: returning a guard would announce a protection that is not
+        // confirmed. The verdict itself is [`verify_purge`], a pure function, so
+        // the race the purge cannot avoid is decided by a rule the test suite can
+        // exercise without `/dev/pf`.
+        let report = match purge.and_then(|inner| inner) {
+            Ok(report) => report,
             Err(e) => {
-                // Best-effort rollback before surfacing the error: the rules
-                // are already loaded, so dropping both the anchor rules and
-                // the enable state we may have turned on is what keeps the
-                // host in its pre-install condition. Mirrors `uninstall`.
-                let rollback_ops = ops.clone();
-                if let Err(fe) = tokio::task::spawn_blocking(move || rollback_ops.flush_rules())
-                    .await
-                    .map_err(|je| KillswitchError::Pf(format!("spawn_blocking flush: {je}")))
-                    .and_then(|inner| inner)
-                {
-                    tracing::error!(
-                        error = %fe,
-                        "pf rollback flush failed after a state purge that \
-                         could not be verified - the anchor may keep blocking. \
-                         Run `sudo pfctl -a {PF_ANCHOR_PATH} -F rules` manually \
-                         to recover internet"
-                    );
-                }
-                let enabled_ops = ops.clone();
-                if !pf_was_enabled
-                    && let Err(de) = tokio::task::spawn_blocking(move || enabled_ops.disable())
-                        .await
-                        .map_err(|je| KillswitchError::Pf(format!("spawn_blocking disable: {je}")))
-                        .and_then(|inner| inner)
-                {
-                    tracing::error!(
-                        error = %de,
-                        "could not restore pf's original disabled state after \
-                         the failed install - run `sudo pfctl -d` manually if \
-                         this host had pf off before Warren ran"
-                    );
-                }
+                roll_back_install(&ops, pf_was_enabled).await;
                 return Err(e);
             }
         };
+        if let Err(e) = verify_purge(&report, &permitted) {
+            roll_back_install(&ops, pf_was_enabled).await;
+            return Err(e);
+        }
+        if !report.survivors.is_empty() {
+            tracing::info!(
+                recreated = report.survivors.len(),
+                "connection state(s) present after the purge match a pass rule of the \
+                 new policy, which only the anchor can have created"
+            );
+        }
+        let killed_states = report.killed;
         tracing::info!(
             tun = %opts.tun_name,
             exit_count = opts.exit_addrs.len(),
@@ -905,10 +1014,13 @@ mod tests {
         fail_on_add_rule_index: Option<usize>,
         /// When `Some(n)`, the n-th `flush_rules` call (0-based) fails.
         fail_on_flush_index: Option<usize>,
-        /// When `true`, `purge_bypass_states` fails. This models the
-        /// production verification step reporting surviving bypass
-        /// states, which must be fatal to the install.
+        /// When `true`, `purge_bypass_states` fails, standing in for a table
+        /// that could not be read or a state that could not be killed.
         fail_purge: bool,
+        /// What the purge reports as still present when it re-reads the table.
+        /// Models the race the purge cannot avoid: the transport recreating its
+        /// own state between the kill and the confirmation read.
+        purge_survivors: Vec<Survivor>,
         /// What `is_enabled` reports - the host's pf state before install.
         initially_enabled: bool,
         /// What `is_enabled` reports after `enable` / `disable` ran, so
@@ -936,11 +1048,18 @@ mod tests {
             }
         }
 
-        /// A mock whose `purge_bypass_states` fails, standing in for a
-        /// real purge that reports bypass states still in the table.
+        /// A mock whose `purge_bypass_states` fails outright.
         fn failing_purge() -> Self {
             Self {
                 fail_purge: true,
+                ..Self::default()
+            }
+        }
+
+        /// A mock whose purge reports these states as still in the table.
+        fn reporting_survivors(survivors: Vec<Survivor>) -> Self {
+            Self {
+                purge_survivors: survivors,
                 ..Self::default()
             }
         }
@@ -1005,17 +1124,23 @@ mod tests {
             }
             Ok(())
         }
-        fn purge_bypass_states(&self, _permitted: &PermittedFlows) -> Result<u32, KillswitchError> {
+        fn purge_bypass_states(
+            &self,
+            permitted: &PermittedFlows,
+        ) -> Result<PurgeReport, KillswitchError> {
             let lan: SocketAddr = (Ipv4Addr::new(192, 168, 1, 20), 22).into();
             self.purge_permits_lan
-                .store(_permitted.permits(Proto::Tcp, lan), Ordering::SeqCst);
+                .store(permitted.permits(Proto::Tcp, lan), Ordering::SeqCst);
             self.record("purge_bypass_states");
             if self.fail_purge {
                 return Err(KillswitchError::Pf(
-                    "mock purge: bypass states survived".into(),
+                    "mock purge: the table could not be read".into(),
                 ));
             }
-            Ok(3)
+            Ok(PurgeReport {
+                killed: 3,
+                survivors: self.purge_survivors.clone(),
+            })
         }
     }
 
@@ -1203,6 +1328,15 @@ mod tests {
 
     const EXIT_V4: Ipv4Addr = Ipv4Addr::new(1, 2, 3, 4);
 
+    /// A state entry as the purge sees it.
+    fn view(local: SocketAddr, remote: SocketAddr, proto: Proto) -> StateView {
+        StateView {
+            local,
+            remote,
+            proto,
+        }
+    }
+
     #[test]
     fn only_destination_scoped_passes_form_the_permitted_set() {
         // The loopback and tunnel passes are interface-scoped, and a state entry
@@ -1244,56 +1378,109 @@ mod tests {
         let lo_v6: SocketAddr = (Ipv6Addr::LOCALHOST, 53).into();
         for (local, remote) in [(lo_a, lo_b), (lo_a, lo_v6), (lo_v6, lo_b)] {
             assert!(
-                !state_can_bypass(local, remote, Proto::Tcp, &flows),
+                !state_must_be_killed(&view(local, remote, Proto::Tcp), &flows),
                 "local IPC cannot leave the host and must be preserved: {local} {remote}"
             );
         }
     }
 
     #[test]
-    fn the_exit_carrier_state_is_preserved() {
+    fn the_exit_carrier_state_is_preserved_when_the_pass_is_not_interface_scoped() {
         let flows = PermittedFlows::from_opts(&opts_minimal());
         let local: SocketAddr = (Ipv4Addr::new(192, 0, 2, 10), 5000).into();
         let carrier: SocketAddr = (EXIT_V4, 443).into();
         assert!(
-            !state_can_bypass(local, carrier, Proto::Udp, &flows),
-            "the carrier is a flow the anchor passes: killing its state would drop \
-             the tunnel's own transport"
+            !state_must_be_killed(&view(local, carrier, Proto::Udp), &flows),
+            "the carrier is a flow the anchor plainly passes: killing its state would \
+             drop the tunnel's own transport"
         );
         assert!(
-            state_can_bypass(local, carrier, Proto::Tcp, &flows),
-            "the carrier exception is UDP-scoped, so a TCP state to the exit address \
-             is not something the anchor passes"
+            state_must_be_killed(&view(local, carrier, Proto::Tcp), &flows),
+            "the carrier exception is UDP-scoped, so a TCP state to the exit address is \
+             not something the anchor passes"
         );
     }
 
     #[test]
-    fn an_interface_scoped_carrier_pass_cannot_be_attributed_to_a_state() {
-        // pf honours an existing state without re-evaluating the ruleset, and a
-        // state entry carries no interface name. With the carrier pass scoped to
-        // the daemon's physical interface, a state to the exit address might be on
-        // another interface, which the scoped rule would refuse: refusing to
-        // preserve it is the fail-closed direction.
+    fn an_interface_scoped_carrier_pass_is_killed_but_its_recreation_is_tolerated() {
+        // The asymmetry, and the reason for it. pf honours an existing state
+        // without re-evaluating the ruleset, and a state entry carries no interface
+        // name, so a state to the exit address might be on another interface than
+        // the one the pass is scoped to: the PURGE refuses to preserve it. Once the
+        // purge has completed, however, a state matching that pass can only have
+        // been created by a rule that passed its first packet, and the only rules
+        // that pass it are the anchor's own, so the CONFIRMATION read tolerates it.
+        // Failing on it would fail the install every time the transport recreates
+        // its state mid-install, and the rollback would remove the blocking rules.
         let local: SocketAddr = (Ipv4Addr::new(192, 0, 2, 10), 5000).into();
         let carrier: SocketAddr = (EXIT_V4, 443).into();
         let mut o = opts_minimal();
         o.phys_iface = Some("en0".into());
+        let flows = PermittedFlows::from_opts(&o);
+        let carrier_view = view(local, carrier, Proto::Udp);
+
         assert!(
-            state_can_bypass(local, carrier, Proto::Udp, &PermittedFlows::from_opts(&o)),
-            "an interface-scoped pass must not preserve a state it cannot be shown \
-             to match"
+            state_must_be_killed(&carrier_view, &flows),
+            "an interface-scoped pass must not preserve a state it cannot be shown to \
+             match"
+        );
+        assert!(
+            !survivor_is_a_bypass(&Survivor::Read(carrier_view), &flows),
+            "a state present after the purge that a pass rule covers is a recreation, \
+             not a bypass"
         );
     }
 
     #[test]
-    fn an_ordinary_public_flow_is_a_bypass_candidate() {
+    fn an_ordinary_public_flow_is_a_bypass_candidate_and_a_surviving_one_is_fatal() {
         let flows = PermittedFlows::from_opts(&opts_minimal());
         let local: SocketAddr = (Ipv4Addr::new(192, 0, 2, 10), 5000).into();
         let remote: SocketAddr = (Ipv4Addr::new(93, 184, 216, 34), 443).into();
+        let probe = view(local, remote, Proto::Tcp);
         assert!(
-            state_can_bypass(local, remote, Proto::Tcp, &flows),
-            "a pre-existing connection with no exception in the policy is exactly \
-             what the purge must kill"
+            state_must_be_killed(&probe, &flows),
+            "a pre-existing connection with no exception in the policy is exactly what \
+             the purge must kill"
+        );
+        assert!(
+            survivor_is_a_bypass(&Survivor::Read(probe), &flows),
+            "and if it survives, no pass rule can explain it: the install must fail"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_survivor_is_a_bypass() {
+        let flows = PermittedFlows::from_opts(&opts_minimal());
+        assert!(
+            survivor_is_a_bypass(&Survivor::Unreadable, &flows),
+            "nothing can be established about an unreadable entry, so it cannot be \
+             called harmless"
+        );
+    }
+
+    #[test]
+    fn verify_purge_fails_only_on_a_survivor_no_pass_rule_covers() {
+        let mut o = opts_minimal();
+        o.phys_iface = Some("en0".into());
+        let flows = PermittedFlows::from_opts(&o);
+        let local: SocketAddr = (Ipv4Addr::new(192, 0, 2, 10), 5000).into();
+        let carrier: SocketAddr = (EXIT_V4, 443).into();
+        let public: SocketAddr = (Ipv4Addr::new(93, 184, 216, 34), 443).into();
+
+        let recreated = PurgeReport {
+            killed: 2,
+            survivors: vec![Survivor::Read(view(local, carrier, Proto::Udp))],
+        };
+        verify_purge(&recreated, &flows)
+            .expect("a transport that recreated its authorised state must not fail the install");
+
+        let leaked = PurgeReport {
+            killed: 2,
+            survivors: vec![Survivor::Read(view(local, public, Proto::Tcp))],
+        };
+        assert!(
+            verify_purge(&leaked, &flows).is_err(),
+            "a survivor no pass rule covers is a pre-existing bypass"
         );
     }
 
@@ -1302,10 +1489,8 @@ mod tests {
         let local: SocketAddr = (Ipv4Addr::new(192, 0, 2, 10), 5000).into();
         let lan: SocketAddr = (Ipv4Addr::new(192, 168, 1, 20), 22).into();
         assert!(
-            state_can_bypass(
-                local,
-                lan,
-                Proto::Tcp,
+            state_must_be_killed(
+                &view(local, lan, Proto::Tcp),
                 &PermittedFlows::from_opts(&opts_minimal())
             ),
             "with the LAN blocked, a LAN connection is a bypass candidate"
@@ -1313,7 +1498,10 @@ mod tests {
         let mut o = opts_minimal();
         o.allow_lan = true;
         assert!(
-            !state_can_bypass(local, lan, Proto::Tcp, &PermittedFlows::from_opts(&o)),
+            !state_must_be_killed(
+                &view(local, lan, Proto::Tcp),
+                &PermittedFlows::from_opts(&o)
+            ),
             "with the LAN allowed the anchor passes it, so its state must survive"
         );
     }
@@ -1323,10 +1511,8 @@ mod tests {
         let local: SocketAddr = (Ipv4Addr::new(0, 0, 0, 0), 68).into();
         let server: SocketAddr = (Ipv4Addr::new(255, 255, 255, 255), 67).into();
         assert!(
-            state_can_bypass(
-                local,
-                server,
-                Proto::Udp,
+            state_must_be_killed(
+                &view(local, server, Proto::Udp),
                 &PermittedFlows::from_opts(&opts_minimal())
             ),
             "DHCP is opt-in"
@@ -1335,24 +1521,23 @@ mod tests {
         o.allow_dhcp = true;
         let flows = PermittedFlows::from_opts(&o);
         assert!(
-            !state_can_bypass(local, server, Proto::Udp, &flows),
+            !state_must_be_killed(&view(local, server, Proto::Udp), &flows),
             "an allowed DHCP exchange must survive the purge"
         );
         let dns: SocketAddr = (Ipv4Addr::new(1, 1, 1, 1), 53).into();
         assert!(
-            state_can_bypass(local, dns, Proto::Udp, &flows),
+            state_must_be_killed(&view(local, dns, Proto::Udp), &flows),
             "only ports 67 and 68 are passed, so a DNS state is still a bypass"
         );
     }
 
     #[tokio::test]
     async fn the_purge_receives_the_flows_the_policy_allows() {
-        // The wiring, not just the predicate: the permitted set handed to the
-        // purge must be the one the anchor installs. With the LAN allowed, a LAN
-        // connection is a flow the policy passes and its state must be preserved;
-        // without it, the same connection is a bypass candidate. Getting this
-        // wrong is what made the purge kill the exit carrier and refuse an
-        // install whose carrier had reconnected.
+        // The wiring, not just the predicate: the permitted set handed to the purge
+        // must be the one the anchor installs. With the LAN allowed, a LAN
+        // connection is a flow the policy passes; without it, the same connection is
+        // a bypass candidate. Getting this wrong is what made the purge kill the
+        // exit carrier and refuse an install whose carrier had reconnected.
         let pf = Arc::new(MockPf::default());
         let mut open = opts_minimal();
         open.allow_lan = true;
@@ -1434,6 +1619,64 @@ mod tests {
         assert!(
             !ops[purge_pos..].iter().any(|o| o == "add_rule"),
             "no rule may be loaded after the purge failed; ops: {ops:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_state_recreated_by_the_transport_does_not_fail_the_install() {
+        // The race the purge cannot avoid: the transport's next packet recreates
+        // its carrier state between the kill and the confirmation read. With
+        // `phys_iface` the pass is interface-scoped, so the purge killed the state
+        // it could not attribute; the state present afterwards is a flow the anchor
+        // passes, and failing on it would strip the blocking rules every time the
+        // tunnel is up during an install.
+        let local: SocketAddr = (Ipv4Addr::new(192, 0, 2, 10), 5000).into();
+        let carrier: SocketAddr = (EXIT_V4, 443).into();
+        let pf = Arc::new(MockPf::reporting_survivors(vec![Survivor::Read(view(
+            local,
+            carrier,
+            Proto::Udp,
+        ))]));
+        let mut o = opts_minimal();
+        o.phys_iface = Some("en0".into());
+
+        let guard = MacosKillswitch::install_with_ops(&o, pf.clone())
+            .await
+            .expect("a recreated authorised state must not fail the install");
+        let ops = pf.recorded();
+        let purge_pos = ops
+            .iter()
+            .position(|o| o == "purge_bypass_states")
+            .expect("the purge ran");
+        assert!(
+            !ops[purge_pos..].iter().any(|o| o == "flush_rules"),
+            "the install must not roll the anchor back for a recreation: {ops:?}"
+        );
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn a_surviving_state_no_pass_rule_covers_fails_the_install() {
+        let local: SocketAddr = (Ipv4Addr::new(192, 0, 2, 10), 5000).into();
+        let public: SocketAddr = (Ipv4Addr::new(93, 184, 216, 34), 443).into();
+        let pf = Arc::new(MockPf::reporting_survivors(vec![Survivor::Read(view(
+            local,
+            public,
+            Proto::Tcp,
+        ))]));
+
+        let err = MacosKillswitch::install_with_ops(&opts_minimal(), pf.clone())
+            .await
+            .expect_err("a pre-existing state that survived must fail the install");
+        assert!(matches!(err, KillswitchError::Pf(_)), "got {err:?}");
+        let ops = pf.recorded();
+        let purge_pos = ops
+            .iter()
+            .position(|o| o == "purge_bypass_states")
+            .expect("the purge ran");
+        assert!(
+            ops[purge_pos..].iter().any(|o| o == "flush_rules"),
+            "and the anchor must be rolled back, not left blocking with no guard: {ops:?}"
         );
     }
 
