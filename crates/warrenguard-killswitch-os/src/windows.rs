@@ -102,7 +102,12 @@
 //!   and an expired bound makes the teardown REFUSE instead of restoring under a
 //!   command that may still write: it keeps whatever that command applies, logs the
 //!   commands an operator has to run by hand, and calls the firewall half-applied
-//!   rather than reporting a restoration a later write could overwrite.
+//!   rather than reporting a restoration a later write could overwrite. A command
+//!   that DOES run counts as a restoration only when it exits zero: the bounded
+//!   runner returns `Some` for any child that exited, a denied cmdlet and a program
+//!   that could not be started included, so the verdict is the exit status
+//!   ([`sync_command_verdict`]) and a command that failed is logged with its status
+//!   and stderr for the operator to run by hand.
 //!
 //! ## What the tests here cover, and what they cannot
 //!
@@ -1365,16 +1370,24 @@ impl FirewallRunner for PowershellRunner {
 
     fn sync_teardown(&self, snapshot: &FirewallSnapshot) {
         match sync_teardown_with(&self.gate, snapshot, SYNC_CLEANUP_TIMEOUT, |cmd| {
-            run_sync_bounded("powershell.exe", cmd, SYNC_CLEANUP_TIMEOUT).is_some()
+            // `run_sync_bounded` returns `Some` for ANY child that exited within the
+            // bound, a denied cmdlet and a missing program (reported as exit 127)
+            // included, so the status is what decides whether anything was restored.
+            sync_command_verdict(
+                "powershell.exe",
+                run_sync_bounded("powershell.exe", cmd, SYNC_CLEANUP_TIMEOUT),
+            )
         }) {
             SyncTeardownOutcome::Restored { unfinished } => {
-                for cmd in unfinished {
+                for failure in unfinished {
                     tracing::warn!(
                         timeout = ?SYNC_CLEANUP_TIMEOUT,
-                        command = %cmd.join(" "),
-                        "killswitch synchronous teardown command did not complete within \
-                         the bound (killed or failed to start), so this part of the \
-                         captured state is NOT restored"
+                        command = %failure.command,
+                        reason = %failure.reason,
+                        "killswitch synchronous teardown command did not restore its part \
+                         of the captured state (it timed out, could not be started, or \
+                         exited non-zero), so that part is NOT restored; run the command \
+                         by hand and check the firewall"
                     );
                 }
             }
@@ -1563,36 +1576,91 @@ impl CommandGate {
     }
 }
 
+/// One restoration command the synchronous teardown could not complete, with why, so
+/// an operator learns both what to run and what went wrong.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, PartialEq, Eq)]
+struct UnfinishedCommand {
+    /// The full command line, ready to paste into a shell.
+    command: String,
+    /// Why it did not restore anything: the bound expired, the program could not be
+    /// started, or it exited non-zero (carrying its status and its stderr).
+    reason: String,
+}
+
 /// What a synchronous teardown did, so the caller can log it and a test can assert
 /// it.
 #[cfg(any(target_os = "windows", test))]
 #[derive(Debug, PartialEq, Eq)]
 enum SyncTeardownOutcome {
-    /// The gate went quiescent, so the restoration commands ran. `unfinished` holds
-    /// the ones that hit the per-command bound, in order.
-    Restored { unfinished: Vec<Vec<String>> },
+    /// The gate went quiescent and the restoration commands ran. `unfinished` holds
+    /// the ones that did not actually restore anything (a timed-out, unstartable or
+    /// non-zero-exit command), in order: a command that ran and failed is NOT a
+    /// restoration.
+    Restored { unfinished: Vec<UnfinishedCommand> },
     /// A command was still applying past the bound: NO restoration command ran, and
     /// `pending` is what the caller has to hand an operator, because nothing will run
     /// them automatically any more.
     Refused { pending: Vec<String> },
 }
 
+/// The verdict on ONE bounded synchronous restoration command.
+///
+/// `None` is a command that never finished within the bound or could not be started.
+/// `Some(out)` is a command that DID exit, and a non-zero status is a failure: that
+/// is the case a caller reading only `Option::is_some` would report as a restoration
+/// while the firewall keeps the change it was supposed to undo. A denied cmdlet and a
+/// missing program (which `posix_spawn` and the Windows loader can both surface as a
+/// normal exit, 127 and 9009 respectively) travel this path.
+///
+/// The reason carries the exit status and the child's stderr, because the operator
+/// running the command by hand needs to know WHY it failed, and the commands this
+/// teardown runs are the ones that remove our rules, re-enable the operator's own and
+/// restore the captured profile settings (no address, no secret in their output).
+#[cfg(any(target_os = "windows", test))]
+fn sync_command_verdict(
+    program: &str,
+    outcome: Option<std::process::Output>,
+) -> Result<(), String> {
+    let Some(out) = outcome else {
+        return Err(format!(
+            "{program} did not finish within the bound or could not be started"
+        ));
+    };
+    if out.status.success() {
+        return Ok(());
+    }
+    let how = match out.status.code() {
+        Some(code) => format!("exit code {code}"),
+        None => "a signal".to_owned(),
+    };
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stderr = stderr.trim();
+    Err(if stderr.is_empty() {
+        format!("{program} exited with {how}")
+    } else {
+        format!("{program} exited with {how}: {stderr}")
+    })
+}
+
 /// The synchronous teardown: close the gate, wait for it, then either restore the
 /// captured state or refuse and report what a human has to run.
 ///
 /// Ungated on purpose, and with the bounded runner injected, so the DECISION the
-/// bound makes is driven on every host: the Windows binding only supplies
-/// `run_sync_bounded("powershell.exe", ...)`. The refusal is the point of this
-/// function. Restoring while a command may still be applying would let that command
-/// overwrite part of the restoration afterwards, so the safe side of that trade is
-/// to leave the policy in place (fail-closed) and keep the operator's recovery
-/// reachable through the returned commands.
+/// bound makes, AND the verdict on each command it does let through, are driven on
+/// every host: the Windows binding only supplies
+/// `sync_command_verdict("powershell.exe", run_sync_bounded(...))`. `run` returns
+/// `Ok` only when the command actually did its work. The refusal is the other point
+/// of this function: restoring while a command may still be applying would let that
+/// command overwrite part of the restoration afterwards, so the safe side of that
+/// trade is to leave what is there and keep the operator's recovery reachable through
+/// the returned commands.
 #[cfg(any(target_os = "windows", test))]
 fn sync_teardown_with(
     gate: &CommandGate,
     snapshot: &FirewallSnapshot,
     timeout: Duration,
-    mut run: impl FnMut(&[String]) -> bool,
+    mut run: impl FnMut(&[String]) -> Result<(), String>,
 ) -> SyncTeardownOutcome {
     if gate.close_and_quiesce(timeout).is_none() {
         return SyncTeardownOutcome::Refused {
@@ -1604,8 +1672,11 @@ fn sync_teardown_with(
     }
     let mut unfinished = Vec::new();
     for cmd in uninstall_ops(snapshot).iter().map(render_op) {
-        if !run(&cmd) {
-            unfinished.push(cmd);
+        if let Err(reason) = run(&cmd) {
+            unfinished.push(UnfinishedCommand {
+                command: cmd.join(" "),
+                reason,
+            });
         }
     }
     SyncTeardownOutcome::Restored { unfinished }
@@ -1717,6 +1788,12 @@ fn wait_child_bounded(
 /// Runs `program args...` synchronously, bounded by `timeout`. Returns `None`
 /// on spawn failure or timeout (the child is killed in the timeout case);
 /// best-effort and panic-free, so it is safe to call from `Drop`.
+///
+/// `Some` means ONLY that the child exited within the bound, never that it
+/// succeeded: a denied cmdlet, and a missing program (which the loader or
+/// `posix_spawn` can surface as an ordinary exit rather than a spawn error), all
+/// return `Some`. A caller that has to know whether the command did its work reads
+/// `Output::status`, which is what [`sync_command_verdict`] exists for.
 ///
 /// Deliberately portable (no OS-specific API) so the bounded-wait logic itself
 /// is exercised by the test suite on every host, even though its only
@@ -3738,7 +3815,7 @@ AllowLocalFirewallRules    : True
         let mut ran: Vec<String> = Vec::new();
         let outcome = sync_teardown_with(&gate, &snap, Duration::from_secs(1), |cmd| {
             ran.push(cmd.join(" "));
-            true
+            Ok(())
         });
         assert_eq!(
             outcome,
@@ -3769,7 +3846,7 @@ AllowLocalFirewallRules    : True
         let mut ran: Vec<String> = Vec::new();
         let outcome = sync_teardown_with(&gate, &snap, Duration::from_millis(50), |cmd| {
             ran.push(cmd.join(" "));
-            true
+            Ok(())
         });
         let pending = match outcome {
             SyncTeardownOutcome::Refused { pending } => pending,
@@ -3793,7 +3870,7 @@ AllowLocalFirewallRules    : True
         drop(reservation);
         assert!(
             matches!(
-                sync_teardown_with(&gate, &snap, Duration::from_secs(1), |_| true),
+                sync_teardown_with(&gate, &snap, Duration::from_secs(1), |_| Ok(())),
                 SyncTeardownOutcome::Restored { .. }
             ),
             "once the pending command is released, the same closed gate restores"
@@ -3801,22 +3878,40 @@ AllowLocalFirewallRules    : True
     }
 
     #[test]
-    fn the_synchronous_teardown_reports_the_commands_it_could_not_finish() {
+    fn the_synchronous_teardown_reports_a_failed_restoration_command_with_its_reason() {
+        // A command that RAN and failed restores nothing, so it must be reported like a
+        // timeout. A caller that reads any exit as a restoration leaves the firewall
+        // changed and says nothing about it.
         let gate = CommandGate::default();
         let snap = snapshot();
-        let outcome = sync_teardown_with(&gate, &snap, Duration::from_secs(1), |_| false);
+        let outcome = sync_teardown_with(&gate, &snap, Duration::from_secs(1), |cmd| {
+            if cmd
+                .join(" ")
+                .contains("Set-NetFirewallProfile -Profile Public")
+            {
+                Err("powershell.exe exited with exit code 1: Access is denied".to_owned())
+            } else {
+                Ok(())
+            }
+        });
         let unfinished = match outcome {
             SyncTeardownOutcome::Restored { unfinished } => unfinished,
             other => panic!("a quiescent gate must restore, got {other:?}"),
         };
+        let public = snap
+            .profiles
+            .iter()
+            .find(|profile| profile.name == "Public")
+            .expect("the snapshot carries every profile we depend on")
+            .clone();
         assert_eq!(
             unfinished,
-            uninstall_ops(&snap)
-                .iter()
-                .map(render_op)
-                .collect::<Vec<_>>(),
-            "every command that did not complete must be reported, so an operator can \
-             see which part of the captured state was not put back"
+            vec![UnfinishedCommand {
+                command: render_op(&FirewallOp::RestoreProfile(public)).join(" "),
+                reason: "powershell.exe exited with exit code 1: Access is denied".to_owned(),
+            }],
+            "exactly the command that failed must be reported, with the reason, so an \
+             operator can see which part of the captured state is still not back"
         );
     }
 
@@ -3827,6 +3922,54 @@ AllowLocalFirewallRules    : True
     #[cfg(unix)]
     mod bounded_wait {
         use super::*;
+
+        #[test]
+        fn sync_command_verdict_accepts_a_successful_child() {
+            let out = run_sync_bounded("/bin/echo", &["hello".to_string()], SYNC_CLEANUP_TIMEOUT);
+            assert_eq!(sync_command_verdict("/bin/echo", out), Ok(()));
+        }
+
+        #[test]
+        fn sync_command_verdict_rejects_a_non_zero_exit_of_a_real_child() {
+            // The case this function exists for: the child DID exit within the bound, so
+            // `run_sync_bounded` returns `Some`, and only the status says that nothing
+            // was restored. Reading `Some` as success would report a firewall
+            // restoration that never happened.
+            let out = run_sync_bounded(
+                "/bin/sh",
+                &[
+                    "-c".to_string(),
+                    "echo 'Access is denied' >&2; exit 7".to_string(),
+                ],
+                SYNC_CLEANUP_TIMEOUT,
+            )
+            .expect("the child exits well within the bound");
+            assert!(
+                !out.status.success(),
+                "the premise of this test is a child that exits non-zero"
+            );
+            let reason = sync_command_verdict("/bin/sh", Some(out))
+                .expect_err("a non-zero exit means the command restored nothing");
+            assert!(
+                reason.contains("exit code 7"),
+                "the reason must carry the exit status: {reason}"
+            );
+            assert!(
+                reason.contains("Access is denied"),
+                "the reason must carry the child's stderr, which is what tells the \
+                 operator why the restoration failed: {reason}"
+            );
+        }
+
+        #[test]
+        fn sync_command_verdict_reports_a_command_that_never_exited() {
+            assert_eq!(
+                sync_command_verdict("/bin/sleep", None),
+                Err(
+                    "/bin/sleep did not finish within the bound or could not be started".to_owned()
+                )
+            );
+        }
 
         #[test]
         fn run_sync_bounded_returns_output_for_a_fast_command() {
