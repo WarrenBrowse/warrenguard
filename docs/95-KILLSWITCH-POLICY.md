@@ -110,6 +110,10 @@ after any change to the rule set.
   await, so it uses a bounded synchronous path) still re-enables the operator's
   rules and restores the captured profile settings. A rollback that completed
   cleanly disarms the guard, since there is then nothing left to restore.
+- Each PowerShell child is built with `kill_on_drop`, because tokio leaves a
+  spawned process running when its output future is dropped. Without it, a command
+  already in flight when an install was cancelled could apply its change AFTER the
+  guard's restoration, leaving the host in a state nobody owns.
 
 ## macOS: states are part of the policy
 
@@ -129,27 +133,22 @@ state that is not loopback":
 - every other state is killed, because it is a connection that would egress
   off-tunnel without an exception.
 
-An interface-scoped pass is deliberately NOT permission: the exit carrier is
-scoped to `phys_iface` when the caller named the physical egress, `pfctl::State`
-exposes no interface name, and pf answers an existing state without re-evaluating
-the ruleset. A state that cannot be shown to match the scoped rule is killed
-rather than preserved, and the cost is one re-established carrier connection. The
-rule is the same in both directions: killing the carrier's state unconditionally
-would drop the tunnel's own transport for no confidentiality gain, and preserving
-an unattributable state would leave a flow the scoped rule refuses.
+An interface-scoped pass is judged on the state's LOCAL address, which is the only
+field of an entry that can attribute it to an interface: the address a packet
+egresses an interface with belongs to that interface, and the install reads them
+from the host (`getifaddrs`). The same decision then serves the purge and the
+confirmation:
 
-The two decisions differ on purpose, and the difference is what keeps an install
-from failing on its own transport:
-
-- the PURGE kills every state whose flow it cannot prove the policy passes, so an
-  unattributable interface-scoped flow does not survive it;
-- the CONFIRMATION read fails only on a surviving state that NO pass rule covers.
-  Once the purge has completed, a state matching a pass rule can only have been
-  created by a rule that passed its first packet, and the only rules that pass
-  those flows are the anchor's own, interface scope included. Failing on an
-  unattributable survivor instead would fail the install every time the transport
-  recreated its state between the kill and the read, and the rollback would then
-  remove the blocking rules.
+- an entry to the exit whose local address belongs to `phys_iface` is a flow the
+  scoped pass covers, so the purge preserves it and its recreation during the
+  install fails nothing;
+- an entry to the exit whose local address belongs to another interface is a flow
+  the scoped pass refuses: the purge kills it, and if it survives, the
+  confirmation refuses to call the protection established instead of accepting it
+  on its destination alone;
+- without the addresses (a lookup that failed, or an interface with none) no entry
+  can be shown to match the scoped pass, and the conservative outcome is the
+  fail-closed one.
 
 A failure of the purge, or of the anchor flush that precedes the rule load, is
 fatal: a host still carrying off-tunnel traffic must not be reported as protected.
@@ -183,9 +182,9 @@ only for compatibility; see `crates/warrenguard-cli/README.md` for the migration
 | Windows: a pre-existing allow rule cannot keep its egress; the tunnel, the carrier and the optional LAN and DHCP flows still pass | Model-driven install tests in `src/windows.rs` (documented precedence, including the bypass rule and the block-beats-allow rule), with mutation-checked RED for each property |
 | Windows: the policy keeps holding for the whole session | A test that adds an allow rule AFTER the install and asserts the traffic stays blocked, with the block-rule removal mutation making it fail |
 | Windows: the install is not reported done unless the active policy confirms it | `check_effective_state` unit tests (profiles enabled, default block, local rules honoured, override flag present on exceptions and absent on the block rule, rule conditions, no leftover rule of ours, no foreign enabled allow rule) plus lifecycle tests against a policy that keeps a profile off, ignores local rules, pins an allow rule, leaves a leftover, or drops the override flag |
-| Windows: partial failure and cancellation roll back | Lifecycle test with an injected command failure, and guard tests for a completed, a failed and a cancelled uninstall plus a CANCELLED install (the last three assert the synchronous `Drop` teardown still restores the operator's rules and the captured profiles, which the install path gets by arming the guard before its first mutation) |
+| Windows: partial failure and cancellation roll back | Lifecycle test with an injected command failure, guard tests for a completed, a failed and a cancelled uninstall plus a CANCELLED install (the last three assert the synchronous `Drop` teardown still restores the operator's rules and the captured profiles, which the install path gets by arming the guard before its first mutation), and a test that a cancelled child command does not outlive its future (`kill_on_drop`) |
 | Windows: the generated commands and the four read-back queries | Golden tests pinning the exact text, so the surface a non-Windows reviewer inspects cannot drift silently |
 | Windows host behaviour, cmdlet and property behaviour, and the `-OverrideBlockRules` reading | NOT verified here. Run `scripts/windows/killswitch-policy-smoke.ps1` on a throwaway Windows host: it reproduces the leak, confirms the block rule, confirms the override exception, confirms that a rule created later cannot reopen the egress, checks the read-back filters, and checks the categorical foreign-allow query |
-| macOS: the anchor-block bypass through pre-existing states, without killing the flows the policy passes, and without failing on a state the transport recreates mid-install | Purge lifecycle tests, the pure permitted-flow predicate (the interface-scoping refusal on the purge side, the recreation tolerance on the confirmation side) and the wiring test that the set handed to the purge follows `KillswitchOpts`, all mutation-checked |
+| macOS: the anchor-block bypass through pre-existing states, without killing the flows the policy passes, and without accepting an off-interface entry | Purge lifecycle tests, the pure permitted-flow predicate (interface attribution by local address, and the conservative outcome when the addresses are unavailable), a lifecycle test for an entry to the exit on another interface, and the wiring test that the set handed to the purge follows `KillswitchOpts`, all mutation-checked |
 | macOS host behaviour, `/dev/pf` purge | NOT verified here (no root). The manual `pfctl -s states` procedure above is the check. |
 | CLI: a reachable open exit is refused without the explicit flag; a secret file with group or other access is refused; no secret reaches a `Debug` rendering or an error | Unit tests in `crates/warrenguard-cli` (RED proven by mutation for each guard) |
