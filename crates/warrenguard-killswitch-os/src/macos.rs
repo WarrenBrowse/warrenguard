@@ -12,11 +12,14 @@
 //! block until its state entry disappears. The install therefore purges the
 //! states the new policy does NOT pass, after the rules are loaded, then
 //! re-reads the table to confirm they are gone. A state the policy does pass
-//! (loopback, the exit carrier, a LAN range under `allow_lan`, the DHCP ports
-//! under `allow_dhcp`) is left alone: killing it would drop the tunnel's own
-//! transport, and a carrier that reconnected before the confirmation read would
-//! make the install fail. See [`PfOps::purge_bypass_states`] for the decision
-//! rule and [`MacosKillswitch::install`] for the failure semantics.
+//! (loopback, an exit carrier that is not interface-scoped, a LAN range under
+//! `allow_lan`, the DHCP ports under `allow_dhcp`) is left alone: killing the
+//! carrier's state would drop the tunnel's own transport. An interface-scoped
+//! carrier pass is NOT permission, because a state entry carries no interface
+//! name and pf answers an existing state without re-evaluating the ruleset; a
+//! state that cannot be attributed is killed rather than preserved. See
+//! [`PfOps::purge_bypass_states`] for the decision rule and
+//! [`MacosKillswitch::install`] for the failure semantics.
 //!
 //! ## Manual verification on a real Mac
 //!
@@ -189,10 +192,18 @@ pub fn build_pf_rules(opts: &KillswitchOpts) -> Result<Vec<FilterRule>, Killswit
 /// A state is judged against this set rather than against "anything that is not
 /// loopback", because the policy's own exceptions are flows the anchor passes:
 /// the exit carrier, a LAN range under `allow_lan`, the DHCP ports under
-/// `allow_dhcp`. Their existing states are legitimate and must survive the purge.
-/// Killing them would drop the tunnel's own transport, and a carrier that
-/// reconnected before the confirmation read would make an install fail and strip
-/// its rules, which is a self-inflicted outage rather than a protection.
+/// `allow_dhcp`. Their existing states are legitimate and must survive the purge:
+/// killing the carrier's would drop the tunnel's own transport for no
+/// confidentiality gain.
+///
+/// An interface-scoped pass is deliberately NOT permission here. `pf_rule_specs`
+/// scopes the exit carrier to `phys_iface` when the caller named the physical
+/// egress, and pf honours an existing state WITHOUT re-evaluating the ruleset, so
+/// a state to the exit address on some other interface would keep flowing past a
+/// rule that refuses it. `pfctl::State` exposes no interface name, so that state
+/// cannot be shown to match the scoped pass: refusing to preserve what cannot be
+/// established is the fail-closed direction, and the cost is one re-established
+/// carrier connection.
 #[derive(Debug, Default)]
 struct PermittedFlows {
     rules: Vec<PermittedFlow>,
@@ -210,11 +221,20 @@ struct PermittedFlow {
     dest: Option<IpNetwork>,
     /// `None` matches any destination port.
     dest_port: Option<u16>,
+    /// The rule is scoped to one interface (`pf_rule_specs` does this on the exit
+    /// carrier when the caller named the physical egress), and a pf state entry
+    /// carries no interface name, so a state cannot be shown to match it.
+    iface_scoped: bool,
 }
 
 impl PermittedFlow {
+    /// Whether this rule would pass a flow with this protocol and remote
+    /// endpoint, from what a state entry records.
+    ///
+    /// An interface-scoped rule never matches here: see [`PermittedFlows`].
     fn matches(&self, proto: Proto, remote: SocketAddr) -> bool {
-        (!self.v6_only || remote.is_ipv6())
+        !self.iface_scoped
+            && (!self.v6_only || remote.is_ipv6())
             && (!self.udp_only || proto == Proto::Udp)
             && self
                 .dest
@@ -247,6 +267,7 @@ impl PermittedFlows {
                     v6_only: spec.v6,
                     dest,
                     dest_port,
+                    iface_scoped: spec.iface.is_some(),
                 })
             })
             .collect();
@@ -1199,6 +1220,20 @@ mod tests {
                 .all(|r| r.dest.is_some() || r.dest_port.is_some()),
             "every permitted flow must be destination-scoped"
         );
+        assert!(
+            flows.rules.iter().all(|r| !r.iface_scoped),
+            "opts_minimal names no physical interface, so no pass is interface-scoped"
+        );
+
+        let mut scoped = opts_minimal();
+        scoped.phys_iface = Some("en0".into());
+        let scoped = PermittedFlows::from_opts(&scoped);
+        assert!(
+            scoped.rules.iter().all(|r| r.iface_scoped),
+            "naming the physical interface scopes the carrier pass, and the purge \
+             must see that: {:#?}",
+            scoped.rules
+        );
     }
 
     #[test]
@@ -1229,6 +1264,24 @@ mod tests {
             state_can_bypass(local, carrier, Proto::Tcp, &flows),
             "the carrier exception is UDP-scoped, so a TCP state to the exit address \
              is not something the anchor passes"
+        );
+    }
+
+    #[test]
+    fn an_interface_scoped_carrier_pass_cannot_be_attributed_to_a_state() {
+        // pf honours an existing state without re-evaluating the ruleset, and a
+        // state entry carries no interface name. With the carrier pass scoped to
+        // the daemon's physical interface, a state to the exit address might be on
+        // another interface, which the scoped rule would refuse: refusing to
+        // preserve it is the fail-closed direction.
+        let local: SocketAddr = (Ipv4Addr::new(192, 0, 2, 10), 5000).into();
+        let carrier: SocketAddr = (EXIT_V4, 443).into();
+        let mut o = opts_minimal();
+        o.phys_iface = Some("en0".into());
+        assert!(
+            state_can_bypass(local, carrier, Proto::Udp, &PermittedFlows::from_opts(&o)),
+            "an interface-scoped pass must not preserve a state it cannot be shown \
+             to match"
         );
     }
 
