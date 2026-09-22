@@ -17,6 +17,10 @@ tokio = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 pfctl = "0.7"
+# The interface addresses, which are what attributes a pf state entry to the
+# interface its pass rule is scoped to: a state carries no interface name, only a
+# local address. Safe wrapper over getifaddrs; already resolved in Cargo.lock.
+getifaddrs = "0.6"
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -3626,6 +3626,7 @@ dependencies = [
 name = "warrenguard-killswitch-os"
 version = "0.1.0"
 dependencies = [
+ "getifaddrs",
  "pfctl",
  "thiserror",
  "tokio",

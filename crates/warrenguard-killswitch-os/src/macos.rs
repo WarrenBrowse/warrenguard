@@ -10,29 +10,32 @@
 //! so a connection opened before the install (for example by macOS's
 //! default `pass all`) keeps carrying off-tunnel traffic past the new
 //! block until its state entry disappears. The install therefore purges the
-//! states the new policy does NOT pass, after the rules are loaded, then
-//! re-reads the table to confirm they are gone. A state the policy does pass
-//! (loopback, an exit carrier that is not interface-scoped, a LAN range under
-//! `allow_lan`, the DHCP ports under `allow_dhcp`) is left alone: killing the
-//! carrier's state would drop the tunnel's own transport. An interface-scoped
-//! carrier pass is NOT permission, because a state entry carries no interface
-//! name and pf answers an existing state without re-evaluating the ruleset; a
-//! state that cannot be attributed is killed rather than preserved. See
+//! states the new policy does NOT pass, after the rules are loaded, then re-reads
+//! the table and refuses to call the protection established while a state it
+//! cannot account for is still there. A state the policy passes (loopback, the
+//! tunnel, the carrier on the physical interface, a LAN range under `allow_lan`,
+//! the DHCP ports under `allow_dhcp`) is left alone: killing the carrier's state
+//! would drop the tunnel's own transport for no confidentiality gain. See
 //! [`PfOps::purge_bypass_states`] for the decision rule and
 //! [`MacosKillswitch::install`] for the failure semantics.
 //!
-//! Those two decisions differ on purpose, and the difference is what keeps the
-//! install from failing on its own transport:
+//! An interface-scoped pass is judged on the state's LOCAL address, which is the
+//! only field of an entry that can attribute it to an interface: the address a
+//! packet egresses an interface with belongs to that interface, and
+//! [`PfOps::interface_addresses`] supplies them. That attribution is what lets the
+//! same decision serve both sides, which is why the purge and the confirmation
+//! cannot disagree:
 //!
-//! - the PURGE kills every state whose flow it cannot prove the policy passes, so
-//!   an unattributable interface-scoped flow does not survive it;
-//! - the CONFIRMATION read fails only on a surviving state that NO pass rule
-//!   covers. A state present once the purge has completed can only have been
-//!   created by a rule that passed its first packet, and the only rules that pass
-//!   those flows are the anchor's own, interface scope included. Failing instead
-//!   on an unattributable survivor would fail the install every time the transport
-//!   recreated its state between the kill and the read, and the rollback would then
-//!   remove the blocking rules, which is the worse outcome for a killswitch.
+//! - an entry to the exit whose local address belongs to `phys_iface` is a flow
+//!   the scoped pass covers, so the purge preserves it and its recreation by the
+//!   transport during the install fails nothing;
+//! - an entry to the exit whose local address belongs to another interface is a
+//!   flow that pass refuses, so the purge kills it, and if it survives the
+//!   confirmation fails the install rather than accepting it on its destination
+//!   alone;
+//! - without the addresses (a lookup that failed, or an interface with none) no
+//!   entry can be shown to match the scoped pass, and the conservative outcome is
+//!   the fail-closed one.
 //!
 //! ## Manual verification on a real Mac
 //!
@@ -40,15 +43,18 @@
 //! privileges. An operator can confirm the purge by hand:
 //!
 //! 1. With a physical connection already open, run `sudo pfctl -s states`
-//!    and note the entries that are not loopback and not the exit carrier.
+//!    and note the entries whose local address is neither the physical
+//!    interface's nor loopback.
 //! 2. Install the killswitch, then run `sudo pfctl -s states` again.
-//! 3. The entries from step 1 must be gone. The exit carrier (UDP to an exit
-//!    address) and any state the policy passes, such as a LAN destination
-//!    under `allow_lan`, may still be present, and the tunnel's own states
-//!    must not have been dropped by the purge.
+//! 3. The entries from step 1 must be gone. A state the policy passes, such as
+//!    the carrier on the physical interface or a LAN destination under
+//!    `allow_lan`, may still be present, and the tunnel's own states must not
+//!    have been dropped by the purge. `ifconfig <phys_iface>` names the
+//!    addresses the attribution uses.
 //! 4. `sudo pfctl -s rules` must show the anchor rules under
 //!    [`PF_ANCHOR_PATH`].
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 
 use pfctl::ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
@@ -223,6 +229,32 @@ struct PermittedFlows {
 }
 
 /// One destination-scoped pass rule of the anchor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IfaceScope {
+    /// The pass matches any interface.
+    Any,
+    /// The pass is scoped to one interface, and these are the addresses the host
+    /// reports for it. A state matches when its LOCAL address is one of them,
+    /// which is what attributes the state to that interface: a state carries no
+    /// interface name, and the local address of a packet that egresses an
+    /// interface is one of that interface's addresses.
+    Addresses(Vec<IpAddr>),
+    /// The pass is scoped to an interface whose addresses could not be read, so no
+    /// state can be shown to match it. Fail-closed: such a pass attributes
+    /// nothing, and a state it might cover is treated as a bypass candidate.
+    Unknown,
+}
+
+impl IfaceScope {
+    fn permits(&self, local: IpAddr) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Addresses(addresses) => addresses.contains(&local),
+            Self::Unknown => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PermittedFlow {
     /// The rule is protocol-scoped to UDP (`pf_rule_specs` sets this on the exit
@@ -234,35 +266,23 @@ struct PermittedFlow {
     dest: Option<IpNetwork>,
     /// `None` matches any destination port.
     dest_port: Option<u16>,
-    /// The rule is scoped to one interface (`pf_rule_specs` does this on the exit
-    /// carrier when the caller named the physical egress), and a pf state entry
-    /// carries no interface name, so a state cannot be shown to match it.
-    iface_scoped: bool,
+    /// The interface the rule is scoped to, judged against the state's local
+    /// address.
+    iface: IfaceScope,
 }
 
 impl PermittedFlow {
-    /// Whether this rule passes a flow with this protocol and remote endpoint,
-    /// IGNORING its interface scope.
-    ///
-    /// Sound only once the anchor is the ruleset that created the state: a state
-    /// present after the purge can only have been created by a rule that passed
-    /// its first packet, and the only rules that pass these flows are the
-    /// anchor's own, interface scope included.
-    fn matches(&self, proto: Proto, remote: SocketAddr) -> bool {
-        (!self.v6_only || remote.is_ipv6())
-            && (!self.udp_only || proto == Proto::Udp)
+    /// Whether this rule passes the flow a state entry records, interface scope
+    /// included: the scope is judged on the state's local address.
+    fn matches(&self, view: &StateView) -> bool {
+        self.iface.permits(view.local.ip())
+            && (!self.v6_only || view.remote.is_ipv6())
+            && (!self.udp_only || view.proto == Proto::Udp)
             && self
                 .dest
                 .as_ref()
-                .is_none_or(|net| net.contains(remote.ip()))
-            && self.dest_port.is_none_or(|port| port == remote.port())
-    }
-
-    /// Whether this rule provably passes such a flow from what a state entry
-    /// records, which for an interface-scoped rule it cannot: pfctl-rs exposes no
-    /// interface name, so the scope cannot be established.
-    fn matches_provably(&self, proto: Proto, remote: SocketAddr) -> bool {
-        !self.iface_scoped && self.matches(proto, remote)
+                .is_none_or(|net| net.contains(view.remote.ip()))
+            && self.dest_port.is_none_or(|port| port == view.remote.port())
     }
 }
 
@@ -274,39 +294,45 @@ impl PermittedFlows {
     /// cannot be attributed to them. Loopback traffic is preserved by its
     /// addresses instead (see [`state_can_bypass`]), and a state on the tunnel
     /// cannot predate the tunnel this install just created.
-    fn from_opts(opts: &KillswitchOpts) -> Self {
+    fn from_opts(
+        opts: &KillswitchOpts,
+        interface_addresses: &BTreeMap<String, Vec<IpAddr>>,
+    ) -> Self {
         let rules = pf_rule_specs(opts)
             .into_iter()
             .filter(|spec| spec.pass)
-            .filter_map(|spec| {
+            .map(|spec| {
                 let (dest, dest_port) = match spec.dest {
                     Some(PfDest::Net(net)) => (Some(net), None),
                     Some(PfDest::AnyPort(port)) => (None, Some(port)),
-                    None => return None,
+                    None => (None, None),
                 };
-                Some(PermittedFlow {
+                let iface = match &spec.iface {
+                    None => IfaceScope::Any,
+                    Some(name) => match interface_addresses.get(name) {
+                        Some(addresses) if !addresses.is_empty() => {
+                            IfaceScope::Addresses(addresses.clone())
+                        }
+                        _ => IfaceScope::Unknown,
+                    },
+                };
+                PermittedFlow {
                     udp_only: spec.udp,
                     v6_only: spec.v6,
                     dest,
                     dest_port,
-                    iface_scoped: spec.iface.is_some(),
-                })
+                    iface,
+                }
             })
             .collect();
         Self { rules }
     }
 
-    /// Whether the new policy passes a flow with this protocol and remote
-    /// endpoint, ignoring an interface scope the state cannot establish.
-    fn permits(&self, proto: Proto, remote: SocketAddr) -> bool {
-        self.rules.iter().any(|rule| rule.matches(proto, remote))
-    }
-
-    /// Whether the new policy PROVABLY passes such a flow.
-    fn permits_provably(&self, proto: Proto, remote: SocketAddr) -> bool {
-        self.rules
-            .iter()
-            .any(|rule| rule.matches_provably(proto, remote))
+    /// Whether the new policy passes the flow this state entry records, from the
+    /// fields the entry carries: protocol, local address, remote address, remote
+    /// port.
+    fn permits(&self, view: &StateView) -> bool {
+        self.rules.iter().any(|rule| rule.matches(view))
     }
 }
 
@@ -339,17 +365,24 @@ fn state_view(state: &pfctl::State) -> Option<StateView> {
     })
 }
 
-/// Whether the purge must kill this state.
+/// Whether this state entry is a flow the new policy passes.
 ///
-/// `true` unless the new policy PROVABLY passes the flow: loopback-to-loopback is
-/// local IPC the anchor's `on lo0` pass covers, and every other flow must match a
-/// destination-scoped pass. An interface-scoped pass is not provable (a state
-/// entry carries no interface name), so a state it might cover is killed rather
-/// than preserved. That is the fail-closed direction: pf answers a surviving
-/// state without re-evaluating the ruleset, so a state on an interface the scoped
-/// rule refuses would keep flowing off-tunnel.
+/// The decision is taken on what the entry carries (protocol, local address,
+/// remote address, remote port) and the interface scope is judged on the LOCAL
+/// address, which is the only field that can attribute an entry to an interface.
+/// Loopback-to-loopback is local IPC and needs no attribution.
+fn state_is_permitted(view: &StateView, permitted: &PermittedFlows) -> bool {
+    view.is_loopback_only() || permitted.permits(view)
+}
+
+/// Whether the purge must kill this state: everything the policy does not pass.
+///
+/// A state the policy passes is preserved (killing the transport's own carrier
+/// state would drop the tunnel for no confidentiality gain); everything else is a
+/// connection that would egress off-tunnel without an exception, and pf answers a
+/// surviving state without re-evaluating the ruleset.
 fn state_must_be_killed(view: &StateView, permitted: &PermittedFlows) -> bool {
-    !view.is_loopback_only() && !permitted.permits_provably(view.proto, view.remote)
+    !state_is_permitted(view, permitted)
 }
 
 /// One state entry that was still in the table when the purge re-read it.
@@ -370,23 +403,19 @@ struct PurgeReport {
     survivors: Vec<Survivor>,
 }
 
-/// Whether a state the purge could not remove is a bypass.
+/// Whether a state the purge could not remove is a bypass, decided exactly as the
+/// purge decided to kill it.
 ///
-/// Deliberately weaker than [`state_must_be_killed`], and the asymmetry is the
-/// point. The purge refuses to PRESERVE an interface-scoped flow it cannot
-/// attribute, but the confirmation read only fails on a flow no pass rule covers
-/// at all, because a state present once the purge has completed can only have
-/// been created by a rule that passed its first packet, and the only rules that
-/// pass these flows are the anchor's own. The typical survivor is the transport's
-/// own next packet recreating its carrier state between the kill and the
-/// confirmation read; treating that as a bypass would fail the install every time
-/// the tunnel is up during one, and the rollback would then remove the blocking
-/// rules, which is the worse outcome for a killswitch.
+/// The confirmation keeps the same interface attribution as the purge, so a
+/// surviving entry on an interface the scoped pass refuses is a bypass and fails
+/// the install, while an entry on the pass's own interface (the transport's next
+/// packet recreating its state between the kill and this read) is a flow the
+/// policy passes and does not. Deciding the two differently, or ignoring the
+/// interface on either side, is what would let an old off-interface state be
+/// accepted as a recreation.
 fn survivor_is_a_bypass(survivor: &Survivor, permitted: &PermittedFlows) -> bool {
     match survivor {
-        Survivor::Read(view) => {
-            !view.is_loopback_only() && !permitted.permits(view.proto, view.remote)
-        }
+        Survivor::Read(view) => state_must_be_killed(view, permitted),
         // Nothing can be established about it, so it cannot be called harmless.
         Survivor::Unreadable => true,
     }
@@ -435,6 +464,14 @@ trait PfOps: Send + Sync + std::fmt::Debug {
     /// `pfctl -d` equivalent. Only called on teardown when
     /// [`Self::is_enabled`] reported pf as OFF before install.
     fn disable(&self) -> Result<(), KillswitchError>;
+    /// The addresses the host reports for each named interface.
+    ///
+    /// A pf state entry carries no interface name, so its LOCAL address is the
+    /// only field that can attribute it to the interface a pass rule is scoped to.
+    /// An interface missing from the result, or reported with no address, is one
+    /// whose passes cannot be attributed: see [`IfaceScope::Unknown`].
+    fn interface_addresses(&self, ifaces: &[String]) -> BTreeMap<String, Vec<IpAddr>>;
+
     /// Register the Warren anchor [`PF_ANCHOR_PATH`].
     fn add_anchor(&self) -> Result<(), KillswitchError>;
     /// Drop every filter rule in the Warren anchor.
@@ -492,6 +529,40 @@ impl PfOps for RealPfOps {
         Self::pf()?
             .try_disable()
             .map_err(|e| KillswitchError::Pf(format!("pf disable: {e}")))
+    }
+
+    fn interface_addresses(&self, ifaces: &[String]) -> BTreeMap<String, Vec<IpAddr>> {
+        let mut wanted: BTreeMap<&str, Vec<IpAddr>> = ifaces
+            .iter()
+            .map(|name| (name.as_str(), Vec::new()))
+            .collect();
+        let entries = match getifaddrs::getifaddrs() {
+            Ok(entries) => entries,
+            Err(e) => {
+                // No address means no attribution, so every interface-scoped pass
+                // stays conservative rather than being assumed to match.
+                tracing::warn!(
+                    error = %e,
+                    "could not read the interface addresses: interface-scoped passes \
+                     stay unattributable for this install"
+                );
+                return BTreeMap::new();
+            }
+        };
+        for entry in entries {
+            let Some(addresses) = wanted.get_mut(entry.name.as_str()) else {
+                continue;
+            };
+            match entry.address {
+                getifaddrs::Address::V4(address) => addresses.push(IpAddr::V4(address.address)),
+                getifaddrs::Address::V6(address) => addresses.push(IpAddr::V6(address.address)),
+                getifaddrs::Address::Mac(_) => {}
+            }
+        }
+        wanted
+            .into_iter()
+            .map(|(name, addresses)| (name.to_owned(), addresses))
+            .collect()
     }
 
     fn add_anchor(&self) -> Result<(), KillswitchError> {
@@ -672,7 +743,17 @@ impl MacosKillswitch {
     ) -> Result<Self, KillswitchError> {
         validate_tun_name(&opts.tun_name)?;
         let rules = build_pf_rules(opts)?;
-        let permitted = PermittedFlows::from_opts(opts);
+        // The interface addresses are what attribute a state entry to the
+        // interface its pass is scoped to, so they are read before the permitted
+        // set is built.
+        let wanted: Vec<String> = opts
+            .phys_iface
+            .iter()
+            .cloned()
+            .chain(std::iter::once(opts.tun_name.clone()))
+            .collect();
+        let interfaces = ops.interface_addresses(&wanted);
+        let permitted = PermittedFlows::from_opts(opts, &interfaces);
 
         // Snapshot pf's enable state BEFORE `apply_rules` turns it on
         // (its first step is `enable()`): reading it any later would
@@ -1030,6 +1111,8 @@ mod tests {
         /// LAN flow. Records the wiring from `KillswitchOpts` to the purge,
         /// which no predicate unit test can observe.
         purge_permits_lan: std::sync::atomic::AtomicBool,
+        /// The addresses `interface_addresses` reports, by interface name.
+        interface_addresses: BTreeMap<String, Vec<IpAddr>>,
     }
 
     impl MockPf {
@@ -1062,6 +1145,14 @@ mod tests {
                 purge_survivors: survivors,
                 ..Self::default()
             }
+        }
+
+        /// The host addresses the seam reports for `iface`, which is what
+        /// attributes a state entry to it.
+        fn with_interface_addresses(mut self, iface: &str, addresses: &[IpAddr]) -> Self {
+            self.interface_addresses
+                .insert(iface.to_owned(), addresses.to_vec());
+            self
         }
 
         /// A mock whose n-th `flush_rules` call fails.
@@ -1104,6 +1195,18 @@ mod tests {
             self.currently_enabled.store(false, Ordering::SeqCst);
             Ok(())
         }
+        fn interface_addresses(&self, ifaces: &[String]) -> BTreeMap<String, Vec<IpAddr>> {
+            self.record("interface_addresses");
+            ifaces
+                .iter()
+                .filter_map(|name| {
+                    self.interface_addresses
+                        .get(name)
+                        .map(|addresses| (name.clone(), addresses.clone()))
+                })
+                .collect()
+        }
+
         fn add_anchor(&self) -> Result<(), KillswitchError> {
             self.record("add_anchor");
             Ok(())
@@ -1129,8 +1232,11 @@ mod tests {
             permitted: &PermittedFlows,
         ) -> Result<PurgeReport, KillswitchError> {
             let lan: SocketAddr = (Ipv4Addr::new(192, 168, 1, 20), 22).into();
-            self.purge_permits_lan
-                .store(permitted.permits(Proto::Tcp, lan), Ordering::SeqCst);
+            let local: SocketAddr = (Ipv4Addr::new(198, 51, 100, 7), 5000).into();
+            self.purge_permits_lan.store(
+                permitted.permits(&view(local, lan, Proto::Tcp)),
+                Ordering::SeqCst,
+            );
             self.record("purge_bypass_states");
             if self.fail_purge {
                 return Err(KillswitchError::Pf(
@@ -1337,42 +1443,64 @@ mod tests {
         }
     }
 
+    /// The host addresses the seam reports for one interface.
+    fn addrs(iface: &str, addresses: &[&str]) -> BTreeMap<String, Vec<IpAddr>> {
+        BTreeMap::from([(
+            iface.to_owned(),
+            addresses
+                .iter()
+                .map(|address| address.parse().expect("an address literal"))
+                .collect(),
+        )])
+    }
+
+    const EN0: &str = "192.0.2.10";
+    const OTHER_IFACE_ADDR: &str = "198.51.100.7";
+
     #[test]
-    fn only_destination_scoped_passes_form_the_permitted_set() {
-        // The loopback and tunnel passes are interface-scoped, and a state entry
-        // carries no interface name, so they cannot be part of the predicate.
+    fn the_permitted_set_keeps_every_pass_with_its_interface_scope() {
+        // Every pass of the ruleset is kept, because the interface scope can now be
+        // judged: a state's LOCAL address is what attributes it to an interface.
         let mut o = opts_minimal();
         o.allow_lan = true;
         o.allow_dhcp = true;
-        let flows = PermittedFlows::from_opts(&o);
-        // One exit host, three v4 LAN ranges, two v6 LAN ranges, two DHCP ports.
-        assert_eq!(flows.rules.len(), 1 + 3 + 2 + 2);
+        let flows = PermittedFlows::from_opts(&o, &BTreeMap::new());
+        // Loopback, tunnel, one exit host, three v4 LAN ranges, two v6 LAN ranges,
+        // two DHCP ports.
+        assert_eq!(flows.rules.len(), 3 + 3 + 2 + 2);
         assert!(
-            flows
-                .rules
-                .iter()
-                .all(|r| r.dest.is_some() || r.dest_port.is_some()),
-            "every permitted flow must be destination-scoped"
-        );
-        assert!(
-            flows.rules.iter().all(|r| !r.iface_scoped),
-            "opts_minimal names no physical interface, so no pass is interface-scoped"
+            flows.rules.iter().all(|r| r.iface != IfaceScope::Any)
+                || flows.rules.iter().any(|r| r.dest.is_some()),
+            "a pass with no destination scope must carry an interface scope, or it \
+             would permit every flow: {:#?}",
+            flows.rules
         );
 
         let mut scoped = opts_minimal();
         scoped.phys_iface = Some("en0".into());
-        let scoped = PermittedFlows::from_opts(&scoped);
+        let unknown = PermittedFlows::from_opts(&scoped, &BTreeMap::new());
         assert!(
-            scoped.rules.iter().all(|r| r.iface_scoped),
-            "naming the physical interface scopes the carrier pass, and the purge \
-             must see that: {:#?}",
-            scoped.rules
+            unknown
+                .rules
+                .iter()
+                .any(|r| r.iface == IfaceScope::Unknown && r.dest.is_some()),
+            "without the interface addresses the carrier pass cannot be attributed: \
+             {:#?}",
+            unknown.rules
+        );
+        let known = PermittedFlows::from_opts(&scoped, &addrs("en0", &[EN0]));
+        assert!(
+            known.rules.iter().any(|r| r.iface
+                == IfaceScope::Addresses(vec![EN0.parse::<IpAddr>().expect("address")])
+                && r.dest.is_some()),
+            "with them, the carrier pass is attributed by address: {:#?}",
+            known.rules
         );
     }
 
     #[test]
     fn loopback_only_states_are_preserved() {
-        let flows = PermittedFlows::from_opts(&opts_minimal());
+        let flows = PermittedFlows::from_opts(&opts_minimal(), &BTreeMap::new());
         let lo_a: SocketAddr = (Ipv4Addr::LOCALHOST, 1234).into();
         let lo_b: SocketAddr = (Ipv4Addr::LOCALHOST, 8080).into();
         let lo_v6: SocketAddr = (Ipv6Addr::LOCALHOST, 53).into();
@@ -1386,8 +1514,8 @@ mod tests {
 
     #[test]
     fn the_exit_carrier_state_is_preserved_when_the_pass_is_not_interface_scoped() {
-        let flows = PermittedFlows::from_opts(&opts_minimal());
-        let local: SocketAddr = (Ipv4Addr::new(192, 0, 2, 10), 5000).into();
+        let flows = PermittedFlows::from_opts(&opts_minimal(), &BTreeMap::new());
+        let local: SocketAddr = (Ipv4Addr::new(198, 51, 100, 7), 5000).into();
         let carrier: SocketAddr = (EXIT_V4, 443).into();
         assert!(
             !state_must_be_killed(&view(local, carrier, Proto::Udp), &flows),
@@ -1402,38 +1530,63 @@ mod tests {
     }
 
     #[test]
-    fn an_interface_scoped_carrier_pass_is_killed_but_its_recreation_is_tolerated() {
-        // The asymmetry, and the reason for it. pf honours an existing state
-        // without re-evaluating the ruleset, and a state entry carries no interface
-        // name, so a state to the exit address might be on another interface than
-        // the one the pass is scoped to: the PURGE refuses to preserve it. Once the
-        // purge has completed, however, a state matching that pass can only have
-        // been created by a rule that passed its first packet, and the only rules
-        // that pass it are the anchor's own, so the CONFIRMATION read tolerates it.
-        // Failing on it would fail the install every time the transport recreates
-        // its state mid-install, and the rollback would remove the blocking rules.
-        let local: SocketAddr = (Ipv4Addr::new(192, 0, 2, 10), 5000).into();
+    fn an_interface_scoped_pass_attributes_a_state_by_its_local_address() {
+        // The distinction the confirmation has to keep. pf answers an existing
+        // state without re-evaluating the ruleset, so an entry on an interface the
+        // scoped pass refuses is a bypass; an entry whose LOCAL address is one of
+        // the scoped interface's addresses is a flow that pass covers, which is
+        // what the transport recreates between the kill and the read.
         let carrier: SocketAddr = (EXIT_V4, 443).into();
         let mut o = opts_minimal();
         o.phys_iface = Some("en0".into());
-        let flows = PermittedFlows::from_opts(&o);
-        let carrier_view = view(local, carrier, Proto::Udp);
+        let flows = PermittedFlows::from_opts(&o, &addrs("en0", &[EN0]));
 
-        assert!(
-            state_must_be_killed(&carrier_view, &flows),
-            "an interface-scoped pass must not preserve a state it cannot be shown to \
-             match"
+        let on_en0 = view(
+            (EN0.parse::<IpAddr>().expect("address"), 5000_u16).into(),
+            carrier,
+            Proto::Udp,
         );
         assert!(
-            !survivor_is_a_bypass(&Survivor::Read(carrier_view), &flows),
-            "a state present after the purge that a pass rule covers is a recreation, \
-             not a bypass"
+            !state_must_be_killed(&on_en0, &flows),
+            "a state whose local address is en0's is a flow the scoped pass covers"
         );
+        assert!(
+            !survivor_is_a_bypass(&Survivor::Read(on_en0), &flows),
+            "and its recreation during the install must not fail the install"
+        );
+
+        let elsewhere = view(
+            (
+                OTHER_IFACE_ADDR.parse::<IpAddr>().expect("address"),
+                5000_u16,
+            )
+                .into(),
+            carrier,
+            Proto::Udp,
+        );
+        assert!(
+            state_must_be_killed(&elsewhere, &flows),
+            "a state to the exit whose local address is another interface's is NOT \
+             something the scoped pass covers"
+        );
+        assert!(
+            survivor_is_a_bypass(&Survivor::Read(elsewhere), &flows),
+            "and if it survives, the protection is not confirmed: the install must fail"
+        );
+
+        // No addresses read means no attribution, which must not be assumed to
+        // match: the conservative outcome is the fail-closed one.
+        let blind = PermittedFlows::from_opts(&o, &BTreeMap::new());
+        assert!(
+            state_must_be_killed(&on_en0, &blind),
+            "an unattributable interface scope must not preserve a state"
+        );
+        assert!(survivor_is_a_bypass(&Survivor::Read(on_en0), &blind));
     }
 
     #[test]
     fn an_ordinary_public_flow_is_a_bypass_candidate_and_a_surviving_one_is_fatal() {
-        let flows = PermittedFlows::from_opts(&opts_minimal());
+        let flows = PermittedFlows::from_opts(&opts_minimal(), &BTreeMap::new());
         let local: SocketAddr = (Ipv4Addr::new(192, 0, 2, 10), 5000).into();
         let remote: SocketAddr = (Ipv4Addr::new(93, 184, 216, 34), 443).into();
         let probe = view(local, remote, Proto::Tcp);
@@ -1450,7 +1603,7 @@ mod tests {
 
     #[test]
     fn an_unreadable_survivor_is_a_bypass() {
-        let flows = PermittedFlows::from_opts(&opts_minimal());
+        let flows = PermittedFlows::from_opts(&opts_minimal(), &BTreeMap::new());
         assert!(
             survivor_is_a_bypass(&Survivor::Unreadable, &flows),
             "nothing can be established about an unreadable entry, so it cannot be \
@@ -1459,24 +1612,48 @@ mod tests {
     }
 
     #[test]
-    fn verify_purge_fails_only_on_a_survivor_no_pass_rule_covers() {
+    fn verify_purge_fails_only_on_a_survivor_the_policy_does_not_pass() {
         let mut o = opts_minimal();
         o.phys_iface = Some("en0".into());
-        let flows = PermittedFlows::from_opts(&o);
-        let local: SocketAddr = (Ipv4Addr::new(192, 0, 2, 10), 5000).into();
+        let flows = PermittedFlows::from_opts(&o, &addrs("en0", &[EN0]));
         let carrier: SocketAddr = (EXIT_V4, 443).into();
         let public: SocketAddr = (Ipv4Addr::new(93, 184, 216, 34), 443).into();
 
         let recreated = PurgeReport {
             killed: 2,
-            survivors: vec![Survivor::Read(view(local, carrier, Proto::Udp))],
+            survivors: vec![Survivor::Read(view(
+                (EN0.parse::<IpAddr>().expect("address"), 5000_u16).into(),
+                carrier,
+                Proto::Udp,
+            ))],
         };
         verify_purge(&recreated, &flows)
             .expect("a transport that recreated its authorised state must not fail the install");
 
+        let off_interface = PurgeReport {
+            killed: 1,
+            survivors: vec![Survivor::Read(view(
+                (
+                    OTHER_IFACE_ADDR.parse::<IpAddr>().expect("address"),
+                    5000_u16,
+                )
+                    .into(),
+                carrier,
+                Proto::Udp,
+            ))],
+        };
+        assert!(
+            verify_purge(&off_interface, &flows).is_err(),
+            "a state to the exit on another interface is a bypass the scoped pass refuses"
+        );
+
         let leaked = PurgeReport {
             killed: 2,
-            survivors: vec![Survivor::Read(view(local, public, Proto::Tcp))],
+            survivors: vec![Survivor::Read(view(
+                (EN0.parse::<IpAddr>().expect("address"), 5000_u16).into(),
+                public,
+                Proto::Tcp,
+            ))],
         };
         assert!(
             verify_purge(&leaked, &flows).is_err(),
@@ -1491,7 +1668,7 @@ mod tests {
         assert!(
             state_must_be_killed(
                 &view(local, lan, Proto::Tcp),
-                &PermittedFlows::from_opts(&opts_minimal())
+                &PermittedFlows::from_opts(&opts_minimal(), &BTreeMap::new())
             ),
             "with the LAN blocked, a LAN connection is a bypass candidate"
         );
@@ -1500,7 +1677,7 @@ mod tests {
         assert!(
             !state_must_be_killed(
                 &view(local, lan, Proto::Tcp),
-                &PermittedFlows::from_opts(&o)
+                &PermittedFlows::from_opts(&o, &BTreeMap::new())
             ),
             "with the LAN allowed the anchor passes it, so its state must survive"
         );
@@ -1513,13 +1690,13 @@ mod tests {
         assert!(
             state_must_be_killed(
                 &view(local, server, Proto::Udp),
-                &PermittedFlows::from_opts(&opts_minimal())
+                &PermittedFlows::from_opts(&opts_minimal(), &BTreeMap::new())
             ),
             "DHCP is opt-in"
         );
         let mut o = opts_minimal();
         o.allow_dhcp = true;
-        let flows = PermittedFlows::from_opts(&o);
+        let flows = PermittedFlows::from_opts(&o, &BTreeMap::new());
         assert!(
             !state_must_be_killed(&view(local, server, Proto::Udp), &flows),
             "an allowed DHCP exchange must survive the purge"
@@ -1632,13 +1809,14 @@ mod tests {
         // tunnel is up during an install.
         let local: SocketAddr = (Ipv4Addr::new(192, 0, 2, 10), 5000).into();
         let carrier: SocketAddr = (EXIT_V4, 443).into();
-        let pf = Arc::new(MockPf::reporting_survivors(vec![Survivor::Read(view(
-            local,
-            carrier,
-            Proto::Udp,
-        ))]));
         let mut o = opts_minimal();
         o.phys_iface = Some("en0".into());
+        // The seam reports en0's addresses, which is what attributes the state to
+        // the interface the carrier pass is scoped to.
+        let pf = Arc::new(
+            MockPf::reporting_survivors(vec![Survivor::Read(view(local, carrier, Proto::Udp))])
+                .with_interface_addresses("en0", &[local.ip()]),
+        );
 
         let guard = MacosKillswitch::install_with_ops(&o, pf.clone())
             .await
@@ -1653,6 +1831,36 @@ mod tests {
             "the install must not roll the anchor back for a recreation: {ops:?}"
         );
         drop(guard);
+    }
+
+    #[tokio::test]
+    async fn a_state_to_the_exit_on_another_interface_fails_the_install() {
+        // The hole a destination-only confirmation left open: a pre-existing state
+        // to the exit address on an interface the scoped pass refuses. Its local
+        // address is what gives it away, and the install must not report a
+        // protection it has not confirmed.
+        let local: SocketAddr = (Ipv4Addr::new(198, 51, 100, 7), 5000).into();
+        let carrier: SocketAddr = (EXIT_V4, 443).into();
+        let mut o = opts_minimal();
+        o.phys_iface = Some("en0".into());
+        let pf = Arc::new(
+            MockPf::reporting_survivors(vec![Survivor::Read(view(local, carrier, Proto::Udp))])
+                .with_interface_addresses("en0", &[EN0.parse::<IpAddr>().expect("address")]),
+        );
+
+        let err = MacosKillswitch::install_with_ops(&o, pf.clone())
+            .await
+            .expect_err("an off-interface state to the exit must fail the install");
+        assert!(matches!(err, KillswitchError::Pf(_)), "got {err:?}");
+        let ops = pf.recorded();
+        let purge_pos = ops
+            .iter()
+            .position(|o| o == "purge_bypass_states")
+            .expect("the purge ran");
+        assert!(
+            ops[purge_pos..].iter().any(|o| o == "flush_rules"),
+            "and the anchor must be rolled back rather than announced: {ops:?}"
+        );
     }
 
     #[tokio::test]
