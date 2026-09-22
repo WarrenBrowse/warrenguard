@@ -110,14 +110,23 @@ after any change to the rule set.
   await, so it uses a bounded synchronous path) still re-enables the operator's
   rules and restores the captured profile settings. A rollback that completed
   cleanly disarms the guard, since there is then nothing left to restore.
-- Each command runs to completion on a blocking task that holds a gate, and the
-  guard's synchronous teardown takes that gate before its own first command: the
-  restoration therefore starts only after an in-flight command has finished, and
-  its writes are the last ones. The gate wait is bounded (a teardown that can hang
-  process exit for ever is worse), and an expired bound is logged as the race it
-  is. Termination timing is not relied on: tokio leaves a spawned child running
-  when its output future is dropped, and on Windows `TerminateProcess` may return
-  before the process is gone.
+- Each command is REGISTERED on a gate before it is spawned, and the guard's
+  synchronous teardown closes that gate and waits for every registered command to be
+  released before its own first command: the restoration therefore starts only after
+  every accepted command has finished, and its writes are the last ones. The
+  registration is taken before the command's first await point, which is what closes
+  the cancellation window: the mutex a command holds while it applies is only taken
+  once its blocking task starts, so a future cancelled between the spawn and that
+  start would leave a teardown that waited on the mutex alone free to restore first,
+  with the queued command applying its change afterwards. The close is one-way, so a
+  command that would have been accepted later is refused instead of running after the
+  restoration. The gate wait is bounded (a teardown that can hang process exit for
+  ever is worse), and an expired bound makes the teardown REFUSE rather than restore:
+  it keeps whatever the still-running command applies, logs the commands an operator
+  has to run by hand, and calls the firewall half-applied instead of reporting a
+  restoration the later write could overwrite. Termination timing is not relied on:
+  tokio leaves a spawned child running when its output future is dropped, and on
+  Windows `TerminateProcess` may return before the process is gone.
 
 ## macOS: states are part of the policy
 
@@ -146,12 +155,18 @@ therefore decides both sides: the purge kills every entry the policy does not
 provably pass, and the confirmation refuses while such an entry survives instead
 of explaining it away as a recreation.
 
-A pre-flight pass runs before the first mutation and refuses the install (typed as
+A pre-flight pass runs before the anchor rules are touched, which is what makes it
+cheaper than the post-load rollback: nothing is flushed, no rule is loaded, and pf's
+enable state is only read. It refuses the install (typed as
 `KillswitchError::UnconfirmedStates`) when such an entry comes back after a kill,
 which means a peer is still sending. That is the transport, and the contract this
-enforces is the operationally correct one anyway: **install the killswitch before
-the transport starts**. The refusal leaves the host exactly as it was, rather than
-rolling a loaded anchor back.
+enforces is the operationally correct one anyway: **install the killswitch before the
+transport starts**. The refusal is not "read-only" on the state table: the pre-flight
+calls the same purge, so it has already killed every off-policy state it could remove.
+That kill is transient (no rule changed, so a killed flow reconnects), and what the
+refusal leaves untouched is the pf ruleset and pf's enable state, rather than rolling
+a loaded anchor back. The error message states that effect, and the tests pin both
+halves of it.
 
 A failure of the purge, or of the anchor flush that precedes the rule load, is
 fatal: a host still carrying off-tunnel traffic must not be reported as protected.
@@ -174,7 +189,9 @@ The wrapper builds as the invoking user and elevates only the compiled test bina
 normal build. It purges every off-policy connection on the host it runs on, which is
 why it is ignored by default, gated on `WARREN_KILLSWITCH_ROOT_TEST=1`, and meant for
 an idle or disposable Mac. `--print-only` shows the elevated command without running
-it, and the log lands in `target/root-killswitch-test.log`.
+it, and the log lands in `target/root-killswitch-test.log`. A pre-flight refusal fails
+the test on purpose, with an "inconclusive" message: the anchor was never loaded, so
+the cycle it exists to prove never ran.
 
 ## Linux: unchanged
 
@@ -200,9 +217,9 @@ only for compatibility; see `crates/warrenguard-cli/README.md` for the migration
 | Windows: a pre-existing allow rule cannot keep its egress; the tunnel, the carrier and the optional LAN and DHCP flows still pass | Model-driven install tests in `src/windows.rs` (documented precedence, including the bypass rule and the block-beats-allow rule), with mutation-checked RED for each property |
 | Windows: the policy keeps holding for the whole session | A test that adds an allow rule AFTER the install and asserts the traffic stays blocked, with the block-rule removal mutation making it fail |
 | Windows: the install is not reported done unless the active policy confirms it | `check_effective_state` unit tests (profiles enabled, default block, local rules honoured, override flag present on exceptions and absent on the block rule, rule conditions, no leftover rule of ours, no foreign enabled allow rule) plus lifecycle tests against a policy that keeps a profile off, ignores local rules, pins an allow rule, leaves a leftover, or drops the override flag |
-| Windows: partial failure and cancellation roll back, and a cancelled command cannot outrun the restoration | Lifecycle test with an injected command failure, guard tests for a completed, a failed and a cancelled uninstall plus a CANCELLED install (the last three assert the synchronous `Drop` teardown still restores the operator's rules and the captured profiles, which the install path gets by arming the guard before its first mutation), a test that a cancelled command still holds the gate until it finishes (real child, real ordering), and a test that a wedged command does not hang the teardown past its bound |
+| Windows: partial failure and cancellation roll back, and a cancelled command cannot outrun the restoration | Lifecycle test with an injected command failure, guard tests for a completed, a failed and a cancelled uninstall plus a CANCELLED install (the last three assert the synchronous `Drop` teardown still restores the operator's rules and the captured profiles, which the install path gets by arming the guard before its first mutation), a test that a cancelled command still holds its gate registration until it finishes (real child, real ordering), a test that a command registered but not yet started still blocks the restoration (the cancellation window the mutex alone left open), a test that a command outliving the bound makes the teardown refuse and hand the operator the exact commands it did not run, and a test that a wedged command does not hang the teardown past its bound; RED proven by mutation for the reservation-aware wait and for the refusal |
 | Windows: the generated commands and the four read-back queries | Golden tests pinning the exact text, so the surface a non-Windows reviewer inspects cannot drift silently |
 | Windows host behaviour, cmdlet and property behaviour, and the `-OverrideBlockRules` reading | NOT verified here. Run `scripts/windows/killswitch-policy-smoke.ps1` on a throwaway Windows host: it reproduces the leak, confirms the block rule, confirms the override exception, confirms that a rule created later cannot reopen the egress, checks the read-back filters, and checks the categorical foreign-allow query |
-| macOS: the anchor-block bypass through pre-existing states, without killing the flows the policy provably passes, and without ever accepting an interface-scoped entry as a recreation | Purge lifecycle tests, the pure permitted-flow predicate (an interface-scoped pass is unprovable on both sides), a pre-flight refusal test asserting nothing was mutated, a post-load failure test asserting the rollback, and the wiring test that the set handed to the purge follows `KillswitchOpts`, all mutation-checked |
-| macOS host behaviour, `/dev/pf` purge | NOT verified here: the dev sudo alias deliberately withholds `pfctl`, and `sudo -n` needs a password in this environment. Two operator gates exist: the manual `pfctl -s states` procedure above, and the ignored root test above (`real_pf_install_and_uninstall_cycle`), which was compiled and whose guard was exercised, but not executed as root. |
+| macOS: the anchor-block bypass through pre-existing states, without killing the flows the policy provably passes, and without ever accepting an interface-scoped entry as a recreation | Purge lifecycle tests, the pure permitted-flow predicate (an interface-scoped pass is unprovable on both sides), a pre-flight refusal test asserting the rulesets and pf's enable state were not touched and pinning the message that says so (the state purge has already run at that point), a post-load failure test asserting the rollback, and the wiring test that the set handed to the purge follows `KillswitchOpts`, all mutation-checked |
+| macOS host behaviour, `/dev/pf` purge | NOT verified here: the dev sudo alias deliberately withholds `pfctl`, and `sudo -n` needs a password in this environment. Two operator gates exist: the manual `pfctl -s states` procedure above, and the ignored root test above (`real_pf_install_and_uninstall_cycle`), which was compiled and whose guard was exercised, but not executed as root. That test now FAILS as inconclusive when the pre-flight refuses, because a refusal means the cycle it exists to prove never ran; the classification of that outcome, and the message the operator sees, are unit-tested without root. |
 | CLI: a reachable open exit is refused without the explicit flag; a secret file with group or other access is refused; no secret reaches a `Debug` rendering or an error | Unit tests in `crates/warrenguard-cli` (RED proven by mutation for each guard) |
