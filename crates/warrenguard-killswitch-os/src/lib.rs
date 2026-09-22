@@ -298,6 +298,14 @@ pub enum KillswitchError {
     #[error("Windows firewall operation failed: {0}")]
     Windows(String),
 
+    /// A live connection state the new policy cannot account for, so the install
+    /// refused BEFORE changing anything. macOS: a state whose flow is passed only
+    /// by an interface-scoped rule, which a pf state entry cannot be shown to
+    /// match. The caller should stop the tunnel (or wait for a stale state to
+    /// expire) and retry.
+    #[error("a live connection state cannot be accounted for: {0}")]
+    UnconfirmedStates(String),
+
     /// I/O between Warren and the firewall process (pipe closed, etc.).
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
