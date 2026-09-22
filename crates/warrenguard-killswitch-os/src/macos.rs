@@ -2,8 +2,33 @@
 //!
 //! Rules are loaded into a pf sub-anchor [`PF_ANCHOR_PATH`] =
 //! `com.apple/250.warrenguard_killswitch_os`.
+//!
+//! ## Connection states (the leak this module must not miss)
+//!
+//! Loading the anchor rules does NOT stop a flow that already exists. pf
+//! keeps a state table and consults it BEFORE it re-evaluates the ruleset,
+//! so a connection opened before the install (for example by macOS's
+//! default `pass all`) keeps carrying off-tunnel traffic past the new
+//! block until its state entry disappears. The install therefore purges
+//! the bypassable states after the rules are loaded and re-reads the table
+//! to confirm they are gone; see [`PfOps::purge_bypass_states`] for the
+//! decision rule and [`MacosKillswitch::install`] for the failure
+//! semantics.
+//!
+//! ## Manual verification on a real Mac
+//!
+//! Automated tests cannot cover this: `/dev/pf` needs root and CI has no
+//! privileges. An operator can confirm the purge by hand:
+//!
+//! 1. With a physical connection already open, run `sudo pfctl -s states`
+//!    and note the non-loopback entries.
+//! 2. Install the killswitch, then run `sudo pfctl -s states` again.
+//! 3. The non-loopback entries from step 1 must be gone, while the tunnel
+//!    state and the exit carrier state must still be present.
+//! 4. `sudo pfctl -s rules` must show the anchor rules under
+//!    [`PF_ANCHOR_PATH`].
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use pfctl::ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
 use pfctl::{AnchorKind, FilterRule, FilterRuleAction, FilterRuleBuilder, PfCtl};
@@ -152,6 +177,47 @@ pub fn build_pf_rules(opts: &KillswitchOpts) -> Result<Vec<FilterRule>, Killswit
         .collect()
 }
 
+/// Whether one pf connection state can carry traffic past the newly loaded
+/// anchor block.
+///
+/// A state whose BOTH endpoints are loopback addresses is local IPC (the
+/// resolver, a Unix-socket peer over TCP, a same-host RPC). It never
+/// egresses a real interface, so it cannot leak and it is preserved: killing
+/// it would break same-host services for no confidentiality gain. Every
+/// other state is a connection that egresses or ingresses a physical
+/// interface, and pf would keep honouring it from the state table instead of
+/// re-evaluating the anchor, so it is a bypass candidate and is killed.
+///
+/// The recorded direction is deliberately NOT an input. pf keeps an entry per
+/// direction for one connection, and either endpoint being a real address is
+/// what makes the flow able to carry off-tunnel traffic; narrowing on the
+/// direction would preserve a surviving entry of a real connection, which is
+/// the leak this purge exists to close.
+///
+/// Interface-scoped clearing was rejected as the mechanism. pfctl(8) offers
+/// `-i <iface>` ("restrict the operation to the given interface") and this
+/// crate exposes `PfCtl::clear_interface_states(Interface)`, but the OS
+/// interface list is not readable from pfctl-rs: it would need `getifaddrs`
+/// (unsafe, forbidden here) or a shell-out, and this backend deliberately
+/// holds to the typed ioctl binding. A caller would also have to name every
+/// interface up front, and `pfctl::State` exposes no interface name, so a
+/// state on an interface the caller did not name would survive. Enumerating
+/// the table and deciding per state needs no interface list at all.
+fn state_can_bypass(local: SocketAddr, remote: SocketAddr) -> bool {
+    !(local.ip().is_loopback() && remote.ip().is_loopback())
+}
+
+/// Classifies one pf state table entry.
+///
+/// `None` means at least one accessor failed: the raw entry could not be read,
+/// so the caller must not assume it is harmless. `Some(true)` is a bypass
+/// candidate, `Some(false)` a loopback-only state that is preserved.
+fn classify_state(state: &pfctl::State) -> Option<bool> {
+    let local = state.local_address().ok()?;
+    let remote = state.remote_address().ok()?;
+    Some(state_can_bypass(local, remote))
+}
+
 /// Seam over the pf operations the killswitch lifecycle performs.
 /// pfctl-rs is a typed ioctl binding (no shell-out), so unlike the
 /// Linux `CommandRunner` this seam mirrors pf *operations* rather than
@@ -176,8 +242,24 @@ trait PfOps: Send + Sync + std::fmt::Debug {
     fn flush_rules(&self) -> Result<(), KillswitchError>;
     /// Append one filter rule to the Warren anchor.
     fn add_rule(&self, rule: &FilterRule) -> Result<(), KillswitchError>;
-    /// Clear connection states matching the Warren anchor.
-    fn clear_states(&self) -> Result<(), KillswitchError>;
+    /// Kill every pf connection state that could carry traffic past the
+    /// newly loaded anchor rules, verify the table is clean, and return the
+    /// number of states killed.
+    ///
+    /// Must run AFTER [`Self::add_rule`]: pf consults the state table before
+    /// it re-evaluates the ruleset, so a connection opened before the
+    /// install (by macOS's default `pass all`, for example) keeps flowing
+    /// off-tunnel until its state entry is gone. See
+    /// [`state_can_bypass`] for the per-state decision.
+    ///
+    /// # Errors
+    ///
+    /// [`KillswitchError::Pf`] when the table cannot be read, a state
+    /// cannot be killed, or bypass states are still present when the table
+    /// is re-read. The last case is a failure and NOT a warning: an install
+    /// that reports success while a bypass state survives claims
+    /// protection it has not confirmed.
+    fn purge_bypass_states(&self) -> Result<u32, KillswitchError>;
 }
 
 /// Production [`PfOps`] backed by `pfctl-rs` against `/dev/pf`.
@@ -227,20 +309,75 @@ impl PfOps for RealPfOps {
             .map_err(|e| KillswitchError::Pf(format!("add rule: {e}")))
     }
 
-    fn clear_states(&self) -> Result<(), KillswitchError> {
-        Self::pf()?
-            .clear_states(PF_ANCHOR_PATH, AnchorKind::Filter)
-            .map(|_| ())
-            .map_err(|e| KillswitchError::Pf(format!("clear states: {e}")))
+    fn purge_bypass_states(&self) -> Result<u32, KillswitchError> {
+        // `PfCtl::clear_states(PF_ANCHOR_PATH, ..)` is NOT usable here: it
+        // kills only states whose `anchor` field equals our anchor's rule
+        // number, and the anchor was registered moments ago, so it kills
+        // nothing and would leave every pre-install state in place. The
+        // table has to be enumerated and filtered per state instead.
+        let mut pf = Self::pf()?;
+        let states = pf
+            .get_states()
+            .map_err(|e| KillswitchError::Pf(format!("get states: {e}")))?;
+
+        let mut killed = 0u32;
+        for state in &states {
+            let Some(bypass) = classify_state(state) else {
+                // An unclassifiable entry (a failed accessor) could be a
+                // bypassing flow, so the purge refuses to guess rather than
+                // certify a table it cannot read.
+                return Err(KillswitchError::Pf(
+                    "a connection state could not be read while purging \
+                     states after the killswitch rules were loaded"
+                        .into(),
+                ));
+            };
+            if !bypass {
+                continue;
+            }
+            // No addresses in the error: this crate's no-log rule forbids
+            // putting a peer address or source IP in a message, and the
+            // count of killed states is what an operator acts on.
+            pf.kill_state(state)
+                .map_err(|e| KillswitchError::Pf(format!("kill a bypass connection state: {e}")))?;
+            killed = killed.saturating_add(1);
+        }
+
+        // Verification is the point of this function: re-read the table and
+        // refuse the install if any bypass state is still there. pf exposes
+        // no atomic "kill and confirm", and a partially applied kill must
+        // never be reported as protection. Only the count is reported, for
+        // the same no-log reason as above.
+        let survivors = pf
+            .get_states()
+            .map_err(|e| KillswitchError::Pf(format!("re-read states after purge: {e}")))?
+            .iter()
+            .filter(|state| classify_state(state) != Some(false))
+            .count();
+
+        if survivors > 0 {
+            return Err(KillswitchError::Pf(format!(
+                "{survivors} bypass state(s) survived the purge after the \
+                 killswitch rules were loaded. Off-tunnel traffic would keep \
+                 flowing through them past the block."
+            )));
+        }
+
+        Ok(killed)
     }
 }
 
 fn apply_rules(ops: &dyn PfOps, rules: &[FilterRule]) -> Result<(), KillswitchError> {
     ops.enable()?;
     ops.add_anchor()?;
-    if let Err(e) = ops.flush_rules() {
-        tracing::debug!(error = %e, "flush existing rules (may be empty)");
-    }
+    // Fatal on purpose. The anchor can hold a ruleset from a previous run
+    // (an earlier install that crashed before teardown), and pfctl-rs
+    // appends with `PF_CHANGE_ADD_TAIL`: loading on top of an unknown
+    // previous ruleset yields a policy that is not the one we intended,
+    // where a stale `pass` rule can re-open egress off-tunnel, while the
+    // caller still reports a successful install. Loading NO rule is the
+    // fail-closed outcome until the anchor is confirmed empty.
+    ops.flush_rules()?;
     for rule in rules {
         if let Err(e) = ops.add_rule(rule) {
             // Partial install: the block-all rule is loaded FIRST, so
@@ -276,11 +413,22 @@ pub struct MacosKillswitch {
 }
 
 impl MacosKillswitch {
-    /// Loads the killswitch rules via pfctl-rs. Idempotent.
+    /// Loads the killswitch rules via pfctl-rs and purges the connection
+    /// states that could bypass them. Idempotent.
+    ///
+    /// The install is complete only when the state purge has confirmed that
+    /// no bypassable state survives: pf consults the state table before it
+    /// re-evaluates the ruleset, so a pre-existing connection would
+    /// otherwise keep carrying off-tunnel traffic past the new block. When
+    /// the purge fails or cannot be confirmed, no guard is constructed and
+    /// the anchor rules plus pf's original enable state are rolled back
+    /// best-effort before the error is returned.
     ///
     /// # Errors
     ///
-    /// [`KillswitchError::InvalidInput`] or [`KillswitchError::Pf`].
+    /// [`KillswitchError::InvalidInput`] or [`KillswitchError::Pf`]. The
+    /// `Pf` cases include a failed pre-load anchor flush and an
+    /// unverifiable state purge.
     pub async fn install(opts: &KillswitchOpts) -> Result<Self, KillswitchError> {
         Self::install_with_ops(opts, std::sync::Arc::new(RealPfOps)).await
     }
@@ -307,23 +455,62 @@ impl MacosKillswitch {
         tokio::task::spawn_blocking(move || apply_rules(apply_ops.as_ref(), &rules))
             .await
             .map_err(|e| KillswitchError::Pf(format!("spawn_blocking: {e}")))??;
-        // Flush pre-existing states so connections opened before the
+        // Purge pre-existing states so connections opened before the
         // killswitch cannot keep leaking through established state
-        // entries.
+        // entries: pf consults that table before it re-evaluates the anchor
+        // rules we just loaded. The call verifies the table afterwards and
+        // fails when a bypass state survives, so its error is FATAL here:
+        // returning a guard would announce a protection that is not
+        // actually in place.
         let states_ops = ops.clone();
-        if let Err(e) = tokio::task::spawn_blocking(move || states_ops.clear_states())
+        let purge = tokio::task::spawn_blocking(move || states_ops.purge_bypass_states())
             .await
-            .map_err(|e| KillswitchError::Pf(format!("spawn_blocking states: {e}")))
-            .and_then(|inner| inner)
-        {
-            tracing::warn!(error = %e, "failed to flush pf states after killswitch install");
-        }
+            .map_err(|e| KillswitchError::Pf(format!("spawn_blocking states: {e}")));
+        let killed_states = match purge.and_then(|inner| inner) {
+            Ok(killed) => killed,
+            Err(e) => {
+                // Best-effort rollback before surfacing the error: the rules
+                // are already loaded, so dropping both the anchor rules and
+                // the enable state we may have turned on is what keeps the
+                // host in its pre-install condition. Mirrors `uninstall`.
+                let rollback_ops = ops.clone();
+                if let Err(fe) = tokio::task::spawn_blocking(move || rollback_ops.flush_rules())
+                    .await
+                    .map_err(|je| KillswitchError::Pf(format!("spawn_blocking flush: {je}")))
+                    .and_then(|inner| inner)
+                {
+                    tracing::error!(
+                        error = %fe,
+                        "pf rollback flush failed after a state purge that \
+                         could not be verified - the anchor may keep blocking. \
+                         Run `sudo pfctl -a {PF_ANCHOR_PATH} -F rules` manually \
+                         to recover internet"
+                    );
+                }
+                let enabled_ops = ops.clone();
+                if !pf_was_enabled
+                    && let Err(de) = tokio::task::spawn_blocking(move || enabled_ops.disable())
+                        .await
+                        .map_err(|je| KillswitchError::Pf(format!("spawn_blocking disable: {je}")))
+                        .and_then(|inner| inner)
+                {
+                    tracing::error!(
+                        error = %de,
+                        "could not restore pf's original disabled state after \
+                         the failed install - run `sudo pfctl -d` manually if \
+                         this host had pf off before Warren ran"
+                    );
+                }
+                return Err(e);
+            }
+        };
         tracing::info!(
             tun = %opts.tun_name,
             exit_count = opts.exit_addrs.len(),
             allow_lan = opts.allow_lan,
             allow_dhcp = opts.allow_dhcp,
             pf_was_enabled,
+            killed_states,
             "Warren killswitch installed (macOS pf via pfctl-rs)"
         );
         Ok(Self {
@@ -602,10 +789,20 @@ mod tests {
     struct MockPf {
         ops: std::sync::Mutex<Vec<String>>,
         rules_added: AtomicUsize,
+        flushes: AtomicUsize,
         /// When `Some(n)`, the n-th `add_rule` call (0-based) fails.
         fail_on_add_rule_index: Option<usize>,
+        /// When `Some(n)`, the n-th `flush_rules` call (0-based) fails.
+        fail_on_flush_index: Option<usize>,
+        /// When `true`, `purge_bypass_states` fails. This models the
+        /// production verification step reporting surviving bypass
+        /// states, which must be fatal to the install.
+        fail_purge: bool,
         /// What `is_enabled` reports - the host's pf state before install.
         initially_enabled: bool,
+        /// What `is_enabled` reports after `enable` / `disable` ran, so
+        /// the restore path is observable the way it is on a real host.
+        currently_enabled: std::sync::atomic::AtomicBool,
     }
 
     impl MockPf {
@@ -624,6 +821,23 @@ mod tests {
             }
         }
 
+        /// A mock whose `purge_bypass_states` fails, standing in for a
+        /// real purge that reports bypass states still in the table.
+        fn failing_purge() -> Self {
+            Self {
+                fail_purge: true,
+                ..Self::default()
+            }
+        }
+
+        /// A mock whose n-th `flush_rules` call fails.
+        fn failing_flush(index: usize) -> Self {
+            Self {
+                fail_on_flush_index: Some(index),
+                ..Self::default()
+            }
+        }
+
         fn recorded(&self) -> Vec<String> {
             self.ops.lock().expect("mock mutex").clone()
         }
@@ -636,14 +850,19 @@ mod tests {
     impl PfOps for MockPf {
         fn enable(&self) -> Result<(), KillswitchError> {
             self.record("enable");
+            self.currently_enabled.store(true, Ordering::SeqCst);
             Ok(())
         }
         fn is_enabled(&self) -> Result<bool, KillswitchError> {
             self.record("is_enabled");
+            if self.currently_enabled.load(Ordering::SeqCst) {
+                return Ok(true);
+            }
             Ok(self.initially_enabled)
         }
         fn disable(&self) -> Result<(), KillswitchError> {
             self.record("disable");
+            self.currently_enabled.store(false, Ordering::SeqCst);
             Ok(())
         }
         fn add_anchor(&self) -> Result<(), KillswitchError> {
@@ -651,7 +870,11 @@ mod tests {
             Ok(())
         }
         fn flush_rules(&self) -> Result<(), KillswitchError> {
+            let index = self.flushes.fetch_add(1, Ordering::SeqCst);
             self.record("flush_rules");
+            if self.fail_on_flush_index == Some(index) {
+                return Err(KillswitchError::Pf("mock flush_rules failure".into()));
+            }
             Ok(())
         }
         fn add_rule(&self, _rule: &FilterRule) -> Result<(), KillswitchError> {
@@ -662,9 +885,14 @@ mod tests {
             }
             Ok(())
         }
-        fn clear_states(&self) -> Result<(), KillswitchError> {
-            self.record("clear_states");
-            Ok(())
+        fn purge_bypass_states(&self) -> Result<u32, KillswitchError> {
+            self.record("purge_bypass_states");
+            if self.fail_purge {
+                return Err(KillswitchError::Pf(
+                    "mock purge: bypass states survived".into(),
+                ));
+            }
+            Ok(3)
         }
     }
 
@@ -811,8 +1039,8 @@ mod tests {
              anchor before surfacing the error; ops: {ops:?}"
         );
         assert!(
-            !ops.contains(&"clear_states".to_owned()),
-            "no state flush after a failed install; ops: {ops:?}"
+            !ops.contains(&"purge_bypass_states".to_owned()),
+            "no state purge after a failed install; ops: {ops:?}"
         );
     }
 
@@ -830,6 +1058,159 @@ mod tests {
             2,
             "install-time flush + uninstall flush only: Drop after an \
              explicit uninstall must be a no-op; ops: {ops:?}"
+        );
+    }
+
+    // ---- pre-existing connection-state purge -------------------------
+    //
+    // pf consults its state table BEFORE re-evaluating the ruleset, so a
+    // connection opened before the install keeps flowing past the new
+    // anchor block until its state entry is gone. The purge must
+    // therefore run after the rules are loaded and must be fatal when it
+    // cannot confirm the table is clean: an install that reports success
+    // while a bypass state survives is a confidentiality bug.
+
+    #[test]
+    fn loopback_only_states_are_preserved_but_every_other_state_is_a_bypass() {
+        let lo_a: SocketAddr = (Ipv4Addr::LOCALHOST, 1234).into();
+        let lo_b: SocketAddr = (Ipv4Addr::LOCALHOST, 8080).into();
+        let lo_v6: SocketAddr = (Ipv6Addr::LOCALHOST, 53).into();
+        let phys: SocketAddr = (Ipv4Addr::new(192, 0, 2, 10), 443).into();
+        let phys_v6: SocketAddr = (Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 443).into();
+
+        assert!(
+            !state_can_bypass(lo_a, lo_b),
+            "loopback to loopback is local IPC: it never egresses a real \
+             interface, so killing it buys no confidentiality and breaks \
+             same-host services"
+        );
+        assert!(
+            !state_can_bypass(lo_v6, lo_a),
+            "an IPv6 loopback endpoint is still loopback: the exclusion must \
+             cover both address families"
+        );
+        assert!(
+            state_can_bypass(lo_a, phys),
+            "loopback to a physical peer leaves the host: a bypass candidate"
+        );
+        assert!(
+            state_can_bypass(phys, lo_b),
+            "a physical local endpoint means the state belongs to a real \
+             connection, whichever side is loopback"
+        );
+        assert!(
+            state_can_bypass(phys, phys_v6),
+            "physical to physical is an off-tunnel flow, in either family: \
+             kill it"
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_runs_after_the_rules_are_loaded_and_before_the_guard() {
+        let pf = Arc::new(MockPf::default());
+        let guard = MacosKillswitch::install_with_ops(&opts_minimal(), pf.clone())
+            .await
+            .expect("install");
+        let ops = pf.recorded();
+        // The guard exists only after the purge confirmed the table is
+        // clean: `recorded()` already includes the uninstall flush below,
+        // so read the install prefix first.
+        let purge_pos = ops
+            .iter()
+            .position(|o| o == "purge_bypass_states")
+            .expect("the install must purge pre-existing states");
+        let last_add = ops
+            .iter()
+            .rposition(|o| o == "add_rule")
+            .expect("the install must load rules");
+        assert!(
+            last_add < purge_pos,
+            "the purge must run AFTER the anchor rules are loaded, else a \
+             connection can be re-created by the old pass-all ruleset \
+             between the purge and the load; ops: {ops:?}"
+        );
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn install_fails_and_rolls_back_when_the_purge_fails() {
+        // Models the production verification step reporting bypass states
+        // still present: the install must not claim protection it has not
+        // confirmed.
+        let pf = Arc::new(MockPf::failing_purge());
+        let err = MacosKillswitch::install_with_ops(&opts_minimal(), pf.clone())
+            .await
+            .expect_err("a failed purge must fail the install, not warn");
+        assert!(matches!(err, KillswitchError::Pf(_)), "got {err:?}");
+
+        let ops = pf.recorded();
+        let purge_pos = ops
+            .iter()
+            .position(|o| o == "purge_bypass_states")
+            .expect("purge attempted");
+        assert!(
+            ops[purge_pos..].iter().any(|o| o == "flush_rules"),
+            "the rollback must flush the anchor after a failed purge, else \
+             the host is left firewalled with no guard to restore it; ops: \
+             {ops:?}"
+        );
+        assert!(
+            ops.contains(&"disable".to_owned()),
+            "the rollback must restore pf's original enable state exactly as \
+             uninstall does (this host had pf off before install); ops: {ops:?}"
+        );
+        assert!(
+            !ops[purge_pos..].iter().any(|o| o == "add_rule"),
+            "no rule may be loaded after the purge failed; ops: {ops:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_failure_on_an_already_enabled_host_leaves_pf_enabled() {
+        // The rollback restores the SNAPSHOT, not "off": a host that had
+        // pf on before install must still have it on afterwards.
+        let pf = Arc::new(MockPf {
+            fail_purge: true,
+            initially_enabled: true,
+            ..MockPf::default()
+        });
+        let err = MacosKillswitch::install_with_ops(&opts_minimal(), pf.clone())
+            .await
+            .expect_err("purge failure must surface");
+        assert!(matches!(err, KillswitchError::Pf(_)), "got {err:?}");
+        let ops = pf.recorded();
+        assert!(
+            !ops.contains(&"disable".to_owned()),
+            "pf was on before install: the rollback must not turn it off; \
+             ops: {ops:?}"
+        );
+        assert!(
+            pf.is_enabled().expect("mock is_enabled"),
+            "pf must still be enabled after the rollback"
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_failure_before_loading_rules_is_fatal() {
+        // The pre-load flush is the only thing that clears an unknown
+        // previous ruleset from the anchor. Swallowing its failure would
+        // append the new rules to that stale set (a stale pass rule can
+        // re-open egress) while still reporting a successful install.
+        let pf = Arc::new(MockPf::failing_flush(0));
+        let err = MacosKillswitch::install_with_ops(&opts_minimal(), pf.clone())
+            .await
+            .expect_err("a pre-load flush failure must abort the install");
+        assert!(matches!(err, KillswitchError::Pf(_)), "got {err:?}");
+
+        let ops = pf.recorded();
+        assert!(
+            !ops.contains(&"add_rule".to_owned()),
+            "no rule may be appended to an anchor whose stale ruleset could \
+             not be cleared; ops: {ops:?}"
+        );
+        assert!(
+            !ops.contains(&"purge_bypass_states".to_owned()),
+            "the install must stop before the state purge; ops: {ops:?}"
         );
     }
 }
