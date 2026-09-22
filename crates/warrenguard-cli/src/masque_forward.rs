@@ -15,6 +15,9 @@ use quinn::Endpoint;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::Mutex;
 use warrenguard_masque::client::{MasqueClient, UdpSender};
+use zeroize::Zeroizing;
+
+use crate::secret::Secret;
 
 /// One `local=host:port` mapping.
 #[derive(Debug, Clone)]
@@ -50,17 +53,19 @@ impl std::str::FromStr for Mapping {
 
 /// The `proxy-authorization` value for a browser-proxy credential: the token
 /// rides as the Basic password under the fixed username.
-fn basic_credential(password: &str) -> String {
-    format!(
+///
+/// Both the `user:password` buffer and the header value carry the token in
+/// clear, so both are zeroized on drop. The header value is the one copy that
+/// has to reach the wire.
+fn basic_credential(password: &str) -> Zeroizing<String> {
+    let userinfo = Zeroizing::new(format!(
+        "{}:{password}",
+        warrenguard_connect_proxy::CREDENTIAL_USERNAME
+    ));
+    Zeroizing::new(format!(
         "Basic {}",
-        data_encoding::BASE64.encode(
-            format!(
-                "{}:{password}",
-                warrenguard_connect_proxy::CREDENTIAL_USERNAME
-            )
-            .as_bytes()
-        )
-    )
+        data_encoding::BASE64.encode(userinfo.as_bytes())
+    ))
 }
 
 /// Runs the forwarder until interrupted. `proxy_addr` dials that address
@@ -69,7 +74,7 @@ fn basic_credential(password: &str) -> String {
 pub(crate) async fn run(
     proxy: String,
     proxy_addr: Option<SocketAddr>,
-    credential: String,
+    credential: Secret,
     tcp: Vec<Mapping>,
     udp: Vec<Mapping>,
     ca: Option<PathBuf>,
@@ -137,7 +142,7 @@ pub(crate) async fn run(
         .get()
         .await
         .context("first connection to the proxy")?;
-    let credential = Arc::new(basic_credential(&credential));
+    let credential = Arc::new(basic_credential(credential.expose()));
     eprintln!("connected to {proxy} over HTTP/3");
 
     let mut tasks = tokio::task::JoinSet::new();
@@ -159,7 +164,7 @@ pub(crate) async fn run(
                         Ok(proxy) => proxy,
                         Err(e) => return eprintln!("proxy unreachable: {e}"),
                     };
-                    match proxy.connect_tcp(&target, Some(&credential)).await {
+                    match proxy.connect_tcp(&target, Some(credential.as_str())).await {
                         Ok(tunnel) => tunnel.pump(socket).await,
                         Err(e) => eprintln!("tcp tunnel refused: {e}"),
                     }
@@ -223,7 +228,7 @@ impl Proxy {
 async fn forward_udp(
     socket: Arc<UdpSocket>,
     client: Arc<Proxy>,
-    credential: Arc<String>,
+    credential: Arc<Zeroizing<String>>,
     mapping: Mapping,
 ) {
     let tunnels: Arc<Mutex<HashMap<SocketAddr, UdpSender>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -241,7 +246,7 @@ async fn forward_udp(
                     }
                 };
                 let tunnel = match proxy
-                    .connect_udp(&mapping.host, mapping.port, Some(&credential))
+                    .connect_udp(&mapping.host, mapping.port, Some(credential.as_str()))
                     .await
                 {
                     Ok(t) => t,
@@ -292,4 +297,40 @@ fn rustls_pemfile_certs(
         bail!("--ca holds no certificate");
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn basic_credential_is_the_browser_proxy_basic_header() {
+        // The ingress authenticates the browser-proxy form: the fixed username,
+        // the token as the password, base64 of `user:password`.
+        let header = basic_credential("dGhlLXRva2Vu");
+        let encoded = header
+            .as_str()
+            .strip_prefix("Basic ")
+            .expect("the Basic scheme prefix");
+        let decoded = data_encoding::BASE64
+            .decode(encoded.as_bytes())
+            .expect("base64 payload");
+        assert_eq!(
+            String::from_utf8(decoded).expect("utf8"),
+            format!(
+                "{}:dGhlLXRva2Vu",
+                warrenguard_connect_proxy::CREDENTIAL_USERNAME
+            )
+        );
+    }
+
+    #[test]
+    fn the_header_value_is_fed_by_the_token_argument() {
+        // Anti-tautology: if the encoder ever stopped reading its argument the
+        // first test would still pass, so pin that two tokens differ.
+        assert_ne!(
+            basic_credential("dG9rZW4tYQ").as_str(),
+            basic_credential("dG9rZW4tYg").as_str()
+        );
+    }
 }

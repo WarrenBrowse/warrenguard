@@ -59,11 +59,18 @@ the full test suite.
 no backend in the path:
 
 ```sh
-warrenguard keygen                         # node key (seed + ed25519 pubkey)
-warrenguard serve --listen 0.0.0.0:443     # open exit (AllowAll)
-warrenguard serve --peer ed25519:<b64> ... # closed static roster
-warrenguard connect --server-key ed25519:<b64> --server-addr host:443
+warrenguard keygen                          # node key (seed + ed25519 pubkey)
+warrenguard serve --seed-file /path/exit.seed \
+      --multihop-exit-id <32-hex>           # exit, loopback bind, open admission
+warrenguard masque-forward --proxy host:443 \
+      --credential-file /path/token         # forward local TCP/UDP over HTTP/3
 ```
+
+`serve` admits every peer that completes the handshake: this CLI carries no
+allowlist and no token admission. It therefore binds loopback by default, and a
+reachable `--listen` requires the explicit `--allow-open-exit`. Both secrets are
+taken from a protected file: a value in the process arguments is readable by
+every local account through `ps`.
 
 The CLI covers the handshake and the tunnel session: it is enough to stand up an
 exit and to prove a client can reach it. It deliberately stops there, and does

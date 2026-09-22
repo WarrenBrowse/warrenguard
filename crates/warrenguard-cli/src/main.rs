@@ -13,8 +13,22 @@
 //!
 //! The identity layer is pulled with `default-features = false` (no BIP39): keys
 //! are raw seeds, so a deployer can source them from a file / KMS / `keygen`.
+//!
+//! ## Two things this CLI refuses to do by accident
+//!
+//! `serve` admits every peer that completes the handshake: this CLI carries no
+//! allowlist and no token admission, so a reachable exit is an exit anybody can
+//! use. It therefore binds loopback by default, and a bind on any other address
+//! requires the explicit [`ALLOW_OPEN_EXIT_FLAG`]. Deployers put their own
+//! admission in front of the engine.
+//!
+//! A durable identity or an admission token passed in the process arguments is
+//! readable by every local account through `ps`, so both are also accepted from
+//! a protected file (`--seed-file`, `--credential-file`); see [`mod@secret`] and
+//! the migration note in `README.md`.
 
 mod masque_forward;
+mod secret;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -34,7 +48,7 @@ use warrenguard_multihop_server::multihop::{
 };
 use warrenguard_transport::RealTun;
 use warrenguard_transport_core::warren_transport_config_exit_multihop_with_gso;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 /// Default multi-hop client subnet: every accepted 1-hop connection draws one
 /// host from here. A deployer overrides it with `--multihop-subnet`.
@@ -42,6 +56,24 @@ const DEFAULT_MULTIHOP_SUBNET: &str = "10.66.0.0/24";
 /// Default multi-hop gateway (the exit-side TUN address), inside
 /// [`DEFAULT_MULTIHOP_SUBNET`].
 const DEFAULT_MULTIHOP_GATEWAY: &str = "10.66.0.1";
+/// Default `serve` bind address: loopback.
+///
+/// This CLI admits every handshaking peer, so the default must not be reachable
+/// from off the host. A deployer who wants a reachable exit says so explicitly
+/// (see [`ALLOW_OPEN_EXIT_FLAG`]).
+const DEFAULT_SERVE_LISTEN: &str = "127.0.0.1:443";
+/// The flag an operator must pass before `serve` binds a non-loopback address.
+/// Named in the refusal message so the fix is visible at the point of failure.
+const ALLOW_OPEN_EXIT_FLAG: &str = "--allow-open-exit";
+/// Legacy in-argv identity input. Kept working so existing self-host scripts do
+/// not break, but every use warns: the value is world-readable via `ps`.
+const LEGACY_SEED_FLAG: &str = "--seed";
+/// Legacy in-argv token input, same reasoning as [`LEGACY_SEED_FLAG`].
+const LEGACY_CREDENTIAL_FLAG: &str = "--credential";
+/// Protected-file identity input: the replacement for [`LEGACY_SEED_FLAG`].
+const SEED_FILE_FLAG: &str = "--seed-file";
+/// Protected-file token input: the replacement for [`LEGACY_CREDENTIAL_FLAG`].
+const CREDENTIAL_FILE_FLAG: &str = "--credential-file";
 
 #[derive(Debug, Parser)]
 #[command(name = "warrenguard", about = "Generic WarrenGuard VPN-over-QUIC tool")]
@@ -60,14 +92,32 @@ enum Command {
     /// tunnel IP per connection. Requires `--seed` (the stable identity the
     /// multi-hop pubkey is bound to) and `--multihop-exit-id`.
     Serve {
-        /// Address to bind the QUIC server on.
-        #[arg(long, default_value = "0.0.0.0:443")]
+        /// Address to bind the QUIC server on. Defaults to loopback because
+        /// this CLI admits every handshaking peer: a reachable bind is an
+        /// explicit decision, taken with `--allow-open-exit`.
+        #[arg(long, default_value = DEFAULT_SERVE_LISTEN)]
         listen: SocketAddr,
+        /// Serve an open exit on a non-loopback `--listen` address. Without
+        /// this flag such a bind is refused. The flag grants network exposure,
+        /// not admission control: `serve` still admits every peer that
+        /// completes the handshake.
+        #[arg(long)]
+        allow_open_exit: bool,
         /// 32-byte node seed as hex (64 chars). Required: the multi-hop pubkey
         /// is derived from this stable Ed25519 identity, so an ephemeral one
         /// would rotate the published pubkey on every restart.
-        #[arg(long)]
-        seed: Option<String>,
+        ///
+        /// Insecure legacy form: an argument value is readable by every local
+        /// account through `ps`. Prefer `--seed-file`.
+        #[arg(long, value_name = "HEX")]
+        seed: Option<secret::Secret>,
+        /// Read the node seed from a file: the 64 hex characters `keygen`
+        /// prints, with surrounding whitespace ignored. The file must not be
+        /// readable or writable by group or others (`chmod 600`). A `/dev/fd/N`
+        /// path works too, for a descriptor inherited from a supervisor that
+        /// never writes the seed to disk.
+        #[arg(long, value_name = "FILE", conflicts_with = "seed")]
+        seed_file: Option<PathBuf>,
         /// 16-byte exit identifier as 32 hex chars. Bound into every sealed
         /// frame so a client's packets target this exit.
         #[arg(long = "multihop-exit-id", value_name = "32-hex")]
@@ -98,8 +148,16 @@ enum Command {
         proxy_addr: Option<SocketAddr>,
         /// The credential presented as the Basic password (the browser-proxy
         /// token, base64url).
+        ///
+        /// Insecure legacy form: an argument value is readable by every local
+        /// account through `ps`. Prefer `--credential-file`.
         #[arg(long, value_name = "TOKEN")]
-        credential: String,
+        credential: Option<secret::Secret>,
+        /// Read the proxy credential from a file instead of the arguments.
+        /// Same permission rule as `serve --seed-file` (`chmod 600`); the
+        /// trailing newline of a one-line file is ignored.
+        #[arg(long, value_name = "FILE", conflicts_with = "credential")]
+        credential_file: Option<PathBuf>,
         /// A TCP mapping `local:port=host:port`; repeatable.
         #[arg(long = "tcp", value_name = "LOCAL=TARGET")]
         tcp: Vec<masque_forward::Mapping>,
@@ -119,13 +177,71 @@ fn format_pubkey(pk: &[u8; 32]) -> String {
 }
 
 fn parse_seed(hex_seed: &str) -> Result<Zeroizing<[u8; 32]>> {
-    let mut raw = hex::decode(hex_seed.trim()).context("seed must be hex")?;
+    // The decode error names the offending character and its position, which
+    // would copy a byte of a malformed seed into a log line; it is rewritten
+    // generically for the same reason the decode buffer is scrubbed below.
+    let raw = Zeroizing::new(
+        hex::decode(hex_seed.trim())
+            .map_err(|_| anyhow::anyhow!("seed must be 64 hex characters (0-9a-f)"))?,
+    );
     let seed: [u8; 32] = raw
         .as_slice()
         .try_into()
         .map_err(|_| anyhow::anyhow!("seed must be exactly 32 bytes (64 hex chars)"))?;
-    raw.zeroize();
     Ok(Zeroizing::new(seed))
+}
+
+/// Refuses to serve an open exit on a reachable address unless the operator
+/// asked for it by name.
+///
+/// `serve` admits every peer that completes the handshake: it has no allowlist
+/// and no token admission, so the bind address is the only thing between a
+/// self-hoster's test exit and a relay anybody on the network can dial. Loopback
+/// stays permitted without the flag because it is unreachable from off the host.
+///
+/// # Errors
+///
+/// Any non-loopback address without `allow_open_exit`.
+fn ensure_listen_is_deliberate(listen: SocketAddr, allow_open_exit: bool) -> Result<()> {
+    if allow_open_exit || listen.ip().is_loopback() {
+        return Ok(());
+    }
+    bail!(
+        "refusing to serve an open exit on {listen}: it admits every peer that completes \
+         the handshake, so a reachable bind must be explicit. Pass {ALLOW_OPEN_EXIT_FLAG} \
+         to accept that exposure, or keep the loopback default ({DEFAULT_SERVE_LISTEN})."
+    )
+}
+
+/// Resolves a secret given either in the process arguments (legacy) or in a
+/// protected file.
+///
+/// Exactly one source may be given; `None` means neither was, which the caller
+/// turns into its own "required" error. The argv form keeps working, because
+/// removing a flag from a deployed command line is a migration, not a fix; it
+/// warns on every use instead.
+///
+/// # Errors
+///
+/// Both sources given, or the file fails [`secret::read_secret_file`]'s checks.
+fn resolve_secret_input(
+    from_argv: Option<secret::Secret>,
+    from_file: Option<&PathBuf>,
+    legacy_flag: &str,
+    file_flag: &str,
+) -> Result<Option<secret::Secret>> {
+    match (from_argv, from_file) {
+        (Some(value), None) => {
+            eprintln!(
+                "warning: {legacy_flag} exposes the secret to every local account through \
+                 `ps`; prefer {file_flag} with a `chmod 600` file"
+            );
+            Ok(Some(value))
+        }
+        (None, Some(path)) => secret::read_secret_file(path).map(Some),
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => bail!("give either {legacy_flag} or {file_flag}, not both"),
+    }
 }
 
 /// Parse a `--multihop-exit-id` (32 hex chars = 16 bytes) into an [`ExitId`].
@@ -168,19 +284,25 @@ fn build_multihop_ip_allocator(
 /// Resolve the 32-byte X25519 multi-hop IKM: read it from `ikm_file` when
 /// given (independent rotation), otherwise derive it deterministically from
 /// the exit's Ed25519 identity so the published pubkey is bound to it.
-fn resolve_multihop_ikm(ikm_file: Option<&str>, signing_key: &SigningKey) -> Result<[u8; 32]> {
+///
+/// The file holds secret material, so it goes through the same permission check
+/// as the seed file and the bytes are zeroized on drop.
+fn resolve_multihop_ikm(
+    ikm_file: Option<&str>,
+    signing_key: &SigningKey,
+) -> Result<Zeroizing<[u8; 32]>> {
     match ikm_file {
         Some(path) => {
-            let bytes = std::fs::read(path)
-                .with_context(|| format!("read --multihop-x25519-ikm {path}"))?;
-            bytes.try_into().map_err(|v: Vec<u8>| {
+            let bytes = secret::read_secret_bytes(std::path::Path::new(path))?;
+            let ikm: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
                 anyhow::anyhow!(
                     "--multihop-x25519-ikm file must be exactly 32 bytes, got {}",
-                    v.len()
+                    bytes.len()
                 )
-            })
+            })?;
+            Ok(Zeroizing::new(ikm))
         }
-        None => Ok(derive_x25519_ikm_from_ed25519(signing_key)),
+        None => Ok(Zeroizing::new(derive_x25519_ikm_from_ed25519(signing_key))),
     }
 }
 
@@ -223,13 +345,13 @@ async fn serve_multihop(
     listen: SocketAddr,
     signing_key: SigningKey,
     exit_id: ExitId,
-    x25519_ikm: [u8; 32],
+    x25519_ikm: Zeroizing<[u8; 32]>,
     network: Ipv4Addr,
     prefix_len: u8,
     gateway: Ipv4Addr,
 ) -> Result<()> {
     let (exit_priv, exit_pub) =
-        derive_x25519_keypair(&x25519_ikm).context("derive the X25519 multi-hop keypair")?;
+        derive_x25519_keypair(&x25519_ikm[..]).context("derive the X25519 multi-hop keypair")?;
     let x25519_pubkey_hex = format_x25519_pubkey_hex(&exit_pub);
     let rpk = signing_key.verifying_key().to_bytes();
 
@@ -289,30 +411,52 @@ async fn main() -> Result<()> {
             proxy,
             proxy_addr,
             credential,
+            credential_file,
             tcp,
             udp,
             ca,
         } => {
+            let credential = resolve_secret_input(
+                credential,
+                credential_file.as_ref(),
+                LEGACY_CREDENTIAL_FLAG,
+                CREDENTIAL_FILE_FLAG,
+            )?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "masque-forward requires {LEGACY_CREDENTIAL_FLAG} or {CREDENTIAL_FILE_FLAG}"
+                )
+            })?;
             masque_forward::run(proxy, proxy_addr, credential, tcp, udp, ca).await?;
         }
 
         Command::Serve {
             listen,
+            allow_open_exit,
             seed,
+            seed_file,
             multihop_exit_id,
             multihop_x25519_ikm,
             multihop_subnet,
             multihop_gateway,
         } => {
+            // Before any privileged work: this CLI has no admission control, so
+            // a reachable bind is a decision the operator has to make on
+            // purpose.
+            ensure_listen_is_deliberate(listen, allow_open_exit)?;
+
             // The multi-hop identity (QUIC RPK + the derived X25519 key) must be
             // stable, so a self-host serve requires a seed: an ephemeral
             // identity would rotate the published pubkey on every restart and
             // break every client pinning it.
+            let seed =
+                resolve_secret_input(seed, seed_file.as_ref(), LEGACY_SEED_FLAG, SEED_FILE_FLAG)?;
             let signing_key = match seed {
-                Some(s) => derive_node_key(&*parse_seed(&s)?),
+                Some(s) => derive_node_key(&*parse_seed(s.expose())?),
                 None => bail!(
-                    "serve requires --seed: the multi-hop pubkey is derived from a stable \
-                     Ed25519 identity, so an ephemeral one would break client pins"
+                    "serve requires {LEGACY_SEED_FLAG} or {SEED_FILE_FLAG}: the multi-hop \
+                     pubkey is derived from a stable Ed25519 identity, so an ephemeral one \
+                     would break client pins"
                 ),
             };
             let exit_id_hex = multihop_exit_id.ok_or_else(|| {
@@ -477,11 +621,11 @@ mod tests {
         let sk = derive_node_key(&[0x51u8; 32]);
         let ikm = resolve_multihop_ikm(None, &sk).expect("derive from identity");
         assert_eq!(
-            ikm,
+            *ikm,
             derive_x25519_ikm_from_ed25519(&sk),
             "the no-file path must reuse the identity-bound IKM"
         );
-        assert_ne!(ikm, [0u8; 32], "a real derivation is never all zero");
+        assert_ne!(*ikm, [0u8; 32], "a real derivation is never all zero");
     }
 
     #[test]
@@ -626,5 +770,227 @@ mod tests {
 
         serve.abort();
         drop(conn);
+    }
+
+    // ---- open-exit exposure ------------------------------------------
+    //
+    // `serve` admits every peer that completes the handshake: the bind address
+    // is the only thing between a test exit and a relay anybody can dial, so it
+    // is worth pinning the default and every refusal.
+
+    const TEST_EXIT_ID: &str = "aabbccddeeff00112233445566778899";
+    const TEST_SEED_HEX: &str = "399963691b81c92648bc094ce4f7369cd3962a41b431c45e0fcc1e4389cabf25";
+
+    #[test]
+    fn serve_defaults_to_a_loopback_bind() {
+        let cli = Cli::try_parse_from(["warrenguard", "serve", "--multihop-exit-id", TEST_EXIT_ID])
+            .expect("valid serve invocation");
+        match cli.cmd {
+            Command::Serve {
+                listen,
+                allow_open_exit,
+                ..
+            } => {
+                assert!(
+                    listen.ip().is_loopback(),
+                    "the default bind must not be reachable from off the host; got {listen}"
+                );
+                assert!(!allow_open_exit, "the exposure flag must be off by default");
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_accepts_an_explicit_open_exit() {
+        let cli = Cli::try_parse_from([
+            "warrenguard",
+            "serve",
+            "--listen",
+            "0.0.0.0:443",
+            "--allow-open-exit",
+            "--multihop-exit-id",
+            TEST_EXIT_ID,
+        ])
+        .expect("valid serve invocation");
+        match cli.cmd {
+            Command::Serve {
+                listen,
+                allow_open_exit,
+                ..
+            } => {
+                assert_eq!(listen, "0.0.0.0:443".parse().expect("addr"));
+                assert!(allow_open_exit);
+                ensure_listen_is_deliberate(listen, allow_open_exit)
+                    .expect("the explicit flag makes the exposure deliberate");
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loopback_needs_no_exposure_flag() {
+        for addr in ["127.0.0.1:443", "[::1]:443"] {
+            let listen: SocketAddr = addr.parse().expect("addr");
+            ensure_listen_is_deliberate(listen, false)
+                .unwrap_or_else(|e| panic!("loopback {addr} must pass without a flag: {e}"));
+        }
+    }
+
+    #[test]
+    fn every_reachable_bind_is_refused_without_the_exposure_flag() {
+        // 0.0.0.0 and [::] are the accidental-public cases (a wildcard bind),
+        // 203.0.113.7 is the deliberate-but-unflagged one, and 10.0.0.5 is the
+        // plausible mistake: an open exit offered to the whole LAN.
+        for addr in ["0.0.0.0:443", "[::]:443", "203.0.113.7:443", "10.0.0.5:443"] {
+            let listen: SocketAddr = addr.parse().expect("addr");
+            let err = ensure_listen_is_deliberate(listen, false)
+                .expect_err("a reachable bind must be refused without the flag");
+            let text = format!("{err:#}");
+            assert!(
+                text.contains(ALLOW_OPEN_EXIT_FLAG),
+                "the refusal must name the flag that lifts it: {text}"
+            );
+            assert!(
+                text.contains(addr),
+                "the refusal must name the address it refused: {text}"
+            );
+        }
+    }
+
+    // ---- secret input -------------------------------------------------
+
+    #[test]
+    fn a_seed_and_a_seed_file_are_mutually_exclusive() {
+        let err = Cli::try_parse_from([
+            "warrenguard",
+            "serve",
+            "--seed",
+            TEST_SEED_HEX,
+            "--seed-file",
+            "/tmp/seed",
+        ])
+        .expect_err("two seed sources must be refused");
+        let text = format!("{err}");
+        assert!(
+            text.contains("seed-file") || text.contains("seed"),
+            "unexpected clap error: {text}"
+        );
+    }
+
+    #[test]
+    fn a_credential_and_a_credential_file_are_mutually_exclusive() {
+        let err = Cli::try_parse_from([
+            "warrenguard",
+            "masque-forward",
+            "--proxy",
+            "proxy.example:443",
+            "--credential",
+            "tok",
+            "--credential-file",
+            "/tmp/tok",
+            "--tcp",
+            "127.0.0.1:8080=example.com:80",
+        ])
+        .expect_err("two credential sources must be refused");
+        assert!(
+            format!("{err}").contains("credential"),
+            "unexpected clap error: {err}"
+        );
+    }
+
+    #[test]
+    fn the_parsed_command_never_renders_a_seed_under_debug() {
+        // The argv form keeps working, so the parsed value stays in memory for
+        // the whole run: a `Debug` rendering of the CLI (a panic payload, a
+        // future log line) must not be the leak that undoes the file form.
+        let cli = Cli::try_parse_from([
+            "warrenguard",
+            "serve",
+            "--seed",
+            TEST_SEED_HEX,
+            "--multihop-exit-id",
+            TEST_EXIT_ID,
+        ])
+        .expect("valid serve invocation");
+        let rendered = format!("{cli:?}");
+        assert!(
+            !rendered.contains(TEST_SEED_HEX),
+            "the full seed must never reach a Debug rendering: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&TEST_SEED_HEX[..8]),
+            "not even a prefix of the seed may reach a Debug rendering: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_seed_file_supplies_the_identity_and_needs_no_argv_secret() {
+        let dir = crate::secret::tests::TempSecret::new("cli-seed-file");
+        let path = dir.write(&format!("{TEST_SEED_HEX}\n"), 0o600);
+        let secret = resolve_secret_input(None, Some(&path), LEGACY_SEED_FLAG, SEED_FILE_FLAG)
+            .expect("a protected seed file resolves")
+            .expect("the file source yields a secret");
+        assert_eq!(secret.expose(), TEST_SEED_HEX);
+        assert_eq!(
+            *parse_seed(secret.expose()).expect("the file content parses"),
+            *parse_seed(TEST_SEED_HEX).expect("the argv form parses"),
+            "both sources must feed the same identity"
+        );
+    }
+
+    #[test]
+    fn a_world_readable_seed_file_is_refused_by_the_secret_path() {
+        let dir = crate::secret::tests::TempSecret::new("cli-seed-file-mode");
+        let path = dir.write(TEST_SEED_HEX, 0o644);
+        let err = resolve_secret_input(None, Some(&path), LEGACY_SEED_FLAG, SEED_FILE_FLAG)
+            .expect_err("a world-readable identity file must be refused");
+        assert!(
+            format!("{err:#}").contains("chmod 600"),
+            "the refusal must say how to fix it: {err:#}"
+        );
+    }
+
+    #[test]
+    fn neither_source_reports_absence_instead_of_inventing_one() {
+        assert!(
+            resolve_secret_input(None, None, LEGACY_CREDENTIAL_FLAG, CREDENTIAL_FILE_FLAG)
+                .expect("absence is not an error at this layer")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn both_sources_are_refused_at_runtime_too() {
+        // clap already refuses the pair, but the resolver is the safety net for
+        // any future call site that builds the arguments directly.
+        let dir = crate::secret::tests::TempSecret::new("cli-both-sources");
+        let path = dir.write(TEST_SEED_HEX, 0o600);
+        let err = resolve_secret_input(
+            Some(secret::Secret::new(TEST_SEED_HEX.to_owned())),
+            Some(&path),
+            LEGACY_SEED_FLAG,
+            SEED_FILE_FLAG,
+        )
+        .expect_err("both sources must be refused");
+        assert!(format!("{err:#}").contains("not both"), "got {err:#}");
+    }
+
+    #[test]
+    fn a_malformed_seed_never_echoes_its_contents() {
+        // A seed file is the one place an operator pastes the wrong thing; the
+        // error must not copy it into a log line.
+        let bogus = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
+        let err = parse_seed(bogus).expect_err("non-hex must be refused");
+        assert!(
+            !format!("{err:#}").contains(bogus),
+            "the error must not carry the secret: {err:#}"
+        );
+        let short = "abcd";
+        let err = parse_seed(short).expect_err("a short seed must be refused");
+        assert!(
+            !format!("{err:#}").contains(short),
+            "the error must not carry the secret: {err:#}"
+        );
     }
 }
