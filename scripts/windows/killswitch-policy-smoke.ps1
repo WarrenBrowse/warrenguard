@@ -1,23 +1,27 @@
 # killswitch-policy-smoke.ps1 - prove, on a real Windows host, that the policy
-# the engine installs actually controls egress.
+# the engine installs actually controls egress, and that it keeps controlling it.
 #
-# Why this exists: the Windows killswitch rests on two documented Windows
-# Firewall behaviours, and neither can be observed from a unit test on a host
-# that is not Windows:
+# Why this exists: the Windows killswitch rests on documented Windows Firewall
+# behaviours, and none of them can be observed from a unit test on a host that is
+# not Windows:
 #
 #   1. an explicitly defined Allow rule outranks the profile DEFAULT block
 #      setting, so "DefaultOutboundAction = Block" alone does NOT stop an
 #      application that already has an Allow rule;
-#   2. disabling that rule is what actually blocks it, and an ordinary Allow rule
-#      (no IPsec, no -OverrideBlockRules) is what lets the tunnel, the daemon
-#      carrier and the optional LAN and DHCP flows out again.
+#   2. an explicit Block rule outranks every conflicting Allow rule, INCLUDING one
+#      created later, which is what keeps the policy binding for the whole
+#      session;
+#   3. an Allow rule carrying -OverrideBlockRules is permitted even where that
+#      Block rule matches, which is how the tunnel, the daemon carrier and the
+#      optional LAN and DHCP flows survive it.
 #
-# The engine deliberately does NOT use -OverrideBlockRules: Microsoft's
-# documentation of that parameter states the traffic "must be authenticated by
-# using a separate IPsec rule" and then carves out outbound rules on Windows 7
-# and later, and this repository has no Windows host to settle which reading
-# holds. This script is how a deployer settles it for their fleet, and it also
-# confirms the mechanism the engine does ship.
+# Step 3 is the one this repository cannot settle by itself. Microsoft documents
+# -OverrideBlockRules as an outbound "allow bypass rule" from Windows 7 on, and
+# the Windows Filtering Platform mechanism behind it is the hard permit, but the
+# same page states earlier that such traffic "must be authenticated by using a
+# separate IPsec rule". This script decides the question with real traffic, so run
+# it BEFORE shipping the Windows killswitch to a fleet, and re-run it after any
+# change to the rule set.
 #
 # Run this on a throwaway Windows host or VM, elevated. It changes the firewall
 # and restores everything in a finally block; do NOT run it on a machine whose
@@ -64,8 +68,14 @@ function Remove-SmokeRules {
         Remove-NetFirewallRule -ErrorAction SilentlyContinue
 }
 
+function Remove-SmokeRule {
+    param([string]$Name)
+    Get-NetFirewallRule -DisplayName $Name -ErrorAction SilentlyContinue |
+        Remove-NetFirewallRule -ErrorAction SilentlyContinue
+}
+
 function New-ProbeAllowRule {
-    param([string]$Name, [string]$Program)
+    param([string]$Name, [string]$Program, [switch]$Override)
     $arguments = @{
         DisplayName   = $Name
         Direction     = 'Outbound'
@@ -75,6 +85,7 @@ function New-ProbeAllowRule {
         RemotePort    = $ProbePort
     }
     if ($Program) { $arguments['Program'] = $Program }
+    if ($Override) { $arguments['OverrideBlockRules'] = $true }
     New-NetFirewallRule @arguments | Out-Null
 }
 
@@ -84,6 +95,13 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     Write-Error 'This smoke test needs an elevated PowerShell (Run as administrator).'
     exit 2
 }
+
+$self = (Get-Process -Id $PID).Path
+$preexisting = "${Prefix}preexisting-allow"
+$block = "${Prefix}block-outbound"
+$exception = "${Prefix}override-allow"
+$later = "${Prefix}later-allow"
+$readback = "${Prefix}readback-allow"
 
 # Snapshot the profile settings we are about to change, so the finally block
 # restores the host exactly as it was found.
@@ -97,47 +115,55 @@ foreach ($p in $Profiles) {
     }
 }
 
-$ruleName = "${Prefix}preexisting-allow"
 try {
     Remove-SmokeRules
 
     # A pre-existing explicit Allow rule, the shape a user's "Allow" answer to a
     # firewall prompt leaves behind. It exists BEFORE the killswitch policy.
-    New-ProbeAllowRule -Name $ruleName
+    New-ProbeAllowRule -Name $preexisting
     Assert-Result 'baseline egress works' (Test-Egress) `
         "TCP $ProbeAddress`:$ProbePort reaches the destination with an allow rule"
 
-    # Step 1: the profile default only. This is the defect: an explicit allow rule
+    # Step 1: the profile default only. The defect: an explicit allow rule
     # outranks the default block, so the application keeps its egress.
     Set-NetFirewallProfile -Profile ($Profiles -join ',') -DefaultOutboundAction Block
     Start-Sleep -Seconds 2
     Assert-Result 'the default block does not outrank a pre-existing allow rule' (Test-Egress) `
-        'reproduces the leak the explicit disable step exists to close'
+        'reproduces the leak the explicit block rule closes'
 
-    # Step 2: the mechanism the engine installs. With the operator's allow rule
-    # disabled, the default block applies to that traffic.
-    Disable-NetFirewallRule -Name (Get-NetFirewallRule -DisplayName $ruleName).Name
+    # Step 2: the persistent mechanism. An explicit Block rule outranks the
+    # conflicting allow rule.
+    New-NetFirewallRule -DisplayName $block -Direction Outbound -Action Block | Out-Null
     Start-Sleep -Seconds 2
-    Assert-Result 'disabling the allow rule stops the traffic' (-not (Test-Egress)) `
-        'the application can no longer egress the physical interface'
+    Assert-Result 'the explicit block rule stops the pre-existing allow rule' `
+        (-not (Test-Egress)) 'the application can no longer egress the physical interface'
 
-    # Step 3: the exception mechanism the engine relies on. An ordinary Allow rule
-    # (no -OverrideBlockRules, no IPsec) outranks the default block.
-    $self = (Get-Process -Id $PID).Path
-    New-ProbeAllowRule -Name "${Prefix}bypass-allow" -Program $self
+    # Step 3: the exception mechanism. An Allow rule carrying OverrideBlockRules is
+    # permitted even where the block rule matches; this is the step that decides
+    # whether the tunnel and the carrier can survive the block on this build.
+    New-ProbeAllowRule -Name $exception -Program $self -Override
     Start-Sleep -Seconds 2
-    Assert-Result 'a plain allow rule outranks the default block' (Test-Egress) `
-        "the exception scoped to $self reaches the destination without IPsec"
+    Assert-Result 'an OverrideBlockRules allow survives the block rule' (Test-Egress) `
+        "the exception scoped to $self reaches the destination"
 
-    # Step 4: the exact read-back surface the engine's verification depends on. A
+    # Step 4: persistence. With the exception removed, a rule created AFTER the
+    # install (no override) must NOT reopen the egress: this is the property the
+    # disable-at-install step alone cannot give.
+    Remove-SmokeRule -Name $exception
+    New-ProbeAllowRule -Name $later
+    Start-Sleep -Seconds 2
+    Assert-Result 'a rule created after the install cannot reopen the egress' `
+        (-not (Test-Egress)) 'the block rule outranks an allow rule added later'
+    Remove-SmokeRule -Name $later
+
+    # Step 5: the read-back surface the engine's verification depends on. A
     # property name or a filter cmdlet that behaves differently on this host makes
     # the engine refuse an install it cannot confirm, so it is worth confirming
     # here rather than discovering it in production.
     $adapter = (Get-NetAdapter -ErrorAction SilentlyContinue |
         Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1).Name
-    $scoped = "${Prefix}readback-allow"
     $arguments = @{
-        DisplayName   = $scoped
+        DisplayName   = $readback
         Direction     = 'Outbound'
         Action        = 'Allow'
         Protocol      = 'TCP'
@@ -146,13 +172,16 @@ try {
         Program       = $self
     }
     if ($adapter) { $arguments['InterfaceAlias'] = $adapter }
-    New-NetFirewallRule @arguments | Out-Null
+    New-NetFirewallRule @arguments -OverrideBlockRules $true | Out-Null
     Start-Sleep -Seconds 2
 
-    $rule = Get-NetFirewallRule -PolicyStore ActiveStore -DisplayName $scoped
+    $rule = Get-NetFirewallRule -PolicyStore ActiveStore -DisplayName $readback
+    $security = $rule | Get-NetFirewallSecurityFilter
     $app = $rule | Get-NetFirewallApplicationFilter
     $port = $rule | Get-NetFirewallPortFilter
     $addr = $rule | Get-NetFirewallAddressFilter
+    Assert-Result '-OverrideBlockRules reads back from the active policy' `
+        ($security.OverrideBlockRules -eq $true) "reported: $($security.OverrideBlockRules)"
     Assert-Result '-Program reads back from the active policy' ($app.Program -eq $self) `
         "reported: $($app.Program)"
     Assert-Result '-Protocol and -RemotePort read back' `
@@ -175,24 +204,23 @@ try {
         (($effective -match 'AllowLocalFirewallRules') -and ($effective -match 'DefaultOutboundAction')) `
         'the engine refuses an install whose effective policy it cannot read'
 
-    # Step 5: the categorical query. With the profiles blocking by default, any
-    # enabled outbound allow rule that is not the engine's is a way out, and the
-    # engine's verification refuses the install while one exists.
+    # Step 6: the categorical query. The engine also disables the operator's own
+    # allow rules, and refuses the install while one of them remains enabled.
     $foreign = @(Get-NetFirewallRule -PolicyStore ActiveStore -Direction Outbound `
         -Action Allow -Enabled True |
         Where-Object { $_.DisplayName -notlike 'warren-killswitch-*' })
     Assert-Result 'the foreign-allow query sees an enabled allow rule' `
-        ([bool]($foreign | Where-Object { $_.DisplayName -eq $scoped })) `
+        ([bool]($foreign | Where-Object { $_.DisplayName -eq $readback })) `
         "$($foreign.Count) enabled outbound allow rule(s) visible to the engine's check"
 
-    $scopedName = (Get-NetFirewallRule -PolicyStore ActiveStore -DisplayName $scoped).Name
-    Disable-NetFirewallRule -Name $scopedName
+    $readbackName = (Get-NetFirewallRule -PolicyStore ActiveStore -DisplayName $readback).Name
+    Disable-NetFirewallRule -Name $readbackName
     Start-Sleep -Seconds 2
     $foreign = @(Get-NetFirewallRule -PolicyStore ActiveStore -Direction Outbound `
         -Action Allow -Enabled True |
         Where-Object { $_.DisplayName -notlike 'warren-killswitch-*' })
     Assert-Result 'a disabled allow rule drops out of the query' `
-        (-not [bool]($foreign | Where-Object { $_.DisplayName -eq $scoped })) `
+        (-not [bool]($foreign | Where-Object { $_.DisplayName -eq $readback })) `
         'the engine establishes its policy only when no such rule remains'
 }
 finally {

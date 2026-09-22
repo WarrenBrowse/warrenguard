@@ -35,43 +35,55 @@
 //! 1. Remove every rule carrying [`RULE_PREFIX`], including the leftovers of a
 //!    session that ended without its teardown running.
 //! 2. Turn the firewall on for all three profiles.
-//! 3. Set `DefaultOutboundAction = Block` on all three. Nothing egresses unless
-//!    an allow rule matches, and our exceptions are ordinary allow rules, which
-//!    the documented precedence puts ahead of the default. No IPsec, no
-//!    override, no weight.
-//! 4. Disable every OTHER enabled outbound allow rule, recording each rule name
-//!    so the teardown re-enables exactly those. This is what closes the hole the
-//!    default alone leaves, and it leaves a categorical property behind: after
-//!    the install, the only enabled outbound allow rules are ours.
-//! 5. Create our exceptions: loopback, the tunnel interface, UDP to each exit
-//!    scoped to the daemon's own executable (`-Program`, the Port Fail /
-//!    TunnelCrack ServerIP closure), and the optional LAN and DHCP ranges.
+//! 3. Set `DefaultOutboundAction = Block` on all three.
+//! 4. Create ONE explicit outbound Block rule. Being an explicit block rule it
+//!    outranks every conflicting allow rule, which is what keeps the policy
+//!    binding for the whole session: an allow rule created later (a user
+//!    answering a firewall prompt, a software installer, a Group Policy refresh)
+//!    loses to it.
+//! 5. Create the exceptions as Allow rules carrying `-OverrideBlockRules True`,
+//!    the documented outbound "allow bypass rule", so that they outrank step 4's
+//!    block: loopback, the tunnel interface, UDP to each exit scoped to the
+//!    daemon's own executable (`-Program`, the Port Fail / TunnelCrack ServerIP
+//!    closure), and the optional LAN and DHCP ranges.
+//! 6. Disable every OTHER enabled outbound allow rule, recording each rule name
+//!    so the teardown re-enables exactly those. This is defence in depth, and it
+//!    is what makes the verified property categorical: after the install the only
+//!    enabled outbound allow rules are ours, so the policy holds even on a build
+//!    where the override in step 5 behaves unexpectedly.
 //!
-//! ## The install is only done once the effective policy reads back correct
+//! ## The one question a non-Windows host cannot settle
 //!
-//! [`check_effective_state`] refuses to call the install finished unless the
-//! active store (`-PolicyStore ActiveStore`, the resultant set, Group Policy
-//! included) reports: all three profiles enabled, all three blocking by
-//! default, local firewall rules not disabled by policy, every expected rule
-//! present, outbound, enabled, carrying the expected action AND conditions
-//! (program, protocol, remote address, remote port, interface), no rule of ours
-//! that we did not expect, and no enabled outbound allow rule outside our
-//! prefix. A failure restores the captured profile settings, re-enables the
-//! rules we disabled, removes our rules, and returns the error: a failed install
-//! never reports success and never leaves a half-applied policy behind.
+//! `-OverrideBlockRules` is documented as an outbound "allow bypass rule" from
+//! Windows 7 on: "matching traffic is permitted through this rule even if other
+//! matching rules would block the traffic". The Windows Filtering Platform
+//! mechanism behind it is the hard permit: "The traffic can be blocked at
+//! another sub-layer only by a callout Veto". The same page states earlier, about
+//! the general case, that such traffic "must be authenticated by using a
+//! separate IPsec rule". This engine has no IPsec story and no Windows host in
+//! CI, so the two readings are:
 //!
-//! ## Residual risk: an allow rule created after the install
+//! - if the outbound carve-out holds, the exceptions work and step 4 keeps the
+//!   policy binding against allow rules created later;
+//! - if it does not hold on some build, the exceptions lose to step 4's block
+//!   rule, so the tunnel and the carrier are blocked: a dead tunnel, visible
+//!   immediately. Step 6 still stops every OTHER application, so the failure mode
+//!   is an outage, never an exposure.
 //!
-//! The policy is complete at the moment it is verified. A rule created later (a
-//! user accepting a firewall prompt, a software installer, a Group Policy
-//! refresh) adds an allow rule this policy does not neutralise, and egress for
-//! that traffic resumes until the install runs again. The install is idempotent
-//! and re-asserts the whole policy, so a deployer that has just installed
-//! software or joined a managed network should re-run it. An explicit block rule
-//! would close that window, and is what a native WFP binding (our own sub-layer,
-//! hard-permit filters) buys; it is not shipped here because its exception path
-//! could not be validated on a Windows host, which is the trade the two readings
-//! above force.
+//! Shipping this policy therefore REQUIRES
+//! `scripts/windows/killswitch-policy-smoke.ps1` to pass on the fleet's Windows
+//! build: it decides the question with real traffic, and its persistence step
+//! confirms that a rule created after the install no longer opens the egress.
+//! Until that has run, the Windows policy is implemented and verified as far as a
+//! non-Windows host can take it, and this document says exactly that.
+//!
+//! ## Residual risks
+//!
+//! - The override reading above: a Windows host decides it, and the failure mode
+//!   is a dead tunnel rather than a leak.
+//! - A Group Policy that forces the firewall off, that disables local rules, or
+//!   that owns an enabled outbound allow rule this install cannot disable: each
+//!   one fails the install instead of announcing a protection that is not there.
 //!
 //! ## What the tests here cover, and what they cannot
 //!
@@ -114,6 +126,7 @@
 
 use std::fmt::Write as _;
 use std::net::IpAddr;
+use std::sync::Arc;
 #[cfg(any(target_os = "windows", test))]
 use std::time::Duration;
 
@@ -188,6 +201,9 @@ struct RuleSpec {
     /// Suffix after [`RULE_PREFIX`]; also the rule's identity on read-back.
     id: String,
     action: RuleAction,
+    /// Permit the traffic even where another rule blocks it. Mandatory on every
+    /// exception: the explicit block rule matches the same traffic.
+    override_block_rules: bool,
     iface: Option<String>,
     udp: bool,
     remote: Option<Remote>,
@@ -322,6 +338,13 @@ trait FirewallRunner: Send + Sync + std::fmt::Debug {
     /// [`KillswitchError::Windows`] when the command fails.
     async fn apply(&self, op: &FirewallOp) -> Result<(), KillswitchError>;
 
+    /// Best-effort SYNCHRONOUS teardown, for [`Drop`], which cannot await.
+    ///
+    /// Implementations must be bounded: a wedged PowerShell must not hang process
+    /// teardown. The asynchronous path is
+    /// [`uninstall_with_runner`](self), which reports errors.
+    fn sync_teardown(&self, snapshot: &FirewallSnapshot);
+
     /// Read the ACTIVE store back and fail unless every protection the install
     /// claims is actually in effect.
     ///
@@ -346,6 +369,9 @@ fn build_rules(opts: &KillswitchOpts, daemon_exe_path: &str) -> Vec<RuleSpec> {
                  program: Option<String>| RuleSpec {
         id,
         action: RuleAction::Allow,
+        // Every exception must outrank the block rule, so this is never optional
+        // for an Allow rule here.
+        override_block_rules: true,
         iface,
         udp,
         remote,
@@ -353,7 +379,21 @@ fn build_rules(opts: &KillswitchOpts, daemon_exe_path: &str) -> Vec<RuleSpec> {
         program,
     };
 
-    let mut rules = Vec::with_capacity(7 + opts.exit_addrs.len());
+    let mut rules = Vec::with_capacity(8 + opts.exit_addrs.len());
+
+    // The rule the policy rests on, and the reason it stays binding for the whole
+    // session: an explicit block, which Windows Firewall documents as taking
+    // precedence over any conflicting allow rule, including one created later.
+    rules.push(RuleSpec {
+        id: "block-outbound".into(),
+        action: RuleAction::Block,
+        override_block_rules: false,
+        iface: None,
+        udp: false,
+        remote: None,
+        remote_port: None,
+        program: None,
+    });
 
     // Loopback explicitly, rather than relying on an implicit exemption: the
     // other platform backends in this crate allow it, and a same-host service
@@ -539,6 +579,9 @@ fn render_create_rule(rule: &RuleSpec) -> String {
         rule.display_name(),
         rule.action.as_token()
     );
+    if rule.override_block_rules {
+        command.push_str(" -OverrideBlockRules True");
+    }
     if let Some(iface) = &rule.iface {
         let _ = write!(
             command,
@@ -618,13 +661,14 @@ fn query_foreign_allows_command() -> String {
 fn query_our_rules_command() -> String {
     format!(
         "Get-NetFirewallRule -PolicyStore ActiveStore -DisplayName '{RULE_PREFIX}*' | \
-         ForEach-Object {{ $a = $_ | Get-NetFirewallApplicationFilter; \
+         ForEach-Object {{ $s = $_ | Get-NetFirewallSecurityFilter; \
+         $a = $_ | Get-NetFirewallApplicationFilter; \
          $p = $_ | Get-NetFirewallPortFilter; $d = $_ | Get-NetFirewallAddressFilter; \
          $i = $_ | Get-NetFirewallInterfaceFilter; \
          'RULE|' + $_.DisplayName + '|' + $_.Direction + '|' + $_.Action + '|' + \
-         $_.Enabled + '|' + $a.Program + '|' + $p.Protocol + '|' + \
-         [string]$d.RemoteAddress + '|' + [string]$p.RemotePort + '|' + \
-         [string]$i.InterfaceAlias }}"
+         $_.Enabled + '|' + $s.OverrideBlockRules + '|' + $a.Program + '|' + \
+         $p.Protocol + '|' + [string]$d.RemoteAddress + '|' + [string]$p.RemotePort \
+         + '|' + [string]$i.InterfaceAlias }}"
     )
 }
 
@@ -694,6 +738,7 @@ struct RuleRow {
     direction: String,
     action: String,
     enabled: Option<GpoBool>,
+    override_block_rules: bool,
     program: Option<String>,
     protocol: Option<String>,
     remote_address: Option<String>,
@@ -733,7 +778,7 @@ fn parse_rule_rows(out: &str) -> Vec<RuleRow> {
             continue;
         };
         let fields: Vec<&str> = rest.split('|').collect();
-        if fields.len() != 9 {
+        if fields.len() != 10 {
             continue;
         }
         let value = |raw: &str| {
@@ -750,11 +795,12 @@ fn parse_rule_rows(out: &str) -> Vec<RuleRow> {
             direction: fields[1].to_owned(),
             action: fields[2].to_owned(),
             enabled: GpoBool::parse(fields[3]),
-            program: value(fields[4]),
-            protocol: value(fields[5]),
-            remote_address: value(fields[6]),
-            remote_port: value(fields[7]),
-            iface: value(fields[8]),
+            override_block_rules: GpoBool::parse(fields[4]) == Some(GpoBool::True),
+            program: value(fields[5]),
+            protocol: value(fields[6]),
+            remote_address: value(fields[7]),
+            remote_port: value(fields[8]),
+            iface: value(fields[9]),
         });
     }
     rows
@@ -856,6 +902,27 @@ fn check_effective_state(
                 row.action,
                 rule.action.as_token()
             )));
+        }
+        // The load-bearing check for an exception: without the override it loses
+        // to the block rule, so the traffic it is meant to permit (the tunnel, the
+        // carrier) stays blocked while a less careful install would report
+        // success. The block rule itself must NOT carry it.
+        match rule.action {
+            RuleAction::Allow if !row.override_block_rules => {
+                return Err(KillswitchError::Windows(format!(
+                    "the exception {name} does not carry OverrideBlockRules in the \
+                     active policy, so the block rule outranks it and the traffic it \
+                     is meant to permit stays blocked"
+                )));
+            }
+            RuleAction::Block if row.override_block_rules => {
+                return Err(KillswitchError::Windows(format!(
+                    "the block rule {name} carries OverrideBlockRules in the active \
+                     policy, which would make it outrank the rules it is meant to \
+                     overrule"
+                )));
+            }
+            _ => {}
         }
         // The conditions matter as much as the rule: an exception that lost its
         // `-Program` scope would hand the off-tunnel path to any process, and one
@@ -989,6 +1056,82 @@ async fn install_with_runner<R: FirewallRunner>(
     Ok(snapshot)
 }
 
+/// The installed policy: the captured state, the runner, and whether the
+/// teardown still has to happen.
+///
+/// `Drop` runs the synchronous teardown while the guard is armed. The flag is
+/// cleared only once `uninstall` has actually completed: a cancelled or failed
+/// uninstall must still leave the operator's rules re-enabled and the captured
+/// profile settings restored, which is the whole reason the guard exists. Before
+/// this was a bare `bool` cleared at the top of `uninstall`, cancelling the
+/// future between two PowerShell invocations silently skipped the restoration.
+struct KillswitchGuard<R: FirewallRunner> {
+    runner: Arc<R>,
+    snapshot: FirewallSnapshot,
+    armed: bool,
+}
+
+impl<R: FirewallRunner> std::fmt::Debug for KillswitchGuard<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KillswitchGuard")
+            .field("runner", &self.runner)
+            .field("snapshot", &self.snapshot)
+            .field("armed", &self.armed)
+            .finish()
+    }
+}
+
+impl<R: FirewallRunner> KillswitchGuard<R> {
+    /// Install the policy through `runner` and return the armed guard.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`install_with_runner`].
+    async fn install(
+        opts: &KillswitchOpts,
+        runner: Arc<R>,
+        daemon_exe_path: &str,
+    ) -> Result<Self, KillswitchError> {
+        let snapshot = install_with_runner(opts, runner.as_ref(), daemon_exe_path).await?;
+        Ok(Self {
+            runner,
+            snapshot,
+            armed: true,
+        })
+    }
+
+    /// Remove our rules, re-enable the ones we disabled, then restore the
+    /// captured profile settings.
+    ///
+    /// The guard stays armed unless this completes: a failure leaves it able to
+    /// retry from `Drop`, and a cancellation drops it mid-teardown, which is
+    /// exactly when `Drop` has to finish the job.
+    ///
+    /// # Errors
+    ///
+    /// [`KillswitchError::Windows`] if a step failed.
+    async fn uninstall(mut self) -> Result<(), KillswitchError> {
+        let result = uninstall_with_runner(self.runner.as_ref(), &self.snapshot).await;
+        if result.is_ok() {
+            self.armed = false;
+        }
+        result
+    }
+}
+
+impl<R: FirewallRunner> Drop for KillswitchGuard<R> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        tracing::warn!(
+            "Warren Windows killswitch guard dropped without a completed uninstall - \
+             running the bounded synchronous teardown"
+        );
+        self.runner.sync_teardown(&self.snapshot);
+    }
+}
+
 /// Removes our rules, puts the disabled rules back, then restores the captured
 /// profile settings.
 ///
@@ -1063,10 +1206,7 @@ async fn rollback<R: FirewallRunner>(
 /// / [`super::MacosKillswitch`] for the install/uninstall lifecycle.
 #[cfg(target_os = "windows")]
 #[derive(Debug)]
-pub struct WindowsKillswitch {
-    snapshot: FirewallSnapshot,
-    installed: bool,
-}
+pub struct WindowsKillswitch(KillswitchGuard<PowershellRunner>);
 
 #[cfg(target_os = "windows")]
 impl WindowsKillswitch {
@@ -1085,11 +1225,9 @@ impl WindowsKillswitch {
     ///   read-back does not confirm the policy.
     pub async fn install(opts: &KillswitchOpts) -> Result<Self, KillswitchError> {
         let daemon_exe_path = resolve_daemon_exe_path()?;
-        let snapshot = install_with_runner(opts, &PowershellRunner, &daemon_exe_path).await?;
-        Ok(Self {
-            snapshot,
-            installed: true,
-        })
+        KillswitchGuard::install(opts, Arc::new(PowershellRunner), &daemon_exe_path)
+            .await
+            .map(Self)
     }
 
     /// Remove our rules, re-enable the rules we disabled, then restore the
@@ -1099,36 +1237,8 @@ impl WindowsKillswitch {
     ///
     /// [`KillswitchError::Windows`] if a step fails; the remaining steps still
     /// run.
-    pub async fn uninstall(mut self) -> Result<(), KillswitchError> {
-        self.installed = false;
-        uninstall_with_runner(&PowershellRunner, &self.snapshot).await
-    }
-}
-
-#[cfg(target_os = "windows")]
-impl Drop for WindowsKillswitch {
-    fn drop(&mut self) {
-        if !self.installed {
-            return;
-        }
-        // Best-effort sync cleanup. Drop is sync, so this cannot await; each
-        // invocation is bounded by SYNC_CLEANUP_TIMEOUT so a wedged
-        // powershell.exe can never hang process teardown indefinitely
-        // (parity with `warrenguard_route_split`'s sync cleanup helpers).
-        // On timeout the child is killed - unrecoverable, but the process is
-        // exiting anyway.
-        for cmd in uninstall_ops(&self.snapshot).iter().map(render_op) {
-            if run_sync_bounded("powershell.exe", &cmd, SYNC_CLEANUP_TIMEOUT).is_none() {
-                tracing::warn!(
-                    timeout = ?SYNC_CLEANUP_TIMEOUT,
-                    "killswitch Drop cleanup command did not complete in time (killed)"
-                );
-            }
-        }
-        tracing::warn!(
-            "Warren Windows killswitch dropped without explicit uninstall - \
-             best-effort bounded sync cleanup ran"
-        );
+    pub async fn uninstall(self) -> Result<(), KillswitchError> {
+        self.0.uninstall().await
     }
 }
 
@@ -1193,6 +1303,17 @@ impl FirewallRunner for PowershellRunner {
 
     async fn apply(&self, op: &FirewallOp) -> Result<(), KillswitchError> {
         run_powershell(&render_op(op)).await
+    }
+
+    fn sync_teardown(&self, snapshot: &FirewallSnapshot) {
+        for cmd in uninstall_ops(snapshot).iter().map(render_op) {
+            if run_sync_bounded("powershell.exe", &cmd, SYNC_CLEANUP_TIMEOUT).is_none() {
+                tracing::warn!(
+                    timeout = ?SYNC_CLEANUP_TIMEOUT,
+                    "killswitch synchronous teardown command did not complete in time (killed)"
+                );
+            }
+        }
     }
 
     async fn verify(&self, rules: &[RuleSpec]) -> Result<(), KillswitchError> {
@@ -1360,17 +1481,23 @@ mod tests {
     // ---- the policy shape --------------------------------------------
 
     #[test]
-    fn the_policy_never_uses_a_block_rule_or_the_override_mechanism() {
-        // Design invariant, not a style preference. An explicit block rule
-        // outranks every conflicting allow rule, so the tunnel and the carrier
-        // would need `-OverrideBlockRules`, whose outbound semantics Microsoft's
-        // own documentation contradicts; the policy must therefore not depend on
-        // it. This test is what stops a later edit from reintroducing the
-        // dependency without a Windows host to validate it on.
+    fn the_policy_is_a_block_rule_plus_overriding_exceptions() {
+        // Design invariant, not a style preference. The block rule is what keeps
+        // the policy binding for the whole session (an allow rule created later
+        // loses to it), and the exceptions are what keeps the tunnel alive under
+        // that block rule, so every exception must carry the override and the
+        // block rule must not.
         let rules = build_rules(&opts_minimal(), TEST_DAEMON_EXE);
+        let block = rules.first().expect("the policy has rules");
+        assert_eq!(block.action, RuleAction::Block, "{rules:#?}");
         assert!(
-            rules.iter().all(|r| r.action == RuleAction::Allow),
-            "the policy must be a default block plus plain allow rules: {rules:#?}"
+            !block.override_block_rules,
+            "the block rule must not carry the override, or it would outrank the \
+             rules it exists to overrule"
+        );
+        assert!(
+            rules.iter().skip(1).all(|r| r.action == RuleAction::Allow),
+            "everything after the block rule is an exception: {rules:#?}"
         );
         for command in rendered_ops(&install_ops(
             &rules,
@@ -1379,15 +1506,18 @@ mod tests {
                 foreign_allows: vec![FOREIGN_RULE_NAME.to_owned()],
             },
         )) {
-            assert!(
-                !command.contains("-Action Block"),
-                "no rendered command may create a block rule: {command}"
-            );
-            assert!(
-                !command.contains("OverrideBlockRules"),
-                "no rendered command may depend on the IPsec-conditional override \
-                 mechanism: {command}"
-            );
+            if command.contains("-Action Allow") {
+                assert!(
+                    command.contains("-OverrideBlockRules True"),
+                    "an exception without the override loses to the block rule: {command}"
+                );
+            }
+            if command.contains("-Action Block") {
+                assert!(
+                    !command.contains("-OverrideBlockRules"),
+                    "the block rule must not carry the override: {command}"
+                );
+            }
         }
     }
 
@@ -1408,6 +1538,19 @@ mod tests {
                 "the removal must not be interleaved with the rule creation"
             );
         }
+        let block = ops
+            .iter()
+            .position(|op| matches!(op, FirewallOp::CreateRule(r) if r.action == RuleAction::Block))
+            .expect("the block rule is created");
+        let first_exception = ops
+            .iter()
+            .position(|op| matches!(op, FirewallOp::CreateRule(r) if r.action == RuleAction::Allow))
+            .expect("the exceptions are created");
+        assert!(
+            block < first_exception,
+            "the block rule must exist before any exception, so no exception is ever \
+             live without it: {ops:#?}"
+        );
     }
 
     #[test]
@@ -1677,9 +1820,10 @@ AllowLocalFirewallRules    : True
         for rule in rules {
             let _ = writeln!(
                 out,
-                "RULE|{}|Outbound|{}|True|{}|{}|{}|{}|{}",
+                "RULE|{}|Outbound|{}|True|{}|{}|{}|{}|{}|{}",
                 rule.display_name(),
                 rule.action.as_token(),
+                rule.override_block_rules,
                 rule.program.as_deref().unwrap_or(""),
                 if rule.udp { "UDP" } else { "Any" },
                 rule.remote
@@ -1716,14 +1860,16 @@ AllowLocalFirewallRules    : True
     #[test]
     fn parse_rule_rows_reads_every_condition() {
         let rows = parse_rule_rows(
-            "RULE|warren-killswitch-allow-tun|Outbound|Allow|True|||Any||warren0\n",
+            "RULE|warren-killswitch-allow-tun|Outbound|Allow|True|True||Any|||warren0\n",
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].display_name, "warren-killswitch-allow-tun");
         assert_eq!(rows[0].action, "Allow");
         assert_eq!(rows[0].enabled, Some(GpoBool::True));
-        assert_eq!(rows[0].remote_address.as_deref(), Some("Any"));
+        assert!(rows[0].override_block_rules);
+        assert_eq!(rows[0].protocol.as_deref(), Some("Any"));
         assert_eq!(rows[0].iface.as_deref(), Some("warren0"));
+        assert!(rows[0].remote_address.is_none());
         assert!(rows[0].program.is_none());
         assert!(parse_rule_rows("noise").is_empty());
     }
@@ -1793,6 +1939,36 @@ AllowLocalFirewallRules    : True
     }
 
     #[test]
+    fn check_effective_state_rejects_an_exception_without_the_override_flag() {
+        // The load-bearing check for the tunnel: without the override the
+        // exception loses to the block rule, so the traffic it permits stays
+        // blocked while the install would otherwise report success.
+        let rules = build_rules(&opts_minimal(), TEST_DAEMON_EXE);
+        let readback = readback_for(&rules).replace(
+            "|warren-killswitch-allow-tun|Outbound|Allow|True|true|",
+            "|warren-killswitch-allow-tun|Outbound|Allow|True|false|",
+        );
+        let err = check_effective_state(EFFECTIVE_BLOCKING, &readback, "", &rules)
+            .expect_err("an exception without the override cannot be trusted");
+        assert!(
+            format!("{err:#}").contains("OverrideBlockRules"),
+            "got {err:#}"
+        );
+    }
+
+    #[test]
+    fn check_effective_state_rejects_a_block_rule_that_carries_the_override() {
+        let rules = build_rules(&opts_minimal(), TEST_DAEMON_EXE);
+        let readback = readback_for(&rules).replace(
+            "|warren-killswitch-block-outbound|Outbound|Block|True|false|",
+            "|warren-killswitch-block-outbound|Outbound|Block|True|true|",
+        );
+        let err = check_effective_state(EFFECTIVE_BLOCKING, &readback, "", &rules)
+            .expect_err("a block rule carrying the override outranks what it must overrule");
+        assert!(format!("{err:#}").contains("block rule"), "got {err:#}");
+    }
+
+    #[test]
     fn check_effective_state_rejects_a_missing_rule() {
         let rules = build_rules(&opts_minimal(), TEST_DAEMON_EXE);
         let readback =
@@ -1831,7 +2007,7 @@ AllowLocalFirewallRules    : True
         // while the policy claims to be the one we just installed.
         let rules = build_rules(&opts_minimal(), TEST_DAEMON_EXE);
         let readback = format!(
-            "{}RULE|warren-killswitch-lan-10.0.0.0/8|Outbound|Allow|True||Any|10.0.0.0/8||\n",
+            "{}RULE|warren-killswitch-lan-10.0.0.0/8|Outbound|Allow|True|True||Any|10.0.0.0/8||\n",
             readback_for(&rules)
         );
         let err = check_effective_state(EFFECTIVE_BLOCKING, &readback, "", &rules)
@@ -1895,6 +2071,9 @@ AllowLocalFirewallRules    : True
         name: String,
         display_name: String,
         action: RuleAction,
+        /// The documented outbound "allow bypass rule": the traffic is permitted
+        /// even where another matching rule blocks it.
+        override_block_rules: bool,
         enabled: bool,
         iface: Option<String>,
         udp: bool,
@@ -1909,6 +2088,7 @@ AllowLocalFirewallRules    : True
                 name: spec.display_name(),
                 display_name: spec.display_name(),
                 action: spec.action,
+                override_block_rules: spec.override_block_rules,
                 enabled: true,
                 iface: spec.iface.clone(),
                 udp: spec.udp,
@@ -2052,6 +2232,7 @@ AllowLocalFirewallRules    : True
                 name: FOREIGN_RULE_NAME.to_owned(),
                 display_name: FOREIGN_RULE_DISPLAY.to_owned(),
                 action: RuleAction::Allow,
+                override_block_rules: false,
                 enabled: true,
                 iface: None,
                 udp: false,
@@ -2071,6 +2252,15 @@ AllowLocalFirewallRules    : True
             let profile = &self.profiles[&self.active_profile];
             if !profile.enabled() {
                 // A firewall that is off filters nothing.
+                return Verdict::Allow;
+            }
+            // Documented precedence, in order: an Allow carrying
+            // OverrideBlockRules (the outbound "allow bypass rule") wins even
+            // where another rule blocks; an explicit Block wins over any other
+            // conflicting Allow; otherwise an Allow matches.
+            if self.rules().any(|r| {
+                r.action == RuleAction::Allow && r.override_block_rules && r.matches(packet)
+            }) {
                 return Verdict::Allow;
             }
             if self
@@ -2102,6 +2292,18 @@ AllowLocalFirewallRules    : True
         /// Stands in for a policy that keeps the profiles disabled whatever the
         /// local store says, so `EnableProfiles` writes and nothing changes.
         refuse_enable: bool,
+        /// Stands in for a cmdlet that accepts `-OverrideBlockRules` and does
+        /// not apply it.
+        drop_override_flag: bool,
+        /// When set, every `apply` stalls for ever, so a test can cancel the
+        /// future and exercise the guard's `Drop`.
+        stall: std::sync::atomic::AtomicBool,
+        /// When set, every `apply` fails, so a test can make a teardown fail
+        /// without failing the install.
+        fail_applies: std::sync::atomic::AtomicBool,
+        /// Names of the events the guard tests observe, in order: an `apply`
+        /// marker per command and one `sync_teardown` for the guard's `Drop`.
+        ops: Mutex<Vec<String>>,
         /// Rules this host will not let us disable, standing in for a rule that
         /// comes from a Group Policy or an MDM policy store.
         pinned_foreign: Vec<String>,
@@ -2119,6 +2321,10 @@ AllowLocalFirewallRules    : True
                 fail_apply_index: None,
                 applies: AtomicUsize::new(0),
                 refuse_enable: false,
+                drop_override_flag: false,
+                stall: std::sync::atomic::AtomicBool::new(false),
+                fail_applies: std::sync::atomic::AtomicBool::new(false),
+                ops: Mutex::new(Vec::new()),
                 pinned_foreign: Vec::new(),
                 undeletable_ours: Vec::new(),
                 allow_local_rules: true,
@@ -2145,8 +2351,31 @@ AllowLocalFirewallRules    : True
             self
         }
 
+        fn dropping_override_flag(mut self) -> Self {
+            self.drop_override_flag = true;
+            self
+        }
+
+        /// Make every later `apply` stall, so the caller can cancel the future.
+        fn stalling(&self) {
+            self.stall.store(true, Ordering::SeqCst);
+        }
+
+        /// Make every later `apply` fail.
+        fn failing_applies(&self) {
+            self.fail_applies.store(true, Ordering::SeqCst);
+        }
+
         fn model(&self) -> std::sync::MutexGuard<'_, FirewallModel> {
             self.model.lock().expect("model mutex")
+        }
+
+        fn recorded(&self) -> Vec<String> {
+            self.ops.lock().expect("ops mutex").clone()
+        }
+
+        fn record(&self, event: &str) {
+            self.ops.lock().expect("ops mutex").push(event.to_owned());
         }
     }
 
@@ -2172,6 +2401,15 @@ AllowLocalFirewallRules    : True
         }
 
         async fn apply(&self, op: &FirewallOp) -> Result<(), KillswitchError> {
+            if self.stall.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            if self.fail_applies.load(Ordering::SeqCst) {
+                return Err(KillswitchError::Windows(
+                    "model: injected apply failure".into(),
+                ));
+            }
+            self.record("apply");
             let index = self.applies.fetch_add(1, Ordering::SeqCst);
             if self.fail_apply_index == Some(index) {
                 return Err(KillswitchError::Windows(
@@ -2202,7 +2440,13 @@ AllowLocalFirewallRules    : True
                         }
                     }
                 }
-                FirewallOp::CreateRule(spec) => model.ours.push(ModelRule::from_spec(spec)),
+                FirewallOp::CreateRule(spec) => {
+                    let mut rule = ModelRule::from_spec(spec);
+                    if self.drop_override_flag {
+                        rule.override_block_rules = false;
+                    }
+                    model.ours.push(rule);
+                }
                 FirewallOp::EnableRules(names) => {
                     for rule in &mut model.preexisting {
                         if names.contains(&rule.name) {
@@ -2218,6 +2462,25 @@ AllowLocalFirewallRules    : True
                 }
             }
             Ok(())
+        }
+
+        fn sync_teardown(&self, snapshot: &FirewallSnapshot) {
+            // What `Drop` does on a real host, in the model: undo our rules,
+            // re-enable the operator's, put the captured profile settings back.
+            let mut model = self.model();
+            model.ours = self.undeletable_ours.clone();
+            for name in &snapshot.foreign_allows {
+                if let Some(rule) = model.preexisting.iter_mut().find(|r| &r.name == name) {
+                    rule.enabled = true;
+                }
+            }
+            for saved in &snapshot.profiles {
+                if let Some(profile) = model.profiles.get_mut(&saved.name) {
+                    profile.local_enabled = saved.local_enabled;
+                    profile.local_default = saved.local_default_outbound_action;
+                }
+            }
+            self.record("sync_teardown");
         }
 
         async fn verify(&self, rules: &[RuleSpec]) -> Result<(), KillswitchError> {
@@ -2252,6 +2515,12 @@ AllowLocalFirewallRules    : True
                 if row.action != spec.action || !row.enabled {
                     return Err(KillswitchError::Windows(format!(
                         "model: the rule {name} is not in effect"
+                    )));
+                }
+                if spec.override_block_rules && !row.override_block_rules {
+                    return Err(KillswitchError::Windows(format!(
+                        "model: the exception {name} does not carry OverrideBlockRules, so \
+                         the block rule outranks it"
                     )));
                 }
             }
@@ -2321,6 +2590,7 @@ AllowLocalFirewallRules    : True
             name: "app-allow".into(),
             display_name: "app-allow".into(),
             action: RuleAction::Allow,
+            override_block_rules: false,
             enabled: true,
             iface: None,
             udp: false,
@@ -2338,6 +2608,7 @@ AllowLocalFirewallRules    : True
             name: "block-all".into(),
             display_name: "block-all".into(),
             action: RuleAction::Block,
+            override_block_rules: false,
             enabled: true,
             iface: None,
             udp: false,
@@ -2349,6 +2620,25 @@ AllowLocalFirewallRules    : True
             model.decide(&packet),
             Verdict::Block,
             "documented rule 2: an explicit block rule outranks a conflicting allow"
+        );
+
+        model.preexisting.push(ModelRule {
+            name: "app-bypass".into(),
+            display_name: "app-bypass".into(),
+            action: RuleAction::Allow,
+            override_block_rules: true,
+            enabled: true,
+            iface: None,
+            udp: false,
+            remote: None,
+            remote_port: None,
+            program: Some(TEST_OTHER_APP.to_owned()),
+        });
+        assert_eq!(
+            model.decide(&packet),
+            Verdict::Allow,
+            "documented outbound allow bypass rule: a matching Allow carrying \
+             OverrideBlockRules is permitted even where the block rule matches"
         );
     }
 
@@ -2547,6 +2837,7 @@ AllowLocalFirewallRules    : True
             name: format!("{RULE_PREFIX}lan-10.0.0.0/8"),
             display_name: format!("{RULE_PREFIX}lan-10.0.0.0/8"),
             action: RuleAction::Allow,
+            override_block_rules: true,
             enabled: true,
             iface: None,
             udp: false,
@@ -2581,6 +2872,7 @@ AllowLocalFirewallRules    : True
             name: format!("{RULE_PREFIX}lan-10.0.0.0/8"),
             display_name: format!("{RULE_PREFIX}lan-10.0.0.0/8"),
             action: RuleAction::Allow,
+            override_block_rules: true,
             enabled: true,
             iface: None,
             udp: false,
@@ -2708,21 +3000,25 @@ AllowLocalFirewallRules    : True
                      -ErrorAction Stop"
                 ),
                 "-NoProfile -Command New-NetFirewallRule -DisplayName \
+                 'warren-killswitch-block-outbound' -Direction Outbound -Action Block"
+                    .to_owned(),
+                "-NoProfile -Command New-NetFirewallRule -DisplayName \
                  'warren-killswitch-allow-loopback-v4' -Direction Outbound -Action Allow \
-                 -RemoteAddress 127.0.0.0/8"
+                 -OverrideBlockRules True -RemoteAddress 127.0.0.0/8"
                     .to_owned(),
                 "-NoProfile -Command New-NetFirewallRule -DisplayName \
                  'warren-killswitch-allow-loopback-v6' -Direction Outbound -Action Allow \
-                 -RemoteAddress ::1/128"
+                 -OverrideBlockRules True -RemoteAddress ::1/128"
                     .to_owned(),
                 "-NoProfile -Command New-NetFirewallRule -DisplayName \
                  'warren-killswitch-allow-tun' -Direction Outbound -Action Allow \
-                 -InterfaceAlias 'warren0'"
+                 -OverrideBlockRules True -InterfaceAlias 'warren0'"
                     .to_owned(),
                 format!(
                     "-NoProfile -Command New-NetFirewallRule -DisplayName \
                      'warren-killswitch-exit-udp-v4-1.2.3.4' -Direction Outbound -Action Allow \
-                     -Protocol UDP -RemoteAddress 1.2.3.4 -Program '{TEST_DAEMON_EXE}'"
+                     -OverrideBlockRules True -Protocol UDP -RemoteAddress 1.2.3.4 \
+                     -Program '{TEST_DAEMON_EXE}'"
                 ),
             ]
         );
@@ -2776,12 +3072,169 @@ AllowLocalFirewallRules    : True
         assert_eq!(
             query_our_rules_command(),
             "Get-NetFirewallRule -PolicyStore ActiveStore -DisplayName 'warren-killswitch-*' \
-             | ForEach-Object { $a = $_ | Get-NetFirewallApplicationFilter; $p = $_ | \
-             Get-NetFirewallPortFilter; $d = $_ | Get-NetFirewallAddressFilter; $i = $_ | \
-             Get-NetFirewallInterfaceFilter; 'RULE|' + $_.DisplayName + '|' + $_.Direction + \
-             '|' + $_.Action + '|' + $_.Enabled + '|' + $a.Program + '|' + $p.Protocol + '|' + \
+             | ForEach-Object { $s = $_ | Get-NetFirewallSecurityFilter; $a = $_ | \
+             Get-NetFirewallApplicationFilter; $p = $_ | Get-NetFirewallPortFilter; $d = $_ | \
+             Get-NetFirewallAddressFilter; $i = $_ | Get-NetFirewallInterfaceFilter; 'RULE|' \
+             + $_.DisplayName + '|' + $_.Direction + '|' + $_.Action + '|' + $_.Enabled + \
+             '|' + $s.OverrideBlockRules + '|' + $a.Program + '|' + $p.Protocol + '|' + \
              [string]$d.RemoteAddress + '|' + [string]$p.RemotePort + '|' + \
              [string]$i.InterfaceAlias }"
+        );
+    }
+
+    // ---- the policy stays binding for the whole session ---------------
+    //
+    // Disabling the allow rules present at install time establishes the policy
+    // once. The explicit block rule is what keeps it established, because an allow
+    // rule created LATER (a user answering a firewall prompt, a software
+    // installer, a Group Policy refresh) loses to an explicit block but outranks
+    // a mere profile default.
+
+    #[tokio::test]
+    async fn a_rule_created_after_the_install_cannot_reopen_the_egress() {
+        let runner = Arc::new(ModelRunner::new(FirewallModel::stock()));
+        install_with_runner(&opts_minimal(), runner.as_ref(), TEST_DAEMON_EXE)
+            .await
+            .expect("install");
+        let packet = outbound_from("Ethernet", TEST_OTHER_APP, PUBLIC_ADDR);
+        assert_eq!(
+            runner.model().decide(&packet),
+            Verdict::Block,
+            "setup: the installed policy blocks the application"
+        );
+
+        runner.model().preexisting.push(ModelRule {
+            name: "installed-later".into(),
+            display_name: "installed later".into(),
+            action: RuleAction::Allow,
+            override_block_rules: false,
+            enabled: true,
+            iface: None,
+            udp: false,
+            remote: None,
+            remote_port: None,
+            program: Some(TEST_OTHER_APP.to_owned()),
+        });
+
+        assert_eq!(
+            runner.model().decide(&packet),
+            Verdict::Block,
+            "an allow rule created after the install must still lose to the block \
+             rule: the disable-at-install step alone would leave that window open \
+             for the rest of the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_is_not_reported_done_when_an_exception_loses_the_override_flag() {
+        // The command was accepted and the flag is not in the effective policy.
+        // Our exception then loses to the block rule, so the tunnel and the
+        // carrier stay blocked: reporting success would announce a protection (a
+        // working tunnel) that is not there.
+        let runner = Arc::new(ModelRunner::new(FirewallModel::stock()).dropping_override_flag());
+        let err = install_with_runner(&opts_minimal(), runner.as_ref(), TEST_DAEMON_EXE)
+            .await
+            .expect_err("an exception without the override flag must fail the install");
+        assert!(
+            format!("{err:#}").contains("OverrideBlockRules"),
+            "got {err:#}"
+        );
+        assert!(
+            runner.model().ours.is_empty(),
+            "the failed install must not leave its rules behind"
+        );
+    }
+
+    // ---- the guard stays armed until the teardown has run --------------
+    //
+    // `Drop` cannot await, so the guard keeps a synchronous teardown for the paths
+    // where the asynchronous one did not complete: an uninstall that failed, or a
+    // future cancelled mid-teardown. Clearing the flag before the first command
+    // (the earlier shape) silently skipped the restoration of the operator's rules
+    // and of the captured profile settings.
+
+    #[tokio::test]
+    async fn a_completed_uninstall_disarms_the_guard() {
+        let runner = Arc::new(ModelRunner::new(FirewallModel::with_preexisting_allow(
+            TEST_OTHER_APP,
+        )));
+        let guard = KillswitchGuard::install(&opts_minimal(), runner.clone(), TEST_DAEMON_EXE)
+            .await
+            .expect("install");
+        guard.uninstall().await.expect("uninstall");
+        assert!(
+            !runner.recorded().contains(&"sync_teardown".to_owned()),
+            "a completed uninstall must not be followed by a second teardown from \
+             Drop: {:#?}",
+            runner.recorded()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_uninstall_keeps_the_guard_armed() {
+        let runner = Arc::new(ModelRunner::new(FirewallModel::with_preexisting_allow(
+            TEST_OTHER_APP,
+        )));
+        let guard = KillswitchGuard::install(&opts_minimal(), runner.clone(), TEST_DAEMON_EXE)
+            .await
+            .expect("install");
+        runner.failing_applies();
+        {
+            let err = guard
+                .uninstall()
+                .await
+                .expect_err("every teardown command fails");
+            assert!(matches!(err, KillswitchError::Windows(_)), "got {err:?}");
+        } // the guard is dropped here, still armed
+        assert!(
+            runner.recorded().contains(&"sync_teardown".to_owned()),
+            "an uninstall that did not complete must leave the guard able to retry: \
+             {:#?}",
+            runner.recorded()
+        );
+        let model = runner.model();
+        assert!(model.ours.is_empty(), "the retry must remove our rules");
+        assert!(
+            model.preexisting.iter().all(|r| r.enabled),
+            "and re-enable the operator's"
+        );
+        assert_eq!(
+            model.profiles["Domain"].local_default,
+            OutboundAction::Allow,
+            "and restore the captured profile settings"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_uninstall_still_restores_the_captured_state() {
+        let runner = Arc::new(ModelRunner::new(FirewallModel::with_preexisting_allow(
+            TEST_OTHER_APP,
+        )));
+        let guard = KillswitchGuard::install(&opts_minimal(), runner.clone(), TEST_DAEMON_EXE)
+            .await
+            .expect("install");
+        // Every later command stalls, so the timeout cancels the future and the
+        // guard is dropped mid-teardown.
+        runner.stalling();
+        let outcome = tokio::time::timeout(Duration::from_millis(50), guard.uninstall()).await;
+        assert!(outcome.is_err(), "the model runner was told to stall");
+
+        assert!(
+            runner.recorded().contains(&"sync_teardown".to_owned()),
+            "a cancelled uninstall must still run the guard's synchronous teardown: \
+             {:#?}",
+            runner.recorded()
+        );
+        let model = runner.model();
+        assert!(model.ours.is_empty(), "our rules must be removed");
+        assert!(
+            model.preexisting.iter().all(|r| r.enabled),
+            "the operator's rules must be re-enabled"
+        );
+        assert_eq!(
+            model.profiles["Domain"].local_default,
+            OutboundAction::Allow,
+            "and the captured profile settings restored"
         );
     }
 

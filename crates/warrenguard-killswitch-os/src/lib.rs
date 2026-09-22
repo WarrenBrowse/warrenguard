@@ -16,14 +16,15 @@
 //! - Linux: nftables ([`build_linux_ruleset`] + [`LinuxKillswitch`]).
 //! - macOS: pf ([`build_macos_pf_ruleset`] + [`MacosKillswitch`]).
 //! - Windows: the Windows Firewall (WFP's user-space surface), driven through
-//!   PowerShell by [`WindowsKillswitch`]. The policy is the profile default
-//!   block plus ordinary Allow exceptions, with every OTHER enabled outbound
-//!   allow rule disabled for the duration (a default block alone does not
-//!   outrank the pre-existing allow rules; see the module doc for why the
-//!   `-OverrideBlockRules` alternative is not used). The install reads the
-//!   active policy back, conditions included, before it reports success. A
-//!   native WFP-API binding (no PowerShell shell-out, our own sub-layer and
-//!   weights) is the follow-up hardening item.
+//!   PowerShell by [`WindowsKillswitch`]. The policy is an explicit outbound
+//!   Block rule (which is what keeps it binding for the whole session, since the
+//!   profile default alone does not outrank pre-existing allow rules) plus Allow
+//!   exceptions carrying `-OverrideBlockRules`, with every OTHER enabled outbound
+//!   allow rule disabled as well. The install reads the active policy back,
+//!   conditions and override flags included, before it reports success, and the
+//!   guard stays armed until a teardown has completed. A native WFP-API binding
+//!   (no PowerShell shell-out, our own sub-layer and weights) is the follow-up
+//!   hardening item.
 //!
 //! ## Strategy
 //!
