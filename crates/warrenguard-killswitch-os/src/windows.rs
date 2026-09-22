@@ -84,6 +84,10 @@
 //! - A Group Policy that forces the firewall off, that disables local rules, or
 //!   that owns an enabled outbound allow rule this install cannot disable: each
 //!   one fails the install instead of announcing a protection that is not there.
+//! - Cancellation: the guard is armed BEFORE the first mutation, so an install
+//!   future dropped between two PowerShell invocations still runs the synchronous
+//!   teardown from `Drop`. A rollback that completed cleanly disarms it, and a
+//!   partial one leaves it armed to retry.
 //!
 //! ## What the tests here cover, and what they cannot
 //!
@@ -1014,46 +1018,24 @@ fn check_effective_state(
 // its rollback are driven for real on every host by the test module. Only the
 // PowerShell binding and the guard type below are Windows-only.
 
-/// Installs the policy through `runner` and confirms it is in effect.
+/// Installs the policy and returns the captured state with the guard DISARMED.
 ///
-/// Returns the captured state the teardown needs. A failure at any step
-/// restores that state and removes our rules before surfacing, so a failed
-/// install neither reports success nor leaves the host half-configured.
+/// A test seam: the tests drive the teardown themselves and want the outcome
+/// observed rather than a `Drop` retry afterwards. Production goes through
+/// [`KillswitchGuard::install`], which keeps the guard armed.
 ///
 /// # Errors
 ///
-/// - [`KillswitchError::InvalidInput`] if `opts.tun_name` is invalid.
-/// - [`KillswitchError::Windows`] if a command fails, a profile cannot be
-///   enabled, or the read-back does not confirm the policy.
-async fn install_with_runner<R: FirewallRunner>(
+/// Same as [`KillswitchGuard::install`].
+#[cfg(test)]
+async fn install_without_guard<R: FirewallRunner>(
     opts: &KillswitchOpts,
-    runner: &R,
+    runner: Arc<R>,
     daemon_exe_path: &str,
 ) -> Result<FirewallSnapshot, KillswitchError> {
-    validate_tun_name(&opts.tun_name)?;
-    let snapshot = runner.snapshot().await?;
-    let rules = build_rules(opts, daemon_exe_path);
-
-    if let Err(error) = apply_ops(runner, &install_ops(&rules, &snapshot)).await {
-        rollback(runner, &snapshot, &error).await;
-        return Err(error);
-    }
-    if let Err(error) = runner.verify(&rules).await {
-        // The policy is not in effect, so it must not stay half-applied under
-        // our name, and the install must not report success.
-        rollback(runner, &snapshot, &error).await;
-        return Err(error);
-    }
-
-    tracing::info!(
-        tun = %opts.tun_name,
-        exit_count = opts.exit_addrs.len(),
-        allow_lan = opts.allow_lan,
-        allow_dhcp = opts.allow_dhcp,
-        disabled_rules = snapshot.foreign_allows.len(),
-        "Warren killswitch installed and verified (Windows Firewall)"
-    );
-    Ok(snapshot)
+    let mut guard = KillswitchGuard::install(opts, runner, daemon_exe_path).await?;
+    guard.armed = false;
+    Ok(guard.snapshot.clone())
 }
 
 /// The installed policy: the captured state, the runner, and whether the
@@ -1084,20 +1066,62 @@ impl<R: FirewallRunner> std::fmt::Debug for KillswitchGuard<R> {
 impl<R: FirewallRunner> KillswitchGuard<R> {
     /// Install the policy through `runner` and return the armed guard.
     ///
+    /// The guard is armed BEFORE the first mutation: from here on every await
+    /// point is cancel-safe, because dropping an armed guard runs the synchronous
+    /// teardown. Arming it only once the install had returned left the window
+    /// between the first `Set-NetFirewallProfile` and that return with nothing able
+    /// to restore the captured state.
+    ///
     /// # Errors
     ///
-    /// Same as [`install_with_runner`].
+    /// - [`KillswitchError::InvalidInput`] if `opts.tun_name` is invalid.
+    /// - [`KillswitchError::Windows`] if a command fails, a profile cannot be
+    ///   enabled, or the read-back does not confirm the policy.
     async fn install(
         opts: &KillswitchOpts,
         runner: Arc<R>,
         daemon_exe_path: &str,
     ) -> Result<Self, KillswitchError> {
-        let snapshot = install_with_runner(opts, runner.as_ref(), daemon_exe_path).await?;
-        Ok(Self {
+        validate_tun_name(&opts.tun_name)?;
+        // Reading the current state is not a mutation, so nothing has to be
+        // restored when it fails.
+        let snapshot = runner.snapshot().await?;
+        let rules = build_rules(opts, daemon_exe_path);
+        let mut guard = Self {
             runner,
             snapshot,
             armed: true,
-        })
+        };
+        guard.apply_policy(&rules).await?;
+        Ok(guard)
+    }
+
+    /// Apply the policy and confirm it, rolling back when either step fails.
+    ///
+    /// A rollback that completed cleanly disarms the guard, since there is then
+    /// nothing left to restore; a partial one leaves it armed so `Drop` retries the
+    /// idempotent teardown commands.
+    async fn apply_policy(&mut self, rules: &[RuleSpec]) -> Result<(), KillswitchError> {
+        let runner = self.runner.clone();
+        if let Err(error) = apply_ops(runner.as_ref(), &install_ops(rules, &self.snapshot)).await {
+            if rollback(runner.as_ref(), &self.snapshot, &error).await {
+                self.armed = false;
+            }
+            return Err(error);
+        }
+        if let Err(error) = runner.verify(rules).await {
+            // The policy is not in effect, so it must not stay half-applied under
+            // our name, and the install must not report success.
+            if rollback(runner.as_ref(), &self.snapshot, &error).await {
+                self.armed = false;
+            }
+            return Err(error);
+        }
+        tracing::info!(
+            disabled_rules = self.snapshot.foreign_allows.len(),
+            "Warren Windows killswitch installed and verified"
+        );
+        Ok(())
     }
 
     /// Remove our rules, re-enable the ones we disabled, then restore the
@@ -1181,23 +1205,28 @@ async fn apply_ops<R: FirewallRunner>(
 /// Best-effort restore of the captured state. The original error is what
 /// surfaces; each failed restore is logged so an operator can see the host was
 /// not fully returned to its previous configuration.
+/// Best-effort restore of the captured state. Returns whether every step was
+/// applied, which decides whether the guard still has anything to retry.
 async fn rollback<R: FirewallRunner>(
     runner: &R,
     snapshot: &FirewallSnapshot,
     cause: &KillswitchError,
-) {
+) -> bool {
     tracing::error!(
         error = %cause,
         "killswitch install failed; restoring the captured firewall settings"
     );
+    let mut restored = true;
     for op in uninstall_ops(snapshot) {
         if let Err(e) = runner.apply(&op).await {
             tracing::warn!(
                 error = %e,
                 "killswitch rollback command failed (best-effort)"
             );
+            restored = false;
         }
     }
+    restored
 }
 
 // ── Runtime exec (Windows only) ──────────────────────────────────────
@@ -2295,9 +2324,10 @@ AllowLocalFirewallRules    : True
         /// Stands in for a cmdlet that accepts `-OverrideBlockRules` and does
         /// not apply it.
         drop_override_flag: bool,
-        /// When set, every `apply` stalls for ever, so a test can cancel the
-        /// future and exercise the guard's `Drop`.
-        stall: std::sync::atomic::AtomicBool,
+        /// `apply` index from which every command stalls for ever, so a test can
+        /// cancel the future at a chosen point and exercise the guard's `Drop`
+        /// (`usize::MAX` never stalls).
+        stall_from: AtomicUsize,
         /// When set, every `apply` fails, so a test can make a teardown fail
         /// without failing the install.
         fail_applies: std::sync::atomic::AtomicBool,
@@ -2322,7 +2352,7 @@ AllowLocalFirewallRules    : True
                 applies: AtomicUsize::new(0),
                 refuse_enable: false,
                 drop_override_flag: false,
-                stall: std::sync::atomic::AtomicBool::new(false),
+                stall_from: AtomicUsize::new(usize::MAX),
                 fail_applies: std::sync::atomic::AtomicBool::new(false),
                 ops: Mutex::new(Vec::new()),
                 pinned_foreign: Vec::new(),
@@ -2356,9 +2386,15 @@ AllowLocalFirewallRules    : True
             self
         }
 
-        /// Make every later `apply` stall, so the caller can cancel the future.
+        /// Make every `apply` from `index` on stall, so the caller can cancel the
+        /// future at a chosen point.
+        fn stalling_from(&self, index: usize) {
+            self.stall_from.store(index, Ordering::SeqCst);
+        }
+
+        /// Make every later `apply` stall.
         fn stalling(&self) {
-            self.stall.store(true, Ordering::SeqCst);
+            self.stalling_from(0);
         }
 
         /// Make every later `apply` fail.
@@ -2401,7 +2437,8 @@ AllowLocalFirewallRules    : True
         }
 
         async fn apply(&self, op: &FirewallOp) -> Result<(), KillswitchError> {
-            if self.stall.load(Ordering::SeqCst) {
+            let index = self.applies.fetch_add(1, Ordering::SeqCst);
+            if index >= self.stall_from.load(Ordering::SeqCst) {
                 std::future::pending::<()>().await;
             }
             if self.fail_applies.load(Ordering::SeqCst) {
@@ -2410,7 +2447,6 @@ AllowLocalFirewallRules    : True
                 ));
             }
             self.record("apply");
-            let index = self.applies.fetch_add(1, Ordering::SeqCst);
             if self.fail_apply_index == Some(index) {
                 return Err(KillswitchError::Windows(
                     "model: injected apply failure".into(),
@@ -2648,7 +2684,9 @@ AllowLocalFirewallRules    : True
         // NOT outrank a pre-existing explicit Allow rule, so a policy built from
         // the default plus our exceptions leaves every other application's egress
         // wide open.
-        let runner = ModelRunner::new(FirewallModel::with_preexisting_allow(TEST_OTHER_APP));
+        let runner = Arc::new(ModelRunner::new(FirewallModel::with_preexisting_allow(
+            TEST_OTHER_APP,
+        )));
         let packet = outbound_from("Ethernet", TEST_OTHER_APP, PUBLIC_ADDR);
         assert_eq!(
             runner.model().decide(&packet),
@@ -2656,7 +2694,7 @@ AllowLocalFirewallRules    : True
             "setup: the pre-existing Allow rule lets the application out"
         );
 
-        install_with_runner(&opts_minimal(), &runner, TEST_DAEMON_EXE)
+        install_without_guard(&opts_minimal(), runner.clone(), TEST_DAEMON_EXE)
             .await
             .expect("install");
 
@@ -2670,8 +2708,10 @@ AllowLocalFirewallRules    : True
 
     #[tokio::test]
     async fn the_tunnel_and_the_daemon_carrier_still_pass_after_the_install() {
-        let runner = ModelRunner::new(FirewallModel::with_preexisting_allow(TEST_OTHER_APP));
-        install_with_runner(&opts_minimal(), &runner, TEST_DAEMON_EXE)
+        let runner = Arc::new(ModelRunner::new(FirewallModel::with_preexisting_allow(
+            TEST_OTHER_APP,
+        )));
+        install_without_guard(&opts_minimal(), runner.clone(), TEST_DAEMON_EXE)
             .await
             .expect("install");
         let model = runner.model();
@@ -2729,7 +2769,7 @@ AllowLocalFirewallRules    : True
         for profile in model.profiles.values_mut() {
             profile.local_enabled = GpoBool::False;
         }
-        let runner = ModelRunner::new(model);
+        let runner = Arc::new(ModelRunner::new(model));
         let packet = outbound_from("Ethernet", TEST_OTHER_APP, PUBLIC_ADDR);
         assert_eq!(
             runner.model().decide(&packet),
@@ -2737,7 +2777,7 @@ AllowLocalFirewallRules    : True
             "setup: with the firewall off nothing filters"
         );
 
-        let snapshot = install_with_runner(&opts_minimal(), &runner, TEST_DAEMON_EXE)
+        let snapshot = install_without_guard(&opts_minimal(), runner.clone(), TEST_DAEMON_EXE)
             .await
             .expect("the install must turn the profiles on rather than trust them");
         assert_eq!(
@@ -2746,7 +2786,7 @@ AllowLocalFirewallRules    : True
             "an install that reported success must actually be filtering"
         );
 
-        uninstall_with_runner(&runner, &snapshot)
+        uninstall_with_runner(runner.as_ref(), &snapshot)
             .await
             .expect("uninstall");
         assert!(
@@ -2768,9 +2808,9 @@ AllowLocalFirewallRules    : True
             .get_mut("Public")
             .expect("the Public profile exists")
             .policy_enabled = Some(false);
-        let runner = ModelRunner::new(model);
+        let runner = Arc::new(ModelRunner::new(model));
 
-        let err = install_with_runner(&opts_minimal(), &runner, TEST_DAEMON_EXE)
+        let err = install_without_guard(&opts_minimal(), runner.clone(), TEST_DAEMON_EXE)
             .await
             .expect_err("a profile the policy keeps off must fail the install");
         assert!(format!("{err:#}").contains("Public"), "got {err:#}");
@@ -2797,9 +2837,10 @@ AllowLocalFirewallRules    : True
             .profiles
             .values_mut()
             .for_each(|p| p.local_enabled = GpoBool::True);
-        let runner = ModelRunner::new(model).pinning_foreign(vec![FOREIGN_RULE_NAME.to_owned()]);
+        let runner =
+            Arc::new(ModelRunner::new(model).pinning_foreign(vec![FOREIGN_RULE_NAME.to_owned()]));
 
-        let err = install_with_runner(&opts_minimal(), &runner, TEST_DAEMON_EXE)
+        let err = install_without_guard(&opts_minimal(), runner.clone(), TEST_DAEMON_EXE)
             .await
             .expect_err("an allow rule we cannot disable must fail the install");
         assert!(
@@ -2818,8 +2859,8 @@ AllowLocalFirewallRules    : True
 
     #[tokio::test]
     async fn install_refuses_when_the_policy_ignores_local_rules() {
-        let runner = ModelRunner::new(FirewallModel::stock()).ignoring_local_rules();
-        let err = install_with_runner(&opts_minimal(), &runner, TEST_DAEMON_EXE)
+        let runner = Arc::new(ModelRunner::new(FirewallModel::stock()).ignoring_local_rules());
+        let err = install_without_guard(&opts_minimal(), runner.clone(), TEST_DAEMON_EXE)
             .await
             .expect_err("local rules ignored means our policy filters nothing");
         assert!(
@@ -2847,10 +2888,10 @@ AllowLocalFirewallRules    : True
         };
         let mut model = FirewallModel::stock();
         model.ours.push(leftover);
-        let runner = ModelRunner::new(model);
+        let runner = Arc::new(ModelRunner::new(model));
         let lan_packet = outbound_from("Ethernet", TEST_OTHER_APP, LAN_ADDR);
 
-        let snapshot = install_with_runner(&opts_minimal(), &runner, TEST_DAEMON_EXE)
+        let snapshot = install_without_guard(&opts_minimal(), runner.clone(), TEST_DAEMON_EXE)
             .await
             .expect("install");
         assert_eq!(
@@ -2860,7 +2901,7 @@ AllowLocalFirewallRules    : True
              allow the LAN"
         );
 
-        uninstall_with_runner(&runner, &snapshot)
+        uninstall_with_runner(runner.as_ref(), &snapshot)
             .await
             .expect("uninstall");
         assert!(runner.model().ours.is_empty());
@@ -2880,9 +2921,10 @@ AllowLocalFirewallRules    : True
             remote_port: None,
             program: None,
         };
-        let runner =
-            ModelRunner::new(FirewallModel::stock()).leaving_behind(vec![leftover.clone()]);
-        let err = install_with_runner(&opts_minimal(), &runner, TEST_DAEMON_EXE)
+        let runner = Arc::new(
+            ModelRunner::new(FirewallModel::stock()).leaving_behind(vec![leftover.clone()]),
+        );
+        let err = install_without_guard(&opts_minimal(), runner.clone(), TEST_DAEMON_EXE)
             .await
             .expect_err("a rule we cannot remove must fail the install");
         assert!(format!("{err:#}").contains("lan-10.0.0.0/8"), "got {err:#}");
@@ -2890,9 +2932,10 @@ AllowLocalFirewallRules    : True
 
     #[tokio::test]
     async fn install_rolls_the_whole_policy_back_when_a_command_fails() {
-        let runner =
-            ModelRunner::new(FirewallModel::with_preexisting_allow(TEST_OTHER_APP)).failing_at(4);
-        let err = install_with_runner(&opts_minimal(), &runner, TEST_DAEMON_EXE)
+        let runner = Arc::new(
+            ModelRunner::new(FirewallModel::with_preexisting_allow(TEST_OTHER_APP)).failing_at(4),
+        );
+        let err = install_without_guard(&opts_minimal(), runner.clone(), TEST_DAEMON_EXE)
             .await
             .expect_err("a failing command must fail the install");
         assert!(matches!(err, KillswitchError::Windows(_)), "got {err:?}");
@@ -2915,8 +2958,10 @@ AllowLocalFirewallRules    : True
 
     #[tokio::test]
     async fn uninstall_restores_the_profiles_and_the_disabled_rules() {
-        let runner = ModelRunner::new(FirewallModel::with_preexisting_allow(TEST_OTHER_APP));
-        let snapshot = install_with_runner(&opts_minimal(), &runner, TEST_DAEMON_EXE)
+        let runner = Arc::new(ModelRunner::new(FirewallModel::with_preexisting_allow(
+            TEST_OTHER_APP,
+        )));
+        let snapshot = install_without_guard(&opts_minimal(), runner.clone(), TEST_DAEMON_EXE)
             .await
             .expect("install");
         let packet = outbound_from("Ethernet", TEST_OTHER_APP, PUBLIC_ADDR);
@@ -2926,7 +2971,7 @@ AllowLocalFirewallRules    : True
             "setup: the policy is in effect"
         );
 
-        uninstall_with_runner(&runner, &snapshot)
+        uninstall_with_runner(runner.as_ref(), &snapshot)
             .await
             .expect("uninstall");
 
@@ -2954,12 +2999,12 @@ AllowLocalFirewallRules    : True
         for profile in model.profiles.values_mut() {
             profile.local_default = OutboundAction::Block;
         }
-        let runner = ModelRunner::new(model);
-        let snapshot = install_with_runner(&opts_minimal(), &runner, TEST_DAEMON_EXE)
+        let runner = Arc::new(ModelRunner::new(model));
+        let snapshot = install_without_guard(&opts_minimal(), runner.clone(), TEST_DAEMON_EXE)
             .await
             .expect("install");
 
-        uninstall_with_runner(&runner, &snapshot)
+        uninstall_with_runner(runner.as_ref(), &snapshot)
             .await
             .expect("uninstall");
         assert_eq!(
@@ -3093,7 +3138,7 @@ AllowLocalFirewallRules    : True
     #[tokio::test]
     async fn a_rule_created_after_the_install_cannot_reopen_the_egress() {
         let runner = Arc::new(ModelRunner::new(FirewallModel::stock()));
-        install_with_runner(&opts_minimal(), runner.as_ref(), TEST_DAEMON_EXE)
+        install_without_guard(&opts_minimal(), runner.clone(), TEST_DAEMON_EXE)
             .await
             .expect("install");
         let packet = outbound_from("Ethernet", TEST_OTHER_APP, PUBLIC_ADDR);
@@ -3132,7 +3177,7 @@ AllowLocalFirewallRules    : True
         // carrier stay blocked: reporting success would announce a protection (a
         // working tunnel) that is not there.
         let runner = Arc::new(ModelRunner::new(FirewallModel::stock()).dropping_override_flag());
-        let err = install_with_runner(&opts_minimal(), runner.as_ref(), TEST_DAEMON_EXE)
+        let err = install_without_guard(&opts_minimal(), runner.clone(), TEST_DAEMON_EXE)
             .await
             .expect_err("an exception without the override flag must fail the install");
         assert!(
@@ -3152,6 +3197,52 @@ AllowLocalFirewallRules    : True
     // future cancelled mid-teardown. Clearing the flag before the first command
     // (the earlier shape) silently skipped the restoration of the operator's rules
     // and of the captured profile settings.
+
+    #[tokio::test]
+    async fn a_cancelled_install_restores_what_it_already_changed() {
+        // The guard is armed BEFORE the first mutation, so a cancellation in the
+        // middle of the install still drops an armed guard: the operator's rules
+        // come back and the profiles are restored. Armed only once the install had
+        // returned (the earlier shape), this window had nothing to undo it, and the
+        // host was left with its firewall modified and no guard.
+        let mut model = FirewallModel::with_preexisting_allow(TEST_OTHER_APP);
+        for profile in model.profiles.values_mut() {
+            profile.local_enabled = GpoBool::False;
+        }
+        let runner = Arc::new(ModelRunner::new(model));
+        // Let the removal, the enable, the default block and the disable of the
+        // operator's rule through, then stall: the host is mid-install.
+        runner.stalling_from(4);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(50),
+            KillswitchGuard::install(&opts_minimal(), runner.clone(), TEST_DAEMON_EXE),
+        )
+        .await;
+        assert!(outcome.is_err(), "the model runner was told to stall");
+
+        assert!(
+            runner.recorded().contains(&"sync_teardown".to_owned()),
+            "a cancelled install must still run the guard's teardown: {:#?}",
+            runner.recorded()
+        );
+        let model = runner.model();
+        assert!(model.ours.is_empty(), "no rule of ours may be left behind");
+        assert!(
+            model.preexisting.iter().all(|r| r.enabled),
+            "the operator's rules must be re-enabled"
+        );
+        assert_eq!(
+            model.profiles["Domain"].local_enabled,
+            GpoBool::False,
+            "and the captured profile enable state restored"
+        );
+        assert_eq!(
+            model.profiles["Domain"].local_default,
+            OutboundAction::Allow,
+            "and the captured default outbound action"
+        );
+    }
 
     #[tokio::test]
     async fn a_completed_uninstall_disarms_the_guard() {
