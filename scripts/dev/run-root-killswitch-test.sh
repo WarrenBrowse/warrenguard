@@ -15,6 +15,11 @@
 # crates/warrenguard-killswitch-os/src/macos.rs for what it asserts and what it
 # restores.
 #
+# A pre-flight refusal (`UnconfirmedStates`, which a busy host triggers) makes the
+# test exit NON-ZERO on purpose, with an "inconclusive" message: the anchor was never
+# loaded, so no install/uninstall cycle ran and the run proves nothing. Rerun it when
+# the host is idle.
+#
 # Usage:
 #   scripts/dev/run-root-killswitch-test.sh                  # run, tee to target/
 #   scripts/dev/run-root-killswitch-test.sh --print-only     # build, print the command
@@ -39,7 +44,7 @@ while [[ $# -gt 0 ]]; do
         --print-only) PRINT_ONLY=1; shift ;;
         --log) LOG="${2:?--log needs a path}"; shift 2 ;;
         --filter) FILTER="${2:?--filter needs a test name}"; shift 2 ;;
-        -h | --help) sed -n '2,30p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        -h | --help) sed -n '2,29p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -99,6 +104,8 @@ echo "==> this purges every connection this policy does not pass, on THIS host"
 echo "==> if it is interrupted, recover with:"
 echo "      sudo pfctl -a com.apple/250.warrenguard_killswitch_os -F rules"
 echo "    and, only if this host had pf off before: sudo pfctl -d"
+echo "==> note: a pre-flight refusal FAILS this test on purpose, as 'inconclusive':"
+echo "==>       the anchor was never loaded, so no install/uninstall cycle ran"
 echo "==> running: ${command[*]}"
 
 if [[ "$PRINT_ONLY" == "1" ]]; then

@@ -31,12 +31,13 @@
 //!   interface-scoped flow's entry goes even when its local address looks right;
 //! - the CONFIRMATION refuses while one is still there, instead of explaining it
 //!   away as a recreation;
-//! - a PRE-FLIGHT pass runs before the first mutation and refuses the install with
+//! - a PRE-FLIGHT pass before the anchor rules are touched refuses the install with
 //!   [`KillswitchError::UnconfirmedStates`] when such an entry comes back, which
 //!   means a peer is still sending: that is the transport, and the contract this
 //!   module enforces is that the killswitch is installed BEFORE the transport
-//!   starts. Refusing there leaves the host exactly as it was, rather than rolling
-//!   a loaded anchor back.
+//!   starts. Refusing there leaves the pf rules and pf's enable state untouched
+//!   (the pre-flight's own state purge has already run, so off-policy connections
+//!   are cut either way), rather than rolling a loaded anchor back.
 //!
 //! ## Manual verification on a real Mac
 //!
@@ -698,13 +699,24 @@ impl MacosKillswitch {
             .await
             .map_err(|e| KillswitchError::Pf(format!("spawn_blocking is_enabled: {e}")))??;
 
-        // Pre-flight, before anything is mutated. A state the new policy does not
-        // provably pass is either a stale entry (killing it is enough) or a live
-        // flow whose peer keeps sending, in which case killing it again cannot
-        // establish the policy. Refusing here, before the first mutation, leaves the
-        // host exactly as it was and tells the operator what to do; the alternative
-        // is discovering it after the anchor is loaded, which rolls a policy back
-        // and teaches nobody why.
+        // Pre-flight, before the anchor RULES are touched: nothing is flushed, no
+        // rule is loaded, and pf's enable state is only read (the snapshot above).
+        // That is what makes the refusal cheaper than the post-load rollback
+        // below, which has to flush an anchor and put pf's enable state back.
+        //
+        // It is NOT read-only on the state table: it calls `purge_bypass_states`,
+        // so it kills every off-policy state it can remove, exactly as the install
+        // would. That kill is a transient effect (no rule changed, so a killed flow
+        // simply reconnects), and it is why the refusal's guarantee is about the
+        // rules and pf's enable state, not about connections.
+        //
+        // A state the new policy does not provably pass is either a stale entry
+        // (killing it is enough) or a live flow whose peer keeps sending, in which
+        // case killing it again cannot establish the policy. Refusing here tells
+        // the operator what to do, and the contract is that the killswitch is
+        // installed BEFORE the transport starts; the alternative is discovering it
+        // after the anchor is loaded, which rolls a policy back and teaches nobody
+        // why.
         let preflight_ops = ops.clone();
         let preflight_permitted = permitted.clone();
         let preflight = tokio::task::spawn_blocking(move || {
@@ -714,10 +726,12 @@ impl MacosKillswitch {
         .map_err(|e| KillswitchError::Pf(format!("spawn_blocking pre-flight states: {e}")))??;
         if let Some(count) = bypass_survivors(&preflight, &permitted) {
             return Err(KillswitchError::UnconfirmedStates(format!(
-                "{count} live connection state(s) are covered by no provable pass rule of \
-                 the new policy, and a pf state entry carries no interface name, so a \
-                 flow whose pass is interface-scoped cannot be shown to match it. Stop \
-                 the tunnel (or wait for a stale state to expire) and install the \
+                "{count} live connection state(s) survived the pre-flight state purge: they are \
+                 covered by no provable pass rule of the new policy, and a pf state entry carries \
+                 no interface name, so a flow whose pass is interface-scoped cannot be shown to \
+                 match it. The pre-flight already killed every off-policy state it could remove, so \
+                 other connections may already have been cut; pf's rules and pf's enable state are \
+                 unchanged. Stop the tunnel (or wait for a stale state to expire) and install the \
                  killswitch before the transport starts."
             )));
         }
@@ -1655,12 +1669,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_live_state_the_policy_cannot_account_for_refuses_before_mutating() {
+    async fn a_live_state_the_policy_cannot_account_for_refuses_before_the_rules_are_touched() {
         // The pre-flight. A state the new policy does not provably pass that comes
         // back after a kill is a peer that keeps sending, so the install cannot
-        // establish the policy. It refuses BEFORE the first mutation, which leaves
-        // the host exactly as it was and turns a race into an actionable error
-        // instead of a rolled-back anchor.
+        // establish the policy. It refuses before any rule is touched: pf's enable
+        // state was only read and the anchor was neither flushed nor loaded, so the
+        // refusal leaves the rules and pf's enable state untouched. The pre-flight
+        // has already killed the off-policy states it could remove, though, so the
+        // guarantee here is about the rules, not about connections.
         let local: SocketAddr = (Ipv4Addr::new(192, 0, 2, 10), 5000).into();
         let carrier: SocketAddr = (EXIT_V4, 443).into();
         let mut o = opts_minimal();
@@ -1676,15 +1692,28 @@ mod tests {
             matches!(err, KillswitchError::UnconfirmedStates(_)),
             "the caller must be able to tell this from a pf failure: got {err:?}"
         );
+        let message = match &err {
+            KillswitchError::UnconfirmedStates(message) => message,
+            other => panic!("expected an UnconfirmedStates refusal: got {other:?}"),
+        };
+        assert!(
+            message.contains("survived the pre-flight state purge"),
+            "the message must name the pre-flight state purge that already ran: got {message}"
+        );
+        assert!(
+            message.contains("pf's rules and pf's enable state are unchanged"),
+            "the message must state what the refusal did leave alone: got {message}"
+        );
         assert_eq!(
             pf.recorded(),
             vec!["is_enabled".to_owned(), "purge_bypass_states".to_owned()],
-            "the refusal must come before anything is mutated"
+            "the refusal must come before the rules are touched: pf's enable state is only \
+             read, nothing is flushed and no rule is loaded"
         );
     }
 
     #[tokio::test]
-    async fn a_preflight_purge_error_refuses_without_mutating() {
+    async fn a_preflight_purge_error_refuses_before_the_rules_are_touched() {
         let pf = Arc::new(MockPf::failing_purge_on(0));
         let err = MacosKillswitch::install_with_ops(&opts_minimal(), pf.clone())
             .await
@@ -1693,7 +1722,7 @@ mod tests {
         let ops = pf.recorded();
         assert!(
             !ops.contains(&"add_rule".to_owned()) && !ops.contains(&"flush_rules".to_owned()),
-            "nothing may be loaded, and there is nothing to roll back: {ops:?}"
+            "no rule was loaded and there is nothing to roll back: {ops:?}"
         );
     }
 
@@ -1818,7 +1847,11 @@ mod tests {
     // The policy is deliberately inert: the exit address is TEST-NET-3 (RFC 5737,
     // 203.0.113.0/24) and the tunnel interface does not exist, so the only traffic it
     // excepts is loopback, the LAN and DHCP. The host's pf enable state is captured
-    // and asserted unchanged afterwards, which is what makes a failure recoverable.
+    // first and asserted unchanged afterwards, which is what lets an operator put an
+    // interrupted run back the way it was.
+    //
+    // A pre-flight refusal FAILS this test on purpose: the anchor was never loaded, so
+    // the install/uninstall cycle the test exists to prove never ran.
     #[cfg(target_os = "macos")]
     #[ignore = "needs root and purges off-policy connections: see the doc comment"]
     #[tokio::test]
@@ -1845,28 +1878,95 @@ mod tests {
             phys_iface: None,
         };
 
-        match MacosKillswitch::install(&opts).await {
-            Ok(guard) => {
+        let result = MacosKillswitch::install(&opts).await;
+        match classify_real_cycle(&result) {
+            RealCycleVerdict::Cycled => {
+                let guard = result.expect("classified as cycled");
                 eprintln!("installed; the anchor is loaded and the state table was purged");
                 guard
                     .uninstall()
                     .await
                     .expect("the real uninstall flushes the anchor and restores pf");
             }
-            Err(KillswitchError::UnconfirmedStates(message)) => {
-                // A busy host: a live flow the policy cannot account for keeps coming
-                // back, so the pre-flight refused before mutating. That is the
-                // designed outcome, and the point of this branch is that it left the
-                // host alone.
-                eprintln!("refused before mutating, as designed: {message}");
+            RealCycleVerdict::RefusedBeforeLoading => {
+                // Asserted BEFORE the panic, so the operator sees that the refusal
+                // changed nothing about pf being on.
+                assert_eq!(
+                    real.is_enabled()
+                        .expect("read pf's enable state after a refusal"),
+                    was_enabled,
+                    "the test must leave pf's enable state exactly as it found it"
+                );
+                let message = match result.as_ref().expect_err("classified as refused") {
+                    KillswitchError::UnconfirmedStates(message) => message,
+                    other => panic!("classify_real_cycle called this a refusal: {other:?}"),
+                };
+                panic!(
+                    "inconclusive: the pre-flight refused the install, so the anchor was never \
+                     loaded and no install/uninstall cycle ran; this run proves nothing about the \
+                     purge. Rerun when the host is idle. Refusal: {message}"
+                );
             }
-            Err(other) => panic!("the real install failed for another reason: {other:?}"),
+            RealCycleVerdict::Failed => {
+                let other = result.expect_err("classified as failed");
+                panic!("the real install failed for another reason: {other:?}");
+            }
         }
 
         assert_eq!(
             real.is_enabled().expect("read pf's enable state again"),
             was_enabled,
             "the test must leave pf's enable state exactly as it found it"
+        );
+    }
+
+    /// What the root-only real-pf cycle test may conclude from an install attempt.
+    #[cfg(test)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RealCycleVerdict {
+        /// A guard came back, so the anchor was loaded and the state table purged:
+        /// the cycle the test exists to prove actually ran.
+        Cycled,
+        /// The pre-flight refused because a live state the policy cannot account for
+        /// kept coming back. The anchor was never loaded and no cycle ran, so the run
+        /// proves nothing.
+        RefusedBeforeLoading,
+        /// The install failed for a reason this test does not model.
+        Failed,
+    }
+
+    /// Classifies an install result for the root-only real-pf cycle test.
+    ///
+    /// A refusal is deliberately NOT a pass: the test's claim is that the real
+    /// `/dev/pf` path loads the anchor, purges the table, confirms it and restores,
+    /// and a refusal returns before any of that happened.
+    #[cfg(test)]
+    fn classify_real_cycle<T>(result: &Result<T, KillswitchError>) -> RealCycleVerdict {
+        match result {
+            Ok(_) => RealCycleVerdict::Cycled,
+            Err(KillswitchError::UnconfirmedStates(_)) => RealCycleVerdict::RefusedBeforeLoading,
+            Err(_) => RealCycleVerdict::Failed,
+        }
+    }
+
+    #[test]
+    fn a_preflight_refusal_is_not_a_completed_real_cycle() {
+        assert_eq!(
+            classify_real_cycle(&Ok::<(), KillswitchError>(())),
+            RealCycleVerdict::Cycled
+        );
+        // Asserted separately: this is the branch that used to be reported as a success.
+        assert_eq!(
+            classify_real_cycle(&Err::<(), KillswitchError>(
+                KillswitchError::UnconfirmedStates("a live state".into())
+            )),
+            RealCycleVerdict::RefusedBeforeLoading
+        );
+        assert_eq!(
+            classify_real_cycle(&Err::<(), KillswitchError>(KillswitchError::Pf(
+                "boom".into()
+            ))),
+            RealCycleVerdict::Failed
         );
     }
 }
