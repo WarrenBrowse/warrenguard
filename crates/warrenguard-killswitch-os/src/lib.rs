@@ -852,14 +852,6 @@ mod tests {
         assert!(matches!(err, KillswitchError::InvalidInput(_)));
     }
 
-    // ---- behavioral fail-closed lifecycle (mock runner) -------------
-    //
-    // The fail-closed contract used to be "tested" only by grepping
-    // the source for `impl Drop` (tests/drop_rollback_contract.rs); an
-    // empty Drop body would have passed. These tests verify the actual
-    // behavior through the CommandRunner seam: which nft command runs,
-    // with which arguments, and when.
-
     use std::sync::Arc;
 
     /// One recorded runner invocation: (program, args, stdin).

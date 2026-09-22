@@ -1856,13 +1856,12 @@ mod tests {
     #[ignore = "needs root and purges off-policy connections: see the doc comment"]
     #[tokio::test]
     async fn real_pf_install_and_uninstall_cycle() {
-        if std::env::var("WARREN_KILLSWITCH_ROOT_TEST").as_deref() != Ok("1") {
-            eprintln!(
-                "refusing to run: this test purges the state table of the host it runs on. \
-                 Set WARREN_KILLSWITCH_ROOT_TEST=1 (and run it as root) to proceed."
-            );
-            return;
-        }
+        assert_eq!(
+            std::env::var("WARREN_KILLSWITCH_ROOT_TEST").as_deref(),
+            Ok("1"),
+            "this test purges the host's state table; set WARREN_KILLSWITCH_ROOT_TEST=1 \
+             and run it as root"
+        );
 
         let real = RealPfOps;
         let was_enabled = real
@@ -1878,37 +1877,28 @@ mod tests {
             phys_iface: None,
         };
 
-        let result = MacosKillswitch::install(&opts).await;
-        match classify_real_cycle(&result) {
-            RealCycleVerdict::Cycled => {
-                let guard = result.expect("classified as cycled");
+        match MacosKillswitch::install(&opts).await {
+            Ok(guard) => {
                 eprintln!("installed; the anchor is loaded and the state table was purged");
                 guard
                     .uninstall()
                     .await
                     .expect("the real uninstall flushes the anchor and restores pf");
             }
-            RealCycleVerdict::RefusedBeforeLoading => {
-                // Asserted BEFORE the panic, so the operator sees that the refusal
-                // changed nothing about pf being on.
+            Err(KillswitchError::UnconfirmedStates(message)) => {
                 assert_eq!(
                     real.is_enabled()
                         .expect("read pf's enable state after a refusal"),
                     was_enabled,
                     "the test must leave pf's enable state exactly as it found it"
                 );
-                let message = match result.as_ref().expect_err("classified as refused") {
-                    KillswitchError::UnconfirmedStates(message) => message,
-                    other => panic!("classify_real_cycle called this a refusal: {other:?}"),
-                };
                 panic!(
                     "inconclusive: the pre-flight refused the install, so the anchor was never \
                      loaded and no install/uninstall cycle ran; this run proves nothing about the \
                      purge. Rerun when the host is idle. Refusal: {message}"
                 );
             }
-            RealCycleVerdict::Failed => {
-                let other = result.expect_err("classified as failed");
+            Err(other) => {
                 panic!("the real install failed for another reason: {other:?}");
             }
         }
@@ -1917,56 +1907,6 @@ mod tests {
             real.is_enabled().expect("read pf's enable state again"),
             was_enabled,
             "the test must leave pf's enable state exactly as it found it"
-        );
-    }
-
-    /// What the root-only real-pf cycle test may conclude from an install attempt.
-    #[cfg(test)]
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum RealCycleVerdict {
-        /// A guard came back, so the anchor was loaded and the state table purged:
-        /// the cycle the test exists to prove actually ran.
-        Cycled,
-        /// The pre-flight refused because a live state the policy cannot account for
-        /// kept coming back. The anchor was never loaded and no cycle ran, so the run
-        /// proves nothing.
-        RefusedBeforeLoading,
-        /// The install failed for a reason this test does not model.
-        Failed,
-    }
-
-    /// Classifies an install result for the root-only real-pf cycle test.
-    ///
-    /// A refusal is deliberately NOT a pass: the test's claim is that the real
-    /// `/dev/pf` path loads the anchor, purges the table, confirms it and restores,
-    /// and a refusal returns before any of that happened.
-    #[cfg(test)]
-    fn classify_real_cycle<T>(result: &Result<T, KillswitchError>) -> RealCycleVerdict {
-        match result {
-            Ok(_) => RealCycleVerdict::Cycled,
-            Err(KillswitchError::UnconfirmedStates(_)) => RealCycleVerdict::RefusedBeforeLoading,
-            Err(_) => RealCycleVerdict::Failed,
-        }
-    }
-
-    #[test]
-    fn a_preflight_refusal_is_not_a_completed_real_cycle() {
-        assert_eq!(
-            classify_real_cycle(&Ok::<(), KillswitchError>(())),
-            RealCycleVerdict::Cycled
-        );
-        // Asserted separately: this is the branch that used to be reported as a success.
-        assert_eq!(
-            classify_real_cycle(&Err::<(), KillswitchError>(
-                KillswitchError::UnconfirmedStates("a live state".into())
-            )),
-            RealCycleVerdict::RefusedBeforeLoading
-        );
-        assert_eq!(
-            classify_real_cycle(&Err::<(), KillswitchError>(KillswitchError::Pf(
-                "boom".into()
-            ))),
-            RealCycleVerdict::Failed
         );
     }
 }

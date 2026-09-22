@@ -1562,9 +1562,8 @@ mod tests {
         // distinguish "our leaked half" from "someone else's live one" -
         // installing a real split-default route here to exercise Drop for
         // real would require root and mutate this host's live routing
-        // table, so this pins the fix at the source level instead (mirrors
-        // `warrenguard-killswitch-os`'s `drop_rollback_contract.rs`
-        // pattern): the Drop impl body must route the halves reclaim
+        // table, so this pins the fix at the source level instead: the Drop
+        // impl body must route the halves reclaim
         // through the ownership-scoped `reclaim_split_halves_v6`, like the
         // v4 Drop does, not a raw unconditional per-half delete loop.
         let src = include_str!("default_route_split_macos.rs");

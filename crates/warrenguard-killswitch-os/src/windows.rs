@@ -88,26 +88,9 @@
 //!   future dropped between two PowerShell invocations still runs the synchronous
 //!   teardown from `Drop`. A rollback that completed cleanly disarms it, and a
 //!   partial one leaves it armed to retry.
-//! - Cancellation, second half: every command is registered on a gate BEFORE it is
-//!   spawned, and the teardown closes that gate and waits for every registration to
-//!   be released before its first command, so the restoration starts only once every
-//!   accepted command has finished and its writes are the last ones. The
-//!   registration is what closes the cancellation window the mutex alone left open:
-//!   the mutex is only taken once the blocking task starts, so a future dropped
-//!   between the spawn and that start would otherwise leave the teardown free to
-//!   restore first. Termination timing is deliberately not relied on: tokio leaves a
-//!   spawned child running when its output future is dropped, and on Windows
-//!   `TerminateProcess` may return before the process is actually gone. The wait is
-//!   bounded (a teardown that can hang process exit for ever is the worse failure),
-//!   and an expired bound makes the teardown REFUSE instead of restoring under a
-//!   command that may still write: it keeps whatever that command applies, logs the
-//!   commands an operator has to run by hand, and calls the firewall half-applied
-//!   rather than reporting a restoration a later write could overwrite. A command
-//!   that DOES run counts as a restoration only when it exits zero: the bounded
-//!   runner returns `Some` for any child that exited, a denied cmdlet and a program
-//!   that could not be started included, so the verdict is the exit status
-//!   ([`sync_command_verdict`]) and a command that failed is logged with its status
-//!   and stderr for the operator to run by hand.
+//! - Each command reserves the gate before spawning. The teardown closes the gate
+//!   and waits for accepted commands to finish before restoring. It refuses to
+//!   restore if the wait expires, and reports any restoration command that fails.
 //!
 //! ## What the tests here cover, and what they cannot
 //!
@@ -1370,9 +1353,6 @@ impl FirewallRunner for PowershellRunner {
 
     fn sync_teardown(&self, snapshot: &FirewallSnapshot) {
         match sync_teardown_with(&self.gate, snapshot, SYNC_CLEANUP_TIMEOUT, |cmd| {
-            // `run_sync_bounded` returns `Some` for ANY child that exited within the
-            // bound, a denied cmdlet and a missing program (reported as exit 127)
-            // included, so the status is what decides whether anything was restored.
             sync_command_verdict(
                 "powershell.exe",
                 run_sync_bounded("powershell.exe", cmd, SYNC_CLEANUP_TIMEOUT),
@@ -1391,10 +1371,6 @@ impl FirewallRunner for PowershellRunner {
                     );
                 }
             }
-            // The bound is a REFUSAL, not a licence to restore anyway: a restoration
-            // written now would be the earlier write, and the command still running
-            // can overwrite parts of it afterwards, which leaves a state nobody can
-            // name while the operator believes the captured state is back.
             SyncTeardownOutcome::Refused { pending } => {
                 tracing::error!(
                     timeout = ?SYNC_CLEANUP_TIMEOUT,
@@ -1421,55 +1397,24 @@ impl FirewallRunner for PowershellRunner {
     }
 }
 
-/// Serializes an in-flight PowerShell command with the guard's synchronous
-/// teardown.
-///
-/// Tokio leaves a spawned child running when its output future is dropped, and
-/// `kill_on_drop` only *requests* termination: on Windows `TerminateProcess` may
-/// return before the process is actually gone, so the guard's restoration could
-/// still race a command that has not finished applying its change. Instead of
-/// depending on termination timing, every command runs to completion on a blocking
-/// task (a blocking task is not cancelled when the future waiting on it is dropped),
-/// and the teardown starts only once the gate is quiescent.
-///
-/// A RESERVATION, not the mutex, is what makes that an ordering guarantee. The mutex
-/// is taken only once the blocking task actually starts, so a future cancelled
-/// between `spawn_blocking` and that moment leaves the mutex free: a teardown that
-/// waited on the mutex alone would restore the firewall, and the queued command
-/// would apply its mutation after that restoration. The reservation is therefore
-/// taken BEFORE the command is spawned, inside the caller's future and before its
-/// first await point, so no cancellation can precede it. The teardown waits for
-/// every reservation to be released, and the release happens after the command's own
-/// writes: the restoration is either the last write or it does not happen at all.
+/// Tracks commands accepted before teardown. A reservation starts before
+/// `spawn_blocking`, so cancelling a future while its task is queued cannot let
+/// that task modify the firewall after restoration.
 #[cfg(any(target_os = "windows", test))]
 #[derive(Debug, Default, Clone)]
 struct CommandGate {
     inner: Arc<GateInner>,
 }
 
-/// The gate's shared state. [`CommandGate`] documents the protocol.
 #[cfg(any(target_os = "windows", test))]
 #[derive(Debug, Default)]
 struct GateInner {
-    /// Held by the command whose blocking task is running, so the mutations of two
-    /// accepted commands never interleave.
     serial: std::sync::Mutex<()>,
-    /// Commands accepted and not yet finished writing. Each live
-    /// [`GateReservation`] owns one count.
     in_flight: std::sync::atomic::AtomicUsize,
-    /// Set by the first teardown and never cleared. No reservation is granted once
-    /// it is set, which is what stops a mutation from starting after a restoration
-    /// has been decided.
     closed: std::sync::atomic::AtomicBool,
 }
 
-/// One accepted command, from the moment it is registered until its child has
-/// exited.
-///
-/// The blocking closure owns it, so the reservation is released whichever way the
-/// task ends: the closure runs the command and releases afterwards, or the runtime
-/// drops the queued task and the [`Drop`] below releases it. A teardown can
-/// therefore rely on the count without a code path being able to leak it.
+/// Releases its count even if a queued blocking task is dropped by the runtime.
 #[cfg(any(target_os = "windows", test))]
 #[derive(Debug)]
 struct GateReservation {
@@ -1478,11 +1423,7 @@ struct GateReservation {
 
 #[cfg(any(target_os = "windows", test))]
 impl GateReservation {
-    /// Runs `f` with the serial mutex held, then releases the reservation.
-    ///
-    /// The order is the point: the mutex is released first and the reservation last,
-    /// so a teardown that observes a quiescent gate has already observed every write
-    /// `f` made.
+    /// Releases the mutex before the reservation, so quiescence follows every write.
     fn run<T>(self, f: impl FnOnce() -> T) -> T {
         let out = {
             // A poisoned mutex means another command panicked; the ordering
@@ -1510,20 +1451,8 @@ impl Drop for GateReservation {
 
 #[cfg(any(target_os = "windows", test))]
 impl CommandGate {
-    /// Registers one command before it can be spawned, or refuses it when the
-    /// teardown has already begun.
-    ///
-    /// MUST be called before the first await point of the caller's future: that is
-    /// what removes the cancellation window. A future dropped at any await point
-    /// afterwards has already published the reservation, and the blocking task that
-    /// owns it cannot be cancelled with it.
-    ///
-    /// The second `closed` read is the handshake's other half. The teardown sets
-    /// `closed` and only then reads `in_flight`, so a reservation granted here is
-    /// either visible to that read (the teardown waits for it) or the teardown had
-    /// already passed the read when `closed` was seen here, in which case this side
-    /// releases the count and refuses: no command runs, so no mutation can follow the
-    /// restoration.
+    /// Call before the first await. The second `closed` read pairs with teardown's
+    /// count read: an accepted command is visible to teardown, or it is refused.
     fn reserve(&self) -> Option<GateReservation> {
         use std::sync::atomic::Ordering;
         if self.inner.closed.load(Ordering::SeqCst) {
@@ -1539,19 +1468,8 @@ impl CommandGate {
         })
     }
 
-    /// Closes the gate, then waits at most `timeout` for every accepted command to
-    /// finish writing.
-    ///
-    /// `Some` is a quiescent gate: nothing is running, nothing can start, so the
-    /// caller's next write (the restoration) is the last one. `None` means a command
-    /// is still writing past the bound, and the caller must NOT restore: a
-    /// restoration that races a command can be overwritten by it afterwards, which
-    /// leaves a host nobody can describe. Availability is the price of refusing, and
-    /// the policy in place is fail-closed, so refusing is the safe side of that
-    /// trade.
-    ///
-    /// The close is one-way on purpose: a gate that reopened would let a queued
-    /// mutation start after the restoration it was refused for.
+    /// Returns `None` on timeout; the caller must then leave restoration to the
+    /// operator because a late command could overwrite it.
     fn close_and_quiesce(&self, timeout: Duration) -> Option<()> {
         use std::sync::atomic::Ordering;
         self.inner.closed.store(true, Ordering::SeqCst);
@@ -1576,85 +1494,46 @@ impl CommandGate {
     }
 }
 
-/// One restoration command the synchronous teardown could not complete, with why, so
-/// an operator learns both what to run and what went wrong.
+/// A restoration command requiring operator attention.
 #[cfg(any(target_os = "windows", test))]
 #[derive(Debug, PartialEq, Eq)]
 struct UnfinishedCommand {
-    /// The full command line, ready to paste into a shell.
     command: String,
-    /// Why it did not restore anything: the bound expired, the program could not be
-    /// started, or it exited non-zero (carrying its status and its stderr).
     reason: String,
 }
 
-/// What a synchronous teardown did, so the caller can log it and a test can assert
-/// it.
+/// Outcome of a synchronous teardown.
 #[cfg(any(target_os = "windows", test))]
 #[derive(Debug, PartialEq, Eq)]
 enum SyncTeardownOutcome {
-    /// The gate went quiescent and the restoration commands ran. `unfinished` holds
-    /// the ones that did not actually restore anything (a timed-out, unstartable or
-    /// non-zero-exit command), in order: a command that ran and failed is NOT a
-    /// restoration.
+    /// Commands that timed out, could not start or exited unsuccessfully.
     Restored { unfinished: Vec<UnfinishedCommand> },
-    /// A command was still applying past the bound: NO restoration command ran, and
-    /// `pending` is what the caller has to hand an operator, because nothing will run
-    /// them automatically any more.
+    /// A command remained in flight; no restoration command ran.
     Refused { pending: Vec<String> },
 }
 
-/// The verdict on ONE bounded synchronous restoration command.
-///
-/// `None` is a command that never finished within the bound or could not be started.
-/// `Some(out)` is a command that DID exit, and a non-zero status is a failure: that
-/// is the case a caller reading only `Option::is_some` would report as a restoration
-/// while the firewall keeps the change it was supposed to undo. A denied cmdlet and a
-/// missing program (which `posix_spawn` and the Windows loader can both surface as a
-/// normal exit, 127 and 9009 respectively) travel this path.
-///
-/// The reason carries the exit status and the child's stderr, because the operator
-/// running the command by hand needs to know WHY it failed, and the commands this
-/// teardown runs are the ones that remove our rules, re-enable the operator's own and
-/// restore the captured profile settings (no address, no secret in their output).
+/// `Some` from the bounded runner only means that the child exited.
 #[cfg(any(target_os = "windows", test))]
 fn sync_command_verdict(
     program: &str,
-    outcome: Option<std::process::Output>,
+    outcome: Option<std::process::ExitStatus>,
 ) -> Result<(), String> {
-    let Some(out) = outcome else {
+    let Some(status) = outcome else {
         return Err(format!(
             "{program} did not finish within the bound or could not be started"
         ));
     };
-    if out.status.success() {
+    if status.success() {
         return Ok(());
     }
-    let how = match out.status.code() {
+    let how = match status.code() {
         Some(code) => format!("exit code {code}"),
         None => "a signal".to_owned(),
     };
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let stderr = stderr.trim();
-    Err(if stderr.is_empty() {
-        format!("{program} exited with {how}")
-    } else {
-        format!("{program} exited with {how}: {stderr}")
-    })
+    Err(format!("{program} exited with {how}"))
 }
 
-/// The synchronous teardown: close the gate, wait for it, then either restore the
-/// captured state or refuse and report what a human has to run.
-///
-/// Ungated on purpose, and with the bounded runner injected, so the DECISION the
-/// bound makes, AND the verdict on each command it does let through, are driven on
-/// every host: the Windows binding only supplies
-/// `sync_command_verdict("powershell.exe", run_sync_bounded(...))`. `run` returns
-/// `Ok` only when the command actually did its work. The refusal is the other point
-/// of this function: restoring while a command may still be applying would let that
-/// command overwrite part of the restoration afterwards, so the safe side of that
-/// trade is to leave what is there and keep the operator's recovery reachable through
-/// the returned commands.
+/// Closes the gate before restoring and returns the commands needing attention.
 #[cfg(any(target_os = "windows", test))]
 fn sync_teardown_with(
     gate: &CommandGate,
@@ -1785,49 +1664,23 @@ fn wait_child_bounded(
     }
 }
 
-/// Runs `program args...` synchronously, bounded by `timeout`. Returns `None`
-/// on spawn failure or timeout (the child is killed in the timeout case);
-/// best-effort and panic-free, so it is safe to call from `Drop`.
-///
-/// `Some` means ONLY that the child exited within the bound, never that it
-/// succeeded: a denied cmdlet, and a missing program (which the loader or
-/// `posix_spawn` can surface as an ordinary exit rather than a spawn error), all
-/// return `Some`. A caller that has to know whether the command did its work reads
-/// `Output::status`, which is what [`sync_command_verdict`] exists for.
-///
-/// Deliberately portable (no OS-specific API) so the bounded-wait logic itself
-/// is exercised by the test suite on every host, even though its only
-/// production caller ([`WindowsKillswitch`]'s `Drop`) only ever runs on Windows.
+/// Returns `None` if the child cannot start or exceeds the deadline. Output is
+/// discarded because restoration only needs the exit status and may run in `Drop`.
 #[cfg(any(target_os = "windows", test))]
 fn run_sync_bounded(
     program: &str,
     args: &[String],
     timeout: Duration,
-) -> Option<std::process::Output> {
+) -> Option<std::process::ExitStatus> {
     let mut child = std::process::Command::new(program)
         .args(args.iter().map(String::as_str))
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .ok()?;
     match wait_child_bounded(&mut child, timeout) {
-        Some(status) => {
-            use std::io::Read as _;
-            let mut stdout = Vec::new();
-            let mut stderr = Vec::new();
-            if let Some(mut h) = child.stdout.take() {
-                let _ = h.read_to_end(&mut stdout);
-            }
-            if let Some(mut h) = child.stderr.take() {
-                let _ = h.read_to_end(&mut stderr);
-            }
-            Some(std::process::Output {
-                status,
-                stdout,
-                stderr,
-            })
-        }
+        Some(status) => Some(status),
         None => {
             let _ = child.kill();
             let _ = child.wait();
@@ -3879,9 +3732,6 @@ AllowLocalFirewallRules    : True
 
     #[test]
     fn the_synchronous_teardown_reports_a_failed_restoration_command_with_its_reason() {
-        // A command that RAN and failed restores nothing, so it must be reported like a
-        // timeout. A caller that reads any exit as a restoration leaves the firewall
-        // changed and says nothing about it.
         let gate = CommandGate::default();
         let snap = snapshot();
         let outcome = sync_teardown_with(&gate, &snap, Duration::from_secs(1), |cmd| {
@@ -3889,7 +3739,7 @@ AllowLocalFirewallRules    : True
                 .join(" ")
                 .contains("Set-NetFirewallProfile -Profile Public")
             {
-                Err("powershell.exe exited with exit code 1: Access is denied".to_owned())
+                Err("powershell.exe exited with exit code 1".to_owned())
             } else {
                 Ok(())
             }
@@ -3908,16 +3758,12 @@ AllowLocalFirewallRules    : True
             unfinished,
             vec![UnfinishedCommand {
                 command: render_op(&FirewallOp::RestoreProfile(public)).join(" "),
-                reason: "powershell.exe exited with exit code 1: Access is denied".to_owned(),
+                reason: "powershell.exe exited with exit code 1".to_owned(),
             }],
             "exactly the command that failed must be reported, with the reason, so an \
              operator can see which part of the captured state is still not back"
         );
     }
-
-    // ---- portable bounded-wait helper (exercised on every host; its only
-    // production caller, WindowsKillswitch's Drop, only ever runs on
-    // Windows and must be validated for real there) --------------------
 
     #[cfg(unix)]
     mod bounded_wait {
@@ -3931,10 +3777,6 @@ AllowLocalFirewallRules    : True
 
         #[test]
         fn sync_command_verdict_rejects_a_non_zero_exit_of_a_real_child() {
-            // The case this function exists for: the child DID exit within the bound, so
-            // `run_sync_bounded` returns `Some`, and only the status says that nothing
-            // was restored. Reading `Some` as success would report a firewall
-            // restoration that never happened.
             let out = run_sync_bounded(
                 "/bin/sh",
                 &[
@@ -3944,21 +3786,10 @@ AllowLocalFirewallRules    : True
                 SYNC_CLEANUP_TIMEOUT,
             )
             .expect("the child exits well within the bound");
-            assert!(
-                !out.status.success(),
-                "the premise of this test is a child that exits non-zero"
-            );
+            assert!(!out.success());
             let reason = sync_command_verdict("/bin/sh", Some(out))
                 .expect_err("a non-zero exit means the command restored nothing");
-            assert!(
-                reason.contains("exit code 7"),
-                "the reason must carry the exit status: {reason}"
-            );
-            assert!(
-                reason.contains("Access is denied"),
-                "the reason must carry the child's stderr, which is what tells the \
-                 operator why the restoration failed: {reason}"
-            );
+            assert_eq!(reason, "/bin/sh exited with exit code 7");
         }
 
         #[test]
@@ -3972,13 +3803,14 @@ AllowLocalFirewallRules    : True
         }
 
         #[test]
-        fn run_sync_bounded_returns_output_for_a_fast_command() {
-            // Reuses the actual production bound (not a smaller literal) so
-            // the constant Drop relies on is exercised by this test too.
-            let out = run_sync_bounded("/bin/echo", &["hello".to_string()], SYNC_CLEANUP_TIMEOUT)
-                .expect("echo must complete well within the bound");
-            assert!(out.status.success());
-            assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hello");
+        fn run_sync_bounded_handles_verbose_children() {
+            let status = run_sync_bounded(
+                "/bin/sh",
+                &["-c".to_string(), "head -c 131072 /dev/zero >&2".to_string()],
+                SYNC_CLEANUP_TIMEOUT,
+            )
+            .expect("a verbose child must finish within the bound");
+            assert!(status.success());
         }
 
         #[test]
@@ -4018,10 +3850,7 @@ AllowLocalFirewallRules    : True
                 Duration::from_secs(1),
             ) {
                 None => {}
-                Some(out) => assert!(
-                    !out.status.success(),
-                    "a missing program cannot report success"
-                ),
+                Some(status) => assert!(!status.success(), "a missing program cannot succeed"),
             }
         }
     }

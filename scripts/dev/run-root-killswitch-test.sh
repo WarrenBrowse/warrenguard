@@ -95,9 +95,14 @@ if [[ -z "$test_binary" || ! -x "$test_binary" ]]; then
 fi
 echo "==> lib test binary: $test_binary"
 
+if ! "$test_binary" --list --ignored "$FILTER" | grep -qE '^[^[:space:]].*: test$'; then
+    echo "error: no ignored test matches filter: $FILTER" >&2
+    exit 2
+fi
+
 # The test refuses to run without this opt-in, because installing the policy purges
 # the host's off-policy connections. Both halves are required: root for /dev/pf, and
-# the variable so an accidental `cargo test -- --ignored` stays a no-op.
+# the variable so an accidental `cargo test -- --ignored` fails before mutation.
 command=(sudo env "WARREN_KILLSWITCH_ROOT_TEST=1" "$test_binary" --ignored --nocapture "$FILTER")
 
 echo "==> this purges every connection this policy does not pass, on THIS host"
