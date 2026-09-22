@@ -88,14 +88,21 @@
 //!   future dropped between two PowerShell invocations still runs the synchronous
 //!   teardown from `Drop`. A rollback that completed cleanly disarms it, and a
 //!   partial one leaves it armed to retry.
-//! - Cancellation, second half: every command runs to completion on a blocking
-//!   task that holds a gate, and the teardown takes that gate before its first
-//!   command, so the restoration starts only once the in-flight command has
-//!   finished and its writes are the last ones. Termination timing is deliberately
-//!   not relied on: tokio leaves a spawned child running when its output future is
-//!   dropped, and on Windows `TerminateProcess` may return before the process is
-//!   actually gone. The wait is bounded (a teardown that can hang process exit for
-//!   ever is the worse failure) and an expired bound is logged as the race it is.
+//! - Cancellation, second half: every command is registered on a gate BEFORE it is
+//!   spawned, and the teardown closes that gate and waits for every registration to
+//!   be released before its first command, so the restoration starts only once every
+//!   accepted command has finished and its writes are the last ones. The
+//!   registration is what closes the cancellation window the mutex alone left open:
+//!   the mutex is only taken once the blocking task starts, so a future dropped
+//!   between the spawn and that start would otherwise leave the teardown free to
+//!   restore first. Termination timing is deliberately not relied on: tokio leaves a
+//!   spawned child running when its output future is dropped, and on Windows
+//!   `TerminateProcess` may return before the process is actually gone. The wait is
+//!   bounded (a teardown that can hang process exit for ever is the worse failure),
+//!   and an expired bound makes the teardown REFUSE instead of restoring under a
+//!   command that may still write: it keeps whatever that command applies, logs the
+//!   commands an operator has to run by hand, and calls the firewall half-applied
+//!   rather than reporting a restoration a later write could overwrite.
 //!
 //! ## What the tests here cover, and what they cannot
 //!
@@ -353,7 +360,12 @@ trait FirewallRunner: Send + Sync + std::fmt::Debug {
     /// Best-effort SYNCHRONOUS teardown, for [`Drop`], which cannot await.
     ///
     /// Implementations must be bounded: a wedged PowerShell must not hang process
-    /// teardown. The asynchronous path is
+    /// teardown. An expired bound is a REFUSAL, not a licence to restore under a
+    /// command that is still applying: a restoration written then would be overwritten
+    /// in part by that command. Such an implementation therefore leaves the host with
+    /// whatever the command applies (a half-applied policy is the honest reading) and
+    /// has to make the manual recovery reachable, because the operator would otherwise
+    /// never learn that the restoration did not happen. The asynchronous path is
     /// [`uninstall_with_runner`](self), which reports errors.
     fn sync_teardown(&self, snapshot: &FirewallSnapshot);
 
@@ -1352,23 +1364,36 @@ impl FirewallRunner for PowershellRunner {
     }
 
     fn sync_teardown(&self, snapshot: &FirewallSnapshot) {
-        // The restoration must not start while a command is still applying: the gate
-        // is what makes that an ordering guarantee rather than a hope about how
-        // quickly a termination request lands. It is bounded, because a teardown that
-        // can hang process exit for ever is the worse failure.
-        if self.gate.take_blocking(SYNC_CLEANUP_TIMEOUT).is_none() {
-            tracing::error!(
-                timeout = ?SYNC_CLEANUP_TIMEOUT,
-                "a firewall command was still running when the guard restored: the \
-                 restoration ran after the bound and a late command may have applied \
-                 a change after it"
-            );
-        }
-        for cmd in uninstall_ops(snapshot).iter().map(render_op) {
-            if run_sync_bounded("powershell.exe", &cmd, SYNC_CLEANUP_TIMEOUT).is_none() {
-                tracing::warn!(
+        match sync_teardown_with(&self.gate, snapshot, SYNC_CLEANUP_TIMEOUT, |cmd| {
+            run_sync_bounded("powershell.exe", cmd, SYNC_CLEANUP_TIMEOUT).is_some()
+        }) {
+            SyncTeardownOutcome::Restored { unfinished } => {
+                for cmd in unfinished {
+                    tracing::warn!(
+                        timeout = ?SYNC_CLEANUP_TIMEOUT,
+                        command = %cmd.join(" "),
+                        "killswitch synchronous teardown command did not complete within \
+                         the bound (killed or failed to start), so this part of the \
+                         captured state is NOT restored"
+                    );
+                }
+            }
+            // The bound is a REFUSAL, not a licence to restore anyway: a restoration
+            // written now would be the earlier write, and the command still running
+            // can overwrite parts of it afterwards, which leaves a state nobody can
+            // name while the operator believes the captured state is back.
+            SyncTeardownOutcome::Refused { pending } => {
+                tracing::error!(
                     timeout = ?SYNC_CLEANUP_TIMEOUT,
-                    "killswitch synchronous teardown command did not complete in time (killed)"
+                    pending = ?pending,
+                    "a firewall command is still applying past the bound, so the captured \
+                     state was NOT restored: a restoration written now would be the \
+                     earlier write, and the command still running could overwrite parts \
+                     of it afterwards. The host keeps whatever that command applies, so \
+                     read it as half-applied rather than as either the killswitch policy \
+                     or the captured state. Once the wedged command has finished (kill \
+                     powershell.exe if it is stuck), run the logged commands by hand to \
+                     put the captured state back."
                 );
             }
         }
@@ -1391,67 +1416,227 @@ impl FirewallRunner for PowershellRunner {
 /// return before the process is actually gone, so the guard's restoration could
 /// still race a command that has not finished applying its change. Instead of
 /// depending on termination timing, every command runs to completion on a blocking
-/// task that holds this gate (a blocking task is not cancelled when the future
-/// waiting on it is dropped), and the teardown takes the gate before its first
-/// command. The restoration therefore starts only once the in-flight command has
-/// finished, and its writes are the last ones.
+/// task (a blocking task is not cancelled when the future waiting on it is dropped),
+/// and the teardown starts only once the gate is quiescent.
+///
+/// A RESERVATION, not the mutex, is what makes that an ordering guarantee. The mutex
+/// is taken only once the blocking task actually starts, so a future cancelled
+/// between `spawn_blocking` and that moment leaves the mutex free: a teardown that
+/// waited on the mutex alone would restore the firewall, and the queued command
+/// would apply its mutation after that restoration. The reservation is therefore
+/// taken BEFORE the command is spawned, inside the caller's future and before its
+/// first await point, so no cancellation can precede it. The teardown waits for
+/// every reservation to be released, and the release happens after the command's own
+/// writes: the restoration is either the last write or it does not happen at all.
 #[cfg(any(target_os = "windows", test))]
 #[derive(Debug, Default, Clone)]
 struct CommandGate {
-    gate: Arc<std::sync::Mutex<()>>,
+    inner: Arc<GateInner>,
+}
+
+/// The gate's shared state. [`CommandGate`] documents the protocol.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Default)]
+struct GateInner {
+    /// Held by the command whose blocking task is running, so the mutations of two
+    /// accepted commands never interleave.
+    serial: std::sync::Mutex<()>,
+    /// Commands accepted and not yet finished writing. Each live
+    /// [`GateReservation`] owns one count.
+    in_flight: std::sync::atomic::AtomicUsize,
+    /// Set by the first teardown and never cleared. No reservation is granted once
+    /// it is set, which is what stops a mutation from starting after a restoration
+    /// has been decided.
+    closed: std::sync::atomic::AtomicBool,
+}
+
+/// One accepted command, from the moment it is registered until its child has
+/// exited.
+///
+/// The blocking closure owns it, so the reservation is released whichever way the
+/// task ends: the closure runs the command and releases afterwards, or the runtime
+/// drops the queued task and the [`Drop`] below releases it. A teardown can
+/// therefore rely on the count without a code path being able to leak it.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug)]
+struct GateReservation {
+    inner: Arc<GateInner>,
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl GateReservation {
+    /// Runs `f` with the serial mutex held, then releases the reservation.
+    ///
+    /// The order is the point: the mutex is released first and the reservation last,
+    /// so a teardown that observes a quiescent gate has already observed every write
+    /// `f` made.
+    fn run<T>(self, f: impl FnOnce() -> T) -> T {
+        let out = {
+            // A poisoned mutex means another command panicked; the ordering
+            // guarantee is what matters, not the panic, so it is taken either way.
+            let _held = self
+                .inner
+                .serial
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            f()
+        };
+        drop(self);
+        out
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl Drop for GateReservation {
+    fn drop(&mut self) {
+        self.inner
+            .in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[cfg(any(target_os = "windows", test))]
 impl CommandGate {
-    /// Runs `f` while holding the gate. Blocking; the production callers run it on
-    /// a blocking task.
-    fn run<T>(&self, f: impl FnOnce() -> T) -> T {
-        // A poisoned gate means another command panicked; the ordering guarantee is
-        // what matters, not the panic, so the guard is taken either way.
-        let _held = self
-            .gate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        f()
+    /// Registers one command before it can be spawned, or refuses it when the
+    /// teardown has already begun.
+    ///
+    /// MUST be called before the first await point of the caller's future: that is
+    /// what removes the cancellation window. A future dropped at any await point
+    /// afterwards has already published the reservation, and the blocking task that
+    /// owns it cannot be cancelled with it.
+    ///
+    /// The second `closed` read is the handshake's other half. The teardown sets
+    /// `closed` and only then reads `in_flight`, so a reservation granted here is
+    /// either visible to that read (the teardown waits for it) or the teardown had
+    /// already passed the read when `closed` was seen here, in which case this side
+    /// releases the count and refuses: no command runs, so no mutation can follow the
+    /// restoration.
+    fn reserve(&self) -> Option<GateReservation> {
+        use std::sync::atomic::Ordering;
+        if self.inner.closed.load(Ordering::SeqCst) {
+            return None;
+        }
+        self.inner.in_flight.fetch_add(1, Ordering::SeqCst);
+        if self.inner.closed.load(Ordering::SeqCst) {
+            self.inner.in_flight.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(GateReservation {
+            inner: Arc::clone(&self.inner),
+        })
     }
 
-    /// Takes the gate, waiting at most `timeout` for an in-flight command.
+    /// Closes the gate, then waits at most `timeout` for every accepted command to
+    /// finish writing.
     ///
-    /// `None` means the wait expired: the caller proceeds anyway (a teardown that
-    /// can hang process exit forever is worse than a logged race) and says so.
-    fn take_blocking(&self, timeout: Duration) -> Option<std::sync::MutexGuard<'_, ()>> {
+    /// `Some` is a quiescent gate: nothing is running, nothing can start, so the
+    /// caller's next write (the restoration) is the last one. `None` means a command
+    /// is still writing past the bound, and the caller must NOT restore: a
+    /// restoration that races a command can be overwritten by it afterwards, which
+    /// leaves a host nobody can describe. Availability is the price of refusing, and
+    /// the policy in place is fail-closed, so refusing is the safe side of that
+    /// trade.
+    ///
+    /// The close is one-way on purpose: a gate that reopened would let a queued
+    /// mutation start after the restoration it was refused for.
+    fn close_and_quiesce(&self, timeout: Duration) -> Option<()> {
+        use std::sync::atomic::Ordering;
+        self.inner.closed.store(true, Ordering::SeqCst);
         let deadline = std::time::Instant::now() + timeout;
         let mut poll = Duration::from_millis(1);
-        loop {
-            match self.gate.try_lock() {
-                Ok(held) => return Some(held),
-                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                    return Some(poisoned.into_inner());
-                }
-                Err(std::sync::TryLockError::WouldBlock) => {}
-            }
+        while self.inner.in_flight.load(Ordering::SeqCst) > 0 {
             if std::time::Instant::now() >= deadline {
                 return None;
             }
             std::thread::sleep(poll);
             poll = (poll * 2).min(Duration::from_millis(64));
         }
+        // In flight is zero, so the serial mutex cannot be held: it is only ever
+        // taken through a reservation. Taking it here is therefore immediate, and it
+        // keeps a direct test caller of `GateReservation::run` from overlapping the
+        // restoration.
+        match self.inner.serial.try_lock() {
+            Ok(_held) => Some(()),
+            Err(std::sync::TryLockError::Poisoned(_)) => Some(()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
     }
 }
 
-/// Runs `program args...` with the gate held, on a blocking task.
+/// What a synchronous teardown did, so the caller can log it and a test can assert
+/// it.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum SyncTeardownOutcome {
+    /// The gate went quiescent, so the restoration commands ran. `unfinished` holds
+    /// the ones that hit the per-command bound, in order.
+    Restored { unfinished: Vec<Vec<String>> },
+    /// A command was still applying past the bound: NO restoration command ran, and
+    /// `pending` is what the caller has to hand an operator, because nothing will run
+    /// them automatically any more.
+    Refused { pending: Vec<String> },
+}
+
+/// The synchronous teardown: close the gate, wait for it, then either restore the
+/// captured state or refuse and report what a human has to run.
 ///
-/// The command runs to completion and its child is reaped before the gate is
-/// released, so a dropped future leaves the ordering guarantee intact: whatever
-/// the command applied is visible to the teardown that follows it.
+/// Ungated on purpose, and with the bounded runner injected, so the DECISION the
+/// bound makes is driven on every host: the Windows binding only supplies
+/// `run_sync_bounded("powershell.exe", ...)`. The refusal is the point of this
+/// function. Restoring while a command may still be applying would let that command
+/// overwrite part of the restoration afterwards, so the safe side of that trade is
+/// to leave the policy in place (fail-closed) and keep the operator's recovery
+/// reachable through the returned commands.
+#[cfg(any(target_os = "windows", test))]
+fn sync_teardown_with(
+    gate: &CommandGate,
+    snapshot: &FirewallSnapshot,
+    timeout: Duration,
+    mut run: impl FnMut(&[String]) -> bool,
+) -> SyncTeardownOutcome {
+    if gate.close_and_quiesce(timeout).is_none() {
+        return SyncTeardownOutcome::Refused {
+            pending: uninstall_ops(snapshot)
+                .iter()
+                .map(|op| render_op(op).join(" "))
+                .collect(),
+        };
+    }
+    let mut unfinished = Vec::new();
+    for cmd in uninstall_ops(snapshot).iter().map(render_op) {
+        if !run(&cmd) {
+            unfinished.push(cmd);
+        }
+    }
+    SyncTeardownOutcome::Restored { unfinished }
+}
+
+/// Runs `program args...` with a reservation held, on a blocking task.
+///
+/// The reservation is taken BEFORE the task is spawned, so a future cancelled at the
+/// await below cannot lose it: the task still runs the command to completion and
+/// releases the reservation after the child has been reaped, and the teardown waits
+/// for that release. A gate the teardown has already closed refuses the command
+/// instead of queueing it, so no mutation can be started after the restoration.
+///
+/// # Errors
+///
+/// [`KillswitchError::Windows`] when the gate is closed (the teardown has begun),
+/// when `program` cannot be spawned, or when it exits non-zero.
 #[cfg(any(target_os = "windows", test))]
 async fn run_gated_command(
     gate: CommandGate,
     program: &'static str,
     args: Vec<String>,
 ) -> Result<String, KillswitchError> {
+    let reservation = gate.reserve().ok_or_else(|| {
+        KillswitchError::Windows(format!(
+            "refused to run {program}: the killswitch teardown has started, and a \
+             command started now could apply its change after the restoration"
+        ))
+    })?;
     tokio::task::spawn_blocking(move || {
-        gate.run(|| {
+        reservation.run(|| {
             let str_args: Vec<&str> = args.iter().map(String::as_str).collect();
             let out = std::process::Command::new(program)
                 .args(&str_args)
@@ -3432,12 +3617,38 @@ AllowLocalFirewallRules    : True
     // ---- an in-flight command and the restoration cannot overlap ---------
     //
     // The guard restores the firewall from `Drop`, which cannot await, so the
-    // restoration must not start while a command is still applying. The gate is
-    // what guarantees the order: the command runs to completion on a blocking task
-    // that holds it (a blocking task is not cancelled with the future waiting on
-    // it), and the teardown takes it before its first command. Termination timing is
-    // deliberately out of the picture: on Windows `TerminateProcess` may return
-    // before the process is gone.
+    // restoration must not start while a command is still applying (or queued to
+    // start). The gate is what guarantees the order, and a RESERVATION is what makes
+    // that guarantee survive cancellation: the mutex alone is taken only once the
+    // blocking task starts, so a future cancelled between `spawn_blocking` and that
+    // moment would leave it free. Termination timing is deliberately out of the
+    // picture: on Windows `TerminateProcess` may return before the process is gone.
+
+    #[test]
+    fn a_command_reserved_but_not_yet_started_blocks_the_teardown() {
+        // The exact race the reservation exists for: the future was cancelled after
+        // `spawn_blocking` was called but before its blocking task took the mutex, so
+        // nothing holds the mutex while the command is still pending. A teardown that
+        // waited on the mutex alone would restore the firewall here, and the queued
+        // command would apply its mutation after that restoration.
+        let gate = CommandGate::default();
+        let reservation = gate.reserve().expect("the gate is open");
+        assert!(
+            gate.close_and_quiesce(Duration::from_millis(50)).is_none(),
+            "a command registered but not yet started is still pending: the teardown \
+             must not be told the gate is quiescent"
+        );
+        assert!(
+            gate.reserve().is_none(),
+            "a gate the teardown closed must grant no reservation, else a mutation \
+             could start after the restoration"
+        );
+        drop(reservation);
+        assert!(
+            gate.close_and_quiesce(Duration::from_secs(1)).is_some(),
+            "the closed gate must become quiescent once the pending command is released"
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -3449,7 +3660,7 @@ AllowLocalFirewallRules    : True
         let script = format!("sleep 1; : > {}", marker.display());
 
         // The future is cancelled, the command is not: the blocking task keeps
-        // running and keeps holding the gate.
+        // running and keeps holding its reservation.
         let cancelled = tokio::time::timeout(
             Duration::from_millis(100),
             run_gated_command(gate.clone(), "/bin/sh", vec!["-c".to_owned(), script]),
@@ -3457,41 +3668,54 @@ AllowLocalFirewallRules    : True
         .await;
         assert!(cancelled.is_err(), "the command was meant to be cancelled");
 
-        let held = gate
-            .take_blocking(Duration::from_secs(10))
-            .expect("the gate is released once the command exits");
+        // The teardown has to wait for it: the reservation outlives the future that
+        // was dropped, and it is released only after the command's own writes.
+        let started = std::time::Instant::now();
+        let quiesced = gate.close_and_quiesce(Duration::from_secs(10));
+        assert!(
+            quiesced.is_some(),
+            "the cancelled command's task still holds its reservation, and the command \
+             finishes well within the bound"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(800),
+            "the teardown was told the gate was quiescent before the cancelled command \
+             finished, so it would have restored the firewall under a command that had \
+             not written yet; took {:?}",
+            started.elapsed()
+        );
         assert!(
             marker.exists(),
-            "the restoration must not start before the cancelled command finished: {} \
-             was not written yet",
+            "the cancelled command must still have run to completion: {} was not written",
             marker.display()
         );
-        drop(held);
         let _ = std::fs::remove_file(&marker);
     }
 
     #[test]
-    fn the_teardown_gives_up_after_the_bound() {
-        // A wedged command must not hang process exit for ever: the teardown takes
-        // the gate with a bound and reports the race instead.
+    fn the_teardown_refuses_the_restoration_while_a_command_outlives_the_bound() {
+        // A wedged command must not hang process exit for ever, and the bound must not
+        // become permission to restore underneath it: `None` is the refusal the
+        // teardown acts on by keeping the policy applied.
         let gate = CommandGate::default();
-        let holder = gate.clone();
+        let reservation = gate.reserve().expect("the gate is open");
         let (acquired, holding) = std::sync::mpsc::channel::<()>();
         let (release, hold) = std::sync::mpsc::channel::<()>();
         let worker = std::thread::spawn(move || {
-            holder.run(|| {
+            reservation.run(|| {
                 let _ = acquired.send(());
                 let _ = hold.recv();
             });
         });
-        // Wait until the command really holds the gate, or the test would take it
-        // first and measure nothing.
-        holding.recv().expect("the holder acquired the gate");
+        // Wait until the command really holds the gate, or the teardown would be told
+        // the gate is quiescent while it is not.
+        holding.recv().expect("the command started");
 
         let started = std::time::Instant::now();
         assert!(
-            gate.take_blocking(Duration::from_millis(100)).is_none(),
-            "a command that outlives the bound must not block the teardown"
+            gate.close_and_quiesce(Duration::from_millis(100)).is_none(),
+            "a command that outlives the bound must be reported as still applying, so \
+             the teardown refuses to restore"
         );
         assert!(
             started.elapsed() < Duration::from_secs(2),
@@ -3500,6 +3724,100 @@ AllowLocalFirewallRules    : True
         );
         let _ = release.send(());
         worker.join().expect("the holder thread joins");
+        assert!(
+            gate.close_and_quiesce(Duration::from_secs(1)).is_some(),
+            "once the command finishes, the closed gate is quiescent again"
+        );
+    }
+
+    #[test]
+    fn the_synchronous_teardown_runs_every_restoration_command_on_a_quiescent_gate() {
+        let gate = CommandGate::default();
+        let mut snap = snapshot();
+        snap.foreign_allows = vec!["Vendor Updater".to_owned()];
+        let mut ran: Vec<String> = Vec::new();
+        let outcome = sync_teardown_with(&gate, &snap, Duration::from_secs(1), |cmd| {
+            ran.push(cmd.join(" "));
+            true
+        });
+        assert_eq!(
+            outcome,
+            SyncTeardownOutcome::Restored {
+                unfinished: Vec::new()
+            }
+        );
+        assert_eq!(
+            ran,
+            uninstall_ops(&snap)
+                .iter()
+                .map(|op| render_op(op).join(" "))
+                .collect::<Vec<_>>(),
+            "the teardown must remove our rules, re-enable the operator's and put the \
+             captured profile settings back"
+        );
+    }
+
+    #[test]
+    fn the_synchronous_teardown_refuses_to_restore_while_a_command_outlives_the_bound() {
+        // The behaviour the bound decides, and why it is a refusal: a restoration that
+        // races a command can be overwritten by that command afterwards. The host keeps
+        // the fail-closed policy, and the operator is the one who finishes the job.
+        let gate = CommandGate::default();
+        let mut snap = snapshot();
+        snap.foreign_allows = vec!["Vendor Updater".to_owned()];
+        let reservation = gate.reserve().expect("the gate is open");
+        let mut ran: Vec<String> = Vec::new();
+        let outcome = sync_teardown_with(&gate, &snap, Duration::from_millis(50), |cmd| {
+            ran.push(cmd.join(" "));
+            true
+        });
+        let pending = match outcome {
+            SyncTeardownOutcome::Refused { pending } => pending,
+            other => panic!(
+                "a command that outlives the bound must make the teardown refuse, got \
+                 {other:?}"
+            ),
+        };
+        assert!(
+            ran.is_empty(),
+            "no restoration command may run while a command is still applying: {ran:?}"
+        );
+        assert_eq!(
+            pending,
+            uninstall_ops(&snap)
+                .iter()
+                .map(|op| render_op(op).join(" "))
+                .collect::<Vec<_>>(),
+            "the refusal must hand the operator exactly the commands that did not run"
+        );
+        drop(reservation);
+        assert!(
+            matches!(
+                sync_teardown_with(&gate, &snap, Duration::from_secs(1), |_| true),
+                SyncTeardownOutcome::Restored { .. }
+            ),
+            "once the pending command is released, the same closed gate restores"
+        );
+    }
+
+    #[test]
+    fn the_synchronous_teardown_reports_the_commands_it_could_not_finish() {
+        let gate = CommandGate::default();
+        let snap = snapshot();
+        let outcome = sync_teardown_with(&gate, &snap, Duration::from_secs(1), |_| false);
+        let unfinished = match outcome {
+            SyncTeardownOutcome::Restored { unfinished } => unfinished,
+            other => panic!("a quiescent gate must restore, got {other:?}"),
+        };
+        assert_eq!(
+            unfinished,
+            uninstall_ops(&snap)
+                .iter()
+                .map(render_op)
+                .collect::<Vec<_>>(),
+            "every command that did not complete must be reported, so an operator can \
+             see which part of the captured state was not put back"
+        );
     }
 
     // ---- portable bounded-wait helper (exercised on every host; its only
