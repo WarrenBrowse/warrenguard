@@ -195,7 +195,10 @@ impl MultiHopBundle {
     /// # Panics
     ///
     /// Panics if `clients` is empty: the supervisor only builds a
-    /// bundle after at least the primary dial succeeded.
+    /// bundle after at least the primary dial succeeded. Panics as well
+    /// if they terminate at more than one exit: everything the bundle
+    /// decodes is charged to one exit ([`Self::exit_id`]), and the
+    /// supervisor bonds every session of a bundle to one dialled circuit.
     #[must_use]
     pub fn new(clients: Vec<Arc<MultiHopClient>>) -> Arc<Self> {
         let bundle = Self::new_unsealed(clients);
@@ -210,10 +213,16 @@ impl MultiHopBundle {
     ///
     /// # Panics
     ///
-    /// Panics if `clients` is empty (same invariant as [`Self::new`]).
+    /// Panics if `clients` is empty or terminates at more than one exit
+    /// (same invariants as [`Self::new`]).
     #[must_use]
     pub fn new_unsealed(mut clients: Vec<Arc<MultiHopClient>>) -> Arc<Self> {
         assert!(!clients.is_empty(), "bundle requires at least one session");
+        let exit = clients[0].exit_id();
+        assert!(
+            clients.iter().all(|c| c.exit_id() == exit),
+            "every bonded session must terminate at one exit"
+        );
         clients.truncate(MAX_BONDED_CONNECTIONS);
         let (merged_tx, merged_rx) = mpsc::channel(MERGED_DOWNLINK_BOUND);
         let (closed_tx, _) = watch::channel(None);
@@ -248,12 +257,17 @@ impl MultiHopBundle {
 
     /// Attaches one late-bonded session: spawns its downlink reader and
     /// makes it eligible for uplink flow pinning. Returns `false`
-    /// without touching `client` when the bundle is sealed or already
-    /// at [`MAX_BONDED_CONNECTIONS`] (the caller then closes it).
+    /// without touching `client` when the bundle is sealed, already
+    /// at [`MAX_BONDED_CONNECTIONS`], or `client` terminates at another
+    /// exit than the bundle's [`Self::exit_id`] (the caller then closes
+    /// it).
     pub fn add_client(&self, client: Arc<MultiHopClient>) -> bool {
         let tx_guard = self.merged_tx.lock();
         let mut clients = self.clients.write();
         if !Self::attach_decision(tx_guard.is_none(), clients.len()) {
+            return false;
+        }
+        if client.exit_id() != clients[0].exit_id() {
             return false;
         }
         let Some(merged_tx) = tx_guard.as_ref() else {
@@ -331,10 +345,9 @@ impl MultiHopBundle {
         self.clients.read()[0].clone()
     }
 
-    /// The exit this bundle's sessions terminate at, which is its primary's:
-    /// the supervisor bonds every secondary to the circuit its primary
-    /// dialled, so this is also the exit that sealed whatever the bundle
-    /// decodes.
+    /// The one exit every session of this bundle terminates at, and so the
+    /// exit that sealed whatever the bundle decodes: [`Self::new`] and
+    /// [`Self::add_client`] admit no session to any other exit.
     #[must_use]
     pub fn exit_id(&self) -> ExitId {
         self.clients.read()[0].exit_id()
@@ -994,8 +1007,8 @@ mod live_tests {
     async fn rebind_wildcard_moves_every_bonded_leg_onto_a_fresh_socket() {
         let pairs = [
             spawn_loopback_multihop_migratable(ExitId::from_bytes([0x7c; 16])).await,
-            spawn_loopback_multihop_migratable(ExitId::from_bytes([0x7d; 16])).await,
-            spawn_loopback_multihop_migratable(ExitId::from_bytes([0x7e; 16])).await,
+            spawn_loopback_multihop_migratable(ExitId::from_bytes([0x7c; 16])).await,
+            spawn_loopback_multihop_migratable(ExitId::from_bytes([0x7c; 16])).await,
         ];
         let bundle = MultiHopBundle::new(pairs.iter().map(|p| p.client.clone()).collect());
 
@@ -1043,7 +1056,7 @@ mod live_tests {
     #[tokio::test]
     async fn a_carrier_leg_is_skipped_without_failing_the_bundle_rebind() {
         let native = spawn_loopback_multihop(ExitId::from_bytes([0x7f; 16])).await;
-        let mut carried = spawn_loopback_multihop(ExitId::from_bytes([0x80; 16])).await;
+        let mut carried = spawn_loopback_multihop(ExitId::from_bytes([0x7f; 16])).await;
         Arc::get_mut(&mut carried.client)
             .expect("sole owner before the bundle clones it")
             .set_over_carrier_for_test();
@@ -1112,7 +1125,7 @@ mod live_tests {
         )
         .await;
         let collapsed = spawn_loopback_multihop_with_transport(
-            ExitId::from_bytes([0x82; 16]),
+            ExitId::from_bytes([0x81; 16]),
             Some(transport_pinned_to_mtu(warrenguard_config::TUNNEL_MIN_MTU)),
         )
         .await;
@@ -1141,16 +1154,47 @@ mod live_tests {
         }
     }
 
-    /// The bundle names its primary's exit, whatever else sits behind it: the
-    /// primary is the session the supervisor dialled, and every secondary is
-    /// bonded to that same circuit.
+    /// Every connection of a bundle terminates at one exit, and `exit_id`
+    /// names it: the exit a drain advisory the bundle decodes is charged to.
     #[tokio::test]
-    async fn exit_id_names_the_primarys_exit() {
-        let primary = spawn_loopback_multihop(ExitId::from_bytes([0x85; 16])).await;
-        let secondary = spawn_loopback_multihop(ExitId::from_bytes([0x86; 16])).await;
+    async fn exit_id_names_the_exit_every_session_terminates_at() {
+        let exit = ExitId::from_bytes([0x85; 16]);
+        let primary = spawn_loopback_multihop(exit).await;
+        let secondary = spawn_loopback_multihop(exit).await;
         let bundle = MultiHopBundle::new(vec![primary.client.clone(), secondary.client.clone()]);
 
-        assert_eq!(bundle.exit_id(), ExitId::from_bytes([0x85; 16]));
+        assert_eq!(bundle.exit_id(), exit);
+    }
+
+    /// A late secondary to another exit is refused (its caller closes it):
+    /// attached, whatever it decodes would be charged to the bundle's exit.
+    #[tokio::test]
+    async fn add_client_refuses_a_session_to_another_exit() {
+        let exit = ExitId::from_bytes([0x86; 16]);
+        let primary = spawn_loopback_multihop(exit).await;
+        let foreign = spawn_loopback_multihop(ExitId::from_bytes([0x87; 16])).await;
+        let sibling = spawn_loopback_multihop(exit).await;
+        let bundle = MultiHopBundle::new_unsealed(vec![primary.client.clone()]);
+
+        assert!(
+            !bundle.add_client(foreign.client.clone()),
+            "a session to another exit must not bond"
+        );
+        assert_eq!(bundle.num_connections(), 1);
+        assert!(
+            bundle.add_client(sibling.client.clone()),
+            "a session to the same exit bonds"
+        );
+        assert_eq!(bundle.num_connections(), 2);
+        bundle.seal();
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "one exit")]
+    async fn a_bundle_of_sessions_to_two_exits_is_refused() {
+        let first = spawn_loopback_multihop(ExitId::from_bytes([0x88; 16])).await;
+        let second = spawn_loopback_multihop(ExitId::from_bytes([0x89; 16])).await;
+        let _ = MultiHopBundle::new(vec![first.client.clone(), second.client.clone()]);
     }
 
     /// A probe addressed to a leg must leave on THAT leg. The whole
@@ -1159,7 +1203,7 @@ mod live_tests {
     #[tokio::test]
     async fn send_probe_on_puts_the_packet_on_the_leg_it_was_given() {
         let a = spawn_loopback_multihop(ExitId::from_bytes([0x83; 16])).await;
-        let b = spawn_loopback_multihop(ExitId::from_bytes([0x84; 16])).await;
+        let b = spawn_loopback_multihop(ExitId::from_bytes([0x83; 16])).await;
         let bundle = MultiHopBundle::new(vec![a.client.clone(), b.client.clone()]);
 
         // DATAGRAM frames, not UDP packets: Quinn sends ACKs and keep-alives
@@ -1195,7 +1239,7 @@ mod live_tests {
     #[tokio::test]
     async fn closed_is_first_error_wins_across_two_bonded_sessions() {
         let pair_a = spawn_loopback_multihop(ExitId::from_bytes([0x73; 16])).await;
-        let pair_b = spawn_loopback_multihop(ExitId::from_bytes([0x74; 16])).await;
+        let pair_b = spawn_loopback_multihop(ExitId::from_bytes([0x73; 16])).await;
         let bundle = MultiHopBundle::new(vec![pair_a.client.clone(), pair_b.client.clone()]);
 
         pair_a
@@ -1225,7 +1269,7 @@ mod live_tests {
     #[tokio::test]
     async fn force_close_for_reconnect_closes_every_bonded_session() {
         let pair_a = spawn_loopback_multihop(ExitId::from_bytes([0x75; 16])).await;
-        let pair_b = spawn_loopback_multihop(ExitId::from_bytes([0x76; 16])).await;
+        let pair_b = spawn_loopback_multihop(ExitId::from_bytes([0x75; 16])).await;
         let bundle = MultiHopBundle::new(vec![pair_a.client.clone(), pair_b.client.clone()]);
 
         bundle.force_close_for_reconnect();
