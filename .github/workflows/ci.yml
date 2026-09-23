@@ -134,8 +134,10 @@ jobs:
       # execute in CI (clippy only lints them). Run them explicitly.
       - run: cargo nextest run --locked -p warrenguard-multihop --features pq-hpke --retries 2
       # Same reasoning for the PQ multihop client datapath (rekey / resend-until-ack
-      # state machine, epoch bootstrap ping): otherwise only clippy ever sees it.
-      - run: cargo nextest run --locked -p warrenguard-transport --features pq-hpke --retries 2
+      # state machine, epoch bootstrap ping) and for the system-VPN pump bodies
+      # behind `system-vpn` (drain advisory interception, reconnect-window drops,
+      # IpAssign reassign loop): otherwise only clippy ever sees them.
+      - run: cargo nextest run --locked -p warrenguard-transport --features pq-hpke,system-vpn --retries 2
       # Every fleet exit build enables pq-hpke, which compiles the `/v2`
       # termination path in the exit datapath; without this run its tests
       # only ever pass clippy.
