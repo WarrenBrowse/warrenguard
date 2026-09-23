@@ -1045,17 +1045,13 @@ async fn route_get_default_raw() -> Option<String> {
 /// Best-effort raw stdout of scutil `show State:/Network/Global/IPv4`
 /// (parsed for both `PrimaryInterface` and `Router`). Returns `None` on
 /// any failure so the pure resolvers surface a single clear diagnostic.
+/// scutil reads the request on its stdin, with no shell in between: macOS's
+/// `sh` is bash, which imports functions from the environment it inherited.
 async fn scutil_global_ipv4_raw() -> Option<String> {
-    let out = SystemTool::Sh
-        .tokio_command()
-        .ok()?
-        .args(["-c", "echo 'show State:/Network/Global/IPv4' | scutil"])
-        .output()
+    tokio::task::spawn_blocking(|| scutil_show("State:/Network/Global/IPv4"))
         .await
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+        .ok()
+        .flatten()
 }
 
 /// RAII guard: holds the "installed" state for automatic best-effort
