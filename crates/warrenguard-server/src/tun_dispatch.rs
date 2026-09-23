@@ -216,7 +216,10 @@ impl TunDownlinkTable {
         }
     }
 
-    /// Sets the downlink rate limiter (exit -> client bandwidth cap).
+    /// Sets the downlink rate limiter (exit -> client bandwidth cap). A client
+    /// that is new to a limiter already at its admission cap has its packets
+    /// dropped until the limiter's owner sweeps a slot free
+    /// ([`IdentityLimiter::retain_active`]).
     #[must_use]
     pub fn with_downlink_limiter(
         mut self,

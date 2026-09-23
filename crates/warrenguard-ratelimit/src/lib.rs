@@ -8,7 +8,7 @@
 //!   a small burst without drop).
 //! - `rate_bps`: refill rate in bytes/second.
 //!
-//! On every `try_consume(n)`, we compute how many tokens were
+//! On every consume of `n` bytes, we compute how many tokens were
 //! replenished since the previous call (`(now - last_refill) * rate`),
 //! add them (capped at `capacity`), then consume `n` if possible.
 //!
@@ -30,7 +30,7 @@ mod registry;
 
 pub use connection_limiter::ConnectionRateLimiter;
 pub use policy::{RateOverride, RatePolicyHandle, RateSpec};
-pub use registry::IdentityLimiter;
+pub use registry::{Admission, DEFAULT_MAX_TRACKED_IDENTITIES, IdentityLimiter};
 
 /// Pure token bucket. Thread-safe via internal `Mutex`; we assume the
 /// hot path is fast readers/writers (Mutex overhead << network I/O
@@ -79,18 +79,11 @@ impl TokenBucket {
         }
     }
 
-    /// Tries to consume `bytes` tokens. Returns `true` if allowed
-    /// (and deducts the tokens), `false` otherwise (state unchanged).
+    /// Tries to consume `bytes` tokens at instant `now`. Returns `true` if
+    /// allowed (and deducts the tokens), `false` otherwise (state unchanged).
     ///
     /// Refill side-effect: before the decision, we add the tokens
     /// produced since the last call (capped at `capacity_bytes`).
-    pub(crate) fn try_consume(&self, bytes: u64) -> bool {
-        self.try_consume_at(bytes, Instant::now())
-    }
-
-    /// Same as [`Self::try_consume`] but with an explicit `now`. Used
-    /// by tests and by `IdentityLimiter::try_consume_at` to drive a
-    /// deterministic clock without sleeping.
     pub(crate) fn try_consume_at(&self, bytes: u64, now: Instant) -> bool {
         let mut state = self.state.lock();
         let elapsed = now.saturating_duration_since(state.last_refill);
@@ -123,25 +116,31 @@ mod tests {
     #[test]
     fn new_bucket_starts_full() {
         let b = TokenBucket::new(1_000, 100);
-        assert!(b.try_consume(1_000), "fresh bucket should allow capacity");
+        assert!(
+            b.try_consume_at(1_000, Instant::now()),
+            "fresh bucket should allow capacity"
+        );
     }
 
     #[test]
     fn consume_more_than_capacity_fails() {
         let b = TokenBucket::new(100, 100);
         assert!(
-            !b.try_consume(101),
+            !b.try_consume_at(101, Instant::now()),
             "must refuse beyond capacity even on a fresh bucket"
         );
         // State is unchanged: we can still consume the full capacity.
-        assert!(b.try_consume(100));
+        assert!(b.try_consume_at(100, Instant::now()));
     }
 
     #[test]
     fn empty_bucket_refuses_until_refill() {
         let b = TokenBucket::new(100, 100);
-        assert!(b.try_consume(100));
-        assert!(!b.try_consume(1), "no tokens left = refuse");
+        assert!(b.try_consume_at(100, Instant::now()));
+        assert!(
+            !b.try_consume_at(1, Instant::now()),
+            "no tokens left = refuse"
+        );
     }
 
     #[test]
@@ -149,13 +148,13 @@ mod tests {
         // 1000 B capacity, 1000 B/s refill. Empty → wait 100ms → ~100 B
         // refilled → 100 B should pass, 200 B should fail.
         let b = TokenBucket::new(1_000, 1_000);
-        assert!(b.try_consume(1_000));
-        assert!(!b.try_consume(50));
+        assert!(b.try_consume_at(1_000, Instant::now()));
+        assert!(!b.try_consume_at(50, Instant::now()));
         thread::sleep(Duration::from_millis(120));
         // Conservative: 100ms × 1000 B/s = 100 B; we ask 90 B to allow
         // some slack on sleep precision.
         assert!(
-            b.try_consume(90),
+            b.try_consume_at(90, Instant::now()),
             "should have refilled enough after ~120ms"
         );
     }
@@ -165,11 +164,14 @@ mod tests {
         // 100 B cap, 10000 B/s rate (fast). Empty → wait 1s → refill
         // would add 10000 B, but must cap at 100.
         let b = TokenBucket::new(100, 10_000);
-        assert!(b.try_consume(100));
+        assert!(b.try_consume_at(100, Instant::now()));
         thread::sleep(Duration::from_millis(50));
         // Refill would add 500 B (50ms × 10kB/s); capped at 100.
-        assert!(b.try_consume(100), "after refill, full again");
-        assert!(!b.try_consume(1), "must not exceed cap");
+        assert!(
+            b.try_consume_at(100, Instant::now()),
+            "after refill, full again"
+        );
+        assert!(!b.try_consume_at(1, Instant::now()), "must not exceed cap");
     }
 
     #[test]
@@ -183,7 +185,7 @@ mod tests {
                 thread::spawn(move || {
                     let mut ok = 0;
                     for _ in 0..100 {
-                        if b.try_consume(10) {
+                        if b.try_consume_at(10, Instant::now()) {
                             ok += 1;
                         }
                     }

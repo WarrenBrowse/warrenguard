@@ -2573,6 +2573,46 @@ mod tests {
         );
     }
 
+    /// A limiter already tracking its cap of clients refuses a NEW client's
+    /// packets instead of growing, while the client it already tracks keeps
+    /// flowing: the admission cap reaches the datapath, fail-closed.
+    #[test]
+    fn accept_downlink_rate_limited_drops_a_new_client_when_the_limiter_is_full() {
+        let client_ip = std::net::Ipv4Addr::new(10, 66, 0, 7);
+        let dg = ipv4_packet_bytes([10, 66, 0, 7], [1, 1, 1, 1]);
+        let limiter: IdentityLimiter<WarrenPubkey> =
+            IdentityLimiter::with_max_tracked(u64::MAX, u64::MAX, std::num::NonZeroUsize::MIN);
+        let admitted = WarrenPubkey::from_bytes([0xB1; 32]);
+        let newcomer = WarrenPubkey::from_bytes([0xB2; 32]);
+        let mut spoof_log = SpoofDropLog::new();
+        let mut accept = |client: &WarrenPubkey| {
+            accept_downlink_rate_limited(
+                &dg,
+                Some((client_ip, None)),
+                &limiter,
+                client,
+                &None,
+                &mut spoof_log,
+            )
+        };
+
+        assert!(accept(&admitted).is_some(), "the first client is admitted");
+        assert!(
+            accept(&newcomer).is_none(),
+            "a new client beyond the cap must be dropped"
+        );
+        assert!(
+            accept(&admitted).is_some(),
+            "the admitted client keeps its slot"
+        );
+        assert_eq!(
+            limiter.tracked_count(),
+            1,
+            "the refused client is not tracked"
+        );
+        assert_eq!(spoof_log.total, 0, "a refusal is not an anti-spoof drop");
+    }
+
     // ----------------------------------------------------------------
     // M22: record_uplink_too_large_drop / send_datagram_drop_too_large
     // ----------------------------------------------------------------
