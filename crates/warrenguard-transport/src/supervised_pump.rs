@@ -674,6 +674,9 @@ pub async fn run_downlink<T: PacketDevice>(
                         // payloads fall through to the TUN unchanged.
                         match warrenguard_multihop::try_decode_control(&payload) {
                             Ok(Some(msg)) => {
+                                // `client` is the bundle this payload came
+                                // from; the watch may already publish its
+                                // successor on another exit.
                                 dispatch_control_message(
                                     &msg,
                                     client.exit_id(),
@@ -803,6 +806,8 @@ pub async fn run_downlink_with_daita<T: PacketDevice>(
                         match warrenguard_multihop::try_decode_control(&payload) {
                             Ok(Some(msg)) => {
                                 control_ok += 1;
+                                // Charged to `client`, the bundle the payload
+                                // came from, as in `run_downlink`.
                                 dispatch_control_message(
                                     &msg,
                                     client.exit_id(),

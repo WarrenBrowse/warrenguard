@@ -37,8 +37,10 @@ pub const DRAINED_EXIT_AVOID_TTL: Duration = Duration::from_secs(300);
 
 /// Maintenance-drain advisory the exit sent mid-session
 /// (`WarrenControlMessage::ExitDraining`, ADR 36). `Copy + Eq` so a
-/// repeated advisory (the exit re-sends until the client leaves) is
-/// dedup'd by a watch subscriber's `current != new` check.
+/// subscriber of one session can recognise a repeat (the exit re-sends
+/// until the client leaves). A subscription that outlives a move between
+/// exits compares [`ExitDrainNotice`]s instead: two exits can send the same
+/// advisory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExitDrainAdvisory {
     /// Absolute Unix epoch seconds after which the exit hard-closes
