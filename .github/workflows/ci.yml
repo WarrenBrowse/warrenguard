@@ -81,6 +81,27 @@ jobs:
       # without that feature), so it is linted too.
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
+  clippy-windows:
+    # No runner builds for Windows, so this is where the Windows code paths
+    # (the killswitch, DNS push and routing drivers, the system tool resolver
+    # and its FFI) get compiled and linted at all. The crates listed are the
+    # ones carrying Windows code that need no C toolchain for the target.
+    name: cargo clippy (windows target)
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: clippy
+          targets: x86_64-pc-windows-msvc
+      - run: >-
+          cargo clippy --locked --target x86_64-pc-windows-msvc
+          -p warrenguard-systool -p warrenguard-killswitch-os
+          -p warrenguard-route-split -p warrenguard-winroute
+          -p warrenguard-socket-bypass -p warrenguard-tun-core
+          --all-targets --all-features -- -D warnings
+
   test:
     name: cargo test
     runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
