@@ -1234,6 +1234,45 @@ fn take_active_for_ip_returns_every_alloc_owned_by_the_client() {
 }
 
 #[test]
+fn an_address_is_named_while_a_mapping_routes_to_it() {
+    let alloc = Allocator::new();
+    let now = Instant::now();
+    assert!(
+        !alloc.names_address(ALICE),
+        "no mapping routes to alice yet"
+    );
+    let mapped = alloc
+        .allocate_at(ALICE, Proto::Tcp, 4242, 0, 600, now)
+        .expect("alice tcp");
+    assert!(alloc.names_address(ALICE), "alice's mapping routes to her");
+    assert!(!alloc.names_address(BOB), "no mapping routes to bob");
+
+    alloc.release_at(&mapped, now);
+    assert!(
+        !alloc.names_address(ALICE),
+        "a released mapping routes nowhere"
+    );
+}
+
+#[test]
+fn a_lapsed_mapping_no_sweep_removed_still_names_its_address() {
+    // The backend rule of a mapping past its lease is only torn down once a
+    // sweep or a take removes the mapping: until then traffic still reaches
+    // the address.
+    let alloc = Allocator::new();
+    let long_ago = Instant::now()
+        .checked_sub(Duration::from_secs(60))
+        .expect("the clock runs past a minute");
+    alloc
+        .allocate_at(ALICE, Proto::Udp, 4242, 0, 1, long_ago)
+        .expect("alice udp, lapsed since");
+    assert!(
+        alloc.names_address(ALICE),
+        "a lapsed mapping still routes until it is swept"
+    );
+}
+
+#[test]
 fn take_active_for_ip_is_noop_when_client_has_no_alloc() {
     let alloc = Allocator::new();
     let removed = alloc.take_active_for_ip(ALICE);

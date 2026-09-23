@@ -1251,6 +1251,18 @@ impl Allocator {
         self.inner.lock().active.values().cloned().collect()
     }
 
+    /// True while a mapping still routes to `client_ip`, including one past
+    /// its lease: its backend rule stays installed until a sweep or a take
+    /// removes it here and hands it to the caller for teardown.
+    #[must_use]
+    pub fn names_address(&self, client_ip: Ipv4Addr) -> bool {
+        self.inner
+            .lock()
+            .active
+            .values()
+            .any(|alloc| alloc.internal_ip == client_ip)
+    }
+
     /// Remove every active mapping owned by `client_ip` and return
     /// them so the caller can tear down the matching backend rules
     /// (typically nftables DNAT). Each freed port enters the same
