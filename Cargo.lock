@@ -3902,6 +3902,7 @@ dependencies = [
  "blind-rsa-signatures",
  "hex",
  "rand 0.10.1",
+ "rsa",
  "sha2",
  "subtle",
  "thiserror",

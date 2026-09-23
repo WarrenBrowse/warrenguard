@@ -248,6 +248,40 @@ fn issuer_key_der_roundtrip_preserves_key_id() {
     reloaded.public_key().verify_token(&token).unwrap();
 }
 
+/// Blinded request built by `blind_token` under the fixed issuer key of
+/// `edge_js_token_vector.rs` (seed `0xED9E5EED`), challenge
+/// `("api.warrenbrowse.com", [0x33; 32])`, client RNG seed `0xB11D5160`.
+const KAT_BLINDED_REQUEST_HEX: &str = concat!(
+    "1585af18ec271450eafc37a91e36681500abe98c58af9bf9c68633799edfed8d16f70685d9d56d2a45a560faa33c89e198a512e215c719417a22917472ef73e1",
+    "0b94ff2fd56b26366ca8ab5daeb5841ee3d58bc4bc08aadbb47defb7eeb818718d60be1b9a60900e52b10caf4391a10a7af674669ddb6565a5e14099760e87e3",
+    "1be20f078d0d1608ff95d5f94a017fe625d408b38c6e5d0173270d0c81b9272002e482f9be4c369f396680aa73e78a0635ce7b54740e13d90728f37d40ef012f",
+    "ce255885017f57006ef759a365df4252037af0a58179493e1f08de893a6f96dc9a656b8eecbbe807d5cc726cf627c7fcf252c2b44ded320ee932eb93f65402e6",
+);
+
+/// The issuer's answer to [`KAT_BLINDED_REQUEST_HEX`]. RSA signing is
+/// deterministic, so neither the server-side blinding factor nor the RNG that
+/// draws it may change these bytes.
+const KAT_BLIND_SIGNATURE_HEX: &str = concat!(
+    "051874c7fff19fe3b8a366765941fc914f07c4dae9eba459f491e1438cabadff2b7a1041b8408101a467bcbb3c06101e50922d2ba9d2e606931c3617b2efdeeb",
+    "9940f0848bc7dbaf970f673bca44cfa725918bd2a20d2f9004acc22d3aaf1a121f202e68c87fe26feab68d40c2533794c32634f65d41a67dcc34c7c6c2b52031",
+    "a9d46744f6fd5a9392c45403588e37c352f5971b7eb94f6f27f4179e9c3c9c3105a00d4f90ba61434f1ae798b87d020196040846b5ae5eeb9aeb3ea4d1625c52",
+    "1da00de6965bf3caa6b7cc31e7faba3add7fe2cefc2ef17ad134150d59cb85fb217fab42d795dcc78a1d21ce57b3cdaa2b6795f5edcb86573a26e659ff798026",
+);
+
+#[test]
+fn blind_signature_over_a_fixed_request_is_frozen() {
+    let sk = IssuerSecretKey::generate(&mut StdRng::seed_from_u64(0xED9E_5EED)).expect("keygen");
+    let request = hex::decode(KAT_BLINDED_REQUEST_HEX).expect("valid hex");
+    let expected = hex::decode(KAT_BLIND_SIGNATURE_HEX).expect("valid hex");
+
+    assert_eq!(sk.blind_sign(&request).expect("blind sign"), expected);
+    assert_eq!(
+        sk.blind_sign(&request).expect("blind sign"),
+        expected,
+        "a second signature, blinded with a fresh factor, is byte-identical"
+    );
+}
+
 #[test]
 fn blind_sign_rejects_wrong_size_request() {
     let sk = issuer();

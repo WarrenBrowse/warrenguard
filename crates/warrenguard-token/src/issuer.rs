@@ -4,7 +4,11 @@ use blind_rsa_signatures::{
     BlindSignature, KeyPairSha384PSSDeterministic, PublicKeySha384PSSDeterministic,
     SecretKeySha384PSSDeterministic, Signature,
 };
-use rand::CryptoRng;
+use rand::rngs::SysRng;
+use rand::{CryptoRng, TryCryptoRng};
+use rsa::hazmat::rsa_encrypt;
+use rsa::traits::PublicKeyParts;
+use rsa::{BoxedUint, RsaPublicKey};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
@@ -123,6 +127,26 @@ impl IssuerPublicKey {
             .verify(&sig, None, token.token_input())
             .map_err(|_| TokenError::VerificationFailed)
     }
+
+    /// `true` when `blind_sig` is the canonical RSA signature of
+    /// `blinded_request` under this key: `blind_sig < n` and
+    /// `blind_sig^e mod n == blinded_request`. Both inputs are public (the
+    /// request comes from the client, the signature goes back to it), so the
+    /// check needs no constant-time care.
+    fn blind_signature_matches(&self, blinded_request: &[u8], blind_sig: &[u8]) -> bool {
+        let key: &RsaPublicKey = self.inner.as_ref();
+        let bits = key.n_bits_precision();
+        let (Ok(request), Ok(sig)) = (
+            BoxedUint::from_be_slice(blinded_request, bits),
+            BoxedUint::from_be_slice(blind_sig, bits),
+        ) else {
+            return false;
+        };
+        if sig >= *key.n().as_ref() {
+            return false;
+        }
+        rsa_encrypt(key, &sig).is_ok_and(|recovered| recovered == request)
+    }
 }
 
 /// An issuer secret key. Holds the RSA private key; never derives `Debug` on
@@ -192,23 +216,163 @@ impl IssuerSecretKey {
     /// that is the blindness guarantee. Enforcing epoch, quota and
     /// subscription is the caller's job, done *before* calling this.
     ///
+    /// The blinding factor comes from the operating system RNG on every call,
+    /// and a signature is returned only after it verifies against the request.
+    ///
     /// # Errors
-    /// [`TokenError::BlindOperation`] if the request is the wrong size or the
-    /// blind-RSA operation fails.
+    /// [`TokenError::BlindOperation`] if the request is the wrong size, the
+    /// blind-RSA operation fails (an OS RNG failure included), or its result
+    /// does not verify.
     pub fn blind_sign(&self, blinded_request: &[u8]) -> Result<Vec<u8>, TokenError> {
+        self.blind_sign_with_rng(&mut SysRng, blinded_request)
+    }
+
+    /// [`Self::blind_sign`] with the RNG that draws the RSA blinding factor.
+    ///
+    /// The client chooses the value this private-key operation runs on. The
+    /// library multiplies it by `r^e` for a uniform `r` drawn here on every
+    /// call, so the modular arithmetic runs on a value the client cannot
+    /// predict, and unblinds the result.
+    fn blind_sign_with_rng<R: TryCryptoRng + ?Sized>(
+        &self,
+        rng: &mut R,
+        blinded_request: &[u8],
+    ) -> Result<Vec<u8>, TokenError> {
         if blinded_request.len() != AUTHENTICATOR_LEN {
             return Err(TokenError::BlindOperation);
         }
         let sig: BlindSignature = self
             .inner
-            .blind_sign(blinded_request)
+            .blind_sign_with_rng(rng, blinded_request)
             .map_err(|_| TokenError::BlindOperation)?;
-        Ok(sig.0)
+        self.release_if_valid(blinded_request, sig.0)
+    }
+
+    /// Releases `blind_sig` only if it verifies against `blinded_request`.
+    ///
+    /// A CRT signature computed with a fault in one of its two halves hands
+    /// its receiver a prime factor of the modulus (`gcd(s^e - m, n)`, the
+    /// Bellcore attack). The RSA library checks its own output today; this
+    /// gate keeps that property in the issuer, independent of the library
+    /// version.
+    fn release_if_valid(
+        &self,
+        blinded_request: &[u8],
+        blind_sig: Vec<u8>,
+    ) -> Result<Vec<u8>, TokenError> {
+        if self
+            .public
+            .blind_signature_matches(blinded_request, &blind_sig)
+        {
+            Ok(blind_sig)
+        } else {
+            Err(TokenError::BlindOperation)
+        }
     }
 
     /// Constant-time equality of the underlying key id (test/ops helper).
     #[must_use]
     pub fn key_id_eq(&self, other: &IssuerKeyId) -> bool {
         self.public.key_id.as_bytes().ct_eq(other.as_bytes()).into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::TokenChallenge;
+    use rand::rngs::StdRng;
+    use rand::{SeedableRng, TryRng};
+
+    /// Counts the bytes drawn through it, so a test can see whether (and how
+    /// much) randomness a signature consumed.
+    struct CountingRng {
+        inner: StdRng,
+        drawn: usize,
+    }
+
+    impl TryRng for CountingRng {
+        type Error = core::convert::Infallible;
+
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            self.drawn += 4;
+            self.inner.try_next_u32()
+        }
+
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            self.drawn += 8;
+            self.inner.try_next_u64()
+        }
+
+        fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+            self.drawn += dst.len();
+            self.inner.try_fill_bytes(dst)
+        }
+    }
+
+    impl TryCryptoRng for CountingRng {}
+
+    fn issuer_and_request() -> (IssuerSecretKey, Vec<u8>) {
+        let sk =
+            IssuerSecretKey::generate(&mut StdRng::seed_from_u64(0x005E_C2E7)).expect("keygen");
+        let challenge =
+            TokenChallenge::for_context("issuer.example", [0x44; 32]).expect("challenge");
+        let (request, _state) = sk
+            .public_key()
+            .blind_token(&mut StdRng::seed_from_u64(0x0B11_17D5), &challenge)
+            .expect("blind");
+        (sk, request)
+    }
+
+    #[test]
+    fn every_signature_draws_a_fresh_modulus_sized_blinding_factor() {
+        let (sk, request) = issuer_and_request();
+        let mut rng = CountingRng {
+            inner: StdRng::seed_from_u64(7),
+            drawn: 0,
+        };
+
+        let first = sk.blind_sign_with_rng(&mut rng, &request).expect("sign");
+        let after_first = rng.drawn;
+        let second = sk.blind_sign_with_rng(&mut rng, &request).expect("sign");
+
+        assert!(
+            after_first >= AUTHENTICATOR_LEN,
+            "the first signature must draw its blinding factor from the given RNG \
+             (drew {after_first} bytes)"
+        );
+        assert!(
+            rng.drawn - after_first >= AUTHENTICATOR_LEN,
+            "the second signature must draw a fresh blinding factor"
+        );
+        assert_eq!(first, second, "blinding never changes the signature");
+    }
+
+    #[test]
+    fn a_blind_signature_that_does_not_verify_is_never_released() {
+        let (sk, request) = issuer_and_request();
+        let genuine = sk.blind_sign(&request).expect("sign");
+        assert_eq!(
+            sk.release_if_valid(&request, genuine.clone())
+                .expect("a genuine signature is released"),
+            genuine
+        );
+
+        let mut faulty = genuine;
+        faulty[AUTHENTICATOR_LEN / 2] ^= 0x01;
+        assert!(matches!(
+            sk.release_if_valid(&request, faulty),
+            Err(TokenError::BlindOperation)
+        ));
+    }
+
+    #[test]
+    fn a_non_canonical_blind_signature_is_never_released() {
+        let (sk, request) = issuer_and_request();
+        // Above the modulus: not the canonical representative of any residue.
+        assert!(matches!(
+            sk.release_if_valid(&request, vec![0xFF; AUTHENTICATOR_LEN]),
+            Err(TokenError::BlindOperation)
+        ));
     }
 }
