@@ -16,8 +16,8 @@ The issuer now draws that factor from the operating system RNG and re-verifies
 each signature itself before releasing it.
 
 The residual risk is stated at the end: the constant-time property rests on
-reading the source rather than measuring timings, and the deployer exposes an
-unbounded number of private-key operations on inputs a subscriber chooses.
+reading the source rather than measuring timings, and how many private-key
+operations a requester can trigger is set by the deployer's issuance policy.
 
 ## The path
 
@@ -132,8 +132,7 @@ address.
 The same fact fixes a usage rule: a blind-RSA issuer key is a raw RSA
 private-key oracle, so it must never serve any other purpose. Any RSA
 ciphertext encrypted to it, or any other signature scheme using it, can be
-opened or forged by submitting the value as a blinded request. The deployer's
-per-epoch, per-class keys, each derived under its own HKDF label, meet this.
+opened or forged by submitting the value as a blinded request.
 
 ### The issuer's own code branches only on public data
 
@@ -163,12 +162,11 @@ Checked on crates.io and in RustCrypto/RSA on 2026-09-23:
 
 No release changes the advisory's status, so the versions stay as they are.
 
-An upgrade of `rsa` or `crypto-primes` has a hazard of its own for the
-deployer: it derives each epoch's issuer key deterministically (HKDF of a
-master seed into a ChaCha20 RNG, then `IssuerSecretKey::generate`). A release
-that changes key generation changes every derived key, which invalidates every
-credential already issued. Such an upgrade needs a frozen
-seed-to-key-id vector in the deployer before it lands.
+An upgrade of `rsa` or `crypto-primes` has a hazard of its own for a deployer
+that derives issuer keys deterministically, by feeding a seeded RNG to
+`IssuerSecretKey::generate`. A release that changes key generation changes
+every derived key, which invalidates every credential already issued. Such a
+deployer needs a frozen seed-to-key-id vector before an upgrade lands.
 
 ## Residual risk
 
@@ -177,14 +175,14 @@ seed-to-key-id vector in the deployer before it lands.
   assembly was done, and a compiler can turn branch-free source into branches.
   The protection rests on `crypto-bigint`'s constant-time discipline, with
   blinding as a second, independent layer.
-- The deployer's issuance endpoint signs the same batch again every time it is
-  re-sent (warren-core `crates/warren-api/src/handlers/token.rs`, the
-  `Reservation::Replay` branch). Any subscriber can therefore drive an
-  unbounded number of private-key operations on inputs of its choice, which is
-  the measurement setting a timing attack needs. Blinding makes those
-  repetitions useless for averaging a fixed internal value, but serving the
-  stored signatures, or rate-limiting replays per account, would bound the
-  exposure outright.
+- This crate does not bound how many signatures a requester obtains; the
+  deployer's issuance policy does. An issuer that signs again any request it
+  has already answered (to let a client recover lost credentials, for
+  instance) lets one requester drive an unbounded number of private-key
+  operations on inputs of its choice, which is the measurement setting a
+  timing attack needs. Blinding makes those repetitions useless for averaging
+  a fixed internal value; serving the stored signatures, or rate-limiting
+  repeats per requester, bounds the exposure outright.
 
 ## Tests that pin these properties
 
