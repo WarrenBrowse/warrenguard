@@ -447,9 +447,10 @@ impl IpAllocator {
     /// drops the addresses that are no free host of it, and every address
     /// it hands out to anyone.
     pub fn enable_restart_reclaim(&mut self, eligible: impl IntoIterator<Item = Ipv4Addr>) {
+        let free: HashSet<Ipv4Addr> = self.free.iter().copied().collect();
         let eligible = eligible
             .into_iter()
-            .filter(|addr| self.free.contains(addr))
+            .filter(|addr| free.contains(addr))
             .collect();
         self.reclaim = Some(RestartReclaim {
             until: Instant::now() + RESTART_RECLAIM_WINDOW,
