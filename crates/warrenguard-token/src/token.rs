@@ -1,7 +1,7 @@
 //! The `Token` structure (RFC 9578 SS2.2) and its redemption serial.
 
 use sha2::{Digest, Sha256};
-use subtle::ConstantTimeEq;
+use subtle::{Choice, ConstantTimeEq};
 
 use crate::{TokenError, challenge::TOKEN_TYPE_BLIND_RSA};
 
@@ -64,7 +64,10 @@ impl core::fmt::Debug for TokenSerial {
 ///     uint8_t authenticator[256];
 /// } Token;
 /// ```
-#[derive(Clone, PartialEq, Eq)]
+///
+/// A bearer credential until spent, so `==` reads every byte whatever the
+/// first difference ([`ConstantTimeEq`]).
+#[derive(Clone)]
 pub struct Token {
     pub(crate) nonce: [u8; NONCE_LEN],
     pub(crate) challenge_digest: [u8; CHALLENGE_DIGEST_LEN],
@@ -84,6 +87,23 @@ impl core::fmt::Debug for Token {
         )
     }
 }
+
+impl ConstantTimeEq for Token {
+    fn ct_eq(&self, other: &Self) -> Choice {
+        self.nonce.ct_eq(&other.nonce)
+            & self.challenge_digest.ct_eq(&other.challenge_digest)
+            & self.token_key_id.ct_eq(&other.token_key_id)
+            & self.authenticator.ct_eq(&other.authenticator)
+    }
+}
+
+impl PartialEq for Token {
+    fn eq(&self, other: &Self) -> bool {
+        self.ct_eq(other).into()
+    }
+}
+
+impl Eq for Token {}
 
 impl Token {
     /// Assembles a token from its finalized parts (used by the client after

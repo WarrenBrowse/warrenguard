@@ -8,6 +8,7 @@
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use sha2::Digest;
+use subtle::ConstantTimeEq as _;
 use warrenguard_token::{
     AUTHENTICATOR_LEN, IssuerPublicKey, IssuerSecretKey, TOKEN_INPUT_LEN, TOKEN_LEN,
     TOKEN_TYPE_BLIND_RSA, Token, TokenChallenge,
@@ -105,6 +106,28 @@ fn token_serialize_parse_roundtrip_and_length() {
     let parsed = Token::parse(&bytes).unwrap();
     assert_eq!(parsed, token);
     assert_eq!(parsed.serial(), token.serial());
+}
+
+#[test]
+fn token_equality_is_constant_time_and_reads_every_field() {
+    let sk = issuer();
+    let pk = sk.public_key();
+    let token = mint(&sk, &pk, [3u8; 32], "api.warrenbrowse.com");
+    let bytes = token.serialize();
+
+    assert!(bool::from(token.ct_eq(&Token::parse(&bytes).unwrap())));
+    // First byte of the nonce, the challenge digest and the key id, and the
+    // last byte of the authenticator.
+    for offset in [2, 34, 66, TOKEN_LEN - 1] {
+        let mut altered = bytes;
+        altered[offset] ^= 1;
+        let altered = Token::parse(&altered).unwrap();
+        assert!(
+            !bool::from(token.ct_eq(&altered)),
+            "tokens differing at byte {offset} compared equal"
+        );
+        assert_ne!(token, altered, "`==` must agree with `ct_eq`");
+    }
 }
 
 // ---- End-to-end issuance/verification ------------------------------------

@@ -148,6 +148,9 @@ impl<'de> Deserialize<'de> for PopSignature {
 /// and redeployed together, so the message carries every field directly
 /// instead of accumulating append-only variants). A future genuine wire
 /// break bumps [`CONTROL_VERSION_V3`].
+///
+/// The only secret a message carries is its session tokens, and `==` compares
+/// each of those in constant time (see [`SessionToken`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum WarrenControlMessage {
     /// Client -> exit. Asks the exit to allocate a tunnel IP.

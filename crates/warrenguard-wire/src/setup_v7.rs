@@ -7,6 +7,7 @@
 //! exchange, and the exit parses them with `warrenguard_token::Token`.
 
 use serde::{Deserialize, Serialize};
+use subtle::{Choice, ConstantTimeEq};
 
 /// Length of one serialized Privacy Pass session token, matching
 /// `warrenguard_token::TOKEN_LEN` (token_input 98 + authenticator 256). The
@@ -27,8 +28,25 @@ pub const MAX_SESSION_TOKENS: usize = 8;
 /// One serialized Privacy Pass token, carried as [`SESSION_TOKEN_LEN`] raw
 /// bytes with no length prefix. The wire crate does
 /// not interpret the bytes; the exit parses them with `warrenguard_token::Token`.
-#[derive(Clone, Copy, PartialEq, Eq)]
+///
+/// A bearer credential until spent, so `==` reads every byte whatever the
+/// first difference ([`ConstantTimeEq`]).
+#[derive(Clone, Copy)]
 pub struct SessionToken(pub [u8; SESSION_TOKEN_LEN]);
+
+impl ConstantTimeEq for SessionToken {
+    fn ct_eq(&self, other: &Self) -> Choice {
+        self.0.ct_eq(&other.0)
+    }
+}
+
+impl PartialEq for SessionToken {
+    fn eq(&self, other: &Self) -> bool {
+        self.ct_eq(other).into()
+    }
+}
+
+impl Eq for SessionToken {}
 
 impl core::fmt::Debug for SessionToken {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -88,6 +106,26 @@ mod tests {
         assert_eq!(bytes, vec![0xCD; SESSION_TOKEN_LEN]);
         let decoded: SessionToken = postcard::from_bytes(&bytes).expect("decode");
         assert_eq!(decoded, token, "SessionToken must round-trip byte-for-byte");
+    }
+
+    #[test]
+    fn session_token_equality_is_constant_time_over_every_byte() {
+        use subtle::ConstantTimeEq as _;
+        let token = SessionToken([0x5a; SESSION_TOKEN_LEN]);
+
+        assert!(bool::from(
+            token.ct_eq(&SessionToken([0x5a; SESSION_TOKEN_LEN]))
+        ));
+        assert_eq!(token, SessionToken([0x5a; SESSION_TOKEN_LEN]));
+        for offset in [0, SESSION_TOKEN_LEN / 2, SESSION_TOKEN_LEN - 1] {
+            let mut altered = token;
+            altered.0[offset] ^= 1;
+            assert!(
+                !bool::from(token.ct_eq(&altered)),
+                "tokens differing at byte {offset} compared equal"
+            );
+            assert_ne!(token, altered, "`==` must agree with `ct_eq`");
+        }
     }
 
     #[test]
