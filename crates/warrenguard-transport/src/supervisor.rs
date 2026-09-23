@@ -1543,6 +1543,9 @@ impl MultiHopSupervisor {
         let primary = match self.connect_once(&target).await {
             Ok(c) => Arc::new(c),
             Err(e) => {
+                // A refusal is reported like one met on a cold dial, so the
+                // deployer reselects while the current session still serves.
+                self.notify_dial_refused(&e, &target);
                 tracing::warn!(error = %e, "overlap dial failed; keeping the current session");
                 return None;
             }
@@ -3102,6 +3105,20 @@ mod run_tests {
             .collect()
     }
 
+    /// Every `on_dial_refused` report a test observed, in order.
+    type RefusalReports = Arc<Mutex<Vec<(multihop::DialRefusedHop, [u8; 16], [u8; 16])>>>;
+
+    /// An `on_dial_refused` observer that records every report into `reports`.
+    fn record_refusals(reports: &RefusalReports) -> DialRefusedObserver {
+        let reports = reports.clone();
+        Arc::new(move |hop, relay_id, exit_id| {
+            reports
+                .lock()
+                .expect("reports lock")
+                .push((hop, relay_id, exit_id));
+        })
+    }
+
     /// A setup the exit refuses after the QUIC handshake (here the drain close
     /// a draining one-hop node answers every new session with) is a failed
     /// dial: nothing is published, the refusal reaches `on_dial_refused`
@@ -3117,19 +3134,10 @@ mod run_tests {
             warrenguard_multihop::WARREN_MH_DRAINING,
             std::sync::atomic::Ordering::Relaxed,
         );
-        type Reports = Vec<(multihop::DialRefusedHop, [u8; 16], [u8; 16])>;
-        let reports: Arc<Mutex<Reports>> = Arc::new(Mutex::new(Vec::new()));
+        let reports = RefusalReports::default();
         let mut config = config_with_fake_exit(&exit, &operational_key);
         config.backoff = TEST_BACKOFF;
-        config.on_dial_refused = Some(Arc::new({
-            let reports = reports.clone();
-            move |hop, relay_id, exit_id| {
-                reports
-                    .lock()
-                    .expect("reports lock")
-                    .push((hop, relay_id, exit_id));
-            }
-        }));
+        config.on_dial_refused = Some(record_refusals(&reports));
         let (supervisor, mut rx) = MultiHopSupervisor::new(config);
         let task = tokio::spawn(supervisor.run());
 
@@ -3179,8 +3187,6 @@ mod run_tests {
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
 
-    type RefusalReports = Vec<(multihop::DialRefusedHop, [u8; 16], [u8; 16])>;
-
     /// A circuit to `exit` entered through a relay named `relay_id`, signed by
     /// `operational_key` so the dial verifies it. Every fake exit presents the
     /// same relay key, so the relay id is what tells two entries apart.
@@ -3209,90 +3215,127 @@ mod run_tests {
         }
     }
 
-    /// Dials an exit that refuses the way `refuse` configures it, lands a
-    /// retarget onto an admitting exit while that very dial is in flight, and
-    /// returns the refusal reports made until the session came up, with the
-    /// circuit the refused attempt dialled.
-    async fn refusal_reports_across_a_mid_dial_retarget(
+    /// The dial path a refusal is met on.
+    #[derive(Clone, Copy)]
+    enum DialPath {
+        /// The cold dial that brings a session up.
+        Cold,
+        /// A make-before-break overlap dial while a session serves.
+        Overlap,
+    }
+
+    fn refuse_handshakes(exit: &FakeMultihopExit) {
+        exit.refuse_handshake
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn refuse_setups(exit: &FakeMultihopExit) {
+        exit.refuse_setup.store(
+            warrenguard_multihop::WARREN_MH_DRAINING,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Dials, on `path`, an exit that refuses the way `refuse` configures it,
+    /// while a retarget onto an admitting exit lands during that very dial,
+    /// and asserts the one refusal report names the circuit the refused
+    /// attempt dialled. The retarget redirects the next attempt only: a
+    /// refusal charged to it would make the deployer avoid the node it has
+    /// just moved to.
+    async fn assert_a_mid_dial_retarget_leaves_the_refusal_on_the_dialled_circuit(
+        path: DialPath,
         refuse: impl FnOnce(&FakeMultihopExit),
-    ) -> (RefusalReports, CircuitTarget) {
+    ) {
         let operational_key = SigningKey::from_bytes(&[0x4D; 32]);
+        let serving = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x5C; 16]));
         let refusing = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x5D; 16]));
         let admitting = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x5E; 16]));
         refuse(&refusing);
         let dialled = circuit_to(&refusing, [0xD1; 16], &operational_key);
         let moved_to = circuit_to(&admitting, [0xD2; 16], &operational_key);
-        let reports: Arc<Mutex<RefusalReports>> = Arc::default();
-        let mut config = config_with_fake_exit(&refusing, &operational_key);
-        config.relay = dialled.relay.clone();
+        let reports = RefusalReports::default();
+        let mut config = match path {
+            DialPath::Cold => SupervisorConfig {
+                relay: dialled.relay.clone(),
+                ..config_with_fake_exit(&refusing, &operational_key)
+            },
+            DialPath::Overlap => config_with_fake_exit(&serving, &operational_key),
+        };
         config.backoff = TEST_BACKOFF;
-        config.on_dial_refused = Some(Arc::new({
-            let reports = reports.clone();
-            move |hop, relay_id, exit_id| {
-                reports
-                    .lock()
-                    .expect("reports lock")
-                    .push((hop, relay_id, exit_id));
-            }
-        }));
+        config.on_dial_refused = Some(record_refusals(&reports));
         let (supervisor, mut rx) = MultiHopSupervisor::new(config);
+        let handle = supervisor.handle();
         let migrate = supervisor.migrate_handle();
         refusing.on_next_dial(move || migrate.migrate_to(moved_to));
         let task = tokio::spawn(supervisor.run());
 
         tokio::time::timeout(Duration::from_secs(5), rx.changed())
             .await
-            .expect("the retargeted attempt must bring a session up")
+            .expect("a session comes up")
             .expect("watch sender alive");
-        let reports = reports.lock().expect("reports lock").clone();
+        if let DialPath::Overlap = path {
+            handle.migrate_to(dialled.clone());
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while reports.lock().expect("reports lock").is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the overlap dial's refusal is reported");
+        }
+        assert_eq!(
+            *reports.lock().expect("reports lock"),
+            vec![(
+                multihop::DialRefusedHop::Entry,
+                dialled.relay.relay_id,
+                *dialled.exit_id.as_bytes()
+            )],
+            "the refusal is charged to the circuit the refused attempt dialled"
+        );
 
         drop(rx);
+        drop(handle);
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-        (reports, dialled)
     }
 
-    /// A retarget that lands while an attempt is in flight redirects the next
-    /// attempt only. The refusal the in-flight attempt meets is charged to the
-    /// node it dialled: charged to the new target, it would make the deployer
-    /// avoid the node it has just moved to.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_handshake_refusal_names_the_dialled_node_when_a_retarget_lands_mid_dial() {
-        let (reports, dialled) = refusal_reports_across_a_mid_dial_retarget(|exit| {
-            exit.refuse_handshake
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-        })
+        assert_a_mid_dial_retarget_leaves_the_refusal_on_the_dialled_circuit(
+            DialPath::Cold,
+            refuse_handshakes,
+        )
         .await;
-        assert_eq!(
-            reports,
-            vec![(
-                multihop::DialRefusedHop::Entry,
-                dialled.relay.relay_id,
-                *dialled.exit_id.as_bytes()
-            )],
-            "the refused handshake is charged to the circuit it dialled"
-        );
     }
 
-    /// Same as the handshake case, for a node that refuses once the handshake
-    /// is done: the setup round-trip reports it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_setup_refusal_names_the_dialled_node_when_a_retarget_lands_mid_dial() {
-        let (reports, dialled) = refusal_reports_across_a_mid_dial_retarget(|exit| {
-            exit.refuse_setup.store(
-                warrenguard_multihop::WARREN_MH_DRAINING,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-        })
+        assert_a_mid_dial_retarget_leaves_the_refusal_on_the_dialled_circuit(
+            DialPath::Cold,
+            refuse_setups,
+        )
         .await;
-        assert_eq!(
-            reports,
-            vec![(
-                multihop::DialRefusedHop::Entry,
-                dialled.relay.relay_id,
-                *dialled.exit_id.as_bytes()
-            )],
-            "the refused setup is charged to the circuit it dialled"
-        );
+    }
+
+    /// An overlap dial refused at the handshake is reported like a cold one,
+    /// so a deployer that migrated onto a refusing node reselects while the
+    /// current session still serves, instead of learning it on the cold
+    /// redial after that session dies.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_overlap_handshake_refusal_names_the_dialled_node_when_a_retarget_lands_mid_dial() {
+        assert_a_mid_dial_retarget_leaves_the_refusal_on_the_dialled_circuit(
+            DialPath::Overlap,
+            refuse_handshakes,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_overlap_setup_refusal_names_the_dialled_node_when_a_retarget_lands_mid_dial() {
+        assert_a_mid_dial_retarget_leaves_the_refusal_on_the_dialled_circuit(
+            DialPath::Overlap,
+            refuse_setups,
+        )
+        .await;
     }
 
     /// The exit each connection of `bundle` terminates at, primary first.
