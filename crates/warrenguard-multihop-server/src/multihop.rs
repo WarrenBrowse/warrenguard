@@ -8905,19 +8905,25 @@ mod tests {
     /// A downlink inner packet no path's datagram budget fits.
     const OVER_ANY_DATAGRAM_BUDGET: usize = 4_000;
 
-    /// The inner packet sizes a real link carries: the smallest TCP packet,
-    /// the IPv4 minimum MTU, a full segment, and the largest that `conn`'s
-    /// datagram budget fits under `frame_overhead`.
-    fn varied_inner_sizes(conn: &quinn::Connection, frame_overhead: usize) -> [usize; 4] {
+    /// Downlink inner sizes: the smallest TCP packet, the IPv4 minimum MTU,
+    /// and a segment any QUIC path carries (its 1200-byte minimum MTU leaves
+    /// more than 1024 bytes of inner budget under either frame format). The
+    /// exit's own MTU discovery, which a test cannot observe, then decides
+    /// nothing about what it can seal.
+    const DOWNLINK_SIZES: [usize; 3] = [40, 576, 1024];
+
+    /// Uplink inner sizes: the downlink ones, plus the largest `conn`'s own
+    /// datagram budget fits under `frame_overhead` at the time of the call.
+    fn uplink_sizes(conn: &quinn::Connection, frame_overhead: usize) -> [usize; 4] {
         let budget = usize::from(crate::datapath::inner_budget(
             conn.max_datagram_size(),
             frame_overhead,
         ));
         assert!(
-            budget > 1200,
-            "a loopback path must fit a full segment, the budget is {budget}"
+            budget > DOWNLINK_SIZES[2],
+            "every QUIC path fits a 1024-byte inner packet, the budget is {budget}"
         );
-        [40, 576, 1200, budget]
+        [40, 576, 1024, budget]
     }
 
     /// A `len`-byte TCP packet (no SYN, so no MSS clamp applies) with a
@@ -8934,16 +8940,17 @@ mod tests {
         pkt
     }
 
-    /// Sends one inner packet of each of `sizes` up and down a live session
-    /// and checks what came out: every uplink size on the TUN, every downlink
-    /// size opened by the client, and a downlink packet over the datagram
-    /// budget reflected into the TUN as ICMP frag-needed instead of sent.
-    /// `open_down` opens one downlink datagram into its inner plaintext.
+    /// Sends one inner packet of each of `up_sizes` up and of
+    /// [`DOWNLINK_SIZES`] down a live session and checks what came out: every
+    /// uplink size on the TUN, every downlink size opened by the client, and a
+    /// downlink packet over the datagram budget reflected into the TUN as ICMP
+    /// frag-needed instead of sent. `open_down` opens one downlink datagram
+    /// into its inner plaintext.
     async fn exchange_every_size(
         tun: &warrenguard_transport_core::FakeTun,
         conn: &quinn::Connection,
         assigned: Ipv4Addr,
-        sizes: &[usize],
+        up_sizes: &[usize],
         mut send_up: impl FnMut(&[u8]),
         open_down: impl Fn(&[u8]) -> Option<Vec<u8>>,
         context: &str,
@@ -8965,27 +8972,27 @@ mod tests {
             }
         };
 
-        for &len in sizes {
+        for &len in up_sizes {
             send_up(&sized_tcp(assigned, RATE_PEER, len));
         }
         let mut delivered: Vec<usize> =
-            settled_tun_outbound(tun, sizes.len(), Duration::from_secs(5))
+            settled_tun_outbound(tun, up_sizes.len(), Duration::from_secs(5))
                 .await
                 .iter()
                 .map(Vec::len)
                 .collect();
         delivered.sort_unstable();
         assert_eq!(
-            delivered, sizes,
+            delivered, up_sizes,
             "{context}: every uplink size must reach the TUN"
         );
 
-        for &len in sizes {
+        for len in DOWNLINK_SIZES {
             tun.inject_inbound(sized_tcp(RATE_PEER, assigned, len));
         }
         tun.inject_inbound(sized_tcp(RATE_PEER, assigned, OVER_ANY_DATAGRAM_BUDGET));
         let mut opened = Vec::new();
-        while opened.len() < sizes.len() {
+        while opened.len() < DOWNLINK_SIZES.len() {
             let plaintext = next_inner()
                 .await
                 .unwrap_or_else(|| panic!("{context}: the downlink stalled after {opened:?}"));
@@ -8993,7 +9000,7 @@ mod tests {
         }
         opened.sort_unstable();
         assert_eq!(
-            opened, sizes,
+            opened, DOWNLINK_SIZES,
             "{context}: every downlink size must reach the client"
         );
 
@@ -9405,7 +9412,7 @@ mod tests {
         tokio::time::sleep(SESSION_CACHE_TTL + Duration::from_secs(1)).await;
         // The real session must survive the idle gap on the keepalive alone,
         // for packets of every size both ways.
-        let sizes = varied_inner_sizes(&client.conn, MULTIHOP_FRAME_V2_DATA_MAX_OVERHEAD);
+        let sizes = uplink_sizes(&client.conn, MULTIHOP_FRAME_V2_DATA_MAX_OVERHEAD);
         let mut seq = 3;
         exchange_every_size(
             &tun,
@@ -9444,11 +9451,12 @@ mod tests {
             wants_daita: false,
         })
         .await;
-        let sizes = varied_inner_sizes(&client.conn, MULTIHOP_FRAME_MAX_OVERHEAD);
+        let sizes = uplink_sizes(&client.conn, MULTIHOP_FRAME_MAX_OVERHEAD);
         let mut seq = client.next_seq;
 
-        for context in ["before the idle gap", "after the idle gap"] {
-            if context == "after the idle gap" {
+        for (idle_first, context) in [(false, "before the idle gap"), (true, "after the idle gap")]
+        {
+            if idle_first {
                 tokio::time::sleep(SESSION_CACHE_TTL + Duration::from_secs(1)).await;
             }
             exchange_every_size(
