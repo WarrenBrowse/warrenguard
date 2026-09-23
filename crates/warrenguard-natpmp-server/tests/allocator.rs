@@ -2652,7 +2652,17 @@ fn a_liveness_answer_about_a_previous_holder_grants_no_reclaim() {
         .allocate_at(ALICE, Proto::Tcp, 52419, 52419, 600, now)
         .expect("the first session pins its port");
 
-    let res = alloc.allocate_at(ALICE_SECOND_SESSION, Proto::Tcp, 52419, 52419, 600, now);
+    // On a thread with a deadline: the callback re-enters the allocator, so a
+    // regression that held the lock across it would hang rather than fail.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = Arc::clone(&alloc);
+    std::thread::spawn(move || {
+        let _ =
+            tx.send(worker.allocate_at(ALICE_SECOND_SESSION, Proto::Tcp, 52419, 52419, 600, now));
+    });
+    let res = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the request completes");
 
     assert!(
         matches!(res, Err(NatPmpError::SuggestedPortInUse(52419))),

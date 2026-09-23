@@ -35,8 +35,9 @@ use crate::{Allocation, NatPmpError, Proto};
 ///
 /// The callback runs with the allocator's lock released, at most once per
 /// request, so an implementation may read the [`Allocator`] back and may take
-/// its own locks. It still runs on the request path: a slow answer delays
-/// that request, never the others.
+/// its own locks. It still runs synchronously on the request path: a slow
+/// answer delays that request, and every request queued behind it when the
+/// caller serializes its requests, as the nftables backend does.
 pub trait QuotaPeers: Send + Sync {
     /// Every address that shares `client_ip`'s port budget, `client_ip`
     /// included. An unknown address answers with just itself.
