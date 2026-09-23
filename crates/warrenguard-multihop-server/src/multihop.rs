@@ -1247,17 +1247,6 @@ pub fn derive_exit_xwing_from_identity(
     Ok((secret, public.mlkem768_ek_bytes()))
 }
 
-/// Cache of `ExitSession`s keyed by encapsulated key, shared across all
-/// QUIC connections served by one exit. The cache lets a single physical
-/// QUIC connection drive multiple sequential rekey epochs and lets the
-/// same client reconnect on top of an existing HPKE setup without
-/// repaying the KEM ECDH on every QUIC handshake.
-///
-/// Entries are kept alive for [`SESSION_CACHE_TTL`] after their last
-/// access; an expired entry is never served, and [`sweep_if_due`] reclaims
-/// it at most one TTL later. This bounds memory at the sessions seen in
-/// the last two TTLs, which on a heavy client comes out to two (current +
-/// just-rekeyed old), and on an idle client comes out to one.
 /// Generous cap on NEW HPKE session derivations per second across the
 /// whole exit: a DoS backstop. Each cache miss runs an X25519 KEM decap,
 /// and an unauthenticated peer can otherwise drive one decap per frame by
@@ -1290,7 +1279,9 @@ impl TokenBucket {
     /// Try to consume one token. Returns `false` (caller drops the work)
     /// when the bucket is empty.
     fn try_take(&mut self, now: Instant) -> bool {
-        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        let elapsed = now
+            .saturating_duration_since(self.last_refill)
+            .as_secs_f64();
         if elapsed > 0.0 {
             self.tokens = (self.tokens + elapsed * self.rate_per_sec).min(self.capacity);
             self.last_refill = now;
@@ -1379,6 +1370,17 @@ struct SessionCacheState {
     create_bucket: TokenBucket,
 }
 
+/// Cache of `ExitSession`s keyed by encapsulated key, shared across all
+/// QUIC connections served by one exit. The cache lets a single physical
+/// QUIC connection drive multiple sequential rekey epochs and lets the
+/// same client reconnect on top of an existing HPKE setup without
+/// repaying the KEM ECDH on every QUIC handshake.
+///
+/// Entries are kept alive for [`SESSION_CACHE_TTL`] after their last
+/// access; an expired entry is never served, and [`sweep_if_due`] reclaims
+/// it at most one TTL later. This bounds memory at the sessions seen in
+/// the last two TTLs, which on a heavy client comes out to two (current +
+/// just-rekeyed old), and on an idle client comes out to one.
 struct SessionCache {
     inner: Mutex<SessionCacheState>,
     ttl: Duration,
