@@ -84,7 +84,7 @@ fn accept_error_backoff(err: &io::Error) -> Option<Duration> {
 /// Hard ceiling on tracked rate-limiter keys. Once reached, new keys are
 /// refused (fail-closed) until the next reclamation, bounding memory under a
 /// flood of distinct source IPs. ~100 bytes/key → well under ~100 MiB.
-const MAX_TRACKED_KEYS: usize = 1_000_000;
+const MAX_TRACKED_KEYS: std::num::NonZeroUsize = std::num::NonZeroUsize::new(1_000_000).unwrap();
 
 /// Read/write buffer size per direction. XOR is per-byte and stream-continuous,
 /// so this only affects syscall batching, never the wire format.

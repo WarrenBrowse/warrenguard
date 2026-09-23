@@ -61,14 +61,10 @@ impl IpRateLimiter {
     /// cannot be turned into a memory-exhaustion vector by a flood of distinct
     /// source IPs, nor that flood into a lockout of the sources it found.
     #[must_use]
-    pub fn new(limit: PerIpLimit, max_keys: usize) -> Self {
+    pub fn new(limit: PerIpLimit, max_keys: NonZeroUsize) -> Self {
         let refill = (Duration::from_secs(1) / limit.per_second.get()).max(Duration::from_nanos(1));
         Self {
-            inner: ConnectionRateLimiter::with_max_tracked(
-                limit.burst.get(),
-                refill,
-                NonZeroUsize::new(max_keys).unwrap_or(NonZeroUsize::MIN),
-            ),
+            inner: ConnectionRateLimiter::with_max_tracked(limit.burst.get(), refill, max_keys),
             full_recovery: refill.saturating_mul(limit.burst.get()),
         }
     }
@@ -82,8 +78,9 @@ impl IpRateLimiter {
         self.inner.try_acquire(&normalize_key(ip))
     }
 
-    /// Drop the keys whose budget has fully recovered. Call periodically to
-    /// bound memory under a churn of distinct source IPs.
+    /// Drop the keys whose budget has fully recovered, and return the memory
+    /// once the map is mostly empty. Call periodically to bound memory under a
+    /// churn of distinct source IPs.
     pub fn cleanup(&self) {
         self.inner.retain_active(self.full_recovery, Instant::now());
     }
@@ -124,7 +121,7 @@ mod tests {
         }
     }
 
-    const NO_KEY_CAP: usize = usize::MAX;
+    const NO_KEY_CAP: NonZeroUsize = NonZeroUsize::MAX;
 
     #[test]
     fn allows_burst_then_throttles() {
@@ -151,7 +148,7 @@ mod tests {
     fn fails_closed_when_key_map_saturated() {
         // Cap of 1 key: the first distinct source registers, any further
         // distinct source is refused until cleanup.
-        let rl = IpRateLimiter::new(limit(100, 100), 1);
+        let rl = IpRateLimiter::new(limit(100, 100), NonZeroUsize::MIN);
         assert!(rl.check("203.0.113.1".parse().unwrap()));
         assert!(
             !rl.check("203.0.113.2".parse().unwrap()),
@@ -163,7 +160,7 @@ mod tests {
     fn a_tracked_source_keeps_its_budget_when_the_key_map_is_full() {
         // A flood of distinct sources that fills the map must not lock out
         // the sources already tracked: only a NEW source is refused.
-        let rl = IpRateLimiter::new(limit(100, 100), 1);
+        let rl = IpRateLimiter::new(limit(100, 100), NonZeroUsize::MIN);
         let known: IpAddr = "203.0.113.1".parse().unwrap();
         assert!(rl.check(known));
         assert!(!rl.check("203.0.113.2".parse().unwrap()));
@@ -175,7 +172,7 @@ mod tests {
     fn cleanup_frees_the_capacity_of_recovered_sources() {
         // One token per millisecond, burst 1: a source idle 1 ms has fully
         // recovered, so dropping it loses nothing.
-        let rl = IpRateLimiter::new(limit(1_000, 1), 1);
+        let rl = IpRateLimiter::new(limit(1_000, 1), NonZeroUsize::MIN);
         assert!(rl.check("203.0.113.1".parse().unwrap()));
         std::thread::sleep(std::time::Duration::from_millis(5));
         rl.cleanup();
