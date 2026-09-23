@@ -434,7 +434,25 @@ pub(crate) struct FakeMultihopExit {
     /// When each connection was accepted, in order, so a test can measure the
     /// spacing of the client's redials.
     pub(crate) accepted_at: Arc<parking_lot::Mutex<Vec<Instant>>>,
+    /// When set, every subsequent QUIC handshake is refused with
+    /// `CONNECTION_REFUSED`: what a drained entry relay's listener answers
+    /// every new connection.
+    pub(crate) refuse_handshake: Arc<AtomicBool>,
+    on_next_dial: NextDialHook,
     _server_ep: Endpoint,
+}
+
+/// One-shot hook the fake exit runs when the next connection attempt reaches
+/// it, before the handshake completes.
+type NextDialHook = Arc<parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
+impl FakeMultihopExit {
+    /// Runs `hook` once, when the next connection attempt reaches this exit
+    /// and before its handshake completes: lets a test land a retarget while
+    /// a dial to this exit is in flight.
+    pub(crate) fn on_next_dial(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.on_next_dial.lock() = Some(Box::new(hook));
+    }
 }
 
 /// How the fake exit answers the connections it accepts, read afresh for each
@@ -612,15 +630,28 @@ pub(crate) fn spawn_fake_multihop_exit_on(
         garbage_reply: Arc::new(AtomicBool::new(false)),
     };
 
+    let refuse_handshake = Arc::new(AtomicBool::new(false));
+    let on_next_dial: NextDialHook = Arc::new(parking_lot::Mutex::new(None));
+
     let accept_loop_ep = server_ep.clone();
     let accept_loop_accepted = accepted.clone();
     let accept_loop_accepted_at = accepted_at.clone();
     let accept_loop_behaviour = behaviour.clone();
+    let accept_loop_refuse_handshake = refuse_handshake.clone();
+    let accept_loop_on_next_dial = on_next_dial.clone();
     tokio::spawn(async move {
         loop {
             let Some(incoming) = accept_loop_ep.accept().await else {
                 return;
             };
+            let hook = accept_loop_on_next_dial.lock().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+            if accept_loop_refuse_handshake.load(Ordering::Relaxed) {
+                incoming.refuse();
+                continue;
+            }
             let Ok(conn) = incoming.await else {
                 continue;
             };
@@ -650,6 +681,8 @@ pub(crate) fn spawn_fake_multihop_exit_on(
         close_after_setup: behaviour.close_after_setup,
         garbage_reply: behaviour.garbage_reply,
         accepted_at,
+        refuse_handshake,
+        on_next_dial,
         _server_ep: server_ep,
     })
 }

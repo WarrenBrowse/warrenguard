@@ -811,7 +811,7 @@ impl MultiHopSupervisor {
             // landing while the retry loop is spinning would otherwise never
             // be observed (the loop-top check runs only between sessions,
             // and a dial that never succeeds re-enters neither).
-            let (client, mut session_relay) = tokio::select! {
+            let (client, mut session_target) = tokio::select! {
                 biased;
                 () = self.tx.closed() => {
                     tracing::info!(
@@ -872,7 +872,7 @@ impl MultiHopSupervisor {
                 SetupOutcome::Failed(error) => {
                     // Never published: the redial draws the next backoff
                     // delay, since nothing reset the schedule.
-                    self.report_setup_failure(&primary, error.as_ref());
+                    self.report_setup_failure(&primary, &session_target, error.as_ref());
                     drop(primary);
                     continue;
                 }
@@ -904,7 +904,10 @@ impl MultiHopSupervisor {
             ));
             self.spawn_background_bond(&bundle, assign, session_tokens);
             self.notify_on_reconnect(first_session);
-            self.notify_path_rtt(session_relay, bundle.quinn_stats().path.rtt);
+            self.notify_path_rtt(
+                session_target.relay.relay_ed25519_pubkey,
+                bundle.quinn_stats().path.rtt,
+            );
             first_session = false;
             // Establishment instant of the session currently served: its
             // lifetime at close is what tells a post-handshake kill (a censor
@@ -994,7 +997,7 @@ impl MultiHopSupervisor {
                         // dial keeps the current session (the cold path still
                         // covers a real death).
                         match self.try_overlap().await {
-                            Some((new_bundle, new_primary, new_relay)) => {
+                            Some((new_bundle, new_primary, new_target)) => {
                                 if !pre_swap_allows(
                                     self.config.pre_swap_check.as_ref(),
                                     new_bundle.clone(),
@@ -1033,7 +1036,10 @@ impl MultiHopSupervisor {
                                 // Last sample of the OLD session before its
                                 // deferred close, then the fresh session's
                                 // post-handshake sample under ITS dialed key.
-                                self.notify_path_rtt(session_relay, bundle.quinn_stats().path.rtt);
+                                self.notify_path_rtt(
+                                    session_target.relay.relay_ed25519_pubkey,
+                                    bundle.quinn_stats().path.rtt,
+                                );
                                 Self::spawn_deferred_close(bundle.clone(), primary.clone());
                                 tracing::info!(
                                     "multi-hop overlap migration: swapped to a fresh session, old draining"
@@ -1049,9 +1055,12 @@ impl MultiHopSupervisor {
                                 }
                                 bundle = new_bundle;
                                 primary = new_primary;
-                                session_relay = new_relay;
+                                session_target = new_target;
                                 session_established = Instant::now();
-                                self.notify_path_rtt(session_relay, bundle.quinn_stats().path.rtt);
+                                self.notify_path_rtt(
+                                    session_target.relay.relay_ed25519_pubkey,
+                                    bundle.quinn_stats().path.rtt,
+                                );
                                 continue;
                             }
                             None => continue,
@@ -1063,7 +1072,10 @@ impl MultiHopSupervisor {
                 // RTT is still readable on the closed connection handle and
                 // is the session's parting sample (a degraded path records
                 // high, correctly biasing later selection away).
-                self.notify_path_rtt(session_relay, bundle.quinn_stats().path.rtt);
+                self.notify_path_rtt(
+                    session_target.relay.relay_ed25519_pubkey,
+                    bundle.quinn_stats().path.rtt,
+                );
                 //
                 // A definitive policy rejection (the exit closed with a known
                 // rejection code) is not a transient loss: redialing hits the
@@ -1131,10 +1143,6 @@ impl MultiHopSupervisor {
         }
     }
 
-    /// Dial ONE fresh QUIC + handshake session to the relay -> exit, no retry.
-    /// The cold-dial retry loop ([`connect_with_unbounded_retry`]) and the warm
-    /// make-before-break overlap dial ([`try_overlap`], a best-effort single
-    /// attempt) both build on this.
     /// Snapshot the live circuit target (relay + exit), cloning out of the
     /// mutex so no lock is held across the dial's awaits.
     fn current_target(&self) -> CircuitTarget {
@@ -1161,18 +1169,16 @@ impl MultiHopSupervisor {
         }
     }
 
-    /// Dial the LIVE target once. Returns the client together with the
-    /// dialed relay's Ed25519 pubkey, captured from the SAME target
-    /// snapshot the dial used, so a concurrent `migrate_to` can never
-    /// mis-key the session's RTT samples ([`PathRttObserver`]).
-    async fn connect_once(&self) -> Result<(MultiHopClient, [u8; 32]), MultiHopError> {
-        // Read the LIVE target (not config): a `migrate_to` retargets this
-        // so the next dial lands on a different exit (cross-exit migration).
-        let target = self.current_target();
-        let relay_pubkey = target.relay.relay_ed25519_pubkey;
-        Self::dial_target(&self.config, &target, self.config.bind_addr)
-            .await
-            .map(|client| (client, relay_pubkey))
+    /// Dial ONE fresh QUIC + handshake session to `target`, no retry. The
+    /// cold-dial retry loop ([`Self::connect_with_unbounded_retry`]) and the
+    /// warm make-before-break overlap dial ([`Self::try_overlap`], a
+    /// best-effort single attempt) both build on this, each with one
+    /// [`Self::current_target`] snapshot per attempt that the attempt keeps:
+    /// a `migrate_to` landing mid-dial redirects the NEXT attempt, and every
+    /// report about this one (a refusal, the RTT samples) names the circuit
+    /// it actually dialled.
+    async fn connect_once(&self, target: &CircuitTarget) -> Result<MultiHopClient, MultiHopError> {
+        Self::dial_target(&self.config, target, self.config.bind_addr).await
     }
 
     /// Dial one fresh session to `target`, preferring the post-quantum X-Wing
@@ -1320,7 +1326,12 @@ impl MultiHopSupervisor {
     /// met at the handshake (so the deployer reselects instead of waiting the
     /// drain out), and say which of the three it was. The close code, when
     /// there is one, rides in the error; no address or identity does.
-    fn report_setup_failure(&self, primary: &MultiHopClient, error: Option<&MultiHopError>) {
+    fn report_setup_failure(
+        &self,
+        primary: &MultiHopClient,
+        dialled: &CircuitTarget,
+        error: Option<&MultiHopError>,
+    ) {
         primary.force_close_for_reconnect();
         match error {
             Some(e) => match e.dial_refusal() {
@@ -1331,7 +1342,7 @@ impl MultiHopSupervisor {
                         "multi-hop setup refused after the handshake by a drained node; \
                          session not published, refusal reported, redialling after backoff"
                     );
-                    self.notify_dial_refused(e);
+                    self.notify_dial_refused(e, dialled);
                 }
                 None => tracing::warn!(
                     error = %e,
@@ -1468,7 +1479,11 @@ impl MultiHopSupervisor {
     /// overlap dial uses this: the current session keeps serving during
     /// an overlap, so there is no user-visible latency to shave, and
     /// swapping in a full-width bundle avoids a throughput dip.
-    async fn establish_session(&self, primary: Arc<MultiHopClient>) -> Established {
+    async fn establish_session(
+        &self,
+        primary: Arc<MultiHopClient>,
+        dialled: &CircuitTarget,
+    ) -> Established {
         // One token stack for this whole session (primary + secondaries).
         let session_tokens = self.select_session_tokens();
         let primary_spec = match self
@@ -1479,7 +1494,7 @@ impl MultiHopSupervisor {
             SetupOutcome::Rejected(reason) => return Established::Rejected(reason),
             SetupOutcome::TimedOut => return Established::SetupTimedOut,
             SetupOutcome::Failed(error) => {
-                self.report_setup_failure(&primary, error.as_ref());
+                self.report_setup_failure(&primary, dialled, error.as_ref());
                 return Established::SetupFailed;
             }
         };
@@ -1521,16 +1536,19 @@ impl MultiHopSupervisor {
     /// `(bundle, primary)` on success, or `None` to keep the current session
     /// (a failed or rejected overlap dial must never tear down the still
     /// healthy current session - the natural cold path covers a real death).
-    async fn try_overlap(&self) -> Option<(Arc<MultiHopBundle>, Arc<MultiHopClient>, [u8; 32])> {
-        let (primary, relay_pubkey) = match self.connect_once().await {
-            Ok((c, relay_pubkey)) => (Arc::new(c), relay_pubkey),
+    async fn try_overlap(
+        &self,
+    ) -> Option<(Arc<MultiHopBundle>, Arc<MultiHopClient>, CircuitTarget)> {
+        let target = self.current_target();
+        let primary = match self.connect_once(&target).await {
+            Ok(c) => Arc::new(c),
             Err(e) => {
                 tracing::warn!(error = %e, "overlap dial failed; keeping the current session");
                 return None;
             }
         };
-        match self.establish_session(primary).await {
-            Established::Session { bundle, primary } => Some((bundle, primary, relay_pubkey)),
+        match self.establish_session(primary, &target).await {
+            Established::Session { bundle, primary } => Some((bundle, primary, target)),
             Established::Rejected(reason) => {
                 tracing::warn!(%reason, "overlap dial rejected by exit; keeping the current session");
                 None
@@ -1763,22 +1781,21 @@ impl MultiHopSupervisor {
     }
 
     /// Fire the [`SupervisorConfig::on_dial_refused`] observer when a
-    /// dial attempt failed with a deliberate refusal, carrying the
-    /// CURRENT target's identity (the circuit whose dial was refused;
-    /// a concurrent `migrate_to` would retarget the NEXT attempt, not
-    /// the one that just failed, but the report then points at a node
-    /// the deployer already moved off, which is harmless). Extracted so
+    /// dial attempt failed with a deliberate refusal, naming `dialled`, the
+    /// circuit that attempt dialled. Never a fresh read of the live target:
+    /// a `migrate_to` that lands while the attempt is in flight redirects
+    /// the next attempt, and reading the target here would charge this
+    /// refusal to the node the deployer has just moved to. Extracted so
     /// the dispatch gate (refusal vs plain transient) is testable
     /// without a real QUIC dial.
-    fn notify_dial_refused(&self, error: &MultiHopError) {
+    fn notify_dial_refused(&self, error: &MultiHopError, dialled: &CircuitTarget) {
         let Some(hop) = error.dial_refusal() else {
             return;
         };
         let Some(observer) = self.config.on_dial_refused.as_ref() else {
             return;
         };
-        let target = self.current_target();
-        observer(hop, target.relay.relay_id, *target.exit_id.as_bytes());
+        observer(hop, dialled.relay.relay_id, *dialled.exit_id.as_bytes());
     }
 
     /// Drive [`MultiHopClient::connect`] /
@@ -1796,7 +1813,7 @@ impl MultiHopSupervisor {
     async fn connect_with_unbounded_retry(
         &self,
         redial: &mut JitterBackoff,
-    ) -> Result<(MultiHopClient, [u8; 32]), MultiHopError> {
+    ) -> Result<(MultiHopClient, CircuitTarget), MultiHopError> {
         let mut attempt_count = 0u64;
         loop {
             let delay = redial.next_delay();
@@ -1804,10 +1821,11 @@ impl MultiHopSupervisor {
                 tokio::time::sleep(delay).await;
             }
             attempt_count = attempt_count.saturating_add(1);
-            match self.connect_once().await {
-                Ok(c) => return Ok(c),
+            let target = self.current_target();
+            match self.connect_once(&target).await {
+                Ok(client) => return Ok((client, target)),
                 Err(e) if e.is_retriable() => {
-                    self.notify_dial_refused(&e);
+                    self.notify_dial_refused(&e, &target);
                     tracing::warn!(
                         error = %e,
                         attempt = attempt_count,
@@ -2509,7 +2527,7 @@ mod tests {
     #[test]
     fn notify_dial_refused_reports_the_refused_circuit_identity() {
         // The observer must fire on a deliberate refusal with the hop
-        // and the CURRENT target's identity, and must stay silent on a
+        // and the dialled circuit's identity, and must stay silent on a
         // plain transient error: firing on every blip would make the
         // deployer exclude healthy nodes on ordinary packet loss.
         type SeenRefusals = Vec<(multihop::DialRefusedHop, [u8; 16], [u8; 16])>;
@@ -2532,6 +2550,7 @@ mod tests {
                 .push((hop, relay_id, exit_id));
         }));
         let (supervisor, _rx) = MultiHopSupervisor::new(config);
+        let dialled = supervisor.current_target();
 
         let refused = MultiHopError::Handshake(quinn::ConnectionError::ConnectionClosed(
             quinn::ConnectionClose {
@@ -2540,8 +2559,11 @@ mod tests {
                 reason: bytes::Bytes::from_static(b""),
             },
         ));
-        supervisor.notify_dial_refused(&refused);
-        supervisor.notify_dial_refused(&MultiHopError::Handshake(quinn::ConnectionError::TimedOut));
+        supervisor.notify_dial_refused(&refused, &dialled);
+        supervisor.notify_dial_refused(
+            &MultiHopError::Handshake(quinn::ConnectionError::TimedOut),
+            &dialled,
+        );
 
         assert_eq!(
             *seen.lock().expect("seen lock"),
@@ -2556,12 +2578,15 @@ mod tests {
         // No observer wired (tests, deployments without a directory):
         // a refusal must not panic or change behavior.
         let (supervisor, _rx) = MultiHopSupervisor::new(dummy_config());
-        supervisor.notify_dial_refused(&MultiHopError::Handshake(
-            quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
-                error_code: quinn::VarInt::from_u32(warrenguard_multihop::WARREN_MH_DRAINING),
-                reason: bytes::Bytes::from_static(b""),
-            }),
-        ));
+        supervisor.notify_dial_refused(
+            &MultiHopError::Handshake(quinn::ConnectionError::ApplicationClosed(
+                quinn::ApplicationClose {
+                    error_code: quinn::VarInt::from_u32(warrenguard_multihop::WARREN_MH_DRAINING),
+                    reason: bytes::Bytes::from_static(b""),
+                },
+            )),
+            &supervisor.current_target(),
+        );
         drop(supervisor);
     }
 
@@ -3152,6 +3177,122 @@ mod run_tests {
 
         drop(rx);
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    type RefusalReports = Vec<(multihop::DialRefusedHop, [u8; 16], [u8; 16])>;
+
+    /// A circuit to `exit` entered through a relay named `relay_id`, signed by
+    /// `operational_key` so the dial verifies it. Every fake exit presents the
+    /// same relay key, so the relay id is what tells two entries apart.
+    fn circuit_to(
+        exit: &FakeMultihopExit,
+        relay_id: [u8; 16],
+        operational_key: &SigningKey,
+    ) -> CircuitTarget {
+        use ed25519_dalek::Signer;
+
+        let signature = operational_key
+            .sign(&warrenguard_multihop::relay_descriptor_signing_payload(
+                &relay_id,
+                &exit.relay.relay_ed25519_pubkey,
+            ))
+            .to_bytes();
+        CircuitTarget {
+            relay: Arc::new(RelayDescriptorSigned {
+                relay_id,
+                signature,
+                ..(*exit.relay).clone()
+            }),
+            exit_id: exit.exit_id,
+            exit_x25519_multihop_pubkey: exit.exit_x25519_pubkey,
+            exit_mlkem768_pubkey: None,
+        }
+    }
+
+    /// Dials an exit that refuses the way `refuse` configures it, lands a
+    /// retarget onto an admitting exit while that very dial is in flight, and
+    /// returns the refusal reports made until the session came up, with the
+    /// circuit the refused attempt dialled.
+    async fn refusal_reports_across_a_mid_dial_retarget(
+        refuse: impl FnOnce(&FakeMultihopExit),
+    ) -> (RefusalReports, CircuitTarget) {
+        let operational_key = SigningKey::from_bytes(&[0x4D; 32]);
+        let refusing = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x5D; 16]));
+        let admitting = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x5E; 16]));
+        refuse(&refusing);
+        let dialled = circuit_to(&refusing, [0xD1; 16], &operational_key);
+        let moved_to = circuit_to(&admitting, [0xD2; 16], &operational_key);
+        let reports: Arc<Mutex<RefusalReports>> = Arc::default();
+        let mut config = config_with_fake_exit(&refusing, &operational_key);
+        config.relay = dialled.relay.clone();
+        config.backoff = TEST_BACKOFF;
+        config.on_dial_refused = Some(Arc::new({
+            let reports = reports.clone();
+            move |hop, relay_id, exit_id| {
+                reports
+                    .lock()
+                    .expect("reports lock")
+                    .push((hop, relay_id, exit_id));
+            }
+        }));
+        let (supervisor, mut rx) = MultiHopSupervisor::new(config);
+        let migrate = supervisor.migrate_handle();
+        refusing.on_next_dial(move || migrate.migrate_to(moved_to));
+        let task = tokio::spawn(supervisor.run());
+
+        tokio::time::timeout(Duration::from_secs(5), rx.changed())
+            .await
+            .expect("the retargeted attempt must bring a session up")
+            .expect("watch sender alive");
+        let reports = reports.lock().expect("reports lock").clone();
+
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        (reports, dialled)
+    }
+
+    /// A retarget that lands while an attempt is in flight redirects the next
+    /// attempt only. The refusal the in-flight attempt meets is charged to the
+    /// node it dialled: charged to the new target, it would make the deployer
+    /// avoid the node it has just moved to.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_handshake_refusal_names_the_dialled_node_when_a_retarget_lands_mid_dial() {
+        let (reports, dialled) = refusal_reports_across_a_mid_dial_retarget(|exit| {
+            exit.refuse_handshake
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        })
+        .await;
+        assert_eq!(
+            reports,
+            vec![(
+                multihop::DialRefusedHop::Entry,
+                dialled.relay.relay_id,
+                *dialled.exit_id.as_bytes()
+            )],
+            "the refused handshake is charged to the circuit it dialled"
+        );
+    }
+
+    /// Same as the handshake case, for a node that refuses once the handshake
+    /// is done: the setup round-trip reports it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_setup_refusal_names_the_dialled_node_when_a_retarget_lands_mid_dial() {
+        let (reports, dialled) = refusal_reports_across_a_mid_dial_retarget(|exit| {
+            exit.refuse_setup.store(
+                warrenguard_multihop::WARREN_MH_DRAINING,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        })
+        .await;
+        assert_eq!(
+            reports,
+            vec![(
+                multihop::DialRefusedHop::Entry,
+                dialled.relay.relay_id,
+                *dialled.exit_id.as_bytes()
+            )],
+            "the refused setup is charged to the circuit it dialled"
+        );
     }
 
     /// A session that dies right after it was established is a flap: the
