@@ -8505,6 +8505,47 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_session_keeps_its_inner_ipv4_across_an_exit_restart() {
+        // The same wallet dials an exit, the exit restarts (same identity, a
+        // fresh process: new allocator, caches and routes), and the redial
+        // names the address the session held, as the client supervisor does.
+        // Keeping the address spares every client a tunnel rebuild per
+        // rollout.
+        let wallet = [0x6B; 32];
+        let ip_request = |prefer_ipv4| WarrenControlMessage::IpRequest {
+            prefer_ipv4,
+            client_pubkey: Some(wallet),
+            wants_ipv6: false,
+            pop_sig: None,
+            wants_daita: false,
+        };
+        let seeded = |seed| {
+            Arc::new(Mutex::new(
+                IpAllocator::with_seed(
+                    Ipv4Addr::new(10, 66, 0, 0),
+                    24,
+                    Ipv4Addr::new(10, 66, 0, 1),
+                    seed,
+                )
+                .expect("/24 pool builds"),
+            ))
+        };
+
+        let before_restart = spawn_terminating_exit(None, seeded(0x51));
+        let (client, held) =
+            client_setup_admitted(&before_restart, ip_request(Some([0, 0, 0, 0]))).await;
+        drop(client);
+        drop(before_restart);
+
+        let after_restart = spawn_terminating_exit(None, seeded(0x52));
+        let (_client, got) = client_setup_admitted(&after_restart, ip_request(Some(held))).await;
+        assert_eq!(
+            got, held,
+            "the redial after the restart must get back the inner IPv4 it names"
+        );
+    }
+
     #[cfg(feature = "pq-hpke")]
     struct TerminatingExitPq {
         addr: std::net::SocketAddr,
