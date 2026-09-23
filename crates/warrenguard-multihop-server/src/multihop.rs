@@ -1254,10 +1254,10 @@ pub fn derive_exit_xwing_from_identity(
 /// repaying the KEM ECDH on every QUIC handshake.
 ///
 /// Entries are kept alive for [`SESSION_CACHE_TTL`] after their last
-/// access. On every `get_or_insert`, the cache lazily evicts expired
-/// entries. This bounds memory at "active sessions in the last 5 s",
-/// which on a heavy client comes out to two (current + just-rekeyed
-/// old), and on an idle client comes out to one.
+/// access; an expired entry is never served, and [`sweep_if_due`] reclaims
+/// it at most one TTL later. This bounds memory at the sessions seen in
+/// the last two TTLs, which on a heavy client comes out to two (current +
+/// just-rekeyed old), and on an idle client comes out to one.
 /// Generous cap on NEW HPKE session derivations per second across the
 /// whole exit: a DoS backstop. Each cache miss runs an X25519 KEM decap,
 /// and an unauthenticated peer can otherwise drive one decap per frame by
@@ -1304,8 +1304,76 @@ impl TokenBucket {
     }
 }
 
+/// A session-cache entry the lazy TTL sweep can age.
+trait CachedSession {
+    fn last_seen_at(&self) -> Instant;
+    fn touch(&mut self, now: Instant);
+}
+
+impl CachedSession for SessionCacheEntry {
+    fn last_seen_at(&self) -> Instant {
+        self.last_seen_at
+    }
+
+    fn touch(&mut self, now: Instant) {
+        self.last_seen_at = now;
+    }
+}
+
+#[cfg(feature = "pq-hpke")]
+impl CachedSession for PqSessionCacheEntry {
+    fn last_seen_at(&self) -> Instant {
+        self.last_seen_at
+    }
+
+    fn touch(&mut self, now: Instant) {
+        self.last_seen_at = now;
+    }
+}
+
+/// Drops the entries of a session cache idle for `ttl`, walking the map only
+/// when a `ttl` has passed since the previous walk.
+///
+/// Every datagram of every connection looks its session up under the
+/// exit-wide cache lock, and a peer rotating `encapsulated_key` fills the map
+/// up to the create budget. Walking on every lookup would make each packet pay
+/// for the whole map. Walking once per `ttl` keeps a lookup O(1) and still bounds
+/// the map to what was seen in the last two TTLs; [`live_entry`] keeps an
+/// entry that expired between two walks from being served.
+fn sweep_if_due<E: CachedSession>(
+    map: &mut HashMap<EncapsulatedKeyBytes, E>,
+    last_sweep: &mut Option<Instant>,
+    now: Instant,
+    ttl: Duration,
+) {
+    if last_sweep.is_some_and(|t| now.saturating_duration_since(t) < ttl) {
+        return;
+    }
+    *last_sweep = Some(now);
+    map.retain(|_, entry| now.saturating_duration_since(entry.last_seen_at()) < ttl);
+}
+
+/// The entry for `key` if it was seen within `ttl`, refreshed to `now`. An
+/// expired entry the sweep has not reclaimed yet counts as absent.
+fn live_entry<'a, E: CachedSession>(
+    map: &'a mut HashMap<EncapsulatedKeyBytes, E>,
+    key: &EncapsulatedKeyBytes,
+    now: Instant,
+    ttl: Duration,
+) -> Option<&'a mut E> {
+    match map.get_mut(key) {
+        Some(entry) if now.saturating_duration_since(entry.last_seen_at()) < ttl => {
+            entry.touch(now);
+            Some(entry)
+        }
+        _ => None,
+    }
+}
+
 struct SessionCacheState {
     map: HashMap<EncapsulatedKeyBytes, SessionCacheEntry>,
+    /// When [`sweep_if_due`] last walked `map`.
+    last_sweep: Option<Instant>,
     /// Rate limiter on NEW session derivations (decaps). Kept under the
     /// same lock as the map so a miss is gated atomically with the build.
     create_bucket: TokenBucket,
@@ -1326,8 +1394,8 @@ struct SessionCacheEntry {
     /// a `(epoch, seq)` accepted on any connection is rejected on all
     /// others sharing the same `encapsulated_key`.
     ///
-    /// Lifetime caveat: the window dies with the cache entry, which the
-    /// lazy sweep reclaims [`SESSION_CACHE_TTL`] after the last frame.
+    /// Lifetime caveat: the window dies with the cache entry, which stops
+    /// being served [`SESSION_CACHE_TTL`] after the last frame.
     /// Within that 5 s residue a deterministic post-TTL reconstruction
     /// (a cache miss rebuilds a byte-identical [`ExitSession`]) would
     /// get a fresh window and could re-accept an ancient replay. The TTL
@@ -1364,6 +1432,7 @@ impl SessionCache {
         Self {
             inner: Mutex::new(SessionCacheState {
                 map: HashMap::new(),
+                last_sweep: None,
                 create_bucket: TokenBucket::new(
                     SESSION_CREATE_RATE_PER_SEC,
                     SESSION_CREATE_BURST,
@@ -1374,11 +1443,10 @@ impl SessionCache {
         }
     }
 
-    /// Get or insert a session keyed by `encapsulated_key`. Sweeps
-    /// expired entries before the lookup and refreshes `last_seen_at`
-    /// on every hit so a steady stream of traffic for one session
-    /// keeps it indefinitely while a paused session is reclaimed
-    /// after [`Self::ttl`].
+    /// Get or insert a session keyed by `encapsulated_key`. Refreshes
+    /// `last_seen_at` on every hit so a steady stream of traffic for one
+    /// session keeps it indefinitely, while a session paused for
+    /// [`Self::ttl`] counts as a miss (and is rebuilt).
     ///
     /// A cache MISS additionally consumes a token from the per-second
     /// session-creation budget before running `build` (the HPKE decap);
@@ -1389,14 +1457,22 @@ impl SessionCache {
         encapsulated_key: &EncapsulatedKeyBytes,
         build: impl FnOnce() -> Result<ExitSession, warrenguard_multihop::MultihopError>,
     ) -> Result<SessionHandle, warrenguard_multihop::MultihopError> {
+        self.get_or_insert_at(encapsulated_key, build, Instant::now())
+    }
+
+    /// [`Self::get_or_insert`] at an explicit `now`, so tests drive the TTL
+    /// without sleeping.
+    fn get_or_insert_at(
+        &self,
+        encapsulated_key: &EncapsulatedKeyBytes,
+        build: impl FnOnce() -> Result<ExitSession, warrenguard_multihop::MultihopError>,
+        now: Instant,
+    ) -> Result<SessionHandle, warrenguard_multihop::MultihopError> {
         let mut guard = self.inner.lock();
-        let now = Instant::now();
         let ttl = self.ttl;
-        guard
-            .map
-            .retain(|_, entry| now.duration_since(entry.last_seen_at) < ttl);
-        if let Some(existing) = guard.map.get_mut(encapsulated_key) {
-            existing.last_seen_at = now;
+        let state = &mut *guard;
+        sweep_if_due(&mut state.map, &mut state.last_sweep, now, ttl);
+        if let Some(existing) = live_entry(&mut state.map, encapsulated_key, now, ttl) {
             return Ok(SessionHandle {
                 session: existing.session.clone(),
                 replay_windows: existing.replay_windows.clone(),
@@ -1445,6 +1521,7 @@ struct PqSessionCacheEntry {
 #[cfg(feature = "pq-hpke")]
 struct PqSessionCacheState {
     map: HashMap<EncapsulatedKeyBytes, PqSessionCacheEntry>,
+    last_sweep: Option<Instant>,
     create_bucket: TokenBucket,
 }
 
@@ -1470,6 +1547,7 @@ impl PqSessionCache {
         Self {
             inner: Mutex::new(PqSessionCacheState {
                 map: HashMap::new(),
+                last_sweep: None,
                 create_bucket: TokenBucket::new(
                     SESSION_CREATE_RATE_PER_SEC,
                     SESSION_CREATE_BURST,
@@ -1496,14 +1574,23 @@ impl PqSessionCache {
         exit_id: ExitId,
         secret: &XWingRecipientSecretKey,
     ) -> Result<PqSessionHandle, MultihopError> {
+        self.establish_or_get_at(encapsulated_key, pq_ct, exit_id, secret, Instant::now())
+    }
+
+    /// [`Self::establish_or_get`] at an explicit `now`.
+    fn establish_or_get_at(
+        &self,
+        encapsulated_key: &EncapsulatedKeyBytes,
+        pq_ct: &[u8],
+        exit_id: ExitId,
+        secret: &XWingRecipientSecretKey,
+        now: Instant,
+    ) -> Result<PqSessionHandle, MultihopError> {
         let mut guard = self.inner.lock();
-        let now = Instant::now();
         let ttl = self.ttl;
-        guard
-            .map
-            .retain(|_, entry| now.duration_since(entry.last_seen_at) < ttl);
-        if let Some(existing) = guard.map.get_mut(encapsulated_key) {
-            existing.last_seen_at = now;
+        let state = &mut *guard;
+        sweep_if_due(&mut state.map, &mut state.last_sweep, now, ttl);
+        if let Some(existing) = live_entry(&mut state.map, encapsulated_key, now, ttl) {
             return Ok(PqSessionHandle {
                 session: existing.session.clone(),
                 replay_windows: existing.replay_windows.clone(),
@@ -1537,14 +1624,20 @@ impl PqSessionCache {
     /// `pq_ct`). A miss returns `None`: the frame is dropped, since the session
     /// cannot be rebuilt without the `pq_ct` only a setup/rekey frame carries.
     fn get(&self, encapsulated_key: &EncapsulatedKeyBytes) -> Option<PqSessionHandle> {
+        self.get_at(encapsulated_key, Instant::now())
+    }
+
+    /// [`Self::get`] at an explicit `now`.
+    fn get_at(
+        &self,
+        encapsulated_key: &EncapsulatedKeyBytes,
+        now: Instant,
+    ) -> Option<PqSessionHandle> {
         let mut guard = self.inner.lock();
-        let now = Instant::now();
         let ttl = self.ttl;
-        guard
-            .map
-            .retain(|_, entry| now.duration_since(entry.last_seen_at) < ttl);
-        let existing = guard.map.get_mut(encapsulated_key)?;
-        existing.last_seen_at = now;
+        let state = &mut *guard;
+        sweep_if_due(&mut state.map, &mut state.last_sweep, now, ttl);
+        let existing = live_entry(&mut state.map, encapsulated_key, now, ttl)?;
         Some(PqSessionHandle {
             session: existing.session.clone(),
             replay_windows: existing.replay_windows.clone(),
@@ -1560,18 +1653,16 @@ impl PqSessionCache {
     ///
     /// Returns whether `encapsulated_key` had a live entry to refresh.
     fn refresh(&self, encapsulated_key: &EncapsulatedKeyBytes) -> bool {
+        self.refresh_at(encapsulated_key, Instant::now())
+    }
+
+    /// [`Self::refresh`] at an explicit `now`.
+    fn refresh_at(&self, encapsulated_key: &EncapsulatedKeyBytes, now: Instant) -> bool {
         let mut guard = self.inner.lock();
-        let now = Instant::now();
         let ttl = self.ttl;
-        guard
-            .map
-            .retain(|_, entry| now.duration_since(entry.last_seen_at) < ttl);
-        if let Some(existing) = guard.map.get_mut(encapsulated_key) {
-            existing.last_seen_at = now;
-            true
-        } else {
-            false
-        }
+        let state = &mut *guard;
+        sweep_if_due(&mut state.map, &mut state.last_sweep, now, ttl);
+        live_entry(&mut state.map, encapsulated_key, now, ttl).is_some()
     }
 
     #[cfg(test)]
@@ -5855,6 +5946,132 @@ mod tests {
             cache.entry_count(),
             1,
             "a touched entry must not be evicted while traffic keeps flowing"
+        );
+    }
+
+    /// Every datagram of every connection looks a session up under the
+    /// exit-wide cache lock, and a flood of junk `encapsulated_key`s can fill
+    /// the map up to the create budget. A lookup between two sweeps must not
+    /// walk the map: an entry that expired since the last sweep stays in
+    /// place (unserved) until the next one, one TTL later.
+    #[test]
+    fn session_cache_lookups_between_sweeps_do_not_walk_the_map() {
+        let ttl = Duration::from_secs(5);
+        let cache = SessionCache::with_ttl(ttl);
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let (d, e, f): (
+            EncapsulatedKeyBytes,
+            EncapsulatedKeyBytes,
+            EncapsulatedKeyBytes,
+        ) = ([0x0d; 32], [0x0e; 32], [0x0f; 32]);
+
+        cache
+            .get_or_insert_at(&d, build_session_for_cache_test, at(0))
+            .expect("insert D");
+        cache
+            .get_or_insert_at(&e, build_session_for_cache_test, at(3))
+            .expect("insert E");
+        // A TTL after the first sweep: this lookup sweeps, dropping D (6 s
+        // idle) and keeping E (3 s idle).
+        cache
+            .get_or_insert_at(&f, build_session_for_cache_test, at(6))
+            .expect("insert F");
+        assert_eq!(cache.entry_count(), 2, "D swept, E and F kept");
+
+        // E expires at 8 s; the next sweep is due at 11 s.
+        cache
+            .get_or_insert_at(&f, build_session_for_cache_test, at(9))
+            .expect("hit F");
+        assert_eq!(
+            cache.entry_count(),
+            2,
+            "a lookup between sweeps must not walk the map"
+        );
+    }
+
+    #[test]
+    fn session_cache_rebuilds_an_expired_session_the_sweep_has_not_reclaimed_yet() {
+        let ttl = Duration::from_secs(5);
+        let cache = SessionCache::with_ttl(ttl);
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let (d, e): (EncapsulatedKeyBytes, EncapsulatedKeyBytes) = ([0x1d; 32], [0x1e; 32]);
+
+        cache
+            .get_or_insert_at(&d, build_session_for_cache_test, at(0))
+            .expect("insert D");
+        let first = cache
+            .get_or_insert_at(&e, build_session_for_cache_test, at(3))
+            .expect("insert E");
+        cache
+            .get_or_insert_at(&d, build_session_for_cache_test, at(6))
+            .expect("rebuild D, sweeping");
+
+        // E expired at 8 s and the next sweep is not due before 11 s.
+        let builds = std::cell::Cell::new(0u32);
+        let again = cache
+            .get_or_insert_at(
+                &e,
+                || {
+                    builds.set(builds.get() + 1);
+                    build_session_for_cache_test()
+                },
+                at(9),
+            )
+            .expect("rebuild E");
+        assert_eq!(builds.get(), 1, "an expired entry is never served");
+        assert!(
+            !Arc::ptr_eq(&first.replay_windows, &again.replay_windows),
+            "the rebuilt session starts a fresh replay window"
+        );
+    }
+
+    #[cfg(feature = "pq-hpke")]
+    #[test]
+    fn pq_session_cache_lookups_between_sweeps_do_not_walk_or_serve_expired_sessions() {
+        let ttl = Duration::from_secs(5);
+        let cache = PqSessionCache::with_ttl(ttl);
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let exit_id = ExitId::from_bytes([0x3f; 16]);
+        let (x, x_secret, x_client) = establish_pq_session_for_cache_test(exit_id);
+        let (k, k_secret, k_client) = establish_pq_session_for_cache_test(exit_id);
+
+        cache
+            .establish_or_get_at(&x, x_client.pq_ct(), exit_id, &x_secret, at(0))
+            .expect("establish X");
+        cache
+            .establish_or_get_at(&k, k_client.pq_ct(), exit_id, &k_secret, at(1))
+            .expect("establish K");
+        // Sweeps at 6 s: X (6 s idle) goes, K (5 s idle) goes too.
+        assert!(cache.get_at(&k, at(6)).is_none());
+        cache
+            .establish_or_get_at(&k, k_client.pq_ct(), exit_id, &k_secret, at(7))
+            .expect("re-establish K");
+        cache
+            .establish_or_get_at(&x, x_client.pq_ct(), exit_id, &x_secret, at(8))
+            .expect("re-establish X");
+
+        // K expired at 12 s, the next sweep is due at 11 s: sweep at 11 s
+        // first (K 4 s idle, kept), then look up at 13 s (no sweep due).
+        assert!(cache.refresh_at(&x, at(11)), "X is live");
+        assert!(
+            cache.refresh_at(&x, at(13)),
+            "X refreshed at 11 s is still live"
+        );
+        assert_eq!(
+            cache.entry_count(),
+            2,
+            "a lookup between sweeps must not walk the map"
+        );
+        assert!(
+            cache.get_at(&k, at(13)).is_none(),
+            "K expired at 12 s and must not be served"
+        );
+        assert!(
+            !cache.refresh_at(&k, at(13)),
+            "an expired entry is not revived"
         );
     }
 
