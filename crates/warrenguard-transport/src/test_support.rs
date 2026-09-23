@@ -427,6 +427,10 @@ pub(crate) struct FakeMultihopExit {
     /// When set, the connection is closed right after the `IpAssign` reply: a
     /// session that is established and dies at once.
     pub(crate) close_after_setup: Arc<AtomicBool>,
+    /// When set, the setup request is answered with bytes that are no sealed
+    /// frame, and the connection is held open: a setup that fails while the
+    /// connection itself stays up.
+    pub(crate) garbage_reply: Arc<AtomicBool>,
     /// When each connection was accepted, in order, so a test can measure the
     /// spacing of the client's redials.
     pub(crate) accepted_at: Arc<parking_lot::Mutex<Vec<Instant>>>,
@@ -443,6 +447,7 @@ struct FakeExitBehaviour {
     swallow_setup: Arc<AtomicBool>,
     refuse_setup: Arc<AtomicU32>,
     close_after_setup: Arc<AtomicBool>,
+    garbage_reply: Arc<AtomicBool>,
 }
 
 const FAKE_EXIT_IKM: [u8; 32] = [0x99; 32];
@@ -472,6 +477,13 @@ async fn serve_one_fake_exit_connection(
     let refuse_code = behaviour.refuse_setup.load(Ordering::Relaxed);
     if refuse_code != 0 {
         conn.close(quinn::VarInt::from_u32(refuse_code), &[]);
+        return;
+    }
+    if behaviour.garbage_reply.load(Ordering::Relaxed) {
+        if send.write_all(&[0xEE; 64]).await.is_ok() {
+            let _ = send.finish();
+        }
+        conn.closed().await;
         return;
     }
     let Ok(frame) = decode_frame(&bytes) else {
@@ -597,6 +609,7 @@ pub(crate) fn spawn_fake_multihop_exit_on(
         swallow_setup: Arc::new(AtomicBool::new(false)),
         refuse_setup: Arc::new(AtomicU32::new(0)),
         close_after_setup: Arc::new(AtomicBool::new(false)),
+        garbage_reply: Arc::new(AtomicBool::new(false)),
     };
 
     let accept_loop_ep = server_ep.clone();
@@ -613,17 +626,14 @@ pub(crate) fn spawn_fake_multihop_exit_on(
             };
             accept_loop_accepted_at.lock().push(Instant::now());
             accept_loop_accepted.fetch_add(1, Ordering::Relaxed);
-            let swallow = accept_loop_behaviour.swallow_setup.load(Ordering::Relaxed);
-            let served =
-                serve_one_fake_exit_connection(conn, exit_id, accept_loop_behaviour.clone());
-            // A swallowed setup holds its connection open until the client
-            // gives up, so serving it inline would stall the accept loop and
-            // the client's next dial would never be answered.
-            if swallow {
-                tokio::spawn(served);
-            } else {
-                served.await;
-            }
+            // Served off the accept loop, so a connection the exit holds open
+            // (a live session, a swallowed setup) never stalls the client's
+            // next dial, a make-before-break one included.
+            tokio::spawn(serve_one_fake_exit_connection(
+                conn,
+                exit_id,
+                accept_loop_behaviour.clone(),
+            ));
         }
     });
 
@@ -638,6 +648,7 @@ pub(crate) fn spawn_fake_multihop_exit_on(
         swallow_setup: behaviour.swallow_setup,
         refuse_setup: behaviour.refuse_setup,
         close_after_setup: behaviour.close_after_setup,
+        garbage_reply: behaviour.garbage_reply,
         accepted_at,
         _server_ep: server_ep,
     })

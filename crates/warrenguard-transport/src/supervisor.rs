@@ -1029,6 +1029,15 @@ impl MultiHopSupervisor {
                                 tracing::info!(
                                     "multi-hop overlap migration: swapped to a fresh session, old draining"
                                 );
+                                // The outgoing session is judged like one that
+                                // died: a healthy one clears the escalation,
+                                // so its successor's early death is not
+                                // charged the waits of older failures.
+                                if crate::redial_policy::is_healthy_uptime(
+                                    session_established.elapsed(),
+                                ) {
+                                    redial.reset();
+                                }
                                 bundle = new_bundle;
                                 primary = new_primary;
                                 session_relay = new_relay;
@@ -1575,8 +1584,8 @@ impl MultiHopSupervisor {
     }
 
     /// Decode the setup-stream reply plaintext into an [`IpAssignSpec`].
-    /// `None` for a non-`IpAssign` reply (the session keeps its
-    /// bootstrap IP) or a decode failure (logged).
+    /// `None` for a non-`IpAssign` reply or a decode failure (logged): a
+    /// connection that gets no address from the exit never carries traffic.
     fn decode_ip_assign(reply: &[u8]) -> Option<IpAssignSpec> {
         match warrenguard_multihop::try_decode_control(reply) {
             Ok(Some(msg)) => {
@@ -3177,6 +3186,82 @@ mod run_tests {
 
         drop(rx);
         drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    /// A make-before-break swap judges the outgoing session like one that
+    /// ended: a healthy one clears the escalation, so a successor that dies
+    /// young is redialled at once instead of after the waits of failures that
+    /// predate the healthy session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_overlap_swap_off_a_healthy_session_clears_the_escalation() {
+        const SLOW_BACKOFF: Backoff = Backoff {
+            base: Duration::from_secs(2),
+            max: Duration::from_secs(2),
+        };
+        let operational_key = SigningKey::from_bytes(&[0x4A; 32]);
+        let exit_id = ExitId::from_bytes([0x5A; 16]);
+        let exit = spawn_fake_multihop_exit(&operational_key, exit_id);
+        exit.close_after_setup
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut config = config_with_fake_exit(&exit, &operational_key);
+        config.backoff = SLOW_BACKOFF;
+        let (supervisor, rx) = MultiHopSupervisor::new(config);
+        let handle = supervisor.handle();
+        let task = tokio::spawn(supervisor.run());
+
+        wait_for_accepts(&exit, 2, Duration::from_secs(5)).await;
+        exit.close_after_setup
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        tokio::time::sleep(
+            SLOW_BACKOFF.max + crate::redial_policy::MIN_HEALTHY_UPTIME + Duration::from_secs(1),
+        )
+        .await;
+        // The successor the overlap dials dies right after its setup.
+        exit.close_after_setup
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let before = exit.accepted_at.lock().len();
+        handle.overlap_reconnect();
+        wait_for_accepts(&exit, before + 2, Duration::from_secs(10)).await;
+        let accepted = exit.accepted_at.lock().clone();
+        let redial_gap = accepted[before + 1] - accepted[before];
+        assert!(
+            redial_gap < Duration::from_millis(500),
+            "the young successor of a healthy session must be redialled without waiting, \
+             took {redial_gap:?}"
+        );
+
+        drop(rx);
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    /// A setup that fails while the connection stays up (here a reply that is
+    /// no sealed frame) is never published, and the supervisor closes that
+    /// connection itself before it redials.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_setup_that_fails_on_a_live_connection_is_closed_and_never_published() {
+        let operational_key = SigningKey::from_bytes(&[0x4B; 32]);
+        let exit_id = ExitId::from_bytes([0x5B; 16]);
+        let exit = spawn_fake_multihop_exit(&operational_key, exit_id);
+        exit.garbage_reply
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut config = config_with_fake_exit(&exit, &operational_key);
+        config.backoff = TEST_BACKOFF;
+        let (supervisor, mut rx) = MultiHopSupervisor::new(config);
+        let task = tokio::spawn(supervisor.run());
+
+        let published = tokio::time::timeout(Duration::from_millis(1500), rx.changed()).await;
+        assert!(
+            published.is_err(),
+            "a setup that got no IpAssign must never be published as a session"
+        );
+        assert!(
+            exit.accepted_at.lock().len() >= 2,
+            "the supervisor must give up the failed connection and redial"
+        );
+
+        drop(rx);
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
 
