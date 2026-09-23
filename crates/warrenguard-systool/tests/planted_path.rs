@@ -15,15 +15,26 @@ const CHILD_MARKER: &str = "WARRENGUARD_SYSTOOL_PLANTED_MARKER";
 
 const TEST_NAME: &str = "a_tool_planted_ahead_in_the_callers_path_never_runs";
 
+/// Arguments that make a real tool print something and exit at once. With
+/// none, `netstat` and `route` resolve every address they list through DNS,
+/// which stalls on a host whose resolver is down.
+fn quiet_args(tool: SystemTool) -> &'static [&'static str] {
+    match tool {
+        SystemTool::Netstat | SystemTool::Route => &["-n"],
+        _ => &[],
+    }
+}
+
 /// Runs every tool this host has, directly and by name through the shell, the
-/// way the engine's call sites do. Nothing is asked of the tools: they get no
-/// argument and no input, so the real ones print a usage or a listing and exit.
+/// way the engine's call sites do. The tools get no input, so the real ones
+/// print a usage or a listing and exit.
 fn run_every_tool() {
     for tool in SystemTool::ALL {
         let Ok(mut command) = tool.command() else {
             continue;
         };
         let _ = command
+            .args(quiet_args(tool))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -32,8 +43,12 @@ fn run_every_tool() {
             continue;
         }
         if let Ok(mut shell) = SystemTool::Sh.command() {
+            let script = std::iter::once(tool.name())
+                .chain(quiet_args(tool).iter().copied())
+                .collect::<Vec<_>>()
+                .join(" ");
             let _ = shell
-                .args(["-c", tool.name()])
+                .args(["-c", &script])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
