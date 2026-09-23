@@ -246,6 +246,14 @@ pub const REGISTRY: &[KnobMeta] = &[
         home: "warrenguard-config/src/knobs.rs (resolver only; deployer-wired, see docs/35-ENV-KNOBS.md)",
     },
     KnobMeta {
+        name: "WARREN_EXIT_V2_DRAIN_SIGNAL",
+        kind: "bool",
+        default: "off",
+        clamp: "\"1\"/\"true\" enables, else off",
+        effect: "send `/v2` sessions the drain advisory and the drain close at the deadline, as `/v1` sessions always get; off leaves an established `/v2` session alone until the exit process stops (a draining exit still refuses new connections either way)",
+        home: "warrenguard-config/src/knobs.rs (resolver only; deployer-wired, see docs/35-ENV-KNOBS.md)",
+    },
+    KnobMeta {
         name: "WARREN_CLIENT_TUN_QUEUES",
         kind: "usize",
         default: "auto (min(cores, num_conns))",
@@ -1086,6 +1094,25 @@ pub fn exit_tun_queues() -> usize {
             1,
             MAX_TUN_QUEUES,
             1,
+        )
+    })
+}
+
+/// `WARREN_EXIT_V2_DRAIN_SIGNAL`: give `/v2` sessions the drain signal (the
+/// `ExitDraining` advisory, then the drain close at the deadline). OFF by
+/// default; `"1"`/`"true"` enables it. Read once.
+///
+/// Has no in-repo caller: a deployer's exit binary calls this resolver and,
+/// when it returns `true`, calls
+/// `ExitTerminateCtx::with_v2_drain_signal` on the context it serves with.
+/// See the "Deployer-wired knobs" section of `docs/35-ENV-KNOBS.md`.
+#[must_use]
+pub fn exit_v2_drain_signal() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        parse_bool_flag(
+            std::env::var("WARREN_EXIT_V2_DRAIN_SIGNAL").ok().as_deref(),
+            false,
         )
     })
 }
