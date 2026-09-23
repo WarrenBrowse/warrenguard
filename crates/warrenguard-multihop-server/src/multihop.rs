@@ -8902,6 +8902,119 @@ mod tests {
         }
     }
 
+    /// A downlink inner packet no path's datagram budget fits.
+    const OVER_ANY_DATAGRAM_BUDGET: usize = 4_000;
+
+    /// The inner packet sizes a real link carries: the smallest TCP packet,
+    /// the IPv4 minimum MTU, a full segment, and the largest that `conn`'s
+    /// datagram budget fits under `frame_overhead`.
+    fn varied_inner_sizes(conn: &quinn::Connection, frame_overhead: usize) -> [usize; 4] {
+        let budget = usize::from(crate::datapath::inner_budget(
+            conn.max_datagram_size(),
+            frame_overhead,
+        ));
+        assert!(
+            budget > 1200,
+            "a loopback path must fit a full segment, the budget is {budget}"
+        );
+        [40, 576, 1200, budget]
+    }
+
+    /// A `len`-byte TCP packet (no SYN, so no MSS clamp applies) with a
+    /// consistent IPv4 total length.
+    fn sized_tcp(src: Ipv4Addr, dst: Ipv4Addr, len: usize) -> Vec<u8> {
+        let (src_port, dst_port) = if src == RATE_PEER {
+            (443, 51_000)
+        } else {
+            (51_000, 443)
+        };
+        let mut pkt = ipv4_tcp_full(src, dst, src_port, dst_port);
+        pkt.resize(len, 0);
+        pkt[2..4].copy_from_slice(&u16::try_from(len).expect("an IPv4 length").to_be_bytes());
+        pkt
+    }
+
+    /// Sends one inner packet of each of `sizes` up and down a live session
+    /// and checks what came out: every uplink size on the TUN, every downlink
+    /// size opened by the client, and a downlink packet over the datagram
+    /// budget reflected into the TUN as ICMP frag-needed instead of sent.
+    /// `open_down` opens one downlink datagram into its inner plaintext.
+    async fn exchange_every_size(
+        tun: &warrenguard_transport_core::FakeTun,
+        conn: &quinn::Connection,
+        assigned: Ipv4Addr,
+        sizes: &[usize],
+        mut send_up: impl FnMut(&[u8]),
+        open_down: impl Fn(&[u8]) -> Option<Vec<u8>>,
+        context: &str,
+    ) {
+        // Inner packets only: a control frame the exit sends on its own is
+        // not part of what this exchange measures.
+        let next_inner = || async {
+            loop {
+                let datagram =
+                    tokio::time::timeout(Duration::from_secs(5), conn.read_datagram()).await;
+                let Ok(datagram) = datagram else {
+                    return None;
+                };
+                let plaintext = open_down(&datagram.expect("read downlink datagram"))
+                    .unwrap_or_else(|| panic!("{context}: a downlink datagram does not open"));
+                if plaintext.first() != Some(&warrenguard_multihop::CONTROL_FIRST_BYTE) {
+                    return Some(plaintext);
+                }
+            }
+        };
+
+        for &len in sizes {
+            send_up(&sized_tcp(assigned, RATE_PEER, len));
+        }
+        let mut delivered: Vec<usize> =
+            settled_tun_outbound(tun, sizes.len(), Duration::from_secs(5))
+                .await
+                .iter()
+                .map(Vec::len)
+                .collect();
+        delivered.sort_unstable();
+        assert_eq!(
+            delivered, sizes,
+            "{context}: every uplink size must reach the TUN"
+        );
+
+        for &len in sizes {
+            tun.inject_inbound(sized_tcp(RATE_PEER, assigned, len));
+        }
+        tun.inject_inbound(sized_tcp(RATE_PEER, assigned, OVER_ANY_DATAGRAM_BUDGET));
+        let mut opened = Vec::new();
+        while opened.len() < sizes.len() {
+            let plaintext = next_inner()
+                .await
+                .unwrap_or_else(|| panic!("{context}: the downlink stalled after {opened:?}"));
+            opened.push(plaintext.len());
+        }
+        opened.sort_unstable();
+        assert_eq!(
+            opened, sizes,
+            "{context}: every downlink size must reach the client"
+        );
+
+        let reflected = settled_tun_outbound(tun, 1, Duration::from_secs(5)).await;
+        assert!(
+            reflected.len() == 1
+                && reflected[0].get(9) == Some(&1)
+                && reflected[0].get(20..22) == Some(&[3, 4][..]),
+            "{context}: the packet over the datagram budget must come back as one ICMP \
+             frag-needed, got packets of {:?} bytes",
+            reflected.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        let stray = tokio::time::timeout(Duration::from_millis(300), next_inner()).await;
+        assert!(
+            stray.is_err(),
+            "{context}: the packet over the datagram budget must not reach the client, \
+             a {:?}-byte packet did",
+            stray.ok().flatten().map(|p| p.len())
+        );
+    }
+
     /// Accumulate TUN deliveries until `at_least` arrived or `deadline`
     /// elapsed, then keep draining for one settle beat so a packet that
     /// SHOULD have been dropped had time to show up before the caller
@@ -9290,14 +9403,78 @@ mod tests {
         client.send(&forged);
 
         tokio::time::sleep(SESSION_CACHE_TTL + Duration::from_secs(1)).await;
-        client.send_data(3, &client.packet(51_003));
-        let got = settled_tun_outbound(&tun, 1, Duration::from_secs(5)).await;
+        // The real session must survive the idle gap on the keepalive alone,
+        // for packets of every size both ways.
+        let sizes = varied_inner_sizes(&client.conn, MULTIHOP_FRAME_V2_DATA_MAX_OVERHEAD);
+        let mut seq = 3;
+        exchange_every_size(
+            &tun,
+            &client.conn,
+            client.assigned,
+            &sizes,
+            |pkt| {
+                client.send_data(seq, pkt);
+                seq += 1;
+            },
+            |datagram| {
+                decode_frame_v2(datagram)
+                    .ok()
+                    .and_then(|frame| client.session.open_response(&frame).ok())
+            },
+            "after the idle gap",
+        )
+        .await;
         client.harness.accept_task.abort();
-        assert_eq!(
-            got.len(),
-            1,
-            "the real session must survive the idle gap on the keepalive alone"
-        );
+    }
+
+    /// The `/v1` session cache reclaims expired sessions at most once per TTL
+    /// instead of on every datagram. A client idle past the TTL comes back to
+    /// a session the exit rebuilds from its next frame, and packets of every
+    /// size must keep flowing both ways across that gap, with the one over the
+    /// datagram budget still reflected as frag-needed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn v1_packets_of_every_size_flow_both_ways_across_a_session_cache_sweep() {
+        let tun = warrenguard_transport_core::FakeTun::new();
+        let exit = spawn_rate_limited_exit(None, tun.clone(), None);
+        let client = data_client(&exit, |_| WarrenControlMessage::IpRequest {
+            prefer_ipv4: None,
+            client_pubkey: Some([0x41; 32]),
+            wants_ipv6: false,
+            pop_sig: None,
+            wants_daita: false,
+        })
+        .await;
+        let sizes = varied_inner_sizes(&client.conn, MULTIHOP_FRAME_MAX_OVERHEAD);
+        let mut seq = client.next_seq;
+
+        for context in ["before the idle gap", "after the idle gap"] {
+            if context == "after the idle gap" {
+                tokio::time::sleep(SESSION_CACHE_TTL + Duration::from_secs(1)).await;
+            }
+            exchange_every_size(
+                &tun,
+                &client.conn,
+                client.assigned_ip,
+                &sizes,
+                |pkt| {
+                    let frame = client.session.seal(pkt, 0, seq).expect("seal data frame");
+                    let bytes = encode_frame(&frame).expect("encode data frame");
+                    client
+                        .conn
+                        .send_datagram(bytes.into())
+                        .expect("send data datagram");
+                    seq += 1;
+                },
+                |datagram| {
+                    decode_frame(datagram)
+                        .ok()
+                        .and_then(|frame| client.session.open_response(&frame).ok())
+                },
+                context,
+            )
+            .await;
+        }
+        exit.accept_task.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
