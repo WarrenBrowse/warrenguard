@@ -10,6 +10,14 @@
 //! feature-gated facade can re-export them. Nothing here reaches a deployer's
 //! build.
 
+#![cfg_attr(
+    not(feature = "bench-internals"),
+    allow(
+        unreachable_pub,
+        reason = "pub so the bench-internals facade can re-export these items; without it they stay crate-private"
+    )
+)]
+
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::ops::ControlFlow;

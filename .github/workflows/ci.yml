@@ -76,6 +76,10 @@ jobs:
       # --all-features lints the cfg-gated per-OS datapath (the Apple fast path,
       # the pfctl killswitch, the experimental TUN) on each native runner.
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      # The default feature set is what a deployer builds, and a lint can fire
+      # only there (an item a feature-gated facade re-exports is unreachable
+      # without that feature), so it is linted too.
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
   test:
     name: cargo test
