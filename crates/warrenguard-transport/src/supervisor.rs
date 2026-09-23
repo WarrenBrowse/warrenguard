@@ -660,9 +660,9 @@ impl MultiHopSupervisor {
     /// Continue the session that `assigned_v4` belongs to instead of starting
     /// an independent one, for a supervisor built to REPLACE a previous one
     /// (a deployer that rebuilds its whole tunnel rather than redialing).
-    /// `assigned_v4` must come from the exit this supervisor is configured
-    /// for ([`SupervisorConfig::exit_id`]): it is named to that exit only.
-    /// Call before [`Self::run`].
+    /// `assigning_exit` is the exit that assigned `assigned_v4`: the address
+    /// is named to that exit only, so a tunnel rebuilt onto another exit
+    /// starts a fresh session there. Call before [`Self::run`].
     ///
     /// A supervisor learns its session's address from the exit and names it on
     /// every redial, which is what keeps a reconnect on one inner IP. That
@@ -675,11 +675,15 @@ impl MultiHopSupervisor {
     /// predecessor. Naming the address makes the exit hand it back and evict
     /// the stale predecessor. A stale or foreign address costs nothing: the
     /// exit degrades it to an independent session start.
-    pub fn resume_session_placement(&self, assigned_v4: std::net::Ipv4Addr) {
+    pub fn resume_session_placement(
+        &self,
+        assigning_exit: ExitId,
+        assigned_v4: std::net::Ipv4Addr,
+    ) {
         *self
             .last_assigned_v4
             .lock()
-            .expect("last_assigned_v4 lock poisoned") = Some((self.config.exit_id, assigned_v4));
+            .expect("last_assigned_v4 lock poisoned") = Some((assigning_exit, assigned_v4));
     }
 
     /// Session-placement hint for the next setup request to `exit_id`: the
@@ -1273,8 +1277,8 @@ impl MultiHopSupervisor {
         let Some(spec) = Self::decode_ip_assign(&reply) else {
             return SetupOutcome::Failed(None);
         };
-        // Whether the exit kept the address this session named: `moved` is
-        // a tunnel rebuild on the client, and after an exit restart `kept` is
+        // Whether the exit kept the IPv4 this session named: `moved` is a
+        // tunnel rebuild on the client, and after an exit restart `kept` is
         // the exit handing the session back its address. The address itself
         // never reaches a log.
         let named = placement.filter(|named| !named.is_unspecified());
@@ -1284,7 +1288,7 @@ impl MultiHopSupervisor {
                 Some(_) => "moved",
                 None => "new",
             },
-            "multi-hop setup assigned the session its inner address"
+            "multi-hop setup assigned the session its inner IPv4"
         );
         self.publish_setup_ip_assign(&spec);
         *self
@@ -2382,7 +2386,7 @@ mod tests {
         let config = dummy_config();
         let exit_id = config.exit_id;
         let (supervisor, _rx) = MultiHopSupervisor::new(config);
-        supervisor.resume_session_placement(std::net::Ipv4Addr::new(10, 66, 0, 7));
+        supervisor.resume_session_placement(exit_id, std::net::Ipv4Addr::new(10, 66, 0, 7));
         assert_eq!(
             supervisor.session_placement_hint(exit_id),
             Some(std::net::Ipv4Addr::new(10, 66, 0, 7)),
@@ -2395,13 +2399,15 @@ mod tests {
         // An address is one exit's allocation. Naming it to another exit
         // tells that exit something about the session elsewhere, and a
         // freshly restarted exit would even hand it over, carrying one inner
-        // address across exits.
+        // address across exits. A tunnel rebuilt onto another exit than the
+        // one its predecessor used is the everyday case.
         let config = dummy_config();
-        let assigning_exit = config.exit_id;
+        let configured_exit = config.exit_id;
+        let assigning_exit = ExitId::from_bytes([0x7E; 16]);
         let (supervisor, _rx) = MultiHopSupervisor::new(config);
-        supervisor.resume_session_placement(std::net::Ipv4Addr::new(10, 66, 0, 7));
+        supervisor.resume_session_placement(assigning_exit, std::net::Ipv4Addr::new(10, 66, 0, 7));
         assert_eq!(
-            supervisor.session_placement_hint(ExitId::from_bytes([0x7E; 16])),
+            supervisor.session_placement_hint(configured_exit),
             Some(std::net::Ipv4Addr::UNSPECIFIED),
             "a dial to another exit must start a fresh session"
         );
