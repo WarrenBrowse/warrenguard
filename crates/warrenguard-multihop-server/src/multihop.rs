@@ -8005,7 +8005,6 @@ mod tests {
         assert_ne!(joined.assigned_v6, s1.assigned_v6);
     }
 
-    /// Builds a minimal IPv6 packet (40-byte header) with the given dst.
     #[test]
     fn a_dual_stack_session_is_never_handed_back_a_lone_ipv4() {
         // After a restart the IPv6 interface ID is always new, since nothing
@@ -8046,6 +8045,7 @@ mod tests {
         );
     }
 
+    /// Builds a minimal IPv6 packet (40-byte header) with the given dst.
     fn ipv6_packet_to(dst: Ipv6Addr) -> Vec<u8> {
         let mut p = vec![0u8; 40];
         p[0] = 0x60; // version 6

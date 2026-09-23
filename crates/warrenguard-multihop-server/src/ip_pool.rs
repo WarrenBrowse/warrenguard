@@ -625,9 +625,10 @@ impl IpAllocator {
                 return Some(target);
             }
             // Stale or foreign target: degrade to Fresh below. Never to
-            // legacy sharing (a mis-aimed join must not co-house sessions)
-            // and never to another key's address (no targeted squatting of
-            // a departed client's address and its NAT-PMP window).
+            // legacy sharing (a mis-aimed join must not co-house sessions),
+            // and outside the restart reclaim the deployer opened, never to
+            // another key's address (no targeted squatting of a departed
+            // client's address and its NAT-PMP window).
         }
         if let Some(preferred) = self.sticky.get(&pubkey).copied() {
             if self.take_free(preferred) {
