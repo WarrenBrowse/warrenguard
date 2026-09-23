@@ -463,6 +463,8 @@ enum SetupOutcome {
 pub(crate) struct PqSetup {
     cache: Arc<PqSessionCache>,
     secret: Arc<XWingRecipientSecretKey>,
+    /// See [`ExitTerminateCtx::with_v2_drain_signal`].
+    drain_signal: bool,
 }
 
 /// Crypto wrapper unifying setup-frame handling across `/v1` and `/v2` so the
@@ -1819,11 +1821,12 @@ fn unix_now_secs() -> u64 {
 /// emits it as a downlink datagram, re-emitting every
 /// [`DRAIN_REEMIT_INTERVAL`] until the deadline. `seal_current` is the only
 /// version-specific part: `/v1` and `/v2` sessions seal and frame
-/// differently, and both must drain. At the deadline it hard-closes the
-/// connection with [`WARREN_MH_DRAINING`] as a backstop for any client that
-/// did not migrate. If the advisory is withdrawn before the deadline (operator
-/// `undrain`, `Some` -> `None`) the emitter returns WITHOUT closing, so a
-/// cancelled maintenance never tears a tunnel down.
+/// differently (and a `/v2` session gets an emitter only when the deployer
+/// turned [`ExitTerminateCtx::with_v2_drain_signal`] on). At the deadline it
+/// hard-closes the connection with [`WARREN_MH_DRAINING`] as a backstop for
+/// any client that did not migrate. If the advisory is withdrawn before the
+/// deadline (operator `undrain`, `Some` -> `None`) the emitter returns
+/// WITHOUT closing, so a cancelled maintenance never tears a tunnel down.
 ///
 /// Returns `None` when no `drain_rx` is wired (bench/test/standalone
 /// entry points), so callers can skip the abort bookkeeping.
@@ -3736,8 +3739,9 @@ pub struct ExitTerminateCtx<T: PacketDevice + Clone> {
     /// Exit-wide drain watch (ADR 36 soft maintenance signal). `Some` only
     /// when the production dispatcher wires it via
     /// [`ExitTerminateCtx::with_drain_rx`]; bench/test/standalone entry
-    /// points leave it `None` (no drain emission). Each terminated
-    /// connection clones the receiver and parks on it.
+    /// points leave it `None` (no drain emission). Each terminated `/v1`
+    /// connection clones the receiver and parks on it, and each `/v2` one
+    /// too when [`ExitTerminateCtx::with_v2_drain_signal`] is on.
     drain_rx: Option<watch::Receiver<Option<DrainAdvisory>>>,
     /// v7 anonymous session-token admitter (doc 64). `Some` only when the
     /// production dispatcher wires it via [`ExitTerminateCtx::with_token_admitter`]:
@@ -3762,6 +3766,10 @@ pub struct ExitTerminateCtx<T: PacketDevice + Clone> {
     /// frames, so a classical-only exit is unchanged.
     #[cfg(feature = "pq-hpke")]
     xwing_secret: Option<Arc<XWingRecipientSecretKey>>,
+    /// Whether `/v2` sessions get the drain signal. Off by default; see
+    /// [`ExitTerminateCtx::with_v2_drain_signal`].
+    #[cfg(feature = "pq-hpke")]
+    v2_drain_signal: bool,
 }
 
 impl<T: PacketDevice + Clone> ExitTerminateCtx<T> {
@@ -3809,6 +3817,8 @@ impl<T: PacketDevice + Clone> ExitTerminateCtx<T> {
             pq_cache: Arc::new(PqSessionCache::new()),
             #[cfg(feature = "pq-hpke")]
             xwing_secret: None,
+            #[cfg(feature = "pq-hpke")]
+            v2_drain_signal: false,
         }
     }
 
@@ -3895,6 +3905,21 @@ impl<T: PacketDevice + Clone> ExitTerminateCtx<T> {
         self
     }
 
+    /// Give `/v2` sessions the drain signal `/v1` sessions always get: the
+    /// sealed `ExitDraining` advisory while the exit drains, then the drain
+    /// close at the deadline. Without it a draining exit refuses new
+    /// connections but leaves established `/v2` sessions alone until the
+    /// process stops. Off by default because a client that reacts to the
+    /// advisory by dropping its tunnel and redialling the drained exit,
+    /// which refuses it until the restart, loses far more than the restart
+    /// alone costs it; turn it on once the clients served handle the advisory.
+    #[cfg(feature = "pq-hpke")]
+    #[must_use]
+    pub fn with_v2_drain_signal(mut self) -> Self {
+        self.v2_drain_signal = true;
+        self
+    }
+
     /// The PQ setup material to thread into the setup path, or `None` when this
     /// exit is classical-only (no X-Wing secret attached).
     #[cfg(feature = "pq-hpke")]
@@ -3902,6 +3927,7 @@ impl<T: PacketDevice + Clone> ExitTerminateCtx<T> {
         self.xwing_secret.as_ref().map(|secret| PqSetup {
             cache: self.pq_cache.clone(),
             secret: secret.clone(),
+            drain_signal: self.v2_drain_signal,
         })
     }
 
@@ -3967,7 +3993,7 @@ impl<T: PacketDevice + Clone> ExitTerminateCtx<T> {
     /// this exit for maintenance, the backend heartbeat publishes a
     /// [`DrainAdvisory`] on the matching `watch::Sender`; every per-conn
     /// handler then emits the soft ExitDraining signal and hard-closes at
-    /// the deadline. Builder (like [`Self::with_session_registry`]) so the
+    /// the deadline (a `/v2` one only with [`Self::with_v2_drain_signal`]). Builder (like [`Self::with_session_registry`]) so the
     /// bench/test/standalone `new(...)` call sites keep the `None` default.
     #[must_use]
     pub fn with_drain_rx(mut self, drain_rx: watch::Receiver<Option<DrainAdvisory>>) -> Self {
@@ -4339,6 +4365,7 @@ async fn serve_terminating_connection<T>(
         SetupOutcome::V2(pq_setup) => {
             if let Some(pq) = pq {
                 let rate = session_rate.zip(pq_setup.session_rate_key);
+                let drain_rx = drain_rx.filter(|_| pq.drain_signal);
                 serve_pq_datagram_pump(
                     conn,
                     exit_id,
@@ -4687,8 +4714,9 @@ async fn serve_terminating_connection<T>(
 /// and rekey datagrams. Anti-spoof, per-flow downlink routing, MTU adaptation
 /// and TUN writes go through the same helpers as the classical path; only the
 /// seal/open and the establish-from-`pq_ct` cache discipline differ. DAITA
-/// cover is not wired on the PQ path yet; the drain emitter is, with the same
-/// advisory and deadline close as the classical pump.
+/// cover is not wired on the PQ path yet. The drain emitter runs when the
+/// caller passes a `drain_rx`, which it does only for an exit that turned
+/// [`ExitTerminateCtx::with_v2_drain_signal`] on.
 #[cfg(feature = "pq-hpke")]
 #[allow(clippy::too_many_arguments)]
 async fn serve_pq_datagram_pump<T>(
@@ -4736,8 +4764,8 @@ async fn serve_pq_datagram_pump<T>(
         Some(Arc::new(conn.clone())),
     );
 
-    // Same ADR 36 drain signal as the classical pump: advisory while the
-    // exit drains, drain close at the deadline.
+    // Same ADR 36 drain signal as the classical pump when the exit enabled
+    // it: advisory while the exit drains, drain close at the deadline.
     let drain_task = spawn_drain_emitter(
         drain_rx,
         seal_current_v2(current.clone()),
@@ -9632,16 +9660,19 @@ mod tests {
         );
     }
 
-    /// A drained exit tells a `/v2` session to leave before it closes it.
-    /// Without the advisory and the deadline close, a post-quantum client,
-    /// the default one, learns of the maintenance only when the exit process
-    /// is killed under it.
+    /// With the `/v2` drain signal on, a drained exit tells a `/v2` session
+    /// to leave before it closes it. Without the advisory and the deadline
+    /// close, a post-quantum client, the default one, learns of the
+    /// maintenance only when the exit process is killed under it.
     #[cfg(feature = "pq-hpke")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_draining_exit_advises_a_pq_session_then_closes_it_at_the_deadline() {
         let (drain_tx, drain_rx) = watch::channel::<Option<DrainAdvisory>>(None);
         let tun = warrenguard_transport_core::FakeTun::new();
-        let client = pq_data_client(tun, |ctx| ctx.with_drain_rx(drain_rx)).await;
+        let client = pq_data_client(tun, |ctx| {
+            ctx.with_drain_rx(drain_rx).with_v2_drain_signal()
+        })
+        .await;
         drain_then_expect_advisory_and_close(&drain_tx, &client.conn, |datagram| {
             decode_frame_v2(datagram)
                 .ok()
@@ -9649,6 +9680,57 @@ mod tests {
         })
         .await;
         client.harness.accept_task.abort();
+    }
+
+    /// Unless the deployer switches the `/v2` drain signal on, a draining
+    /// exit leaves a `/v2` session alone: no advisory, no close at the
+    /// deadline, traffic keeps flowing until the process stops. Installed
+    /// clients tear a working tunnel down on the advisory and redial the
+    /// drained exit even when it is the only one they may use, so the
+    /// signal stays off until those clients are gone.
+    #[cfg(feature = "pq-hpke")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_draining_exit_leaves_a_pq_session_alone_without_the_v2_drain_signal() {
+        let (drain_tx, drain_rx) = watch::channel::<Option<DrainAdvisory>>(None);
+        let tun = warrenguard_transport_core::FakeTun::new();
+        let client = pq_data_client(tun.clone(), |ctx| ctx.with_drain_rx(drain_rx)).await;
+        let deadline_unix_secs = unix_now_secs() + 2;
+        drain_tx.send_replace(Some(DrainAdvisory {
+            deadline_unix_secs,
+            reason_code: 3,
+        }));
+
+        // Longer than the deadline, and than one re-emit interval: an
+        // advisory and a deadline close would both have landed by then.
+        let observed = tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                let datagram = client.conn.read_datagram().await?;
+                let control = decode_frame_v2(&datagram)
+                    .ok()
+                    .and_then(|frame| client.session.open_response(&frame).ok())
+                    .and_then(|plaintext| try_decode_control(&plaintext).ok().flatten());
+                if let Some(advisory @ WarrenControlMessage::ExitDraining { .. }) = control {
+                    return Ok::<_, quinn::ConnectionError>(advisory);
+                }
+            }
+        })
+        .await;
+        assert!(
+            observed.is_err(),
+            "a /v2 session got the drain signal while it is off: {observed:?}"
+        );
+        assert!(
+            client.conn.close_reason().is_none(),
+            "the session outlives the drain deadline"
+        );
+        client.send_data(1, &client.packet(51_002));
+        let got = settled_tun_outbound(&tun, 1, Duration::from_secs(5)).await;
+        client.harness.accept_task.abort();
+        assert_eq!(
+            got.len(),
+            1,
+            "the session still forwards after the drain deadline"
+        );
     }
 
     /// The classical twin: the same advisory and deadline close for a `/v1`
