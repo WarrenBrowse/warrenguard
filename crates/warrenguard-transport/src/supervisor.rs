@@ -1223,17 +1223,6 @@ impl MultiHopSupervisor {
         .await
     }
 
-    /// Run the primary's reliable setup-stream round-trip and detect a
-    /// definitive policy rejection. Returns the decoded `IpAssign`
-    /// (already published on the [`IpAssignChannel`]) or `None` when
-    /// the exit stayed on its legacy first-frame path.
-    ///
-    /// # Errors
-    ///
-    /// The exit's rejection reason: a definitive policy refusal must
-    /// NOT become a live session (it would be a fake "Connected" + a
-    /// reconnect storm). It surfaces as the sealed detail on the setup
-    /// stream (specific cause) or the opaque close code.
     /// The anonymous v7 token stack for ONE session, or `None` when no
     /// provider is wired (v6) or the provider yielded an empty stack (no token
     /// available this epoch, so fall back to v6 rather than fail closed). Called
@@ -1245,6 +1234,13 @@ impl MultiHopSupervisor {
         (!tokens.is_empty()).then_some(tokens)
     }
 
+    /// Run the primary's reliable setup-stream round-trip, bounded by
+    /// [`SETUP_ROUND_TRIP_TIMEOUT`], and say what it produced. An assigned
+    /// address is already published on the [`IpAssignChannel`] when this
+    /// returns. A definitive policy refusal must NOT become a live session
+    /// (it would be a fake "Connected" plus a reconnect storm): it comes back
+    /// as [`SetupOutcome::Rejected`], read from the sealed detail on the setup
+    /// stream (specific cause) or from the opaque close code.
     async fn setup_primary(
         &self,
         primary: &Arc<MultiHopClient>,
@@ -1594,12 +1590,6 @@ impl MultiHopSupervisor {
         }
     }
 
-    /// Fire the [`SupervisorConfig::on_reconnect`] observer when a
-    /// reconnect (not the initial connect) just completed. Extracted as
-    /// a helper so the dispatch logic is testable without a real QUIC
-    /// connection: tests can drive this directly with a counter-bumping
-    /// observer and assert the gate (first_session vs subsequent
-    /// publication).
     /// Decode the setup-stream reply plaintext as an HPKE-sealed
     /// rejection detail (`Rejected` -> not authorized, `IpExhausted` ->
     /// pool exhausted), or `None` for a normal (or undecodable) reply.
@@ -1775,6 +1765,12 @@ impl MultiHopSupervisor {
         None
     }
 
+    /// Fire the [`SupervisorConfig::on_reconnect`] observer when a
+    /// reconnect (not the initial connect) just completed. Extracted as
+    /// a helper so the dispatch logic is testable without a real QUIC
+    /// connection: tests can drive this directly with a counter-bumping
+    /// observer and assert the gate (first_session vs subsequent
+    /// publication).
     fn notify_on_reconnect(&self, first_session: bool) {
         if first_session {
             return;
