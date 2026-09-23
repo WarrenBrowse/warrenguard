@@ -1809,11 +1809,13 @@ fn unix_now_secs() -> u64 {
 /// Spawn the per-connection drain emitter (ADR 36 soft in-band signal).
 ///
 /// It parks on `drain_rx` until the exit publishes a [`DrainAdvisory`]
-/// (`None` -> `Some`), then seals an [`WarrenControlMessage::ExitDraining`]
-/// with this connection's CURRENT session (so it rides any rekey
-/// transparently, like the DAITA timer) and emits it as a downlink
-/// datagram, re-emitting every [`DRAIN_REEMIT_INTERVAL`] until the
-/// deadline. At the deadline it hard-closes the connection with
+/// (`None` -> `Some`), then has `seal_current` seal an
+/// [`WarrenControlMessage::ExitDraining`] with this connection's CURRENT
+/// session (so it rides any rekey transparently, like the DAITA timer) and
+/// emits it as a downlink datagram, re-emitting every
+/// [`DRAIN_REEMIT_INTERVAL`] until the deadline. `seal_current` is the only
+/// version-specific part: `/v1` and `/v2` sessions seal and frame
+/// differently, and both must drain. At the deadline it hard-closes the connection with
 /// [`WARREN_MH_DRAINING`] as a backstop for any client that did not
 /// migrate. If the advisory is withdrawn before the deadline (operator
 /// `undrain`, `Some` -> `None`) the emitter returns WITHOUT closing, so a
@@ -1821,12 +1823,15 @@ fn unix_now_secs() -> u64 {
 ///
 /// Returns `None` when no `drain_rx` is wired (bench/test/standalone
 /// entry points), so callers can skip the abort bookkeeping.
-fn spawn_drain_emitter(
+fn spawn_drain_emitter<F>(
     drain_rx: Option<watch::Receiver<Option<DrainAdvisory>>>,
-    current: SharedCurrentSession,
+    seal_current: F,
     reverse_seq: Arc<AtomicU64>,
     conn: Connection,
-) -> Option<tokio::task::JoinHandle<()>> {
+) -> Option<tokio::task::JoinHandle<()>>
+where
+    F: Fn(&[u8], u64) -> Option<Vec<u8>> + Send + 'static,
+{
     let mut drain_rx = drain_rx?;
     Some(tokio::spawn(async move {
         let encode_adv = |adv: DrainAdvisory| {
@@ -1855,24 +1860,15 @@ fn spawn_drain_emitter(
             }
         };
         loop {
-            // Seal with the connection's latest session (rotates on rekey).
-            let (session, epoch) = current.lock().clone();
             let seq = reverse_seq.fetch_add(1, Ordering::AcqRel);
-            match session.seal_response(&plaintext, epoch, seq) {
-                Ok(frame) => match encode_frame(&frame) {
-                    Ok(bytes) => {
-                        // Best-effort: a transient PMTU dip can make even a
-                        // tiny control frame momentarily TooLarge; the next
-                        // re-emit retries. A hard send error means the conn is
-                        // gone, so stop.
-                        match conn.send_datagram(bytes.into()) {
-                            Ok(()) | Err(SendDatagramError::TooLarge) => {}
-                            Err(_) => return,
-                        }
-                    }
-                    Err(e) => tracing::trace!(error = %e, "drain: encode_frame failed"),
-                },
-                Err(e) => tracing::trace!(error = %e, "drain: seal_response failed"),
+            if let Some(bytes) = seal_current(&plaintext, seq) {
+                // Best-effort: a transient PMTU dip can make even a tiny
+                // control frame momentarily TooLarge; the next re-emit
+                // retries. A hard send error means the conn is gone, so stop.
+                match conn.send_datagram(bytes.into()) {
+                    Ok(()) | Err(SendDatagramError::TooLarge) => {}
+                    Err(_) => return,
+                }
             }
             let now = unix_now_secs();
             if now >= advisory.deadline_unix_secs {
@@ -1915,6 +1911,38 @@ fn spawn_drain_emitter(
         // have migrated off the soft advisory; this only catches stragglers.
         conn.close(VarInt::from_u32(WARREN_MH_DRAINING), &[]);
     }))
+}
+
+/// Drain-emitter sealer for a `/v1` connection: the latest classical session
+/// (a rekey replaces it) and the classical frame encoding.
+fn seal_current_v1(current: SharedCurrentSession) -> impl Fn(&[u8], u64) -> Option<Vec<u8>> {
+    move |plaintext, seq| {
+        let (session, epoch) = current.lock().clone();
+        let frame = session
+            .seal_response(plaintext, epoch, seq)
+            .map_err(|e| tracing::trace!(error = %e, "drain: seal_response failed"))
+            .ok()?;
+        encode_frame(&frame)
+            .map_err(|e| tracing::trace!(error = %e, "drain: encode_frame failed"))
+            .ok()
+    }
+}
+
+/// Drain-emitter sealer for a `/v2` connection: the latest X-Wing session and
+/// the `/v2` frame encoding, which the post-quantum client decodes like any
+/// other downlink datagram.
+#[cfg(feature = "pq-hpke")]
+fn seal_current_v2(current: SharedPqCurrentSession) -> impl Fn(&[u8], u64) -> Option<Vec<u8>> {
+    move |plaintext, seq| {
+        let (session, epoch) = current.lock().clone();
+        let frame = session
+            .seal_response(plaintext, epoch, seq)
+            .map_err(|e| tracing::trace!(error = %e, "drain: v2 seal_response failed"))
+            .ok()?;
+        encode_frame_v2(&frame)
+            .map_err(|e| tracing::trace!(error = %e, "drain: encode_frame_v2 failed"))
+            .ok()
+    }
 }
 
 /// Upper bound on bonded downlink channels per assigned IP. Generous
@@ -4319,6 +4347,7 @@ async fn serve_terminating_connection<T>(
                     reverse_seq,
                     rate,
                     pool,
+                    drain_rx,
                 )
                 .await;
             }
@@ -4358,8 +4387,12 @@ async fn serve_terminating_connection<T>(
     // ADR 36 soft drain signal: park on the exit-wide drain watch and, when
     // the exit is marked for maintenance, seal+emit ExitDraining on this
     // connection, hard-closing at the deadline.
-    let drain_task =
-        spawn_drain_emitter(drain_rx, current.clone(), reverse_seq.clone(), conn.clone());
+    let drain_task = spawn_drain_emitter(
+        drain_rx,
+        seal_current_v1(current.clone()),
+        reverse_seq.clone(),
+        conn.clone(),
+    );
 
     // Transport path probe (Lever 1a): the unified prod dispatcher terminates
     // clients HERE, so the multihop path needs its own probe spawn for
@@ -4650,7 +4683,8 @@ async fn serve_terminating_connection<T>(
 /// and rekey datagrams. Anti-spoof, per-flow downlink routing, MTU adaptation
 /// and TUN writes go through the same helpers as the classical path; only the
 /// seal/open and the establish-from-`pq_ct` cache discipline differ. DAITA
-/// cover and the soft-drain emitter are not wired on the PQ path yet.
+/// cover is not wired on the PQ path yet; the drain emitter is, with the same
+/// advisory and deadline close as the classical pump.
 #[cfg(feature = "pq-hpke")]
 #[allow(clippy::too_many_arguments)]
 async fn serve_pq_datagram_pump<T>(
@@ -4672,6 +4706,7 @@ async fn serve_pq_datagram_pump<T>(
     reverse_seq: Arc<AtomicU64>,
     rate: Option<(SessionRatePolicy, SessionRateKey)>,
     pool: TunnelPool,
+    drain_rx: Option<watch::Receiver<Option<DrainAdvisory>>>,
 ) where
     T: PacketDevice + Clone,
 {
@@ -4695,6 +4730,15 @@ async fn serve_pq_datagram_pump<T>(
         assigned_ip_v6,
         &rx_activity,
         Some(Arc::new(conn.clone())),
+    );
+
+    // Same ADR 36 drain signal as the classical pump: advisory while the
+    // exit drains, drain close at the deadline.
+    let drain_task = spawn_drain_emitter(
+        drain_rx,
+        seal_current_v2(current.clone()),
+        reverse_seq.clone(),
+        conn.clone(),
     );
 
     drop(warrenguard_transport_core::spawn_path_probe(
@@ -4937,7 +4981,12 @@ async fn serve_pq_datagram_pump<T>(
     });
 
     let _ = rx_task.await;
-    for task in [tx_task, keepalive_task] {
+    // Joining the drain emitter before the pump's own close keeps the drain
+    // code the one the client sees when the deadline closed the connection.
+    for task in [Some(tx_task), Some(keepalive_task), drain_task]
+        .into_iter()
+        .flatten()
+    {
         task.abort();
         let _ = task.await;
     }
@@ -9290,28 +9339,29 @@ mod tests {
 
     #[cfg(feature = "pq-hpke")]
     async fn pq_data_client(
-        policy: Option<SessionRatePolicy>,
         tun: warrenguard_transport_core::FakeTun,
+        configure: impl FnOnce(
+            ExitTerminateCtx<warrenguard_transport_core::FakeTun>,
+        ) -> ExitTerminateCtx<warrenguard_transport_core::FakeTun>,
     ) -> PqDataClient {
         let exit_key = SigningKey::from_bytes(&[0x42; 32]);
         let x25519_ikm = derive_x25519_ikm_from_ed25519(&exit_key);
         let (privkey, exit_pub) = derive_x25519_keypair(&x25519_ikm).expect("x25519 keypair");
         let (xwing_secret, mlkem_ek) =
             derive_exit_xwing_from_identity(&exit_key).expect("xwing derive");
-        let mut ctx = ExitTerminateCtx::new(
-            privkey,
-            ExitId::from_bytes(ANTI_ORACLE_EXIT_ID),
-            tun,
-            None,
-            None,
-            v4_alloc(),
-            None,
-            None,
-        )
-        .with_xwing_secret(Arc::new(xwing_secret));
-        if let Some(policy) = policy {
-            ctx = ctx.with_session_rate_policy(policy);
-        }
+        let ctx = configure(
+            ExitTerminateCtx::new(
+                privkey,
+                ExitId::from_bytes(ANTI_ORACLE_EXIT_ID),
+                tun,
+                None,
+                None,
+                v4_alloc(),
+                None,
+                None,
+            )
+            .with_xwing_secret(Arc::new(xwing_secret)),
+        );
         let harness = spawn_exit_accept_loop(&exit_key, ctx);
 
         let provider = warrenguard_tls::default_crypto_provider();
@@ -9379,7 +9429,7 @@ mod tests {
         let policy = SessionRatePolicy::new();
         policy.set_policy(RateSpec::new(250, 1), std::iter::empty());
         let tun = warrenguard_transport_core::FakeTun::new();
-        let client = pq_data_client(Some(policy), tun.clone()).await;
+        let client = pq_data_client(tun.clone(), |ctx| ctx.with_session_rate_policy(policy)).await;
 
         for seq in 1..=5u64 {
             client.send_data(seq, &client.packet(51_000));
@@ -9404,7 +9454,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn pq_forged_frame_does_not_steer_the_session_keepalive() {
         let tun = warrenguard_transport_core::FakeTun::new();
-        let client = pq_data_client(None, tun.clone()).await;
+        let client = pq_data_client(tun.clone(), |ctx| ctx).await;
         client.send_data(1, &client.packet(51_001));
         let got = settled_tun_outbound(&tun, 1, Duration::from_secs(5)).await;
         assert_eq!(got.len(), 1, "the authenticated packet is delivered");
@@ -9440,6 +9490,123 @@ mod tests {
         )
         .await;
         client.harness.accept_task.abort();
+    }
+
+    /// Publish a drain on `drain_tx` and require what a client attached to the
+    /// exit must observe: the sealed `ExitDraining` advisory on the datagram
+    /// path (`open` opens one downlink datagram with the client's session),
+    /// then the connection closed with the drain code at the deadline.
+    async fn drain_then_expect_advisory_and_close(
+        drain_tx: &watch::Sender<Option<DrainAdvisory>>,
+        conn: &quinn::Connection,
+        open: impl Fn(&[u8]) -> Option<Vec<u8>>,
+    ) {
+        let deadline_unix_secs = unix_now_secs() + 2;
+        drain_tx.send_replace(Some(DrainAdvisory {
+            deadline_unix_secs,
+            reason_code: 3,
+        }));
+
+        let advisory = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let datagram = conn
+                    .read_datagram()
+                    .await
+                    .expect("the session stays open until the drain deadline");
+                let control = open(&datagram)
+                    .and_then(|plaintext| try_decode_control(&plaintext).ok().flatten());
+                if let Some(msg) = control {
+                    return msg;
+                }
+            }
+        })
+        .await
+        .expect("the session must receive the drain advisory before the deadline");
+        assert_eq!(
+            advisory,
+            WarrenControlMessage::ExitDraining {
+                deadline_unix_secs,
+                reason_code: 3,
+            },
+            "the advisory must carry the exit's deadline and reason verbatim"
+        );
+
+        let closed = tokio::time::timeout(Duration::from_secs(5), conn.closed())
+            .await
+            .expect("the exit must close the session at the drain deadline");
+        let (code, _) = expect_app_close(&closed);
+        assert_eq!(
+            code,
+            u64::from(WARREN_MH_DRAINING),
+            "a session still attached at the deadline is closed with the drain code"
+        );
+    }
+
+    /// A drained exit tells a `/v2` session to leave before it closes it.
+    /// Without the advisory and the deadline close, a post-quantum client,
+    /// the default one, learns of the maintenance only when the exit process
+    /// is killed under it.
+    #[cfg(feature = "pq-hpke")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_draining_exit_advises_a_pq_session_then_closes_it_at_the_deadline() {
+        let (drain_tx, drain_rx) = watch::channel::<Option<DrainAdvisory>>(None);
+        let tun = warrenguard_transport_core::FakeTun::new();
+        let client = pq_data_client(tun, |ctx| ctx.with_drain_rx(drain_rx)).await;
+        drain_then_expect_advisory_and_close(&drain_tx, &client.conn, |datagram| {
+            decode_frame_v2(datagram)
+                .ok()
+                .and_then(|frame| client.session.open_response(&frame).ok())
+        })
+        .await;
+        client.harness.accept_task.abort();
+    }
+
+    /// The classical twin: the same advisory and deadline close for a `/v1`
+    /// session, sealed and framed the classical way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_draining_exit_advises_a_v1_session_then_closes_it_at_the_deadline() {
+        let (drain_tx, drain_rx) = watch::channel::<Option<DrainAdvisory>>(None);
+        let exit_key = SigningKey::from_bytes(&[0x42; 32]);
+        let (privkey, exit_pub) =
+            derive_x25519_keypair(&ANTI_ORACLE_EXIT_IKM).expect("x25519 keypair derives");
+        let ctx = ExitTerminateCtx::new(
+            privkey,
+            ExitId::from_bytes(ANTI_ORACLE_EXIT_ID),
+            warrenguard_transport_core::FakeTun::new(),
+            None,
+            None,
+            v4_alloc(),
+            None,
+            None,
+        )
+        .with_drain_rx(drain_rx);
+        let ExitHarness {
+            addr,
+            sni,
+            endpoint,
+            accept_task,
+        } = spawn_exit_accept_loop(&exit_key, ctx);
+        let exit = TerminatingExit {
+            addr,
+            sni,
+            exit_pub,
+            _endpoint: endpoint,
+            accept_task,
+        };
+        let client = data_client(&exit, |_| WarrenControlMessage::IpRequest {
+            prefer_ipv4: None,
+            client_pubkey: Some([0x3E; 32]),
+            wants_ipv6: false,
+            pop_sig: None,
+            wants_daita: false,
+        })
+        .await;
+        drain_then_expect_advisory_and_close(&drain_tx, &client.conn, |datagram| {
+            decode_frame(datagram)
+                .ok()
+                .and_then(|frame| client.session.open_response(&frame).ok())
+        })
+        .await;
     }
 
     /// The `/v1` session cache reclaims expired sessions at most once per TTL

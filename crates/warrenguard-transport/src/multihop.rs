@@ -4167,6 +4167,45 @@ mod tests {
             );
         }
 
+        /// An exit's drain advisory sealed into a `/v2` downlink datagram
+        /// comes out of the client's `recv` as the control plaintext both
+        /// downlink pumps dispatch to the drain channel. Draining `/v2`
+        /// sessions therefore reuses the frozen control and `/v2` frame
+        /// formats as they are.
+        #[tokio::test]
+        async fn a_pq_client_opens_a_sealed_drain_advisory_into_its_control_plaintext() {
+            let pair =
+                crate::test_support::spawn_loopback_multihop_pq(ExitId::from_bytes([0x79; 16]))
+                    .await;
+            let control =
+                warrenguard_multihop::encode_control(&WarrenControlMessage::ExitDraining {
+                    deadline_unix_secs: 1_800_000_000,
+                    reason_code: 5,
+                })
+                .expect("encode the advisory");
+            let frame = pair
+                .exit_session
+                .seal_response(&control, 0, 0)
+                .expect("seal_response");
+            pair.exit_conn
+                .send_datagram(bytes::Bytes::from(
+                    encode_frame_v2(&frame).expect("encode_frame_v2"),
+                ))
+                .expect("send_datagram");
+
+            let opened = tokio::time::timeout(Duration::from_secs(2), pair.client.recv())
+                .await
+                .expect("must not time out")
+                .expect("recv opens the sealed advisory");
+            let msg = warrenguard_multihop::try_decode_control(&opened)
+                .expect("a well-formed control plaintext")
+                .expect("a control message, not an IP packet");
+            let advisory = crate::drain_policy::ExitDrainAdvisory::from_control(&msg)
+                .expect("an ExitDraining advisory");
+            assert_eq!(advisory.deadline_unix_secs, 1_800_000_000);
+            assert_eq!(advisory.reason_code, 5);
+        }
+
         /// Reads and decodes the next raw `/v2` datagram the client sent,
         /// with the same 2 s bound every other loopback test in this module
         /// uses.
