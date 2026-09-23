@@ -7,16 +7,16 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use quinn::{Connection, VarInt};
-use tokio::sync::{Semaphore, mpsc, watch};
+use tokio::sync::{OnceCell, Semaphore, mpsc, watch};
 use warrenguard_edge::read_masque_datagram;
 
 /// What one HTTP/3 connection knows about itself while the ingress serves it.
 pub(crate) struct ConnState {
     conn: Connection,
-    /// `Some` once a credential verified on this connection; the instant is
-    /// when the admission ends. It is never extended: the connection is closed
-    /// at that instant and the client reconnects with a fresh credential.
-    admitted_until: Mutex<Option<Instant>>,
+    /// Set once a credential verified on this connection, to the instant the
+    /// admission ends. It is never extended: the connection is closed at that
+    /// instant and the client reconnects with a fresh credential.
+    admitted_until: OnceCell<Instant>,
     /// One permit per live tunnel.
     tunnels: Arc<Semaphore>,
     /// The HTTP Datagram routes of the connection's CONNECT-UDP tunnels.
@@ -30,7 +30,7 @@ impl ConnState {
     pub(crate) fn new(conn: Connection, max_tunnels: u32) -> Self {
         Self {
             conn,
-            admitted_until: Mutex::new(None),
+            admitted_until: OnceCell::new(),
             tunnels: Arc::new(Semaphore::new(max_tunnels as usize)),
             routes: DatagramRoutes::default(),
             h3_datagram: watch::Sender::new(None),
@@ -38,33 +38,45 @@ impl ConnState {
     }
 
     /// Whether a credential has admitted this connection. Expiry is not
-    /// checked here: the timer armed by [`Self::admit`] closes the connection
-    /// at the deadline, so an open connection with an admission is admitted.
+    /// checked here: the timer armed by [`Self::admit_once`] closes the
+    /// connection at the deadline, so an open connection with an admission is
+    /// admitted.
     pub(crate) fn is_admitted(&self) -> bool {
-        self.admitted_until
-            .lock()
-            .map(|a| a.is_some())
-            .unwrap_or(false)
+        self.admitted_until.initialized()
     }
 
-    /// Records the admission for `ttl` and arms the close that ends it. A
-    /// second verified credential on the same connection changes nothing: the
-    /// first admission's deadline stands.
-    pub(crate) fn admit(&self, ttl: Duration) {
-        let Ok(mut admitted) = self.admitted_until.lock() else {
-            return;
-        };
-        if admitted.is_some() {
-            return;
-        }
-        *admitted = Some(Instant::now() + ttl);
-        let conn = self.conn.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(ttl).await;
-            // A neutral code: the client reconnects and presents the next
-            // epoch's credential on its first CONNECT.
-            conn.close(VarInt::from_u32(0), b"");
-        });
+    /// Admits the connection through `verify` unless it is admitted already,
+    /// and arms the close that ends the admission after the `ttl` `verify`
+    /// grants.
+    ///
+    /// One verification at a time: a request arriving while another is being
+    /// verified waits for that outcome, and runs its own only if that one did
+    /// not admit. Verifying spends the credential, so concurrent first
+    /// requests carrying the same one would otherwise spend it twice and see
+    /// the second attempt refused.
+    ///
+    /// # Errors
+    ///
+    /// What `verify` refused with, when the connection is still not admitted.
+    pub(crate) async fn admit_once<F, Fut, E>(&self, verify: F) -> Result<(), E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Duration, E>>,
+    {
+        self.admitted_until
+            .get_or_try_init(|| async {
+                let ttl = verify().await?;
+                let conn = self.conn.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(ttl).await;
+                    // A neutral code: the client reconnects and presents the
+                    // next epoch's credential on its first CONNECT.
+                    conn.close(VarInt::from_u32(0), b"");
+                });
+                Ok(Instant::now() + ttl)
+            })
+            .await
+            .map(|_| ())
     }
 
     /// Reserves a tunnel slot, or `None` when the connection is at its cap.

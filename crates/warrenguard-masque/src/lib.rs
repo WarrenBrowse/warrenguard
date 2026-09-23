@@ -439,35 +439,36 @@ where
         state: &ConnState,
         credential: Option<ProxyCredential>,
     ) -> Option<Vec<u8>> {
-        if state.is_admitted() {
-            return None;
-        }
-        let Some(credential) = credential else {
-            return Some(proxy_challenge_response());
-        };
-        match admit_credential(self.admitter.as_ref(), &credential).await {
-            TokenAdmission::Admit { .. } => {
-                let ttl = admission_ttl(
-                    unix_now(),
-                    self.config.admission_period,
-                    self.config.admission_grace,
-                );
-                state.admit(ttl);
-                // Value-free: one line per admitted connection, no peer, no
-                // destination, no credential.
-                tracing::debug!(
-                    conn = state.id(),
-                    ttl_secs = ttl.as_secs(),
-                    "masque: connection admitted"
-                );
-                None
-            }
-            // Challenge rather than refuse: a stale credential is the ordinary
-            // case at an epoch boundary, and the client answers a 407 with a
-            // fresh one.
-            TokenAdmission::Reject => Some(proxy_challenge_response()),
-            TokenAdmission::Denied => Some(encode_response_headers(403, &[])),
-        }
+        state
+            .admit_once(|| async {
+                let Some(credential) = credential else {
+                    return Err(proxy_challenge_response());
+                };
+                match admit_credential(self.admitter.as_ref(), &credential).await {
+                    TokenAdmission::Admit { .. } => {
+                        let ttl = admission_ttl(
+                            unix_now(),
+                            self.config.admission_period,
+                            self.config.admission_grace,
+                        );
+                        // Value-free: one line per admitted connection, no
+                        // peer, no destination, no credential.
+                        tracing::debug!(
+                            conn = state.id(),
+                            ttl_secs = ttl.as_secs(),
+                            "masque: connection admitted"
+                        );
+                        Ok(ttl)
+                    }
+                    // Challenge rather than refuse: a stale credential is the
+                    // ordinary case at an epoch boundary, and the client
+                    // answers a 407 with a fresh one.
+                    TokenAdmission::Reject => Err(proxy_challenge_response()),
+                    TokenAdmission::Denied => Err(encode_response_headers(403, &[])),
+                }
+            })
+            .await
+            .err()
     }
 }
 

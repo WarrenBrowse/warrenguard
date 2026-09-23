@@ -34,30 +34,51 @@ const COVER: &str = "cover.example.com";
 struct StubAdmitter {
     verdict: TokenAdmission,
     calls: AtomicUsize,
+    /// `Some`: the credential is spent by the first verification, which takes
+    /// this long to answer; every later verification finds it spent.
+    single_use_after: Option<Duration>,
 }
 
 impl StubAdmitter {
     fn admitting() -> Arc<Self> {
-        Arc::new(Self {
-            verdict: TokenAdmission::Admit {
-                serial: [9u8; TOKEN_SERIAL_LEN],
-            },
-            calls: AtomicUsize::new(0),
+        Self::with(TokenAdmission::Admit {
+            serial: [9u8; TOKEN_SERIAL_LEN],
         })
     }
     fn with(verdict: TokenAdmission) -> Arc<Self> {
         Arc::new(Self {
             verdict,
             calls: AtomicUsize::new(0),
+            single_use_after: None,
+        })
+    }
+    fn single_use(verification: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            verdict: TokenAdmission::Admit {
+                serial: [9u8; TOKEN_SERIAL_LEN],
+            },
+            calls: AtomicUsize::new(0),
+            single_use_after: Some(verification),
         })
     }
 }
 
 impl SessionTokenAdmitter for StubAdmitter {
     fn admit<'a>(&'a self, _tokens: &'a [SessionToken]) -> BoxFuture<'a, TokenAdmission> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        let earlier = self.calls.fetch_add(1, Ordering::SeqCst);
         let verdict = self.verdict.clone();
-        Box::pin(async move { verdict })
+        let single_use_after = self.single_use_after;
+        Box::pin(async move {
+            let Some(verification) = single_use_after else {
+                return verdict;
+            };
+            tokio::time::sleep(verification).await;
+            if earlier == 0 {
+                verdict
+            } else {
+                TokenAdmission::Denied
+            }
+        })
     }
     fn renew_live<'a>(&'a self, _live: &'a [[u8; TOKEN_SERIAL_LEN]]) -> BoxFuture<'a, ()> {
         Box::pin(async {})
@@ -488,6 +509,46 @@ async fn a_second_connect_on_an_admitted_connection_is_not_verified_again() {
         1,
         "one verification admits the connection"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_first_requests_on_one_connection_spend_one_credential() {
+    // A browser opens several tunnels at once on a fresh connection, each
+    // carrying the same credential. The first verification must admit the
+    // connection for all of them: verifying each one spends the token again,
+    // and the copies then find it spent.
+    let (config, dialer) = tunnel_config().await;
+    let admitter = StubAdmitter::single_use(Duration::from_millis(300));
+    let (addr, root) = spawn_server(ingress(admitter.clone(), true, dialer, config));
+    let conn = connect(addr, &root).await;
+    let _ctrl = open_control(&conn, true).await;
+    let credential = credential();
+    let head_a = connect_head("a.example:443", Some(&credential));
+    let head_b = connect_head("b.example:443", Some(&credential));
+
+    let (first, second) = tokio::join!(request(&conn, &head_a), request(&conn, &head_b));
+
+    assert_eq!((first.status, second.status), (200, 200));
+    assert_eq!(
+        admitter.calls.load(Ordering::SeqCst),
+        1,
+        "one connection spends one credential"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_challenged_connection_admits_on_a_later_verified_credential() {
+    let (config, dialer) = tunnel_config().await;
+    let admitter = StubAdmitter::admitting();
+    let (addr, root) = spawn_server(ingress(admitter.clone(), true, dialer, config));
+    let conn = connect(addr, &root).await;
+    let _ctrl = open_control(&conn, true).await;
+
+    let challenged = request(&conn, &connect_head("a.example:443", None)).await;
+    let admitted = request(&conn, &connect_head("b.example:443", Some(&credential()))).await;
+
+    assert_eq!((challenged.status, admitted.status), (407, 200));
+    assert_eq!(admitter.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
