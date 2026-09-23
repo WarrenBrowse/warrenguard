@@ -15,7 +15,7 @@
 
 use std::time::Duration;
 
-use warrenguard_multihop::WarrenControlMessage;
+use warrenguard_multihop::{ExitId, WarrenControlMessage};
 
 /// Floor kept between the jittered reconnect and the exit's hard-close
 /// deadline, so the proactive migration finishes before the backstop close.
@@ -64,6 +64,20 @@ impl ExitDrainAdvisory {
             _ => None,
         }
     }
+}
+
+/// A drain advisory together with the exit that sealed it, which is the exit
+/// of the session whose downlink decoded it. The advisory names no exit on the
+/// wire: a consumer whose subscription outlives a gap-free move to another exit
+/// reads here whose drain it is, and two exits' identical advisories stay
+/// distinct values, so deduplicating by value never drops the new exit's one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExitDrainNotice {
+    /// The exit that sealed the advisory. It arrives sealed under that
+    /// session's keys, so neither the relay nor another exit can forge it.
+    pub exit_id: ExitId,
+    /// What that exit announced.
+    pub advisory: ExitDrainAdvisory,
 }
 
 /// Anti-stampede delay before reacting to a drain advisory.

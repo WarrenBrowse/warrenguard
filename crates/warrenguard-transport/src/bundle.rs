@@ -27,7 +27,7 @@ use parking_lot::{Mutex as PlMutex, RwLock};
 
 use quinn::Connection;
 use tokio::sync::{mpsc, watch};
-use warrenguard_multihop::{MULTIHOP_FRAME_MAX_OVERHEAD, RejectionReason};
+use warrenguard_multihop::{ExitId, MULTIHOP_FRAME_MAX_OVERHEAD, RejectionReason};
 
 use crate::multihop::{MultiHopClient, MultiHopError, RebindError, RebindPolicy};
 
@@ -329,6 +329,15 @@ impl MultiHopBundle {
     #[must_use]
     pub fn primary(&self) -> Arc<MultiHopClient> {
         self.clients.read()[0].clone()
+    }
+
+    /// The exit this bundle's sessions terminate at, which is its primary's:
+    /// the supervisor bonds every secondary to the circuit its primary
+    /// dialled, so this is also the exit that sealed whatever the bundle
+    /// decodes.
+    #[must_use]
+    pub fn exit_id(&self) -> ExitId {
+        self.clients.read()[0].exit_id()
     }
 
     /// Snapshot of the bonded sessions, primary first.
@@ -1130,6 +1139,18 @@ mod live_tests {
         for hash in 0..16u64 {
             assert_eq!(plan.route(Some(hash), 0, healthy_budget), 0);
         }
+    }
+
+    /// The bundle names its primary's exit, whatever else sits behind it: the
+    /// primary is the session the supervisor dialled, and every secondary is
+    /// bonded to that same circuit.
+    #[tokio::test]
+    async fn exit_id_names_the_primarys_exit() {
+        let primary = spawn_loopback_multihop(ExitId::from_bytes([0x85; 16])).await;
+        let secondary = spawn_loopback_multihop(ExitId::from_bytes([0x86; 16])).await;
+        let bundle = MultiHopBundle::new(vec![primary.client.clone(), secondary.client.clone()]);
+
+        assert_eq!(bundle.exit_id(), ExitId::from_bytes([0x85; 16]));
     }
 
     /// A probe addressed to a leg must leave on THAT leg. The whole

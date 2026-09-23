@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use parking_lot::Mutex as PlMutex;
 use warrenguard_daita::DaitaState;
-use warrenguard_multihop::WarrenControlMessage;
+use warrenguard_multihop::{ExitId, WarrenControlMessage};
 use warrenguard_pump::{TunIoTolerance, is_daita_dummy, record_uplink_too_large_drop};
 use warrenguard_transport_core::{
     PacketDevice, clamp_downlink_syn, clamp_uplink_syn, is_tcp_syn, uplink_frag_needed,
@@ -41,21 +41,26 @@ use crate::multihop::MultiHopError;
 use crate::supervisor::ClientWatch;
 
 pub use crate::{IpAssignChannel, IpAssignSpec};
-// The advisory type moved to `drain_policy` (the single drain-reaction home);
+// The advisory types live in `drain_policy` (the single drain-reaction home);
 // re-exported here so pump-side consumers keep their import path.
-pub use crate::drain_policy::ExitDrainAdvisory;
+pub use crate::drain_policy::{ExitDrainAdvisory, ExitDrainNotice};
 
 /// `tokio::sync::watch` channel the downlink pump uses to publish an
-/// [`ExitDrainAdvisory`] to the orchestrator (ADR 36), mirroring
+/// [`ExitDrainNotice`] to the orchestrator (ADR 36), mirroring
 /// [`IpAssignChannel`]. The pump writes; the orchestrator subscribes and,
-/// on an advisory, proactively migrates the user to another exit
+/// on a notice, proactively migrates the user to another exit
 /// (make-before-break) before the draining exit hard-closes at the
 /// deadline. The draining exit is never named as a *destination* on the
 /// wire, so the orchestrator re-selects from its signed relay list: a
 /// hostile exit can only make a client leave, never steer it.
+///
+/// One channel serves every session the watch publishes, across gap-free
+/// moves between exits, so each notice carries the exit whose session
+/// decoded the advisory. That is the exit the orchestrator excludes,
+/// whichever exit it believes the tunnel is on when the notice arrives.
 #[derive(Clone)]
 pub struct ExitDrainingChannel {
-    sender: Arc<tokio::sync::watch::Sender<Option<ExitDrainAdvisory>>>,
+    sender: Arc<tokio::sync::watch::Sender<Option<ExitDrainNotice>>>,
 }
 
 impl Default for ExitDrainingChannel {
@@ -74,26 +79,28 @@ impl ExitDrainingChannel {
         }
     }
 
-    /// Publish a fresh advisory to every active subscriber (latest wins).
-    pub fn publish(&self, adv: ExitDrainAdvisory) {
-        let _ = self.sender.send_replace(Some(adv));
+    /// Publish a fresh notice to every active subscriber (latest wins).
+    pub fn publish(&self, notice: ExitDrainNotice) {
+        let _ = self.sender.send_replace(Some(notice));
     }
 
-    /// Subscribe to subsequent drain advisories.
+    /// Subscribe to subsequent drain notices.
     #[must_use]
-    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<Option<ExitDrainAdvisory>> {
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<Option<ExitDrainNotice>> {
         self.sender.subscribe()
     }
 }
 
 /// Route a decoded downlink control message to its consumer channel.
-/// `IpAssign` -> `ip_assign_channel`; `ExitDraining` -> `exit_draining_channel`;
+/// `IpAssign` -> `ip_assign_channel`; `ExitDraining` -> `exit_draining_channel`,
+/// attributed to `sealed_by`, the exit of the session that decoded it;
 /// anything else (or a missing channel) is logged and dropped. Shared by
 /// both downlink pumps so the dispatch policy lives in one place. A `0xC0`
 /// control plaintext is never an IP packet nor a DAITA dummy, so the
 /// caller routes here before the IP-forward path.
 fn dispatch_control_message(
     msg: &WarrenControlMessage,
+    sealed_by: ExitId,
     ip_assign_channel: Option<&IpAssignChannel>,
     exit_draining_channel: Option<&ExitDrainingChannel>,
 ) {
@@ -118,7 +125,10 @@ fn dispatch_control_message(
                 reason_code = adv.reason_code,
                 "downlink received ExitDraining; publishing migrate advisory (make-before-break)"
             );
-            ch.publish(adv);
+            ch.publish(ExitDrainNotice {
+                exit_id: sealed_by,
+                advisory: adv,
+            });
         } else {
             tracing::debug!("downlink received ExitDraining with no consumer; dropping");
         }
@@ -666,6 +676,7 @@ pub async fn run_downlink<T: PacketDevice>(
                             Ok(Some(msg)) => {
                                 dispatch_control_message(
                                     &msg,
+                                    client.exit_id(),
                                     None,
                                     exit_draining_channel.as_ref(),
                                 );
@@ -794,6 +805,7 @@ pub async fn run_downlink_with_daita<T: PacketDevice>(
                                 control_ok += 1;
                                 dispatch_control_message(
                                     &msg,
+                                    client.exit_id(),
                                     ip_assign_channel.as_ref(),
                                     exit_draining_channel.as_ref(),
                                 );
@@ -1085,18 +1097,21 @@ mod tests {
     }
 
     #[test]
-    fn exit_draining_channel_publishes_latest_advisory() {
-        // The channel surfaces the advisory to a subscriber (latest wins),
+    fn exit_draining_channel_publishes_latest_notice() {
+        // The channel surfaces the notice to a subscriber (latest wins),
         // the seam the orchestrator uses to trigger make-before-break.
         let ch = ExitDrainingChannel::new();
         let mut rx = ch.subscribe();
         assert!(rx.borrow_and_update().is_none(), "starts empty");
-        ch.publish(ExitDrainAdvisory {
-            deadline_unix_secs: 42,
-            reason_code: 0,
-        });
-        let got = rx.borrow_and_update().expect("advisory published");
-        assert_eq!(got.deadline_unix_secs, 42);
+        let notice = ExitDrainNotice {
+            exit_id: ExitId::from_bytes([0x2A; 16]),
+            advisory: ExitDrainAdvisory {
+                deadline_unix_secs: 42,
+                reason_code: 0,
+            },
+        };
+        ch.publish(notice);
+        assert_eq!(*rx.borrow_and_update(), Some(notice));
     }
 
     // ----------------------------------------------------------------
@@ -1679,14 +1694,9 @@ mod live_pump_tests {
         .expect("encode_control");
         exit_send_datagram(&pair, 0, control).await;
 
-        let adv = tokio::time::timeout(RECV_TIMEOUT, draining_rx.changed())
-            .await
-            .expect("must not time out")
-            .map(|()| *draining_rx.borrow_and_update())
-            .expect("advisory published")
-            .expect("Some advisory");
-        assert_eq!(adv.deadline_unix_secs, 1_800_000_000);
-        assert_eq!(adv.reason_code, 7);
+        let notice = next_notice(&mut draining_rx).await;
+        assert_eq!(notice.advisory.deadline_unix_secs, 1_800_000_000);
+        assert_eq!(notice.advisory.reason_code, 7);
 
         // The control frame must never be handed to the TUN: a raw 0xC0
         // plaintext is not a valid IP packet and the doc comment on
@@ -1715,6 +1725,73 @@ mod live_pump_tests {
         assert!(
             result.is_err(),
             "closing the watch mid-serve must surface as Err"
+        );
+    }
+
+    /// Waits for the next notice on a drain channel subscription.
+    async fn next_notice(
+        rx: &mut tokio::sync::watch::Receiver<Option<ExitDrainNotice>>,
+    ) -> ExitDrainNotice {
+        tokio::time::timeout(RECV_TIMEOUT, rx.changed())
+            .await
+            .expect("a drain notice within the timeout")
+            .expect("drain channel alive");
+        rx.borrow_and_update().expect("a notice was published")
+    }
+
+    /// Runs a downlink pump across a gap-free move between two exits that
+    /// both announce the same soft maintenance drain, and returns the notice
+    /// published for each, with the id of each exit.
+    async fn drain_notices_across_a_move(
+        spawn_pump: impl FnOnce(ClientWatch, ExitDrainingChannel) -> tokio::task::JoinHandle<Result<()>>,
+    ) -> ([ExitDrainNotice; 2], [ExitId; 2]) {
+        let exits = [
+            ExitId::from_bytes([0x25; 16]),
+            ExitId::from_bytes([0x26; 16]),
+        ];
+        let first = spawn_loopback_multihop(exits[0]).await;
+        let second = spawn_loopback_multihop(exits[1]).await;
+        let (tx, rx) =
+            tokio::sync::watch::channel(Some(MultiHopBundle::new(vec![first.client.clone()])));
+        let draining = ExitDrainingChannel::new();
+        let mut notices = draining.subscribe();
+        let task = spawn_pump(rx, draining);
+        let advisory = encode_control(&WarrenControlMessage::ExitDraining {
+            deadline_unix_secs: u64::MAX,
+            reason_code: 0,
+        })
+        .expect("encode_control");
+
+        exit_send_datagram(&first, 0, advisory.clone()).await;
+        let from_first = next_notice(&mut notices).await;
+        // The move an overlap swap makes: the watch goes live to live.
+        tx.send(Some(MultiHopBundle::new(vec![second.client.clone()])))
+            .expect("the pump holds the watch");
+        exit_send_datagram(&second, 0, advisory).await;
+        let from_second = next_notice(&mut notices).await;
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        ([from_first, from_second], exits)
+    }
+
+    /// Each drain advisory is published with the exit that sealed it. A
+    /// consumer whose channel outlives a gap-free move then knows whose drain
+    /// it reads, and deduplicating by value never drops the new exit's
+    /// advisory as a repeat of the old exit's identical one.
+    #[tokio::test]
+    async fn run_downlink_publishes_each_drain_advisory_with_the_exit_that_sealed_it() {
+        let tun = warrenguard_transport_core::FakeTun::new();
+        let ([from_first, from_second], [first, second]) =
+            drain_notices_across_a_move(|rx, draining| {
+                tokio::spawn(run_downlink(rx, tun, Some(draining)))
+            })
+            .await;
+        assert_eq!(from_first.exit_id, first);
+        assert_eq!(from_second.exit_id, second);
+        assert_eq!(
+            from_second.advisory, from_first.advisory,
+            "both exits announced the same drain"
         );
     }
 
@@ -1941,6 +2018,32 @@ mod live_pump_tests {
         assert!(
             result.is_err(),
             "closing the watch mid-serve must surface as Err"
+        );
+    }
+
+    /// Same as the plain pump: each advisory names the exit that sealed it.
+    #[tokio::test]
+    async fn run_downlink_with_daita_publishes_each_drain_advisory_with_the_exit_that_sealed_it() {
+        let tun = warrenguard_transport_core::FakeTun::new();
+        let daita: DaitaShared = Arc::new(PlMutex::new(DaitaState::disabled()));
+        let state_changed = Arc::new(tokio::sync::Notify::new());
+        let ([from_first, from_second], [first, second]) =
+            drain_notices_across_a_move(|rx, draining| {
+                tokio::spawn(run_downlink_with_daita(
+                    rx,
+                    tun,
+                    daita,
+                    state_changed,
+                    None,
+                    Some(draining),
+                ))
+            })
+            .await;
+        assert_eq!(from_first.exit_id, first);
+        assert_eq!(from_second.exit_id, second);
+        assert_eq!(
+            from_second.advisory, from_first.advisory,
+            "both exits announced the same drain"
         );
     }
 
