@@ -3343,12 +3343,22 @@ mod run_tests {
         bundle.clients().iter().map(|c| c.exit_id()).collect()
     }
 
+    /// Whether `WARREN_MULTIHOP_CONNS` pins the bond to a single connection in
+    /// this process, which leaves a bonding test no secondary to observe.
+    fn bond_pinned_to_one_connection_by_env() -> bool {
+        warrenguard_config::knobs::multihop_conns_override().is_some_and(|width| width < 2)
+    }
+
     /// Every connection of a bonded session terminates at the exit its primary
     /// dialled, even when the target moves while that primary is being set up.
     /// A secondary dialled to the new target would name the primary's address
     /// to another exit, and one bond would then span two exits.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_cold_dial_bonds_its_secondaries_to_the_exit_its_primary_dialled() {
+        if bond_pinned_to_one_connection_by_env() {
+            eprintln!("skipped: WARREN_MULTIHOP_CONNS pins the bond to one connection");
+            return;
+        }
         let operational_key = SigningKey::from_bytes(&[0x4E; 32]);
         let dialled = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x60; 16]));
         let elsewhere = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x61; 16]));
@@ -3394,6 +3404,10 @@ mod run_tests {
     /// retarget lands during that primary's setup.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_overlap_bonds_its_secondaries_to_the_exit_its_primary_dialled() {
+        if bond_pinned_to_one_connection_by_env() {
+            eprintln!("skipped: WARREN_MULTIHOP_CONNS pins the bond to one connection");
+            return;
+        }
         let operational_key = SigningKey::from_bytes(&[0x4F; 32]);
         let serving = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x62; 16]));
         let next = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x63; 16]));
