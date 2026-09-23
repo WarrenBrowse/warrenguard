@@ -5815,10 +5815,12 @@ mod tests {
     #[cfg(feature = "pq-hpke")]
     #[test]
     fn refresh_keeps_a_pq_session_past_the_ttl() {
-        // Same TTL/sleep shape as `session_cache_hit_refreshes_last_seen_at`
-        // below: 20 ms touches against a 40 ms TTL.
+        // 20 ms touches against a 40 ms TTL, on an injected clock: a loaded
+        // runner stretching a real sleep past the TTL decides nothing.
         let ttl = Duration::from_millis(40);
+        let touch = Duration::from_millis(20);
         let exit_id = ExitId::from_bytes([0x3d; 16]);
+        let t0 = Instant::now();
 
         // WITH refresh: touched inside every TTL window, must survive past
         // a total elapsed time greater than the TTL. This is the fix: the
@@ -5827,17 +5829,16 @@ mod tests {
         let (ek, secret, client) = establish_pq_session_for_cache_test(exit_id);
         let refreshed_cache = PqSessionCache::with_ttl(ttl);
         refreshed_cache
-            .establish_or_get(&ek, client.pq_ct(), exit_id, &secret)
+            .establish_or_get_at(&ek, client.pq_ct(), exit_id, &secret, t0)
             .expect("establish");
-        for _ in 0..4 {
-            std::thread::sleep(Duration::from_millis(20));
+        for step in 1..=4 {
             assert!(
-                refreshed_cache.refresh(&ek),
+                refreshed_cache.refresh_at(&ek, t0 + touch * step),
                 "refresh must find the just-established entry"
             );
         }
         assert!(
-            refreshed_cache.get(&ek).is_some(),
+            refreshed_cache.get_at(&ek, t0 + touch * 4).is_some(),
             "a session refreshed inside every TTL window must survive past the TTL"
         );
 
@@ -5847,11 +5848,10 @@ mod tests {
         // genuinely idle/disconnected one.
         let idle_cache = PqSessionCache::with_ttl(ttl);
         idle_cache
-            .establish_or_get(&ek, client.pq_ct(), exit_id, &secret)
+            .establish_or_get_at(&ek, client.pq_ct(), exit_id, &secret, t0)
             .expect("establish");
-        std::thread::sleep(Duration::from_millis(80));
         assert!(
-            idle_cache.get(&ek).is_none(),
+            idle_cache.get_at(&ek, t0 + touch * 4).is_none(),
             "an un-refreshed session must still be evicted after the TTL"
         );
     }
@@ -5929,26 +5929,34 @@ mod tests {
 
     #[test]
     fn session_cache_hit_refreshes_last_seen_at() {
-        // ARRANGE: short TTL, one entry installed.
+        // ARRANGE: short TTL, one entry installed, on an injected clock.
         let cache = SessionCache::with_ttl(Duration::from_millis(40));
         let encap: EncapsulatedKeyBytes = [0x11; 32];
-        cache
-            .get_or_insert(&encap, build_session_for_cache_test)
+        let t0 = Instant::now();
+        let first = cache
+            .get_or_insert_at(&encap, build_session_for_cache_test, t0)
             .expect("initial insert");
 
         // ACT: touch the entry every 20 ms for 120 ms total. Each touch
         // resets last_seen_at, so the entry must survive.
-        for _ in 0..6 {
-            std::thread::sleep(Duration::from_millis(20));
-            cache
-                .get_or_insert(&encap, build_session_for_cache_test)
-                .expect("refresh");
+        let mut last = None;
+        for step in 1..=6 {
+            last = Some(
+                cache
+                    .get_or_insert_at(
+                        &encap,
+                        build_session_for_cache_test,
+                        t0 + Duration::from_millis(20) * step,
+                    )
+                    .expect("refresh"),
+            );
         }
 
-        // ASSERT.
-        assert_eq!(
-            cache.entry_count(),
-            1,
+        // ASSERT: still the first session, never rebuilt, so its replay
+        // window carried across.
+        let last = last.expect("six touches");
+        assert!(
+            Arc::ptr_eq(&first.session, &last.session),
             "a touched entry must not be evicted while traffic keeps flowing"
         );
     }
