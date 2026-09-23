@@ -21,9 +21,10 @@
 //!
 //! An exit restart loses every allocation, since none is ever written to
 //! disk. What survives is the client's own memory of its address, which it
-//! names on its redial; for [`RESTART_RECLAIM_WINDOW`] after a pool is built
-//! it hands that address back (see [`IpAllocator::allocate_for_pubkey_with_intent`]),
-//! so a rollout does not force every client to rebuild its tunnel.
+//! names on its redial. A deployer that knows which addresses may be taken
+//! back that way enables it for [`RESTART_RECLAIM_WINDOW`]
+//! ([`IpAllocator::enable_restart_reclaim`]), so a rollout does not force
+//! every client to rebuild its tunnel.
 //!
 //! The allocator is **not** thread-safe. Wrap in `Arc<Mutex<_>>` for
 //! shared access across the multi-conn spawn loop.
@@ -79,25 +80,24 @@ fn os_seed() -> u64 {
     })
 }
 
-/// How long after an [`IpAllocator`] is built a client may take back an
-/// address by naming it, provided the pool has not handed that address to
-/// anyone since it was built: the address the client held before the exit
-/// restarted. It covers the clients that were connected through the restart,
-/// which redial within seconds of noticing the dead exit (under a backoff
-/// capped at 15 s). It is kept short because inside it the pool cannot tell
-/// such a client from one naming an address it held on another exit, which
-/// clients predating the exit-bound placement hint do.
+/// How long after [`IpAllocator::enable_restart_reclaim`] a client may take
+/// back an eligible address by naming it: the address it held before the
+/// exit restarted. It covers the clients that were connected through the
+/// restart, which redial within seconds of noticing the dead exit (under a
+/// backoff capped at 15 s). It is kept short because inside it the pool
+/// cannot tell such a client from one naming an address it held on another
+/// exit, which clients predating the exit-bound placement hint do.
 pub const RESTART_RECLAIM_WINDOW: Duration = Duration::from_secs(120);
 
-/// The restart-reclaim state of a young pool (see [`RESTART_RECLAIM_WINDOW`]).
+/// The restart reclaim a deployer enabled (see
+/// [`IpAllocator::enable_restart_reclaim`]).
 #[derive(Debug)]
 struct RestartReclaim {
     until: Instant,
-    /// Every host the pool handed out since it was built. Once given to
-    /// anyone after the restart, an address is nobody's to take back: the
-    /// exit knows a live or departed owner for it again, and the ordinary
-    /// ownership rules apply. Bounded by the subnet size.
-    handed_out: HashSet<Ipv4Addr>,
+    /// The addresses still open to a reclaim. Handing one out to anyone
+    /// removes it: the pool then knows a live or departed owner for it
+    /// again, and the ordinary ownership rules apply. Bounded by the subnet.
+    eligible: HashSet<Ipv4Addr>,
 }
 
 /// Caller-supplied unique identifier for a multi-hop connection. The
@@ -131,7 +131,7 @@ pub enum SessionIntent {
     /// holding `<addr>`. Shared only when `<addr>` is held by (or sticky
     /// for) the SAME authenticated key, so a hint can never land a client
     /// on another identity's address. The one other grant is the restart
-    /// reclaim: a free `<addr>` a young pool has handed to nobody yet.
+    /// reclaim ([`IpAllocator::allocate_for_pubkey_reclaiming`]).
     Join(Ipv4Addr),
 }
 
@@ -328,7 +328,8 @@ pub struct IpAllocator {
     /// address may only be shared between connections of the SAME identity.
     used: Holdings<Ipv4Addr>,
     sticky: HashMap<[u8; 32], Ipv4Addr>,
-    /// `None` once [`RESTART_RECLAIM_WINDOW`] has passed.
+    /// `None` until the deployer enables the restart reclaim, and again from
+    /// the first reclaim attempt after its window.
     reclaim: Option<RestartReclaim>,
 }
 
@@ -430,30 +431,48 @@ impl IpAllocator {
             rng: SplitMix64::new(seed),
             used: Holdings::new(),
             sticky: HashMap::new(),
-            reclaim: Some(RestartReclaim {
-                until: Instant::now() + RESTART_RECLAIM_WINDOW,
-                handed_out: HashSet::new(),
-            }),
+            reclaim: None,
         })
     }
 
+    /// Let clients take back, by naming them, the `eligible` addresses for
+    /// [`RESTART_RECLAIM_WINDOW`] from now: the addresses that were in use
+    /// before this exit restarted. Call it once, on a freshly built pool,
+    /// before serving.
+    ///
+    /// Any address that carries state from before the restart which another
+    /// client could inherit with it (a restored port forward above all)
+    /// must be left out: a client naming an address is not proof that it
+    /// held it, since the exit kept no record of who did. The pool itself
+    /// drops the addresses that are no free host of it, and every address
+    /// it hands out to anyone.
+    pub fn enable_restart_reclaim(&mut self, eligible: impl IntoIterator<Item = Ipv4Addr>) {
+        let eligible = eligible
+            .into_iter()
+            .filter(|addr| self.free.contains(addr))
+            .collect();
+        self.reclaim = Some(RestartReclaim {
+            until: Instant::now() + RESTART_RECLAIM_WINDOW,
+            eligible,
+        });
+    }
+
     /// Record that `conn` now holds `addr`: the single place every
-    /// allocation path goes through, so the restart reclaim sees each address
-    /// the pool hands out.
+    /// allocation path goes through, so an address handed out to anyone is
+    /// no longer open to the restart reclaim.
     fn hold(&mut self, conn: ConnId, addr: Ipv4Addr, owner: Option<[u8; 32]>) {
         if let Some(reclaim) = self.reclaim.as_mut() {
-            reclaim.handed_out.insert(addr);
+            reclaim.eligible.remove(&addr);
         }
         self.used.hold(conn, addr, owner);
     }
 
-    /// Whether `target` may be handed back to whoever names it at `now`: the
-    /// pool is still inside its reclaim window and has handed `target` to
-    /// nobody since it was built. Drops the reclaim state once the window
-    /// has passed.
+    /// Whether `target` may be handed back to whoever names it at `now`:
+    /// the reclaim is enabled, its window is open and `target` is still
+    /// eligible. Drops the reclaim state once the window has passed.
     fn reclaimable(&mut self, target: Ipv4Addr, now: Instant) -> bool {
         match &self.reclaim {
-            Some(reclaim) if now < reclaim.until => !reclaim.handed_out.contains(&target),
+            Some(reclaim) if now < reclaim.until => reclaim.eligible.contains(&target),
             Some(_) => {
                 self.reclaim = None;
                 false
@@ -538,33 +557,47 @@ impl IpAllocator {
     /// request never lands on an inner IP that another live session of the
     /// same key holds, so the downlink route key (the inner IP) identifies
     /// exactly one session.
-    ///
-    /// A [`SessionIntent::Join`] naming a FREE address the pool has handed to
-    /// nobody since it was built, within [`RESTART_RECLAIM_WINDOW`] of that,
-    /// gets that address whatever the key: the client is taking back the
-    /// address it held before the exit restarted, under a key the new
-    /// process may never have seen (an anonymous token serial is new for
-    /// every session). The address stays exit-assigned and volatile, never
-    /// derived from a client identifier; only the client's memory of it
-    /// crosses the restart. No address ever serves two live clients, and an
-    /// address handed to anyone since the restart falls back under the
-    /// ordinary rules.
     pub fn allocate_for_pubkey_with_intent(
         &mut self,
         conn: ConnId,
         pubkey: [u8; 32],
         intent: SessionIntent,
     ) -> Option<Ipv4Addr> {
-        self.allocate_for_pubkey_with_intent_at(conn, pubkey, intent, Instant::now())
+        self.allocate_at(conn, pubkey, intent, Instant::now(), false)
     }
 
-    /// [`Self::allocate_for_pubkey_with_intent`] at an explicit `now`.
-    fn allocate_for_pubkey_with_intent_at(
+    /// [`Self::allocate_for_pubkey_with_intent`], plus the restart reclaim
+    /// once the deployer enabled it ([`Self::enable_restart_reclaim`]): a
+    /// [`SessionIntent::Join`] naming a free, still eligible address gets it
+    /// whatever the key. The client is taking back the address it held
+    /// before the exit restarted, under a key the new process may never
+    /// have seen (an anonymous token serial is new for every session). The
+    /// address stays exit-assigned and volatile, never derived from a client
+    /// identifier; only the client's memory of it crosses the restart. No
+    /// address ever serves two live clients.
+    ///
+    /// Only for a session whose whole addressing the client can name, which
+    /// today means IPv4 only: the request carries no IPv6 hint, so a
+    /// dual-stack session would keep its IPv4 and get a new IPv6, a change a
+    /// client that watches its IPv4 does not act on.
+    pub fn allocate_for_pubkey_reclaiming(
+        &mut self,
+        conn: ConnId,
+        pubkey: [u8; 32],
+        intent: SessionIntent,
+    ) -> Option<Ipv4Addr> {
+        self.allocate_at(conn, pubkey, intent, Instant::now(), true)
+    }
+
+    /// Both allocation entry points at an explicit `now`; `may_reclaim`
+    /// opens the restart reclaim to a join.
+    fn allocate_at(
         &mut self,
         conn: ConnId,
         pubkey: [u8; 32],
         intent: SessionIntent,
         now: Instant,
+        may_reclaim: bool,
     ) -> Option<Ipv4Addr> {
         if let Some(addr) = self.used.address_of(conn) {
             return Some(addr);
@@ -583,9 +616,9 @@ impl IpAllocator {
                 self.hold(conn, target, Some(pubkey));
                 return Some(target);
             }
-            // Restart reclaim: a free address no one was given since this
-            // pool was built.
-            if self.reclaimable(target, now) && self.take_free(target) {
+            // Restart reclaim: an eligible address no one was given since
+            // the deployer enabled it.
+            if may_reclaim && self.reclaimable(target, now) && self.take_free(target) {
                 self.hold(conn, target, Some(pubkey));
                 self.bind_sticky(pubkey, target);
                 return Some(target);
@@ -1806,8 +1839,9 @@ mod tests {
 
     #[test]
     fn join_intent_with_a_stale_target_falls_back_to_a_session_fresh_ip() {
-        // The join target is none of this key's: the request degrades to
-        // Fresh, i.e. it still never lands on the incumbent's live IP.
+        // The join target vanished (exit restart, pool churn): the request
+        // degrades to Fresh, i.e. it still never lands on the incumbent's
+        // live IP.
         let mut pool = IpAllocator::new(NET, 24, GW).expect("/24 pool builds");
         let pubkey = [0x5A; 32];
         let incumbent = pool.allocate_for_pubkey(1, pubkey).expect("session 1");
@@ -1821,6 +1855,16 @@ mod tests {
         );
     }
 
+    /// The addresses of `NET`/24 a client can be handed.
+    fn hosts() -> impl Iterator<Item = Ipv4Addr> {
+        (2..=254u8).map(|h| Ipv4Addr::new(10, 66, 0, h))
+    }
+
+    /// A moment past the reclaim window of a pool enabled now.
+    fn after_the_window() -> Instant {
+        Instant::now() + RESTART_RECLAIM_WINDOW + Duration::from_secs(1)
+    }
+
     #[test]
     fn a_restarted_pool_hands_a_client_back_the_address_it_names() {
         // An exit restart loses every allocation. The client still knows the
@@ -1832,8 +1876,9 @@ mod tests {
             .allocate_for_pubkey_with_intent(1, [0xA1; 32], SessionIntent::Fresh)
             .expect("the session before the restart");
         let mut after = IpAllocator::with_seed(NET, 24, GW, 0x0B).expect("/24 pool builds");
+        after.enable_restart_reclaim([held]);
         let got = after
-            .allocate_for_pubkey_with_intent(1, [0xA2; 32], SessionIntent::Join(held))
+            .allocate_for_pubkey_reclaiming(1, [0xA2; 32], SessionIntent::Join(held))
             .expect("the redial after the restart");
         assert_eq!(
             got, held,
@@ -1842,16 +1887,60 @@ mod tests {
     }
 
     #[test]
+    fn a_pool_hands_nothing_back_unless_the_deployer_enables_it() {
+        // Naming a free address proves nothing about having held it: without
+        // the deployer's word on which addresses may be taken back, a join
+        // stays under the ordinary ownership rules.
+        let mut pool = IpAllocator::with_seed(NET, 24, GW, 0x0B).expect("/24 pool builds");
+        let named = Ipv4Addr::new(10, 66, 0, 77);
+        let got = pool
+            .allocate_for_pubkey_reclaiming(1, [0xA2; 32], SessionIntent::Join(named))
+            .expect("a redial");
+        assert_ne!(got, named, "the reclaim must be off by default");
+    }
+
+    #[test]
+    fn an_address_the_deployer_left_out_is_never_handed_back() {
+        // The deployer leaves out an address whose restored state another
+        // client could inherit, such as a port forward.
+        let mut pool = IpAllocator::with_seed(NET, 24, GW, 0x0B).expect("/24 pool builds");
+        let forwarded = Ipv4Addr::new(10, 66, 0, 78);
+        pool.enable_restart_reclaim(hosts().filter(|addr| *addr != forwarded));
+        let got = pool
+            .allocate_for_pubkey_reclaiming(1, [0xA2; 32], SessionIntent::Join(forwarded))
+            .expect("a redial");
+        assert_ne!(got, forwarded, "a withheld address must not be handed back");
+    }
+
+    #[test]
+    fn a_named_address_that_is_no_free_host_is_never_handed_back() {
+        let mut pool = IpAllocator::with_seed(NET, 24, GW, 0x0B).expect("/24 pool builds");
+        let outside = Ipv4Addr::new(10, 66, 1, 5);
+        pool.enable_restart_reclaim([GW, outside]);
+        for named in [GW, outside] {
+            let got = pool
+                .allocate_for_pubkey_reclaiming(
+                    u64::from(named.octets()[3]),
+                    [0xA3; 32],
+                    SessionIntent::Join(named),
+                )
+                .expect("a redial");
+            assert_ne!(got, named, "only a free pool host can be handed back");
+        }
+    }
+
+    #[test]
     fn a_restarted_pool_never_hands_back_an_address_it_gave_out_since() {
-        // Once a young pool has given an address to anyone, it knows an
-        // owner for it again: naming it is no longer enough to take it.
+        // Once the pool has given an address to anyone, it knows an owner for
+        // it again: naming it is no longer enough to take it.
         let mut pool = IpAllocator::with_seed(NET, 24, GW, 0x0C).expect("/24 pool builds");
+        pool.enable_restart_reclaim(hosts());
         let given = pool
             .allocate_for_pubkey_with_intent(1, [0xC1; 32], SessionIntent::Fresh)
             .expect("an address given out after the restart");
         pool.release(1);
         let got = pool
-            .allocate_for_pubkey_with_intent(2, [0xC2; 32], SessionIntent::Join(given))
+            .allocate_for_pubkey_reclaiming(2, [0xC2; 32], SessionIntent::Join(given))
             .expect("another key's redial");
         assert_ne!(
             got, given,
@@ -1861,18 +1950,37 @@ mod tests {
 
     #[test]
     fn the_restart_reclaim_ends_with_its_window() {
-        let mut before = IpAllocator::with_seed(NET, 24, GW, 0x0A).expect("/24 pool builds");
-        let held = before
-            .allocate_for_pubkey_with_intent(1, [0xA1; 32], SessionIntent::Fresh)
-            .expect("the session before the restart");
-        let mut after = IpAllocator::with_seed(NET, 24, GW, 0x0B).expect("/24 pool builds");
-        let late = Instant::now() + RESTART_RECLAIM_WINDOW + Duration::from_secs(1);
-        let got = after
-            .allocate_for_pubkey_with_intent_at(1, [0xA2; 32], SessionIntent::Join(held), late)
+        let mut pool = IpAllocator::with_seed(NET, 24, GW, 0x0B).expect("/24 pool builds");
+        let named = Ipv4Addr::new(10, 66, 0, 79);
+        pool.enable_restart_reclaim([named]);
+        let got = pool
+            .allocate_at(
+                1,
+                [0xA2; 32],
+                SessionIntent::Join(named),
+                after_the_window(),
+                true,
+            )
             .expect("a redial after the window");
         assert_ne!(
-            got, held,
+            got, named,
             "past the window, a named address is granted only under the ordinary rules"
+        );
+    }
+
+    #[test]
+    fn a_session_the_caller_keeps_from_the_reclaim_is_never_handed_back_an_address() {
+        // The plain entry point never reclaims, even on an enabled pool: it
+        // is what a dual-stack session goes through.
+        let mut pool = IpAllocator::with_seed(NET, 24, GW, 0x0B).expect("/24 pool builds");
+        let named = Ipv4Addr::new(10, 66, 0, 80);
+        pool.enable_restart_reclaim([named]);
+        let got = pool
+            .allocate_for_pubkey_with_intent(1, [0xA2; 32], SessionIntent::Join(named))
+            .expect("a redial");
+        assert_ne!(
+            got, named,
+            "only the reclaiming entry point hands addresses back"
         );
     }
 
@@ -1883,17 +1991,20 @@ mod tests {
         let mut pool = IpAllocator::with_seed(NET, 24, GW, 0x0D).expect("/24 pool builds");
         let named = Ipv4Addr::new(10, 66, 0, 77);
         let pubkey = [0xD1; 32];
+        pool.enable_restart_reclaim([named]);
         let reclaimed = pool
-            .allocate_for_pubkey_with_intent(1, pubkey, SessionIntent::Join(named))
+            .allocate_for_pubkey_reclaiming(1, pubkey, SessionIntent::Join(named))
             .expect("the redial after the restart");
-        assert_eq!(
-            reclaimed, named,
-            "a free, never-given address is handed back"
-        );
+        assert_eq!(reclaimed, named, "an eligible free address is handed back");
         pool.release(1);
-        let late = Instant::now() + RESTART_RECLAIM_WINDOW + Duration::from_secs(1);
         let reconnect = pool
-            .allocate_for_pubkey_with_intent_at(2, pubkey, SessionIntent::Join(named), late)
+            .allocate_at(
+                2,
+                pubkey,
+                SessionIntent::Join(named),
+                after_the_window(),
+                true,
+            )
             .expect("a clean reconnect after the window");
         assert_eq!(
             reconnect, named,

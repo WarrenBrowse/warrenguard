@@ -168,9 +168,13 @@ fn allocate_on_first_frame(
 ) -> Option<IpAssignSpec> {
     let pubkey = sticky_pubkey;
     let intent = SessionIntent::from_prefer_ipv4(prefer_ipv4);
+    // The request names no IPv6, so a dual-stack session cannot take its
+    // whole addressing back after a restart and stays out of the reclaim.
+    let dual_stack = wants_ipv6 && ip_allocator_v6.is_some();
     let mut guard = ip_allocator.lock();
     let assigned = match pubkey {
-        Some(pk) => guard.allocate_for_pubkey_with_intent(conn_id, pk, intent)?,
+        Some(pk) if dual_stack => guard.allocate_for_pubkey_with_intent(conn_id, pk, intent)?,
+        Some(pk) => guard.allocate_for_pubkey_reclaiming(conn_id, pk, intent)?,
         None => guard.allocate(conn_id)?,
     };
     let spec_gateway = guard.gateway();
@@ -1815,9 +1819,9 @@ fn unix_now_secs() -> u64 {
 /// emits it as a downlink datagram, re-emitting every
 /// [`DRAIN_REEMIT_INTERVAL`] until the deadline. `seal_current` is the only
 /// version-specific part: `/v1` and `/v2` sessions seal and frame
-/// differently, and both must drain. At the deadline it hard-closes the connection with
-/// [`WARREN_MH_DRAINING`] as a backstop for any client that did not
-/// migrate. If the advisory is withdrawn before the deadline (operator
+/// differently, and both must drain. At the deadline it hard-closes the
+/// connection with [`WARREN_MH_DRAINING`] as a backstop for any client that
+/// did not migrate. If the advisory is withdrawn before the deadline (operator
 /// `undrain`, `Some` -> `None`) the emitter returns WITHOUT closing, so a
 /// cancelled maintenance never tears a tunnel down.
 ///
@@ -8002,6 +8006,46 @@ mod tests {
     }
 
     /// Builds a minimal IPv6 packet (40-byte header) with the given dst.
+    #[test]
+    fn a_dual_stack_session_is_never_handed_back_a_lone_ipv4() {
+        // After a restart the IPv6 interface ID is always new, since nothing
+        // names it. Handing the IPv4 back would leave a client that watches
+        // its IPv4 on a stale IPv6, so the session starts fresh on both.
+        let named = Ipv4Addr::new(10, 66, 0, 81);
+        let pool = Arc::new(Mutex::new(
+            IpAllocator::with_seed(
+                Ipv4Addr::new(10, 66, 0, 0),
+                24,
+                Ipv4Addr::new(10, 66, 0, 1),
+                0x0B,
+            )
+            .expect("/24 pool builds"),
+        ));
+        pool.lock().enable_restart_reclaim([named]);
+        let spec = allocate_on_first_frame(
+            &pool,
+            v6_alloc().as_ref(),
+            1,
+            Some([0x12; 32]),
+            true,
+            Some(named.octets()),
+        )
+        .expect("allocation succeeds");
+        assert!(spec.assigned_v6.is_some(), "the session is dual-stack");
+        assert_ne!(
+            spec.assigned, named,
+            "a dual-stack session must not take back its IPv4 alone"
+        );
+
+        let spec =
+            allocate_on_first_frame(&pool, None, 2, Some([0x13; 32]), true, Some(named.octets()))
+                .expect("allocation succeeds");
+        assert_eq!(
+            spec.assigned, named,
+            "on an IPv4-only exit the same request takes its address back"
+        );
+    }
+
     fn ipv6_packet_to(dst: Ipv6Addr) -> Vec<u8> {
         let mut p = vec![0u8; 40];
         p[0] = 0x60; // version 6
@@ -8508,10 +8552,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_session_keeps_its_inner_ipv4_across_an_exit_restart() {
         // The same wallet dials an exit, the exit restarts (same identity, a
-        // fresh process: new allocator, caches and routes), and the redial
-        // names the address the session held, as the client supervisor does.
-        // Keeping the address spares every client a tunnel rebuild per
-        // rollout.
+        // fresh process: new allocator, caches and routes, and the deployer
+        // opens the addresses it knows were in use to a reclaim), and the
+        // redial names the address the session held, as the client
+        // supervisor does. Keeping the address spares every client a tunnel
+        // rebuild per rollout.
         let wallet = [0x6B; 32];
         let ip_request = |prefer_ipv4| WarrenControlMessage::IpRequest {
             prefer_ipv4,
@@ -8538,7 +8583,11 @@ mod tests {
         drop(client);
         drop(before_restart);
 
-        let after_restart = spawn_terminating_exit(None, seeded(0x52));
+        let restarted_pool = seeded(0x52);
+        restarted_pool
+            .lock()
+            .enable_restart_reclaim([Ipv4Addr::from(held)]);
+        let after_restart = spawn_terminating_exit(None, restarted_pool);
         let (_client, got) = client_setup_admitted(&after_restart, ip_request(Some(held))).await;
         assert_eq!(
             got, held,
