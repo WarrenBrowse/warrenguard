@@ -26,11 +26,16 @@
 //! ([`IpAllocator::enable_restart_reclaim`]), so a rollout does not force
 //! every client to rebuild its tunnel.
 //!
+//! An address something outside the pool still routes traffic to, such as a
+//! departed client's port forward, stays out of the draw until that route
+//! ends; only the key that last held it gets it back ([`AddressClaims`]).
+//!
 //! The allocator is **not** thread-safe. Wrap in `Arc<Mutex<_>>` for
 //! shared access across the multi-conn spawn loop.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Minimal SplitMix64 PRNG used ONLY to pick which free host a fresh
@@ -98,6 +103,43 @@ struct RestartReclaim {
     /// removes it: the pool then knows a live or departed owner for it
     /// again, and the ordinary ownership rules apply. Bounded by the subnet.
     eligible: HashSet<Ipv4Addr>,
+}
+
+/// Tells the pool which addresses something outside it still routes traffic
+/// to after the session holding them ended.
+///
+/// The pool returns an address to its free set the moment its last
+/// connection closes. A deployer that forwards inbound traffic to a tunnel
+/// address (a NAT-PMP port mapping) keeps that route for a grace period after
+/// the session ends, so that the client can come back and keep its port. A
+/// new session drawn onto such an address would receive the departed client's
+/// forwarded traffic, and could refresh or delete its mappings as if it were
+/// that client.
+///
+/// So the pool hands a claimed address back only to the key that last held
+/// it, through that key's sticky binding: that is the departed client
+/// reconnecting, and the forwards are its own. A client whose key changes
+/// with every session cannot be told from a stranger, so it is drawn another
+/// address and asks for its forwards again. A claimed address stays out of
+/// the draw until its claim ends, so every claim must end on its own once no
+/// session holds the address (the deployer's orphan reaper releasing its
+/// mappings).
+///
+/// Asked with the pool's lock held, whenever the pool is about to hand out a
+/// free address: answer cheaply from your own state and never call back into
+/// the pool.
+pub trait AddressClaims: Send + Sync {
+    /// True while something outside the pool still routes traffic to `addr`.
+    fn is_claimed(&self, addr: Ipv4Addr) -> bool;
+}
+
+/// The deployer's [`AddressClaims`], wrapped so the pool keeps its `Debug`.
+struct Claims(Arc<dyn AddressClaims>);
+
+impl std::fmt::Debug for Claims {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AddressClaims")
+    }
 }
 
 /// Caller-supplied unique identifier for a multi-hop connection. The
@@ -331,6 +373,13 @@ pub struct IpAllocator {
     /// `None` until the deployer enables the restart reclaim, and again from
     /// the first reclaim attempt after its window.
     reclaim: Option<RestartReclaim>,
+    /// `None` until the deployer wires [`Self::set_address_claims`].
+    claims: Option<Claims>,
+    /// The key of the last connection that held each address, `None` for a
+    /// keyless one, recorded once claims are wired. A claimed address goes
+    /// back to that key only: whatever still routes to it was left by that
+    /// key's sessions. Bounded by the subnet.
+    last_holder: HashMap<Ipv4Addr, Option<[u8; 32]>>,
 }
 
 impl IpAllocator {
@@ -432,7 +481,16 @@ impl IpAllocator {
             used: Holdings::new(),
             sticky: HashMap::new(),
             reclaim: None,
+            claims: None,
+            last_holder: HashMap::new(),
         })
+    }
+
+    /// Keep every address `claims` names from new sessions (see
+    /// [`AddressClaims`]). Call it once, on a freshly built pool, before
+    /// serving; a later call replaces the earlier claims.
+    pub fn set_address_claims(&mut self, claims: Arc<dyn AddressClaims>) {
+        self.claims = Some(Claims(claims));
     }
 
     /// Let clients take back, by naming them, the `eligible` addresses for
@@ -460,10 +518,13 @@ impl IpAllocator {
 
     /// Record that `conn` now holds `addr`: the single place every
     /// allocation path goes through, so an address handed out to anyone is
-    /// no longer open to the restart reclaim.
+    /// no longer open to the restart reclaim, and its last holder is known.
     fn hold(&mut self, conn: ConnId, addr: Ipv4Addr, owner: Option<[u8; 32]>) {
         if let Some(reclaim) = self.reclaim.as_mut() {
             reclaim.eligible.remove(&addr);
+        }
+        if self.claims.is_some() {
+            self.last_holder.insert(addr, owner);
         }
         self.used.hold(conn, addr, owner);
     }
@@ -482,26 +543,51 @@ impl IpAllocator {
         }
     }
 
-    /// Take `addr` out of the free set. `false` when it is not free (held, or
-    /// not a pool host at all).
-    fn take_free(&mut self, addr: Ipv4Addr) -> bool {
-        match self.free.iter().position(|&a| a == addr) {
-            Some(pos) => {
-                self.free.swap_remove(pos);
-                true
-            }
-            None => false,
+    /// Take `addr` out of the free set for `pubkey`. `false` when it is not
+    /// free (held, or not a pool host at all), or when something still routes
+    /// traffic to it and `pubkey` was not its last holder (see
+    /// [`AddressClaims`]).
+    fn take_free(&mut self, addr: Ipv4Addr, pubkey: &[u8; 32]) -> bool {
+        let Some(pos) = self.free.iter().position(|&a| a == addr) else {
+            return false;
+        };
+        if self.claimed(addr) && !self.last_held_by(addr, pubkey) {
+            return false;
         }
+        self.free.swap_remove(pos);
+        true
     }
 
-    /// Remove and return a uniformly random free host, or `None` when the
-    /// pool is exhausted. O(1): swap-remove at a random index.
+    /// Whether the last connection that held `addr` was authenticated by
+    /// `pubkey`.
+    fn last_held_by(&self, addr: Ipv4Addr, pubkey: &[u8; 32]) -> bool {
+        self.last_holder.get(&addr) == Some(&Some(*pubkey))
+    }
+
+    /// Whether something outside the pool still routes traffic to `addr`
+    /// (see [`AddressClaims`]).
+    fn claimed(&self, addr: Ipv4Addr) -> bool {
+        self.claims
+            .as_ref()
+            .is_some_and(|claims| claims.0.is_claimed(addr))
+    }
+
+    /// Remove and return a uniformly random unclaimed free host, or `None`
+    /// when there is none. A claimed host drawn is swapped past the part of
+    /// `free` still to draw from, so each is asked about once and the first
+    /// unclaimed host drawn is uniform among the unclaimed ones. O(1) when
+    /// nothing is claimed.
     fn pop_random(&mut self) -> Option<Ipv4Addr> {
-        if self.free.is_empty() {
-            return None;
+        let mut undrawn = self.free.len();
+        while undrawn > 0 {
+            let idx = self.rng.bounded(undrawn);
+            if !self.claimed(self.free[idx]) {
+                return Some(self.free.swap_remove(idx));
+            }
+            undrawn -= 1;
+            self.free.swap(idx, undrawn);
         }
-        let idx = self.rng.bounded(self.free.len());
-        Some(self.free.swap_remove(idx))
+        None
     }
 
     /// Allocate an IPv4 for `conn`. Idempotent : if `conn` is already
@@ -612,14 +698,18 @@ impl IpAllocator {
                 return Some(target);
             }
             // Clean-close reconnect: the remembered address is free and
-            // still sticky-bound to this wallet.
-            if self.sticky.get(&pubkey) == Some(&target) && self.take_free(target) {
+            // still sticky-bound to this wallet, or it still carries
+            // forwards a session of this wallet left on it (a second
+            // session, whose address the sticky binding does not follow).
+            let own = self.sticky.get(&pubkey) == Some(&target)
+                || (self.claimed(target) && self.last_held_by(target, &pubkey));
+            if own && self.take_free(target, &pubkey) {
                 self.hold(conn, target, Some(pubkey));
                 return Some(target);
             }
             // Restart reclaim: an eligible address no one was given since
             // the deployer enabled it.
-            if may_reclaim && self.reclaimable(target, now) && self.take_free(target) {
+            if may_reclaim && self.reclaimable(target, now) && self.take_free(target, &pubkey) {
                 self.hold(conn, target, Some(pubkey));
                 self.bind_sticky(pubkey, target);
                 return Some(target);
@@ -631,7 +721,7 @@ impl IpAllocator {
             // client's address and its NAT-PMP window).
         }
         if let Some(preferred) = self.sticky.get(&pubkey).copied() {
-            if self.take_free(preferred) {
+            if self.take_free(preferred, &pubkey) {
                 self.hold(conn, preferred, Some(pubkey));
                 return Some(preferred);
             }
@@ -716,8 +806,9 @@ impl IpAllocator {
         }
     }
 
-    /// Number of host slots currently available for allocation. Useful
-    /// for ops dashboards and exhaustion warnings.
+    /// Number of free host slots, including any the deployer's
+    /// [`AddressClaims`] keep out of the draw for now. Useful for ops
+    /// dashboards and exhaustion warnings.
     #[must_use]
     pub fn free_count(&self) -> usize {
         self.free.len()
@@ -2136,5 +2227,212 @@ mod tests {
                 "an address went back to the free set early or late at step {conn}"
             );
         }
+    }
+
+    /// Stands in for the deployer's port forwards: the addresses they still
+    /// route inbound traffic to.
+    struct Forwards(parking_lot::Mutex<HashSet<Ipv4Addr>>);
+
+    impl Forwards {
+        fn naming(addrs: impl IntoIterator<Item = Ipv4Addr>) -> Arc<Self> {
+            Arc::new(Self(parking_lot::Mutex::new(addrs.into_iter().collect())))
+        }
+
+        fn name(&self, addr: Ipv4Addr) {
+            self.0.lock().insert(addr);
+        }
+
+        fn end(&self, addr: Ipv4Addr) {
+            self.0.lock().remove(&addr);
+        }
+    }
+
+    impl AddressClaims for Forwards {
+        fn is_claimed(&self, addr: Ipv4Addr) -> bool {
+            self.0.lock().contains(&addr)
+        }
+    }
+
+    #[test]
+    fn a_new_session_never_draws_an_address_a_forward_still_names() {
+        // The owner left, its forward outlives it for the reaper's grace: the
+        // address is free again, and whoever the pool draws onto it would
+        // receive the owner's inbound traffic.
+        let mut pool = IpAllocator::with_seed(NET, 29, GW, 0x29).expect("/29 pool builds");
+        let forwards = Forwards::naming([]);
+        pool.set_address_claims(forwards.clone());
+        let owned = pool
+            .allocate_for_pubkey_with_intent(1, [0x01; 32], SessionIntent::Fresh)
+            .expect("the owner's session");
+        forwards.name(owned);
+        pool.release(1);
+
+        for conn in 2..6u64 {
+            let got = if conn % 2 == 0 {
+                pool.allocate_for_pubkey_with_intent(conn, [conn as u8; 32], SessionIntent::Fresh)
+            } else {
+                pool.allocate(conn)
+            }
+            .expect("four other hosts are free");
+            assert_ne!(got, owned, "a forwarded address went to another session");
+        }
+        assert_eq!(
+            pool.allocate_for_pubkey_with_intent(9, [0x09; 32], SessionIntent::Fresh),
+            None,
+            "with only the forwarded address left, the pool is exhausted for everyone else"
+        );
+    }
+
+    #[test]
+    fn the_departed_owner_gets_its_forwarded_address_back_under_its_key() {
+        // The forwards are the owner's own: coming back under the same key,
+        // whatever its placement hint, it keeps them.
+        let mut pool = IpAllocator::with_seed(NET, 24, GW, 0x2A).expect("/24 pool builds");
+        let forwards = Forwards::naming([]);
+        pool.set_address_claims(forwards.clone());
+        let owner = [0x0A; 32];
+        let owned = pool
+            .allocate_for_pubkey_with_intent(1, owner, SessionIntent::Fresh)
+            .expect("the owner's session");
+        forwards.name(owned);
+        pool.release(1);
+
+        for (conn, intent) in [
+            (2, SessionIntent::Legacy),
+            (3, SessionIntent::Fresh),
+            (4, SessionIntent::Join(owned)),
+        ] {
+            let got = pool
+                .allocate_for_pubkey_reclaiming(conn, owner, intent)
+                .expect("the owner reconnects");
+            assert_eq!(got, owned, "{intent:?}: the owner must keep its forwards");
+            pool.release(conn);
+        }
+    }
+
+    #[test]
+    fn a_second_session_of_a_key_takes_its_forwarded_address_back_by_naming_it() {
+        // A wallet runs two sessions; its sticky binding stays with the
+        // first. The second one's forwards are still its own when it
+        // reconnects naming its address.
+        let mut pool = IpAllocator::with_seed(NET, 24, GW, 0x2C).expect("/24 pool builds");
+        let forwards = Forwards::naming([]);
+        pool.set_address_claims(forwards.clone());
+        let wallet = [0x2C; 32];
+        pool.allocate_for_pubkey(1, wallet)
+            .expect("the first session");
+        let second = pool
+            .allocate_for_pubkey_with_intent(2, wallet, SessionIntent::Fresh)
+            .expect("the second session");
+        forwards.name(second);
+        pool.release(2);
+
+        let back = pool
+            .allocate_for_pubkey_with_intent(3, wallet, SessionIntent::Join(second))
+            .expect("the second session reconnects");
+        assert_eq!(back, second, "the second session must keep its forwards");
+    }
+
+    #[test]
+    fn a_restarted_pool_never_hands_back_an_address_a_forward_names() {
+        // Naming an address after a restart proves nothing about having held
+        // it: an address something still routes to stays with its owner.
+        let mut pool = IpAllocator::with_seed(NET, 24, GW, 0x2B).expect("/24 pool builds");
+        let named = Ipv4Addr::new(10, 66, 0, 81);
+        pool.enable_restart_reclaim([named]);
+        pool.set_address_claims(Forwards::naming([named]));
+        let got = pool
+            .allocate_for_pubkey_reclaiming(1, [0x0B; 32], SessionIntent::Join(named))
+            .expect("a redial");
+        assert_ne!(got, named, "a forwarded address must not be handed back");
+    }
+
+    #[test]
+    fn an_address_given_out_without_a_key_stops_being_its_previous_owners() {
+        // A keyless session was drawn onto the address after its previous
+        // owner left, and left forwards of its own on it. The previous owner
+        // coming back must not inherit them.
+        let mut pool = IpAllocator::with_seed(NET, 30, GW, 0x31).expect("/30 pool: one free host");
+        let forwards = Forwards::naming([]);
+        pool.set_address_claims(forwards.clone());
+        let previous_owner = [0x0C; 32];
+        let addr = pool
+            .allocate_for_pubkey(1, previous_owner)
+            .expect("the previous owner's session");
+        pool.release(1);
+        assert_eq!(pool.allocate(2), Some(addr), "the keyless session");
+        forwards.name(addr);
+        pool.release(2);
+
+        assert_eq!(
+            pool.allocate_for_pubkey(3, previous_owner),
+            None,
+            "the keyless session's forwards must not reach the previous owner"
+        );
+    }
+
+    #[test]
+    fn the_draw_among_unforwarded_hosts_stays_random() {
+        // Keeping forwarded addresses out must not turn the draw into a scan
+        // that hands out the same unforwarded host every time.
+        let forwarded: HashSet<Ipv4Addr> = (2..12u8).map(|h| Ipv4Addr::new(10, 66, 0, h)).collect();
+        let unforwarded: HashSet<Ipv4Addr> =
+            (12..31u8).map(|h| Ipv4Addr::new(10, 66, 0, h)).collect();
+        let seeds = 500u64;
+        let mut drawn: HashMap<Ipv4Addr, u64> = HashMap::new();
+        for seed in 0..seeds {
+            let mut pool = IpAllocator::with_seed(NET, 27, GW, seed).expect("/27 pool builds");
+            pool.set_address_claims(Forwards::naming(forwarded.iter().copied()));
+            let got = pool.allocate(1).expect("an unforwarded host");
+            assert!(
+                !forwarded.contains(&got),
+                "seed {seed} drew a forwarded host"
+            );
+            *drawn.entry(got).or_default() += 1;
+        }
+        assert_eq!(
+            drawn.keys().copied().collect::<HashSet<_>>(),
+            unforwarded,
+            "every unforwarded host must be drawable"
+        );
+        // About 26 draws each; a draw that favoured the host after a run of
+        // forwarded ones would give it several times that.
+        let fair_share = seeds / unforwarded.len() as u64;
+        let (host, most) = drawn.iter().max_by_key(|(_, n)| **n).expect("draws");
+        assert!(
+            *most <= 2 * fair_share,
+            "{host} drawn {most} times out of {seeds}: the draw is biased"
+        );
+    }
+
+    #[test]
+    fn addresses_go_back_to_the_draw_once_their_forwards_end() {
+        // Skipping a forwarded host moves it within the free set: none may
+        // be lost on the way.
+        let mut pool = IpAllocator::with_seed(NET, 27, GW, 0x2D).expect("/27 pool builds");
+        let capacity = pool.free_count();
+        let forwarded: Vec<Ipv4Addr> = (2..12u8).map(|h| Ipv4Addr::new(10, 66, 0, h)).collect();
+        let forwards = Forwards::naming(forwarded.iter().copied());
+        pool.set_address_claims(forwards.clone());
+        let mut handed = HashSet::new();
+        let mut conn = 0u64;
+        while let Some(addr) = pool.allocate(conn) {
+            assert!(handed.insert(addr), "{addr} handed out twice");
+            conn += 1;
+        }
+        assert_eq!(handed.len(), capacity - forwarded.len());
+
+        for addr in &forwarded {
+            forwards.end(*addr);
+        }
+        while let Some(addr) = pool.allocate(conn) {
+            assert!(handed.insert(addr), "{addr} handed out twice");
+            conn += 1;
+        }
+        assert_eq!(
+            handed.len(),
+            capacity,
+            "an address whose forward ended must not be lost to the pool"
+        );
     }
 }
