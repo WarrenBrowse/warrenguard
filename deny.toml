@@ -32,13 +32,14 @@ ignore = [
     # `downcast_mut` (verified: zero uses); anyhow is used only for error
     # context/propagation in binaries, so the unsound path is unreachable.
     "RUSTSEC-2026-0190",
-    # rsa 0.10-rc (Marvin timing sidechannel): exploitable only against
-    # variable-time RSA PRIVATE-KEY PKCS#1 v1.5 DECRYPTION of attacker-controlled
-    # ciphertext (a padding oracle). warrenguard-token pulls rsa via
-    # blind-rsa-signatures solely for RFC 9474 RSA blind signatures, which
-    # blind-sign and public-key-verify, never PKCS#1 v1.5 decryption, so the
-    # vulnerable path is not reachable. No fixed rsa release exists (upstream
-    # API rewrite pending). Kept in sync with .cargo/audit.toml.
+    # rsa 0.10.0-rc.18 (Marvin timing side channel, no patched release). The
+    # engine's only private-key use is the RFC 9474 blind-signing issuer: raw
+    # RSA on client-chosen input, with no padding, blinded by a fresh OS-RNG
+    # factor per signature, computed on crypto-bigint's constant-time
+    # arithmetic, and re-verified before release. The open upstream items
+    # (PKCS#1 v1.5 unpadding, implicit rejection, unblinded default decryption)
+    # are not on that path. Analysis, residual risk and when to revisit:
+    # docs/97-BLIND-RSA-ISSUER-TIMING.md. Kept in sync with .cargo/audit.toml.
     "RUSTSEC-2023-0071",
 ]
 
