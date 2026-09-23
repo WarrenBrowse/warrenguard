@@ -134,6 +134,86 @@ pub enum SessionIntentV6<'a> {
     Join(&'a [ConnId]),
 }
 
+/// The live allocations of a pool: the address each connection holds, the
+/// key that authenticated it, and the connections holding each address.
+///
+/// Bonded connections of one session share an address, so "who holds this
+/// address", "does this key hold it" and "is it free again" are asked on
+/// every allocation and release. `by_addr` answers them in time proportional
+/// to that address's own holders, never to every connection on the exit.
+#[derive(Debug)]
+struct Holdings<A> {
+    by_conn: HashMap<ConnId, A>,
+    owners: HashMap<ConnId, [u8; 32]>,
+    by_addr: HashMap<A, Vec<ConnId>>,
+}
+
+impl<A: Copy + Eq + std::hash::Hash> Holdings<A> {
+    fn new() -> Self {
+        Self {
+            by_conn: HashMap::new(),
+            owners: HashMap::new(),
+            by_addr: HashMap::new(),
+        }
+    }
+
+    fn address_of(&self, conn: ConnId) -> Option<A> {
+        self.by_conn.get(&conn).copied()
+    }
+
+    fn owner_of(&self, conn: ConnId) -> Option<&[u8; 32]> {
+        self.owners.get(&conn)
+    }
+
+    /// Records that `conn` holds `addr`, authenticated by `owner` when there
+    /// is one. A connection holds one address: an earlier one is released.
+    fn hold(&mut self, conn: ConnId, addr: A, owner: Option<[u8; 32]>) {
+        if self.by_conn.contains_key(&conn) {
+            self.release(conn);
+        }
+        self.by_conn.insert(conn, addr);
+        self.by_addr.entry(addr).or_default().push(conn);
+        if let Some(owner) = owner {
+            self.owners.insert(conn, owner);
+        }
+    }
+
+    /// Forgets `conn`. Returns the address it held, and whether no connection
+    /// holds that address any more.
+    fn release(&mut self, conn: ConnId) -> Option<(A, bool)> {
+        self.owners.remove(&conn);
+        let addr = self.by_conn.remove(&conn)?;
+        let vacated = self.by_addr.get_mut(&addr).is_none_or(|holders| {
+            holders.retain(|&c| c != conn);
+            holders.is_empty()
+        });
+        if vacated {
+            self.by_addr.remove(&addr);
+        }
+        Some((addr, vacated))
+    }
+
+    fn holders(&self, addr: A) -> &[ConnId] {
+        self.by_addr.get(&addr).map_or(&[], Vec::as_slice)
+    }
+
+    fn is_held(&self, addr: A) -> bool {
+        self.by_addr.contains_key(&addr)
+    }
+
+    /// True when `addr` is held by at least one connection `pubkey`
+    /// authenticated.
+    fn held_by(&self, addr: A, pubkey: &[u8; 32]) -> bool {
+        self.holders(addr)
+            .iter()
+            .any(|c| self.owners.get(c) == Some(pubkey))
+    }
+
+    fn len(&self) -> usize {
+        self.by_conn.len()
+    }
+}
+
 /// Errors returned by [`IpAllocator::new`].
 #[derive(Debug, thiserror::Error)]
 pub enum IpPoolError {
@@ -206,15 +286,16 @@ pub struct IpAllocator {
     gateway: Ipv4Addr,
     /// Free hosts in no meaningful order: allocation swap-removes a random
     /// index, release pushes back. Order carries no information by design.
+    /// Taking a named host back (a sticky or joined address) walks it, a cost
+    /// bounded by the subnet the deployer configures, not by client traffic.
     free: Vec<Ipv4Addr>,
     rng: SplitMix64,
-    used: HashMap<ConnId, Ipv4Addr>,
+    /// Live allocations, with the pubkey that authenticated each (absent for
+    /// the legacy no-pubkey `allocate` path). The owner is what the
+    /// same-pubkey sharing in [`Self::allocate_for_pubkey`] checks: an
+    /// address may only be shared between connections of the SAME identity.
+    used: Holdings<Ipv4Addr>,
     sticky: HashMap<[u8; 32], Ipv4Addr>,
-    /// Pubkey that authenticated each live allocation (absent for the
-    /// legacy no-pubkey `allocate` path). Required by the same-pubkey
-    /// takeover in [`Self::allocate_for_pubkey`]: an address may only
-    /// be transferred between two connections of the SAME identity.
-    owners: HashMap<ConnId, [u8; 32]>,
 }
 
 impl IpAllocator {
@@ -313,9 +394,8 @@ impl IpAllocator {
             gateway,
             free,
             rng: SplitMix64::new(seed),
-            used: HashMap::new(),
+            used: Holdings::new(),
             sticky: HashMap::new(),
-            owners: HashMap::new(),
         })
     }
 
@@ -333,11 +413,11 @@ impl IpAllocator {
     /// in the `used` map, returns the same address without consuming a
     /// fresh entry. Returns `None` when the pool is exhausted.
     pub fn allocate(&mut self, conn: ConnId) -> Option<Ipv4Addr> {
-        if let Some(addr) = self.used.get(&conn).copied() {
+        if let Some(addr) = self.used.address_of(conn) {
             return Some(addr);
         }
         let addr = self.pop_random()?;
-        self.used.insert(conn, addr);
+        self.used.hold(conn, addr, None);
         Some(addr)
     }
 
@@ -368,18 +448,13 @@ impl IpAllocator {
     /// siblings' interface ID, and lets tests observe sharing directly.
     #[must_use]
     pub fn conns_holding(&self, ip: Ipv4Addr) -> Vec<ConnId> {
-        self.used
-            .iter()
-            .filter_map(|(&c, &a)| (a == ip).then_some(c))
-            .collect()
+        self.used.holders(ip).to_vec()
     }
 
     /// True when `ip` is live-held by at least one connection whose
     /// authenticated owner is `pubkey`.
     fn held_by_pubkey(&self, ip: Ipv4Addr, pubkey: &[u8; 32]) -> bool {
-        self.used
-            .iter()
-            .any(|(c, &a)| a == ip && self.owners.get(c) == Some(pubkey))
+        self.used.held_by(ip, pubkey)
     }
 
     /// [`Self::allocate_for_pubkey`] with an explicit session-placement
@@ -394,7 +469,7 @@ impl IpAllocator {
         pubkey: [u8; 32],
         intent: SessionIntent,
     ) -> Option<Ipv4Addr> {
-        if let Some(addr) = self.used.get(&conn).copied() {
+        if let Some(addr) = self.used.address_of(conn) {
             return Some(addr);
         }
         if let SessionIntent::Join(target) = intent {
@@ -402,8 +477,7 @@ impl IpAllocator {
             // authenticated key of its current holders authorizes it
             // (bonded secondary, overlap or fast reconnect of that session).
             if self.held_by_pubkey(target, &pubkey) {
-                self.used.insert(conn, target);
-                self.owners.insert(conn, pubkey);
+                self.used.hold(conn, target, Some(pubkey));
                 return Some(target);
             }
             // Clean-close reconnect: the remembered address is free and
@@ -412,8 +486,7 @@ impl IpAllocator {
                 && let Some(pos) = self.free.iter().position(|&a| a == target)
             {
                 self.free.swap_remove(pos);
-                self.used.insert(conn, target);
-                self.owners.insert(conn, pubkey);
+                self.used.hold(conn, target, Some(pubkey));
                 return Some(target);
             }
             // Stale or foreign target: degrade to Fresh below. Never to
@@ -424,8 +497,7 @@ impl IpAllocator {
         if let Some(preferred) = self.sticky.get(&pubkey).copied() {
             if let Some(pos) = self.free.iter().position(|&a| a == preferred) {
                 self.free.swap_remove(pos);
-                self.used.insert(conn, preferred);
-                self.owners.insert(conn, pubkey);
+                self.used.hold(conn, preferred, Some(pubkey));
                 return Some(preferred);
             }
             // Same-pubkey SHARING, hint-less requests only: the sticky
@@ -450,14 +522,12 @@ impl IpAllocator {
             // session gets its own address so the downlink route key never
             // spans two live sessions.
             if matches!(intent, SessionIntent::Legacy) && self.held_by_pubkey(preferred, &pubkey) {
-                self.used.insert(conn, preferred);
-                self.owners.insert(conn, pubkey);
+                self.used.hold(conn, preferred, Some(pubkey));
                 return Some(preferred);
             }
         }
         let addr = self.pop_random()?;
-        self.used.insert(conn, addr);
-        self.owners.insert(conn, pubkey);
+        self.used.hold(conn, addr, Some(pubkey));
         // Self-cleaning: when recycling an
         // address that another pubkey previously held a sticky binding
         // for, drop the stale binding so the sticky map never holds
@@ -496,18 +566,15 @@ impl IpAllocator {
     /// draws a random host, so a freshly-reconnected client does not
     /// deterministically land on the exact same address.
     pub fn release(&mut self, conn: ConnId) {
-        if let Some(addr) = self.used.remove(&conn) {
-            // Refcounted: only return the address to the free pool when
-            // NO other connection still holds it. Bonded multi-connection
-            // sessions (and a reconnect overlapping its predecessor)
-            // share one inner IP across several `used` entries; pushing
-            // it to `free` while a sibling still uses it would let the
-            // allocator re-hand it to a DIFFERENT identity = collision.
-            if !self.used.values().any(|&held| held == addr) {
-                self.free.push(addr);
-            }
+        // Refcounted: only return the address to the free pool when
+        // NO other connection still holds it. Bonded multi-connection
+        // sessions (and a reconnect overlapping its predecessor)
+        // share one inner IP across several `used` entries; pushing
+        // it to `free` while a sibling still uses it would let the
+        // allocator re-hand it to a DIFFERENT identity = collision.
+        if let Some((addr, true)) = self.used.release(conn) {
+            self.free.push(addr);
         }
-        self.owners.remove(&conn);
     }
 
     /// Number of host slots currently available for allocation. Useful
@@ -584,11 +651,10 @@ pub struct IpAllocatorV6 {
     rng: SplitMix64,
     /// Offsets returned by `release`, reused before drawing a fresh one.
     recycled: Vec<u64>,
-    used: HashMap<ConnId, u64>,
+    /// Live allocations and the pubkey behind each, mirror of
+    /// [`IpAllocator::used`].
+    used: Holdings<u64>,
     sticky: HashMap<[u8; 32], u64>,
-    /// Pubkey behind each live allocation; same-pubkey takeover guard,
-    /// mirrors [`IpAllocator::owners`].
-    owners: HashMap<ConnId, [u8; 32]>,
 }
 
 impl IpAllocatorV6 {
@@ -615,9 +681,8 @@ impl IpAllocatorV6 {
             gateway,
             rng: SplitMix64::new(seed),
             recycled: Vec::new(),
-            used: HashMap::new(),
+            used: Holdings::new(),
             sticky: HashMap::new(),
-            owners: HashMap::new(),
         }
     }
 
@@ -642,7 +707,7 @@ impl IpAllocatorV6 {
             if offset < 2 {
                 continue;
             }
-            if self.used.values().any(|&o| o == offset) {
+            if self.used.is_held(offset) {
                 continue;
             }
             return Some(offset);
@@ -653,11 +718,11 @@ impl IpAllocatorV6 {
     /// Allocate an IPv6 for `conn`. Idempotent on a known `ConnId`
     /// (returns the same address without consuming a fresh offset).
     pub fn allocate(&mut self, conn: ConnId) -> Option<Ipv6Addr> {
-        if let Some(&offset) = self.used.get(&conn) {
+        if let Some(offset) = self.used.address_of(conn) {
             return Some(self.addr_of(offset));
         }
         let offset = self.pop_offset()?;
-        self.used.insert(conn, offset);
+        self.used.hold(conn, offset, None);
         Some(self.addr_of(offset))
     }
 
@@ -683,7 +748,7 @@ impl IpAllocatorV6 {
         pubkey: [u8; 32],
         intent: SessionIntentV6<'_>,
     ) -> Option<Ipv6Addr> {
-        if let Some(&offset) = self.used.get(&conn) {
+        if let Some(offset) = self.used.address_of(conn) {
             return Some(self.addr_of(offset));
         }
         if let SessionIntentV6::Join(siblings) = intent {
@@ -691,22 +756,20 @@ impl IpAllocatorV6 {
             // interface ID a same-key sibling connection holds. A sibling
             // owned by another key is never joined; no usable sibling
             // degrades to Fresh below.
-            let shared = siblings.iter().find_map(|c| {
-                (self.owners.get(c) == Some(&pubkey))
-                    .then(|| self.used.get(c).copied())
+            let shared = siblings.iter().find_map(|&c| {
+                (self.used.owner_of(c) == Some(&pubkey))
+                    .then(|| self.used.address_of(c))
                     .flatten()
             });
             if let Some(offset) = shared {
-                self.used.insert(conn, offset);
-                self.owners.insert(conn, pubkey);
+                self.used.hold(conn, offset, Some(pubkey));
                 return Some(self.addr_of(offset));
             }
         }
         if let Some(&preferred) = self.sticky.get(&pubkey) {
             if let Some(pos) = self.recycled.iter().position(|&o| o == preferred) {
                 self.recycled.swap_remove(pos);
-                self.used.insert(conn, preferred);
-                self.owners.insert(conn, pubkey);
+                self.used.hold(conn, preferred, Some(pubkey));
                 return Some(self.addr_of(preferred));
             }
             // Same-pubkey SHARING, hint-less requests only, mirror of the
@@ -720,14 +783,12 @@ impl IpAllocatorV6 {
             // interface ID.
             if matches!(intent, SessionIntentV6::Legacy) && self.held_by_pubkey(preferred, &pubkey)
             {
-                self.used.insert(conn, preferred);
-                self.owners.insert(conn, pubkey);
+                self.used.hold(conn, preferred, Some(pubkey));
                 return Some(self.addr_of(preferred));
             }
         }
         let offset = self.pop_offset()?;
-        self.used.insert(conn, offset);
-        self.owners.insert(conn, pubkey);
+        self.used.hold(conn, offset, Some(pubkey));
         // Self-cleaning (mirror of the v4 allocator): if the minted
         // offset was sticky-bound to a *different* pubkey, drop that
         // stale binding so `sticky.len()` never exceeds the count of
@@ -757,9 +818,7 @@ impl IpAllocatorV6 {
     /// True when `offset` is live-held by at least one connection whose
     /// authenticated owner is `pubkey`.
     fn held_by_pubkey(&self, offset: u64, pubkey: &[u8; 32]) -> bool {
-        self.used
-            .iter()
-            .any(|(c, &o)| o == offset && self.owners.get(c) == Some(pubkey))
+        self.used.held_by(offset, pubkey)
     }
 
     /// Release a previously-allocated address. Idempotent on unknown
@@ -768,16 +827,13 @@ impl IpAllocatorV6 {
     /// deterministically reuse it), and the sticky binding is
     /// intentionally kept alive for a future reconnect of the same pubkey.
     pub fn release(&mut self, conn: ConnId) {
-        if let Some(offset) = self.used.remove(&conn) {
-            // Refcounted (mirror of the v4 allocator): only recycle the
-            // interface ID once no other connection still holds it, so a
-            // bonded sibling sharing the offset never has it recycled out
-            // from under it.
-            if !self.used.values().any(|&held| held == offset) {
-                self.recycled.push(offset);
-            }
+        // Refcounted (mirror of the v4 allocator): only recycle the
+        // interface ID once no other connection still holds it, so a
+        // bonded sibling sharing the offset never has it recycled out
+        // from under it.
+        if let Some((offset, true)) = self.used.release(conn) {
+            self.recycled.push(offset);
         }
-        self.owners.remove(&conn);
     }
 
     /// Number of interface IDs currently held by live connections.
@@ -1718,5 +1774,71 @@ mod tests {
             "the v6 sticky binding must stay with the incumbent session"
         );
         assert_ne!(legacy_reconnect, second);
+    }
+
+    /// Random churn of bonded sessions, fresh sessions, joins, anonymous
+    /// allocations and releases, checked after every step against a model
+    /// that remembers only which connection holds which address. The pool's
+    /// per-address bookkeeping must agree with it at every step: who holds an
+    /// address, and whether it went back to the free set exactly when its
+    /// last holder left.
+    #[test]
+    fn per_address_holders_follow_the_connections_through_churn() {
+        use std::collections::BTreeSet;
+
+        let net = Ipv4Addr::new(10, 66, 0, 0);
+        let gw = Ipv4Addr::new(10, 66, 0, 1);
+        let mut pool = IpAllocator::with_seed(net, 28, gw, 7).expect("/28 pool builds");
+        let capacity = pool.free_count();
+        let mut rng = SplitMix64::new(0xC0FF_EE00);
+        let mut model: HashMap<ConnId, Ipv4Addr> = HashMap::new();
+        let keys = [[0x11; 32], [0x22; 32], [0x33; 32]];
+
+        for (step, conn) in (0..2_000u64).enumerate() {
+            let live: Vec<ConnId> = model.keys().copied().collect();
+            match rng.bounded(6) {
+                0 | 1 if !live.is_empty() => {
+                    let victim = live[rng.bounded(live.len())];
+                    pool.release(victim);
+                    model.remove(&victim);
+                }
+                2 => {
+                    if let Some(addr) = pool.allocate(conn) {
+                        model.insert(conn, addr);
+                    }
+                }
+                choice => {
+                    let key = keys[rng.bounded(keys.len())];
+                    let intent = match (choice, live.is_empty()) {
+                        (3, false) => SessionIntent::Join(model[&live[rng.bounded(live.len())]]),
+                        (4, _) => SessionIntent::Fresh,
+                        _ => SessionIntent::Legacy,
+                    };
+                    if let Some(addr) = pool.allocate_for_pubkey_with_intent(conn, key, intent) {
+                        model.insert(conn, addr);
+                    }
+                }
+            }
+
+            let mut held: HashMap<Ipv4Addr, BTreeSet<ConnId>> = HashMap::new();
+            for (&c, &a) in &model {
+                held.entry(a).or_default().insert(c);
+            }
+            for host in 2..15u8 {
+                let addr = Ipv4Addr::new(10, 66, 0, host);
+                let holders: BTreeSet<ConnId> = pool.conns_holding(addr).into_iter().collect();
+                assert_eq!(
+                    holders,
+                    held.get(&addr).cloned().unwrap_or_default(),
+                    "holders of {addr} diverged at step {step}"
+                );
+            }
+            assert_eq!(pool.used_count(), model.len(), "step {step}");
+            assert_eq!(
+                pool.free_count(),
+                capacity - held.len(),
+                "an address went back to the free set early or late at step {step}"
+            );
+        }
     }
 }
