@@ -28,7 +28,7 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 hex = { workspace = true }
-governor = { workspace = true }
+warrenguard-ratelimit = { path = "../warrenguard-ratelimit" }
 
 # Global allocator, matching the relay/exit binaries: the proxy sits on the
 # API access-method hot path and forwards every byte of the client's TLS

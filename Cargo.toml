@@ -84,7 +84,6 @@ toml = "0.8"
 
 # HTTP (the eDNS proxy admission surface)
 axum = "0.8"
-governor = "0.10"
 
 # Observability
 tracing = "0.1"
