@@ -21,6 +21,7 @@
 
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
@@ -30,7 +31,14 @@ use parking_lot::RwLock;
 /// [`ConnectionRateLimiter::retain_active`]. Mirrors the nonce-store hard cap
 /// elsewhere. When the map is full of genuinely-active keys, a brand-new key
 /// is refused (fail-closed) rather than admitted at the cost of unbounded RAM.
-const MAX_TRACKED_KEYS: usize = 1_000_000;
+const MAX_TRACKED_KEYS: NonZeroUsize = NonZeroUsize::new(1_000_000).unwrap();
+
+/// Minimum gap between two reclaim walks of a full map. The walk is O(n)
+/// under the write lock that every connection attempt takes; without this
+/// gap, a flood of new keys holding the map at its cap (the key is a source
+/// address, which a deployer may read before any address validation) would
+/// buy one full walk per attempt and stall every accept behind it.
+const RECLAIM_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 struct State {
@@ -48,7 +56,15 @@ struct State {
 pub struct ConnectionRateLimiter<K: Eq + Hash + Clone> {
     burst: u32,
     refill_interval: Duration,
-    state: RwLock<HashMap<K, State>>,
+    max_tracked: usize,
+    state: RwLock<Tracked<K>>,
+}
+
+#[derive(Debug)]
+struct Tracked<K> {
+    keys: HashMap<K, State>,
+    /// When the last reclaim walk ran, see [`RECLAIM_MIN_INTERVAL`].
+    last_reclaim: Option<Instant>,
 }
 
 impl<K: Eq + Hash + Clone> ConnectionRateLimiter<K> {
@@ -61,6 +77,21 @@ impl<K: Eq + Hash + Clone> ConnectionRateLimiter<K> {
     /// produce nonsensical limits.
     #[must_use]
     pub fn new(burst: u32, refill_interval: Duration) -> Self {
+        Self::with_max_tracked(burst, refill_interval, MAX_TRACKED_KEYS)
+    }
+
+    /// Same as [`Self::new`] with a tighter cap than the default backstop on
+    /// the number of tracked keys.
+    ///
+    /// # Panics
+    ///
+    /// Same conditions as [`Self::new`].
+    #[must_use]
+    pub fn with_max_tracked(
+        burst: u32,
+        refill_interval: Duration,
+        max_tracked: NonZeroUsize,
+    ) -> Self {
         assert!(burst > 0, "ConnectionRateLimiter burst must be > 0");
         assert!(
             !refill_interval.is_zero(),
@@ -69,7 +100,11 @@ impl<K: Eq + Hash + Clone> ConnectionRateLimiter<K> {
         Self {
             burst,
             refill_interval,
-            state: RwLock::new(HashMap::new()),
+            max_tracked: max_tracked.get(),
+            state: RwLock::new(Tracked {
+                keys: HashMap::new(),
+                last_reclaim: None,
+            }),
         }
     }
 
@@ -83,19 +118,28 @@ impl<K: Eq + Hash + Clone> ConnectionRateLimiter<K> {
     /// deterministic tests that drive the clock manually.
     pub fn try_acquire_at(&self, key: &K, now: Instant) -> bool {
         let mut w = self.state.write();
+        let tracked = &mut *w;
         // Memory backstop: only relevant when inserting a brand-new key at the
         // cap. First drop entries idle long enough to have fully refilled to
-        // baseline (lossless: a forgotten key re-inits to a full bucket). If
-        // the map is still saturated by actively-limited keys, refuse the new
-        // key rather than grow unbounded.
-        if !w.contains_key(key) && w.len() >= MAX_TRACKED_KEYS {
-            let full_recovery = self.refill_interval.saturating_mul(self.burst);
-            w.retain(|_, st| now.saturating_duration_since(st.last_refill) < full_recovery);
-            if w.len() >= MAX_TRACKED_KEYS {
+        // baseline (lossless: a forgotten key re-inits to a full bucket), at
+        // most once per RECLAIM_MIN_INTERVAL. If the map is still saturated by
+        // actively-limited keys, refuse the new key rather than grow unbounded.
+        if !tracked.keys.contains_key(key) && tracked.keys.len() >= self.max_tracked {
+            let walk_due = tracked
+                .last_reclaim
+                .is_none_or(|t| now.saturating_duration_since(t) >= RECLAIM_MIN_INTERVAL);
+            if walk_due {
+                tracked.last_reclaim = Some(now);
+                let full_recovery = self.refill_interval.saturating_mul(self.burst);
+                tracked
+                    .keys
+                    .retain(|_, st| now.saturating_duration_since(st.last_refill) < full_recovery);
+            }
+            if tracked.keys.len() >= self.max_tracked {
                 return false;
             }
         }
-        let entry = w.entry(key.clone()).or_insert(State {
+        let entry = tracked.keys.entry(key.clone()).or_insert(State {
             tokens: self.burst,
             last_refill: now,
         });
@@ -129,7 +173,7 @@ impl<K: Eq + Hash + Clone> ConnectionRateLimiter<K> {
     /// Number of tracked keys. Useful for metrics + tests.
     #[must_use]
     pub fn tracked_count(&self) -> usize {
-        self.state.read().len()
+        self.state.read().keys.len()
     }
 
     /// Garbage-collects state entries whose `last_refill` is older than `idle`
@@ -137,7 +181,8 @@ impl<K: Eq + Hash + Clone> ConnectionRateLimiter<K> {
     /// unbounded map for ephemeral subscribers.
     pub fn retain_active(&self, idle: Duration, now: Instant) {
         let mut w = self.state.write();
-        w.retain(|_, st| now.saturating_duration_since(st.last_refill) < idle);
+        w.keys
+            .retain(|_, st| now.saturating_duration_since(st.last_refill) < idle);
     }
 }
 
@@ -221,6 +266,62 @@ mod tests {
         assert_eq!(lim.tracked_count(), 2);
         // GC entries idle more than 45s before t0 + 60s (= alice only).
         lim.retain_active(Duration::from_secs(45), t0 + Duration::from_secs(60));
+        assert_eq!(lim.tracked_count(), 1);
+    }
+
+    fn capped(max: usize) -> ConnectionRateLimiter<&'static str> {
+        // One token per 10 ms: a key idle 10 ms is fully recovered.
+        ConnectionRateLimiter::with_max_tracked(
+            1,
+            Duration::from_millis(10),
+            NonZeroUsize::new(max).expect("non-zero cap"),
+        )
+    }
+
+    #[test]
+    fn a_new_key_at_the_cap_is_refused_while_every_tracked_key_is_active() {
+        let lim = capped(2);
+        let t0 = Instant::now();
+        assert!(lim.try_acquire_at(&"alice", t0));
+        assert!(lim.try_acquire_at(&"bob", t0));
+        assert!(!lim.try_acquire_at(&"carol", t0));
+        assert_eq!(lim.tracked_count(), 2, "the refused key is not tracked");
+        // Alice kept her (drained) bucket: nobody was evicted for Carol.
+        assert!(!lim.try_acquire_at(&"alice", t0));
+    }
+
+    #[test]
+    fn a_new_key_at_the_cap_reclaims_fully_recovered_keys() {
+        let lim = capped(2);
+        let t0 = Instant::now();
+        assert!(lim.try_acquire_at(&"alice", t0));
+        assert!(lim.try_acquire_at(&"bob", t0));
+        let recovered = t0 + Duration::from_millis(20);
+        assert!(lim.try_acquire_at(&"carol", recovered));
+        assert_eq!(lim.tracked_count(), 1, "the recovered keys were dropped");
+    }
+
+    /// The reclaim walks the whole map under the write lock. A flood of new
+    /// keys at the cap must not buy one walk per attempt: after a walk, new
+    /// keys are refused in O(1) until the reclaim interval has passed, even
+    /// if entries became reclaimable in between.
+    #[test]
+    fn the_reclaim_walk_runs_at_most_once_per_interval() {
+        let lim = capped(2);
+        let t0 = Instant::now();
+        assert!(lim.try_acquire_at(&"alice", t0));
+        assert!(lim.try_acquire_at(&"bob", t0));
+        assert!(!lim.try_acquire_at(&"carol", t0), "nothing to reclaim yet");
+
+        let recovered = t0 + Duration::from_millis(20);
+        assert!(
+            !lim.try_acquire_at(&"dave", recovered),
+            "no second walk within the reclaim interval"
+        );
+        assert_eq!(lim.tracked_count(), 2);
+
+        let next_walk = t0 + RECLAIM_MIN_INTERVAL;
+        assert!(lim.try_acquire_at(&"erin", next_walk));
         assert_eq!(lim.tracked_count(), 1);
     }
 
