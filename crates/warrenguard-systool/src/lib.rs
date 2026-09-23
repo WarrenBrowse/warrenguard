@@ -11,9 +11,13 @@
 //!
 //! [`SystemTool`] resolves every tool from fixed system locations instead: the
 //! root-owned directories in [`TRUSTED_DIRS`] on Unix, and the directory
-//! `GetSystemDirectoryW` reports on Windows. On Unix, a [`Command`] built here
-//! also runs with [`TRUSTED_PATH`] as its own `PATH`, so a tool that starts
-//! another program by name (a `sh -c` pipeline) resolves it the same way.
+//! `GetSystemDirectoryW` reports on Windows. A [`Command`] built here also
+//! gets the search paths the tool itself uses from the system rather than from
+//! the launcher: [`TRUSTED_PATH`] as its `PATH` on Unix, so a tool that starts
+//! another program by name resolves it the same way; on Windows, the system's
+//! own `PATH` and PowerShell module path, since Windows PowerShell loads the
+//! module behind each firewall or DNS cmdlet from the first `PSModulePath`
+//! directory that has one.
 //!
 //! The workspace `clippy.toml` refuses `Command::new` everywhere else, so a new
 //! spawn site cannot bypass this crate by accident.
@@ -111,8 +115,8 @@ impl SystemTool {
         imp::locate(self)
     }
 
-    /// A [`Command`] that runs this tool from [`Self::path`]. On Unix its `PATH`
-    /// is [`TRUSTED_PATH`].
+    /// A [`Command`] that runs this tool from [`Self::path`], with the search
+    /// paths described in the crate documentation.
     ///
     /// # Errors
     ///
@@ -124,7 +128,7 @@ impl SystemTool {
             reason = "the one place a resolved absolute tool path becomes a Command"
         )]
         let mut command = Command::new(path);
-        imp::restrict_search_path(&mut command);
+        imp::pin_search_paths(&mut command)?;
         Ok(command)
     }
 
@@ -142,6 +146,7 @@ impl SystemTool {
 /// The source of the [`io::ErrorKind::NotFound`] error [`SystemTool::path`]
 /// returns for a tool this host does not have.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ToolNotFound(pub SystemTool);
 
 impl fmt::Display for ToolNotFound {
@@ -169,8 +174,9 @@ mod imp {
 
     use super::{SystemTool, TRUSTED_DIRS, TRUSTED_PATH, not_found};
 
-    pub(crate) fn restrict_search_path(command: &mut Command) {
+    pub(crate) fn pin_search_paths(command: &mut Command) -> io::Result<()> {
         command.env("PATH", TRUSTED_PATH);
+        Ok(())
     }
 
     pub(crate) fn locate(tool: SystemTool) -> io::Result<PathBuf> {
@@ -195,23 +201,42 @@ mod imp {
     use std::ffi::OsString;
     use std::io;
     use std::os::windows::ffi::OsStringExt as _;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
 
     use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 
     use super::{SystemTool, not_found};
 
-    /// PowerShell finds cmdlets through its module path, not `PATH`, and the
-    /// tools this crate starts on Windows start nothing by name.
-    pub(crate) fn restrict_search_path(_command: &mut Command) {}
+    /// The only directory Windows PowerShell may load a module from.
+    const POWERSHELL_HOME: &str = r"WindowsPowerShell\v1.0";
+
+    /// Gives the child the system's own `PATH`, `PSModulePath`, `SystemRoot`
+    /// and `windir`, all derived from the System32 directory the kernel
+    /// reports, so none of them is the launcher's.
+    pub(crate) fn pin_search_paths(command: &mut Command) -> io::Result<()> {
+        let system = system_directory()?;
+        let windows = system
+            .parent()
+            .map_or_else(|| system.clone(), Path::to_path_buf);
+        let powershell_home = system.join(POWERSHELL_HOME);
+        let path = std::env::join_paths([&system, &windows, &powershell_home])
+            .map_err(io::Error::other)?;
+        command
+            .env("PATH", path)
+            .env("PSModulePath", powershell_home.join("Modules"))
+            .env("SystemRoot", &windows)
+            .env("windir", &windows);
+        Ok(())
+    }
 
     pub(crate) fn locate(tool: SystemTool) -> io::Result<PathBuf> {
-        let relative = match tool {
-            SystemTool::PowerShell => r"WindowsPowerShell\v1.0\powershell.exe",
-            _ => return Err(not_found(tool)),
-        };
-        let path = system_directory()?.join(relative);
+        if tool != SystemTool::PowerShell {
+            return Err(not_found(tool));
+        }
+        let path = system_directory()?
+            .join(POWERSHELL_HOME)
+            .join("powershell.exe");
         if path.is_file() {
             Ok(path)
         } else {
@@ -252,7 +277,9 @@ mod imp {
 
     use super::{SystemTool, not_found};
 
-    pub(crate) fn restrict_search_path(_command: &mut Command) {}
+    pub(crate) fn pin_search_paths(_command: &mut Command) -> io::Result<()> {
+        Ok(())
+    }
 
     pub(crate) fn locate(tool: SystemTool) -> io::Result<PathBuf> {
         Err(not_found(tool))
@@ -295,6 +322,11 @@ mod tests {
     }
 
     #[test]
+    fn the_trusted_path_lists_the_trusted_directories() {
+        assert_eq!(TRUSTED_PATH, TRUSTED_DIRS.join(":"));
+    }
+
+    #[test]
     fn a_started_tool_sees_only_the_trusted_path() {
         let out = SystemTool::Sh
             .command()
@@ -319,7 +351,31 @@ mod tests {
             .expect("every supported Windows ships Windows PowerShell");
 
         assert!(path.is_absolute());
-        assert!(path.ends_with(r"System32\WindowsPowerShell\v1.0\powershell.exe"));
+        assert!(path.ends_with(r"WindowsPowerShell\v1.0\powershell.exe"));
+        // The kernel reports `system32` in whatever case the install uses.
+        let system = path.ancestors().nth(3).and_then(std::path::Path::file_name);
+        assert!(
+            system.is_some_and(|name| name.eq_ignore_ascii_case("system32")),
+            "{}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn powershell_loads_modules_from_the_system_directory_first() {
+        let out = SystemTool::PowerShell
+            .command()
+            .expect("powershell resolves")
+            .args(["-NoProfile", "-Command", "$env:PSModulePath"])
+            .output()
+            .expect("powershell runs");
+
+        let module_path = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
+        let first = module_path.trim().split(';').next().unwrap_or_default();
+        assert!(
+            first.ends_with(r"\system32\windowspowershell\v1.0\modules"),
+            "{module_path}"
+        );
     }
 
     #[test]
