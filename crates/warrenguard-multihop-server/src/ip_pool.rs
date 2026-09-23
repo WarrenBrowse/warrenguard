@@ -166,11 +166,14 @@ impl<A: Copy + Eq + std::hash::Hash> Holdings<A> {
     }
 
     /// Records that `conn` holds `addr`, authenticated by `owner` when there
-    /// is one. A connection holds one address: an earlier one is released.
+    /// is one. `conn` holds nothing yet: every allocation path answers a
+    /// known connection with the address it already holds before it gets
+    /// here.
     fn hold(&mut self, conn: ConnId, addr: A, owner: Option<[u8; 32]>) {
-        if self.by_conn.contains_key(&conn) {
-            self.release(conn);
-        }
+        debug_assert!(
+            !self.by_conn.contains_key(&conn),
+            "a connection holds one address"
+        );
         self.by_conn.insert(conn, addr);
         self.by_addr.entry(addr).or_default().push(conn);
         if let Some(owner) = owner {
@@ -1794,7 +1797,7 @@ mod tests {
         let mut model: HashMap<ConnId, Ipv4Addr> = HashMap::new();
         let keys = [[0x11; 32], [0x22; 32], [0x33; 32]];
 
-        for (step, conn) in (0..2_000u64).enumerate() {
+        for conn in 0..2_000u64 {
             let live: Vec<ConnId> = model.keys().copied().collect();
             match rng.bounded(6) {
                 0 | 1 if !live.is_empty() => {
@@ -1830,14 +1833,14 @@ mod tests {
                 assert_eq!(
                     holders,
                     held.get(&addr).cloned().unwrap_or_default(),
-                    "holders of {addr} diverged at step {step}"
+                    "holders of {addr} diverged at step {conn}"
                 );
             }
-            assert_eq!(pool.used_count(), model.len(), "step {step}");
+            assert_eq!(pool.used_count(), model.len(), "step {conn}");
             assert_eq!(
                 pool.free_count(),
                 capacity - held.len(),
-                "an address went back to the free set early or late at step {step}"
+                "an address went back to the free set early or late at step {conn}"
             );
         }
     }
