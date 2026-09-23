@@ -256,6 +256,7 @@ pub trait NftExecutor: Send + Sync {
 pub struct NftablesBackend<E> {
     allocator: Arc<Allocator>,
     runner: Arc<E>,
+    operations: Arc<tokio::sync::Mutex<()>>,
     table: String,
     chain: String,
     portfail_guard: Option<PortFailGuard>,
@@ -434,6 +435,7 @@ impl<E: NftExecutor + 'static> NftablesBackend<E> {
         Ok(Self {
             allocator: Arc::new(Allocator::new()),
             runner,
+            operations: Arc::new(tokio::sync::Mutex::new(())),
             table: table.to_string(),
             chain: chain.to_string(),
             portfail_guard,
@@ -504,9 +506,11 @@ impl<E: NftExecutor + 'static> NftablesBackend<E> {
     ) -> impl Future<Output = Result<Allocation, NatPmpError>> + Send {
         let allocator = Arc::clone(&self.allocator);
         let runner = Arc::clone(&self.runner);
+        let operations = Arc::clone(&self.operations);
         let table = self.table.clone();
         let lifetime_secs = u32::try_from(lifetime.as_secs()).unwrap_or(u32::MAX);
         async move {
+            let _operation = operations.lock().await;
             // 1. Reserve a port in the Allocator (abuse mitigations
             // applied). `allocate_at_collecting` also surfaces every
             // entry it removed as a side effect: expired mappings
@@ -578,7 +582,17 @@ impl<E: NftExecutor + 'static> NftablesBackend<E> {
                 dnat_port,
             );
             if let Err(stderr) = runner.run_script(&script).await {
-                allocator.release(&alloc);
+                // A timed-out nft process may have applied the add before its
+                // result was lost. Remove that possible rule before freeing the
+                // port for another client.
+                let cleanup = render_delete_element(&table, proto, alloc.external_port);
+                if runner.run_script(&cleanup).await.is_ok() {
+                    allocator.release(&alloc);
+                } else {
+                    tracing::error!(
+                        "uncertain nft add could not be cleaned up; port remains reserved"
+                    );
+                }
                 return Err(NatPmpError::Backend(stderr));
             }
             Ok(alloc)
@@ -608,17 +622,21 @@ impl<E: NftExecutor + 'static> PortForwardingBackend for NftablesBackend<E> {
     fn release(&self, alloc: &Allocation) -> impl Future<Output = Result<(), NatPmpError>> + Send {
         let allocator = Arc::clone(&self.allocator);
         let runner = Arc::clone(&self.runner);
+        let operations = Arc::clone(&self.operations);
         let table = self.table.clone();
         let alloc = alloc.clone();
         async move {
-            // The allocator is idempotent best-effort on release -
-            // call nft first (its error is the most interesting one
-            // to log), then release in the allocator even on nft
-            // failure so the pool is not blocked.
+            let _operation = operations.lock().await;
+            // Keep the port reserved until the kernel rule is gone. Releasing
+            // RAM after a failed delete could hand a still-forwarded port to
+            // another client.
             let script = render_delete_element(&table, alloc.proto, alloc.external_port);
-            let nft_res = runner.run_script(&script).await;
+            runner
+                .run_script(&script)
+                .await
+                .map_err(NatPmpError::Backend)?;
             allocator.release(&alloc);
-            nft_res.map_err(NatPmpError::Backend)
+            Ok(())
         }
     }
 
@@ -627,30 +645,27 @@ impl<E: NftExecutor + 'static> PortForwardingBackend for NftablesBackend<E> {
         client_ip: Ipv4Addr,
         internal_port: u16,
         proto: Proto,
-    ) -> impl Future<Output = bool> + Send {
+    ) -> impl Future<Output = Result<bool, NatPmpError>> + Send {
         let allocator = Arc::clone(&self.allocator);
         let runner = Arc::clone(&self.runner);
+        let operations = Arc::clone(&self.operations);
         let table = self.table.clone();
         async move {
-            // 1. Lookup + release in the Allocator by (client_ip,
-            // internal_port, proto). Recover the real `external_port`
-            // for the delete script.
-            let Some(alloc) = allocator.release_by_client(client_ip, internal_port, proto) else {
-                return false;
+            let _operation = operations.lock().await;
+            let Some(alloc) = allocator.snapshot_active().into_iter().find(|alloc| {
+                alloc.internal_ip == client_ip
+                    && alloc.internal_port == internal_port
+                    && alloc.proto == proto
+            }) else {
+                return Ok(false);
             };
-            // 2. Emit the delete element for the resolved
-            // external_port. The error is logged but we return `true`
-            // (the RAM pool is freed; a kernel drift will be cleaned
-            // up on the next setup or reload).
             let script = render_delete_element(&table, proto, alloc.external_port);
-            if let Err(stderr) = runner.run_script(&script).await {
-                tracing::warn!(
-                    error = %stderr,
-                    external_port = alloc.external_port,
-                    "nft delete element failed"
-                );
-            }
-            true
+            runner
+                .run_script(&script)
+                .await
+                .map_err(NatPmpError::Backend)?;
+            allocator.release(&alloc);
+            Ok(true)
         }
     }
 
@@ -661,8 +676,10 @@ impl<E: NftExecutor + 'static> PortForwardingBackend for NftablesBackend<E> {
     fn restore(&self, entries: Vec<Allocation>) -> impl Future<Output = Vec<Allocation>> + Send {
         let allocator = Arc::clone(&self.allocator);
         let runner = Arc::clone(&self.runner);
+        let operations = Arc::clone(&self.operations);
         let table = self.table.clone();
         async move {
+            let _operation = operations.lock().await;
             let mut live = Vec::new();
             for alloc in allocator.restore(entries) {
                 // Same port-0 forwarding fallback as `allocate_at`: the
@@ -708,6 +725,9 @@ impl<E: NftExecutor + 'static> PortForwardingBackend for NftablesBackend<E> {
 pub struct ShellNftExecutor;
 
 #[cfg(target_os = "linux")]
+const NFT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[cfg(target_os = "linux")]
 impl ShellNftExecutor {
     /// Builds an executor; consumes no resources until the first
     /// `run_script` call.
@@ -727,40 +747,67 @@ impl Default for ShellNftExecutor {
 #[cfg(target_os = "linux")]
 impl NftExecutor for ShellNftExecutor {
     fn run_script(&self, script: &str) -> impl Future<Output = Result<(), String>> + Send {
-        use std::process::Stdio;
-        use tokio::io::AsyncWriteExt;
         use tokio::process::Command;
         let script_owned = script.to_string();
         async move {
-            let mut child = Command::new("nft")
-                .arg("-f")
-                .arg("-")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .map_err(|e| format!("failed to spawn nft: {e}"))?;
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin
-                    .write_all(script_owned.as_bytes())
-                    .await
-                    .map_err(|e| format!("failed to write nft stdin: {e}"))?;
-                drop(stdin);
-            }
-            let output = child
-                .wait_with_output()
-                .await
-                .map_err(|e| format!("failed to wait for nft: {e}"))?;
-            if output.status.success() {
-                Ok(())
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-                Err(format!(
-                    "nft exited with {}: {}",
-                    output.status,
-                    stderr.trim()
-                ))
-            }
+            let mut command = Command::new("nft");
+            command.arg("-f").arg("-");
+            run_nft_command(command, &script_owned, NFT_COMMAND_TIMEOUT).await
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn run_nft_command(
+    mut command: tokio::process::Command,
+    script: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+
+    command
+        .kill_on_drop(true)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("failed to spawn nft: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        tokio::time::timeout(timeout, stdin.write_all(script.as_bytes()))
+            .await
+            .map_err(|_| "nft command timed out while writing input".to_string())?
+            .map_err(|e| format!("failed to write nft stdin: {e}"))?;
+        drop(stdin);
+    }
+    let output = tokio::time::timeout(timeout, child.wait_with_output())
+        .await
+        .map_err(|_| "nft command timed out while waiting for exit".to_string())?
+        .map_err(|e| format!("failed to wait for nft: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        Err(format!(
+            "nft exited with {}: {}",
+            output.status,
+            stderr.trim()
+        ))
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod shell_nft_executor_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_stalled_nft_process_is_bounded() {
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg("cat >/dev/null; sleep 60");
+
+        let result = run_nft_command(command, "test input", Duration::from_millis(50)).await;
+
+        assert!(result.is_err_and(|e| e.contains("timed out")));
     }
 }

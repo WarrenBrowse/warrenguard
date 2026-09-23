@@ -49,7 +49,9 @@ async fn stub_backend_implements_release_by_client_via_trait() {
 
     // Trait call (RFC §3.3.2: pass internal_port, not external).
     let released: bool =
-        PortForwardingBackend::release_by_client(&backend, ALICE, internal_port, Proto::Tcp).await;
+        PortForwardingBackend::release_by_client(&backend, ALICE, internal_port, Proto::Tcp)
+            .await
+            .expect("release succeeds");
     assert!(released, "Stub must release a mapping it allocated");
     assert_eq!(backend.allocator().active_count(), 0);
 }
@@ -73,7 +75,9 @@ async fn nftables_backend_implements_release_by_client_via_trait() {
         .expect("alloc");
 
     let released =
-        PortForwardingBackend::release_by_client(&backend, ALICE, internal_port, Proto::Udp).await;
+        PortForwardingBackend::release_by_client(&backend, ALICE, internal_port, Proto::Udp)
+            .await
+            .expect("release succeeds");
     assert!(released, "Nftables must release a mapping it allocated");
     assert_eq!(backend.allocator().active_count(), 0);
 
@@ -104,7 +108,9 @@ async fn release_by_client_rejects_other_clients_request_via_trait() {
         .expect("alice alloc");
 
     let released =
-        PortForwardingBackend::release_by_client(&backend, BOB, internal_port, Proto::Tcp).await;
+        PortForwardingBackend::release_by_client(&backend, BOB, internal_port, Proto::Tcp)
+            .await
+            .expect("no matching mapping");
     assert!(!released, "Bob must not be able to release Alice's port");
     assert_eq!(backend.allocator().active_count(), 1);
 }

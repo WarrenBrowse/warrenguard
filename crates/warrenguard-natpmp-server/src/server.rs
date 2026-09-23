@@ -13,12 +13,22 @@
 //!      - `Map { lifetime=0 }` → `release_by_client` on the
 //!        backend's underlying allocator (RFC §3.3.2).
 //!      - `Map { lifetime>0 }` → `backend.allocate(...)`.
+//! - Datagrams are handled in separate tasks, concurrent with each other
+//!   and bounded by [`MAX_IN_FLIGHT_REQUESTS`], so one slow request does
+//!   not immobilize the service for the others.
+//! - Every deployer-facing await in the dispatch (credential
+//!   presentation, `allocate`, `release_by_client`) is bounded by the
+//!   server's `request_timeout` (default [`DEFAULT_REQUEST_TIMEOUT`], see
+//!   [`Server::with_request_timeout`]). Past that bound the request is
+//!   refused fail-closed with `NetworkFailure`: no allocation is served on
+//!   a credential the authority never verified, and no `Success` is
+//!   reported for a release that did not complete.
 
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::net::UdpSocket;
@@ -28,6 +38,29 @@ use crate::protocol::{
     Request, Response, ResultCode, credential_trailer, parse_request, serialize_response,
 };
 use crate::{Allocation, PortForwardingBackend, Proto};
+
+/// Bound applied to every deployer-facing await in the dispatch: the
+/// credential authority's `present`, the backend's `allocate`, and the
+/// backend's `release_by_client`.
+///
+/// Past it the request is refused fail-closed with
+/// [`ResultCode::NetworkFailure`] rather than held open: an authority that
+/// never answers must not hand out an unverified allocation, and a release
+/// that never completed must not be reported as a `Success`. Overridable per
+/// server with [`Server::with_request_timeout`].
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum number of datagrams handled concurrently.
+///
+/// [`Server::run`] spawns one task per received datagram and stops receiving
+/// while this many are outstanding, so a burst of requests that each wait on
+/// a slow deployer call applies backpressure instead of growing tasks (and
+/// their frames) without bound.
+pub const MAX_IN_FLIGHT_REQUESTS: usize = 64;
+
+// A timed-out allocation must finish its compensating release before another
+// request can refresh the same mapping and receive a port that cleanup removes.
+const MAX_BACKEND_OPERATIONS: usize = 1;
 
 /// Checks that `ip` is in the Warren tunnel pool (`10.66.0.0/16`).
 fn in_tunnel_pool(ip: Ipv4Addr) -> bool {
@@ -88,6 +121,10 @@ pub struct Server<B> {
     /// Where a presented credential goes. `None` (the default) means the
     /// deployer gates nothing on one, and any trailer is ignored.
     credential_authority: Option<Arc<dyn CredentialAuthority>>,
+    /// Wall-clock bound on every deployer-facing response in `dispatch`.
+    /// Defaults to [`DEFAULT_REQUEST_TIMEOUT`].
+    request_timeout: Duration,
+    backend_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl<B: PortForwardingBackend + 'static> Server<B> {
@@ -124,6 +161,8 @@ impl<B: PortForwardingBackend + 'static> Server<B> {
             epoch: Instant::now(),
             auth_filter,
             credential_authority: None,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            backend_slots: Arc::new(tokio::sync::Semaphore::new(MAX_BACKEND_OPERATIONS)),
         })
     }
 
@@ -133,6 +172,21 @@ impl<B: PortForwardingBackend + 'static> Server<B> {
     #[must_use]
     pub fn with_credential_authority(mut self, authority: Arc<dyn CredentialAuthority>) -> Self {
         self.credential_authority = Some(authority);
+        self
+    }
+
+    /// Bounds the response wait for credential presentation, allocation and
+    /// release by `timeout`. A backend operation already in progress retains
+    /// its bounded worker slot until it finishes; an allocation completed
+    /// after the response deadline is released before that slot is freed.
+    ///
+    /// A deployer call that exceeds the bound is refused fail-closed with
+    /// [`ResultCode::NetworkFailure`]. Defaults to
+    /// [`DEFAULT_REQUEST_TIMEOUT`]; tests shorten it to exercise the
+    /// expiry paths without waiting out the production bound.
+    #[must_use]
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
         self
     }
 
@@ -146,20 +200,29 @@ impl<B: PortForwardingBackend + 'static> Server<B> {
         self.socket.local_addr()
     }
 
-    /// Infinite listen loop: receive, dispatch, respond. Returns on a
+    /// Infinite listen loop: receive, spawn, respond. Returns on a
     /// fatal socket error (rare).
+    ///
+    /// Each datagram is handed to its own task, so a request blocked on a
+    /// deployer call no longer immobilizes the service for the others. At
+    /// most [`MAX_IN_FLIGHT_REQUESTS`] requests are handled concurrently:
+    /// while that many are outstanding the loop stops receiving, which
+    /// applies backpressure rather than growing tasks without bound.
     ///
     /// # Errors
     ///
-    /// Non-recoverable `recv_from` or `send_to` error.
+    /// Non-recoverable `recv_from` error, or the in-flight semaphore found
+    /// closed (a bug: nothing closes it).
     pub async fn run(self) -> Result<()> {
         // Must hold the largest frame a client can legitimately send: an RFC
         // Map request plus a full credential trailer. Sized short, a
         // credential is silently truncated away and the deployer never sees
         // what the client presented.
         let mut buf = [0u8; MAP_REQUEST_LEN + 4 + MAX_CREDENTIAL_LEN];
+        let server = Arc::new(self);
+        let in_flight = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_REQUESTS));
         loop {
-            let res = self.socket.recv_from(&mut buf).await;
+            let res = server.socket.recv_from(&mut buf).await;
             let (n, src) = match res {
                 Ok(v) => v,
                 Err(e) => {
@@ -179,7 +242,25 @@ impl<B: PortForwardingBackend + 'static> Server<B> {
                     }
                 }
             };
-            self.handle_one(&buf[..n], src).await;
+            // `buf` is reused by the next `recv_from` while the spawned task
+            // still reads this datagram, so the frame has to be owned by the
+            // task. One allocation per datagram is the price of handling
+            // requests independently of one another.
+            let frame = buf[..n].to_vec();
+            // Backpressure: a permit is taken before the task is spawned, so
+            // the receive loop parks here while `MAX_IN_FLIGHT_REQUESTS`
+            // requests are still running.
+            let permit = Arc::clone(&in_flight)
+                .acquire_owned()
+                .await
+                .context("NAT-PMP in-flight request semaphore closed")?;
+            let server = Arc::clone(&server);
+            tokio::spawn(async move {
+                // Held for the whole request; dropping it on task exit frees
+                // the slot for the next datagram.
+                let _permit = permit;
+                server.handle_one(&frame, src).await;
+            });
         }
     }
 
@@ -196,6 +277,13 @@ impl<B: PortForwardingBackend + 'static> Server<B> {
         }
     }
 
+    /// Builds the response for one datagram.
+    ///
+    /// Every deployer-facing response here is bounded by
+    /// [`Self::request_timeout`] and fails closed with
+    /// [`ResultCode::NetworkFailure`] on expiry. Called by `handle_one`,
+    /// itself either driven by the per-datagram task `run` spawns or
+    /// directly by a test.
     async fn dispatch(&self, frame: &[u8], src: SocketAddr) -> Response {
         let epoch_secs = self.epoch_secs();
         // Source IP scoping: refuse anything not authorized by the
@@ -234,21 +322,46 @@ impl<B: PortForwardingBackend + 'static> Server<B> {
                 lifetime_secs: 0,
                 ..
             } => {
-                // RFC §3.3.2: delete-mapping. Always respond Success
+                // RFC §3.3.2: delete-mapping. On success, respond Success
                 // with lifetime=0, whether or not a mapping existed -
                 // the client is just told that nothing is mapped now.
-                self.backend
-                    .release_by_client(src_v4, internal_port, proto_from_wire(proto))
-                    .await;
-                Response::Map {
-                    proto,
-                    result_code: ResultCode::Success,
-                    epoch_secs,
-                    internal_port,
-                    external_port: internal_port,
-                    lifetime_secs: 0,
-                    // Release ack: no budget hint needed.
-                    rate_limit: None,
+                // Bounded: a release that never completed must not be
+                // reported as done, because a client that believes its
+                // mapping is gone while it still stands is worse off than
+                // one told the release failed.
+                let Ok(Ok(permit)) = tokio::time::timeout(
+                    self.request_timeout,
+                    self.backend_slots.clone().acquire_owned(),
+                )
+                .await
+                else {
+                    return error_response(frame, ResultCode::NetworkFailure, epoch_secs);
+                };
+                let backend = Arc::clone(&self.backend);
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let released = backend
+                        .release_by_client(src_v4, internal_port, proto_from_wire(proto))
+                        .await;
+                    let _ = tx.send(released);
+                });
+                match tokio::time::timeout(self.request_timeout, rx).await {
+                    Ok(Ok(Ok(_released))) => Response::Map {
+                        proto,
+                        result_code: ResultCode::Success,
+                        epoch_secs,
+                        internal_port,
+                        external_port: internal_port,
+                        lifetime_secs: 0,
+                        // Release ack: no budget hint needed.
+                        rate_limit: None,
+                    },
+                    Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => {
+                        // No-log: never log the client's tunnel-inner address.
+                        tracing::warn!("natpmp release failed or timed out");
+                        error_response(frame, ResultCode::NetworkFailure, epoch_secs)
+                    }
                 }
             }
             Request::Map {
@@ -267,7 +380,22 @@ impl<B: PortForwardingBackend + 'static> Server<B> {
                     self.credential_authority.as_ref(),
                     credential_trailer(frame),
                 ) {
-                    authority.present(src_v4, credential).await;
+                    // Bounded, and fail closed: an authority that does not
+                    // answer has not verified the credential, so the
+                    // allocation is refused rather than served unverified.
+                    if tokio::time::timeout(
+                        self.request_timeout,
+                        authority.present(src_v4, credential),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        // No-log: never log the client's tunnel-inner address.
+                        tracing::warn!(
+                            "natpmp credential authority timed out; refusing the map request"
+                        );
+                        return error_response(frame, ResultCode::NetworkFailure, epoch_secs);
+                    }
                 }
                 // Defense in depth: clamp
                 // the wire-supplied lifetime to RFC 6886 §3.3 bounds
@@ -284,24 +412,61 @@ impl<B: PortForwardingBackend + 'static> Server<B> {
                 // The client's suggested external port (RFC 6886 §3.3)
                 // is forwarded as-is; the allocator decides whether it
                 // can honour it. `0` = no preference.
-                match self
-                    .backend
-                    .allocate(
-                        src_v4,
-                        proto_from_wire(proto),
-                        internal_port,
-                        suggested_external_port,
-                        lifetime,
-                    )
-                    .await
-                {
-                    Ok(alloc) => {
+                //
+                // Bounded: a backend that does not return within the
+                // request timeout is reported as a network failure rather
+                // than holding the request (and its in-flight slot) open.
+                let Ok(Ok(permit)) = tokio::time::timeout(
+                    self.request_timeout,
+                    self.backend_slots.clone().acquire_owned(),
+                )
+                .await
+                else {
+                    return error_response(frame, ResultCode::NetworkFailure, epoch_secs);
+                };
+                let backend = Arc::clone(&self.backend);
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let result = backend
+                        .allocate(
+                            src_v4,
+                            proto_from_wire(proto),
+                            internal_port,
+                            suggested_external_port,
+                            lifetime,
+                        )
+                        .await;
+                    if let Err(Ok(alloc)) = tx.send(result) {
+                        // The requester timed out while the backend was in flight.
+                        // Keep the slot until the unacknowledged mapping is gone.
+                        if backend.release(&alloc).await.is_err() {
+                            tracing::error!(
+                                "timed-out NAT-PMP allocation could not be rolled back"
+                            );
+                        }
+                    }
+                });
+                match tokio::time::timeout(self.request_timeout, rx).await {
+                    Ok(Ok(Ok(alloc))) => {
                         // Attach the post-allocation rate-limit budget so
                         // the client/UI can warn before the next ban.
                         let rate_limit = self.backend.rate_limit_status(src_v4);
                         map_success_response(&alloc, internal_port, epoch_secs, Some(rate_limit))
                     }
-                    Err(e) => map_failure_response(proto, internal_port, &e, epoch_secs),
+                    Ok(Ok(Err(e))) => map_failure_response(proto, internal_port, &e, epoch_secs),
+                    Ok(Err(_)) | Err(_) => {
+                        // No-log: never log the client's tunnel-inner address.
+                        tracing::warn!(
+                            "natpmp backend allocate timed out; refusing the map request"
+                        );
+                        map_failure_response(
+                            proto,
+                            internal_port,
+                            &crate::NatPmpError::Backend("allocate timed out".to_string()),
+                            epoch_secs,
+                        )
+                    }
                 }
             }
         }

@@ -93,6 +93,39 @@ fn element_set(scripts: &[String]) -> std::collections::BTreeSet<(String, u16)> 
 }
 
 #[tokio::test]
+async fn failed_kernel_delete_keeps_the_mapping_reserved() {
+    let runner = Recorder::new();
+    let backend = NftablesBackend::new(runner.clone()).await.expect("setup");
+    let alloc = backend
+        .allocate(ALICE, Proto::Tcp, 8080, 0, Duration::from_secs(600))
+        .await
+        .expect("allocate");
+    runner.arm_failure();
+
+    assert!(backend.release(&alloc).await.is_err());
+    assert_eq!(backend.allocator().active_count(), 1);
+}
+
+#[tokio::test]
+async fn failed_client_release_reports_error_and_keeps_the_mapping() {
+    let runner = Recorder::new();
+    let backend = NftablesBackend::new(runner.clone()).await.expect("setup");
+    backend
+        .allocate(ALICE, Proto::Udp, 8080, 0, Duration::from_secs(600))
+        .await
+        .expect("allocate");
+    runner.arm_failure();
+
+    assert!(
+        backend
+            .release_by_client(ALICE, 8080, Proto::Udp)
+            .await
+            .is_err()
+    );
+    assert_eq!(backend.allocator().active_count(), 1);
+}
+
+#[tokio::test]
 async fn backend_setup_runs_setup_script_on_construction() {
     let recorder = Recorder::new();
     let _backend = NftablesBackend::new(Arc::clone(&recorder))
@@ -454,6 +487,13 @@ async fn backend_rolls_back_alloc_when_nft_fails() {
         backend.allocator().active_count(),
         0,
         "rollback: no mapping must remain active after a failed add element"
+    );
+    assert!(
+        recorder
+            .scripts()
+            .iter()
+            .any(|script| script.starts_with("delete element")),
+        "an uncertain add failure must be followed by a compensating delete"
     );
 }
 

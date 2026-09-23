@@ -99,9 +99,11 @@ fn dispatch_control_message(
 ) {
     if let Some(spec) = IpAssignSpec::from_control(msg) {
         if let Some(ch) = ip_assign_channel {
+            // No-log (INV-3): a per-session tunnel address is a correlation
+            // handle across log lines, never an event field, on either
+            // address family. `prefix_len` is enough for ops to see that an
+            // assignment landed.
             tracing::info!(
-                assigned = %spec.assigned,
-                gateway = %spec.gateway,
                 prefix_len = spec.prefix_len,
                 "downlink received IpAssign; publishing on the IpAssignChannel"
             );
@@ -249,26 +251,26 @@ pub async fn run_reassign_loop<T: ReassignableTun>(
         let cached = *rx.borrow_and_update();
         if let Some(spec) = cached {
             if spec.assigned == current_ipv4 {
-                tracing::debug!(
-                    assigned = %spec.assigned,
-                    "IpAssign matches the current TUN IPv4; no reassign needed"
-                );
+                // No-log (INV-3): the per-session tunnel address never reaches
+                // an event; that the assignment was a no-op is what ops need.
+                tracing::debug!("IpAssign matches the current TUN IPv4; no reassign needed");
             } else {
                 match tun.reassign_ipv4(spec.assigned, spec.prefix_len) {
                     Ok(()) => {
+                        // No-log (INV-3): neither the previous nor the new
+                        // per-session address is an event field.
                         tracing::info!(
-                            old = %current_ipv4,
-                            assigned = %spec.assigned,
                             prefix_len = spec.prefix_len,
-                            gateway = %spec.gateway,
                             "TUN reassigned to exit-allocated address"
                         );
                         current_ipv4 = spec.assigned;
                     }
                     Err(e) => {
+                        // No-log (INV-3): the address we failed to install is
+                        // the same correlation handle; `error` + `prefix_len`
+                        // localise the failure.
                         tracing::error!(
                             error = %e,
-                            assigned = %spec.assigned,
                             prefix_len = spec.prefix_len,
                             "reassign_ipv4 failed; TUN keeps its current IP"
                         );
@@ -281,47 +283,75 @@ pub async fn run_reassign_loop<T: ReassignableTun>(
                 && let Some(v6) = spec.assigned_v6
                 && current_ipv6 != Some(v6)
             {
-                if let Some(old) = current_ipv6 {
-                    let _ = tun.remove_ipv6(old);
-                }
-                match tun.reassign_ipv6(v6, spec.prefix_len_v6) {
-                    Ok(()) => {
-                        // no-log (INV-3): never log the per-session
-                        // client v6 itself.
-                        tracing::info!(
-                            prefix_len_v6 = spec.prefix_len_v6,
-                            "TUN reassigned to exit-allocated IPv6 (dual-stack)"
-                        );
-                        current_ipv6 = Some(v6);
-                        #[cfg(target_os = "linux")]
-                        if cfg.install_v6_split_route && v6_route_guard.is_none() {
-                            match warrenguard_route_split::default_route_split::DefaultRouteSplitV6Guard::install(
-                                None,
-                                tun.name(),
-                                None,
-                            )
-                            .await
-                            {
-                                Ok(guard) => {
-                                    tracing::info!(
-                                        tun = tun.name(),
-                                        "installed ::/1 + 8000::/1 v6 split route"
-                                    );
-                                    v6_route_guard = Some(guard);
-                                }
-                                Err(e) => tracing::error!(
-                                    error = %e,
-                                    "v6 split-route install failed; v6 stays on the \
-                                     physical default route"
-                                ),
-                            }
+                // Linux: the v6 split route MUST already be in place BEFORE the
+                // TUN carries the exit-allocated address. Installing the address
+                // first left the host on its physical IPv6 default route for the
+                // window between the two, and a FAILED route install left that
+                // address bound with nothing to capture it: the address alone is
+                // not a tunnel, so v6 would egress off-tunnel until the killswitch
+                // (if any) caught it. The route is therefore installed first and a
+                // failure is fatal FOR THIS V6 SESSION: `route_ready` stays false
+                // and the address is never applied, so no v6 address can outlive
+                // the route that captures it. The v4 session is untouched, and the
+                // next IpAssign retries (the loop parks on the channel rather than
+                // spinning).
+                #[cfg(target_os = "linux")]
+                let route_ready = if cfg.install_v6_split_route && v6_route_guard.is_none() {
+                    match warrenguard_route_split::default_route_split::DefaultRouteSplitV6Guard::install(
+                        None,
+                        tun.name(),
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(guard) => {
+                            tracing::info!(
+                                tun = tun.name(),
+                                "installed ::/1 + 8000::/1 v6 split route"
+                            );
+                            v6_route_guard = Some(guard);
+                            true
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "v6 split-route install failed; refusing the exit-allocated \
+                                 IPv6 for this session, because applying it without the route \
+                                 would send v6 out of the physical default route"
+                            );
+                            false
                         }
                     }
-                    Err(e) => tracing::error!(
-                        error = %e,
-                        prefix_len_v6 = spec.prefix_len_v6,
-                        "reassign_ipv6 failed; TUN keeps its current v6"
-                    ),
+                } else {
+                    // No route to install: either it is already held (the guard
+                    // lives for the whole loop), or this caller asked for v6
+                    // without the Linux split-route install (tests, and clients
+                    // whose firewall keeps v6 leak-safe on its own).
+                    true
+                };
+                #[cfg(not(target_os = "linux"))]
+                let route_ready = true;
+
+                if route_ready {
+                    if let Some(old) = current_ipv6 {
+                        let _ = tun.remove_ipv6(old);
+                    }
+                    match tun.reassign_ipv6(v6, spec.prefix_len_v6) {
+                        Ok(()) => {
+                            // no-log (INV-3): never log the per-session
+                            // client v6 itself.
+                            tracing::info!(
+                                prefix_len_v6 = spec.prefix_len_v6,
+                                "TUN reassigned to exit-allocated IPv6 (dual-stack)"
+                            );
+                            current_ipv6 = Some(v6);
+                        }
+                        Err(e) => tracing::error!(
+                            error = %e,
+                            prefix_len_v6 = spec.prefix_len_v6,
+                            "reassign_ipv6 failed; TUN keeps its current v6"
+                        ),
+                    }
                 }
             }
         }
@@ -341,8 +371,9 @@ pub async fn run_reassign_loop<T: ReassignableTun>(
                 }
             }
             _ = tokio::time::sleep_until(warn_deadline), if !first_wait_logged => {
+                // No-log (INV-3): the bootstrap address is a per-session
+                // tunnel address too, so the timeout itself is the event.
                 tracing::warn!(
-                    bootstrap = %cfg.bootstrap_ipv4,
                     "no IpAssign received within 30 s; TUN keeps the bootstrap \
                      address (exit may run without --multihop-subnet). The \
                      reassign loop keeps listening."

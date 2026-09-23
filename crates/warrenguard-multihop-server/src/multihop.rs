@@ -920,10 +920,15 @@ async fn process_setup_frame(
         sticky_pubkey.map(WarrenPubkey::from_bytes),
     ) {
         (Some(registry), Some(pubkey)) => {
-            registry.register(pubkey, conn_id, conn.clone());
+            if token_serial.is_some() {
+                registry.register_token(pubkey, conn_id, conn.clone());
+            } else {
+                registry.register(pubkey, conn_id, conn.clone());
+            }
             let guard = SessionGuard {
                 registry: Arc::clone(registry),
                 pubkey,
+                is_token: token_serial.is_some(),
                 conn_id,
             };
             // TOCTOU allowlist recheck applies ONLY to the v6 wallet path: a
@@ -1018,11 +1023,13 @@ async fn process_setup_frame(
         tracing::debug!(error = %e, "multihop: finish setup reply stream failed");
         return None;
     }
-    // The assigned address is the ephemeral exit-internal pool address
-    // (10.66.0.x), not a client identifier, so it is benign to log. The v6
-    // address is omitted; the `dual_stack` flag is enough for ops.
+    // No-log (INV-3): the per-session tunnel addresses never reach an event.
+    // The v4 pool is /24-scale but the address is still assigned per session,
+    // so it is a correlation handle across log lines exactly like the v6 one;
+    // only the FAMILY presence (`dual_stack`) and the prefix length are
+    // emitted. `crates/warrenguard-multihop-server/tests/log_privacy.rs`
+    // enforces this at the source level.
     tracing::info!(
-        assigned = %spec.assigned,
         dual_stack = spec.assigned_v6.is_some(),
         "ip-nego: IpAssign sent over setup stream"
     );
@@ -2932,6 +2939,55 @@ const _: () = assert!(
         > ORPHAN_LEASE_RECLAIM_WORST_CASE_SECS + warrenguard_config::NATPMP_PORT_COOLDOWN_SECS
 );
 
+/// Cadence of the local allowlist-expiry sweep
+/// ([`MultihopSessionRegistry::terminate_where`] driven by
+/// [`ExitTerminateCtx::with_session_registry`]).
+///
+/// The per-entry `expires_at` was only ever consulted at ADMISSION, so a session
+/// admitted a second before its subscription lapsed kept tunnelling until the
+/// control plane told the exit to tear it down. During a control-plane outage
+/// that never happens, and the egress window is then bounded by the client
+/// rather than by the subscription. This sweep re-derives the same decision
+/// locally, from state the exit already holds, so expiry no longer depends on a
+/// poll landing. One interval is the worst-case overrun past `expires_at`; it is
+/// deliberately short enough to matter and long enough not to walk the live set
+/// pointlessly (a session is only ever closed once).
+const SESSION_EXPIRY_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Arm the local allowlist-expiry sweep: every
+/// [`SESSION_EXPIRY_SWEEP_INTERVAL`], force-close the live sessions whose
+/// pubkey [`AllowlistHandle::is_allowed_at`] no longer admits.
+///
+/// It goes through [`AllowlistHandle`] for both halves of the verdict the exit
+/// can decide on its own: the per-entry `expires_at` and the CRL. A deployer's control-plane refresh loop keeps that handle current, and this
+/// sweep is what makes the teardown follow a lapsing subscription even while
+/// that loop cannot reach the API - the case the control-plane broadcast alone
+/// cannot cover. Counts only reach the log; a pubkey never does.
+///
+/// Generic over the connection type purely so the cadence is testable with the
+/// registry's fake (`ExitTerminateCtx` itself only ever holds the real
+/// `quinn::Connection`).
+fn spawn_allowlist_expiry_sweep<C: ClosableConn>(
+    registry: Arc<MultihopSessionRegistry<C>>,
+    allowlist: AllowlistHandle,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(SESSION_EXPIRY_SWEEP_INTERVAL).await;
+            let closed = registry
+                .terminate_where(|pk| allowlist.is_allowed_at(pk, warrenguard_config::unix_now()));
+            if closed > 0 {
+                tracing::info!(
+                    closed,
+                    "closed sessions whose local allowlist entry no longer admits them \
+                     (expired subscription or revocation, decided without a \
+                     control-plane poll)"
+                );
+            }
+        }
+    });
+}
+
 /// One tunnel-IP attribution entry for the admin port-forward view.
 struct Ipv4Owner {
     pubkey: WarrenPubkey,
@@ -2942,8 +2998,7 @@ struct Ipv4Owner {
     departed_deadline: Option<Instant>,
 }
 
-/// Registry of live multi-hop connections keyed by the account pubkey
-/// that was admitted at setup.
+/// Registry of live multi-hop connections keyed by the admission identity.
 ///
 /// Why this exists: the exit allowlist gate (`allowlist_admits`) runs
 /// ONCE, at setup. Without this registry a pubkey that is de-allowlisted
@@ -2955,11 +3010,12 @@ struct Ipv4Owner {
 /// connection, bounding revocation latency to one poll interval.
 ///
 /// A bonded client opens several QUIC connections under one pubkey, so a
-/// pubkey maps to a set of `(conn_id, conn)`; a revocation closes them
-/// all. Generic over [`ClosableConn`] (defaulting to the real
+/// wallet key maps to a set of `(conn_id, conn)`; a revocation closes them
+/// all. Anonymous token serials occupy a separate key space and cannot be
+/// evaluated against the wallet allowlist. Generic over [`ClosableConn`] (defaulting to the real
 /// `quinn::Connection`) purely for unit-testability.
 pub struct MultihopSessionRegistry<C: ClosableConn = Connection> {
-    live: Mutex<HashMap<WarrenPubkey, HashMap<ConnId, C>>>,
+    live: Mutex<HashMap<SessionKey, HashMap<ConnId, C>>>,
     /// Reverse map `assigned tunnel IPv4 -> owning account`, recorded at setup
     /// once the IP is allocated. Lets `port_forward_sync` attribute each NAT-PMP
     /// allocation (keyed by internal tunnel IP) to the owning subscriber in the
@@ -2968,6 +3024,12 @@ pub struct MultihopSessionRegistry<C: ClosableConn = Connection> {
     /// client's entry is tombstoned (not dropped) until its lease can no longer
     /// linger (see [`Ipv4Owner::departed_deadline`]).
     ipv4_to_pubkey: Mutex<HashMap<Ipv4Addr, Ipv4Owner>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum SessionKey {
+    Wallet(WarrenPubkey),
+    TokenSerial(WarrenPubkey),
 }
 
 impl<C: ClosableConn> Default for MultihopSessionRegistry<C> {
@@ -2991,23 +3053,39 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
     /// the same `(pubkey, conn_id)` overwrites the previous handle (a
     /// sticky reconnect reusing the stable id), which is harmless.
     fn register(&self, pubkey: WarrenPubkey, conn_id: ConnId, conn: C) {
+        self.register_key(SessionKey::Wallet(pubkey), conn_id, conn);
+    }
+
+    fn register_token(&self, serial: WarrenPubkey, conn_id: ConnId, conn: C) {
+        self.register_key(SessionKey::TokenSerial(serial), conn_id, conn);
+    }
+
+    fn register_key(&self, key: SessionKey, conn_id: ConnId, conn: C) {
         self.live
             .lock()
-            .entry(pubkey)
+            .entry(key)
             .or_default()
             .insert(conn_id, conn);
     }
 
     /// Remove one connection from the registry (called from the RAII
     /// [`SessionGuard`] when the handler ends). Idempotent.
+    #[cfg(test)]
     fn unregister(&self, pubkey: &WarrenPubkey, conn_id: ConnId) {
+        self.unregister_key(SessionKey::Wallet(*pubkey), conn_id);
+    }
+
+    fn unregister_key(&self, key: SessionKey, conn_id: ConnId) {
         let mut guard = self.live.lock();
-        if let Some(conns) = guard.get_mut(pubkey) {
+        if let Some(conns) = guard.get_mut(&key) {
             conns.remove(&conn_id);
             if conns.is_empty() {
-                guard.remove(pubkey);
+                guard.remove(&key);
                 drop(guard);
-                self.tombstone_attribution(pubkey, Instant::now());
+                let pubkey = match key {
+                    SessionKey::Wallet(pubkey) | SessionKey::TokenSerial(pubkey) => pubkey,
+                };
+                self.tombstone_attribution(&pubkey, Instant::now());
             }
         }
     }
@@ -3100,7 +3178,11 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
     /// `unregister` from a closing handler cannot deadlock or double-act.
     #[must_use]
     pub fn terminate(&self, pubkey: &WarrenPubkey) -> usize {
-        let conns = self.live.lock().remove(pubkey).unwrap_or_default();
+        let conns = self
+            .live
+            .lock()
+            .remove(&SessionKey::Wallet(*pubkey))
+            .unwrap_or_default();
         self.ipv4_to_pubkey
             .lock()
             .retain(|_, owner| &owner.pubkey != pubkey);
@@ -3119,6 +3201,41 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
     #[must_use]
     pub fn live_client_count(&self) -> usize {
         self.live.lock().len()
+    }
+
+    /// Force-close every live connection whose pubkey
+    /// `is_still_authorized` rejects, returning how many were closed.
+    /// Idempotent, and a no-op for an empty registry.
+    ///
+    /// This is the local re-evaluation of the admission gate. A subscriber's
+    /// `expires_at` used to be consulted only when its setup stream was
+    /// admitted, so a session whose subscription lapsed mid-flight kept
+    /// tunnelling until the control plane pushed its removal  -  which never
+    /// happens while the control plane is unreachable. The exit already holds
+    /// the per-entry expiry (and the CRL) locally, so a deployer can re-derive
+    /// the same verdict without a poll;
+    /// [`ExitTerminateCtx::with_session_registry`] does exactly that on a
+    /// timer.
+    ///
+    /// The predicate is the authority here: it must return `true` for a pubkey
+    /// that is still allowed, exactly as `AllowlistHandle::is_allowed_at` does.
+    /// It is evaluated for every live wallet pubkey, so it should be cheap and
+    /// must not block. Anonymous token sessions retain their admission verdict.
+    #[must_use]
+    pub fn terminate_where(&self, is_still_authorized: impl Fn(&WarrenPubkey) -> bool) -> usize {
+        // Snapshot the doomed pubkeys under the lock, then close outside it:
+        // `terminate` takes the same locks, so calling it while holding the
+        // key iterator would deadlock.
+        let doomed: Vec<WarrenPubkey> = {
+            let live = self.live.lock();
+            live.keys()
+                .filter_map(|key| match key {
+                    SessionKey::Wallet(pubkey) if !is_still_authorized(pubkey) => Some(*pubkey),
+                    _ => None,
+                })
+                .collect()
+        };
+        doomed.iter().map(|pk| self.terminate(pk)).sum()
     }
 
     /// Per-connection datapath stats for the telemetry sampler (doc 52
@@ -3207,12 +3324,18 @@ fn ipv4_source_of(addr: std::net::SocketAddr) -> Option<Ipv4Addr> {
 struct SessionGuard {
     registry: Arc<MultihopSessionRegistry>,
     pubkey: WarrenPubkey,
+    is_token: bool,
     conn_id: ConnId,
 }
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        self.registry.unregister(&self.pubkey, self.conn_id);
+        let key = if self.is_token {
+            SessionKey::TokenSerial(self.pubkey)
+        } else {
+            SessionKey::Wallet(self.pubkey)
+        };
+        self.registry.unregister_key(key, self.conn_id);
     }
 }
 
@@ -3697,8 +3820,20 @@ impl<T: PacketDevice + Clone> ExitTerminateCtx<T> {
     /// `new` argument so the many existing `new(...)` call sites (tests,
     /// bench, single-tenant listener) stay unchanged and keep the `None`
     /// default.
+    ///
+    /// When an [`AllowlistHandle`] is also attached (it is, in strict mode:
+    /// [`Self::new`] takes it), this also spawns the LOCAL expiry sweep. The
+    /// control-plane broadcast only fires on a payload the exit actually
+    /// receives, so without the sweep a session admitted moments before its
+    /// `expires_at` keeps tunnelling through a control-plane outage  -  the
+    /// egress window is then bounded by the client instead of by the
+    /// subscription. The sweep re-derives the admission verdict from state the
+    /// exit already holds, so it is independent of any poll landing.
     #[must_use]
     pub fn with_session_registry(mut self, registry: Arc<MultihopSessionRegistry>) -> Self {
+        if let Some(allowlist) = self.allowlist.clone() {
+            spawn_allowlist_expiry_sweep(registry.clone(), allowlist);
+        }
         self.session_registry = Some(registry);
         self
     }
@@ -5153,6 +5288,143 @@ mod tests {
             0,
             "second terminate is a no-op"
         );
+    }
+
+    #[test]
+    fn registry_terminate_where_closes_only_the_rejected_pubkeys() {
+        // The local expiry sweep: the predicate is the admission verdict the
+        // exit re-derives from its own state, so a lapsed subscriber is closed
+        // while a still-admitted one keeps its tunnel. This is what makes the
+        // teardown independent of the control plane.
+        let registry: MultihopSessionRegistry<FakeConn> = MultihopSessionRegistry::default();
+        let lapsed = FakeConn::new();
+        let admitted = FakeConn::new();
+        let bonded = FakeConn::new();
+        registry.register(reg_pk(1), 100, lapsed.clone());
+        registry.register(reg_pk(1), 101, bonded.clone());
+        registry.register(reg_pk(2), 200, admitted.clone());
+
+        let closed = registry.terminate_where(|pk| *pk == reg_pk(2));
+
+        assert_eq!(closed, 2, "both bonded conns of the lapsed pubkey close");
+        assert_eq!(lapsed.closes(), 1);
+        assert_eq!(bonded.closes(), 1);
+        assert_eq!(
+            admitted.closes(),
+            0,
+            "a pubkey the predicate still admits must keep tunnelling"
+        );
+        assert_eq!(registry.live_client_count(), 1);
+    }
+
+    #[test]
+    fn registry_terminate_where_admitting_everything_is_a_noop() {
+        let registry: MultihopSessionRegistry<FakeConn> = MultihopSessionRegistry::default();
+        let conn = FakeConn::new();
+        registry.register(reg_pk(1), 100, conn.clone());
+
+        assert_eq!(registry.terminate_where(|_| true), 0);
+        assert_eq!(conn.closes(), 0);
+        assert_eq!(registry.live_client_count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_local_expiry_sweep_closes_a_lapsed_session_without_a_poll() {
+        // The sweep, not just the predicate: the timer re-derives the admission
+        // verdict from state the exit already holds. The entry here lapsed long
+        // ago (`expires_at` = 1), and no control-plane payload is ever applied in
+        // this test - exactly the outage the audit describes. Paused time
+        // auto-advances to the sweep's own sleep.
+        let (allowlist, _rx) = AllowlistHandle::new();
+        let lapsed = reg_pk(7);
+        allowlist.apply_snapshot(warrenguard_server::AllowlistSnapshot {
+            generation: 1,
+            pubkeys: std::collections::HashMap::from([(lapsed, 1u64)]),
+            fetched_at_unix_secs: warrenguard_config::unix_now(),
+        });
+        assert!(
+            !allowlist.is_allowed_at(&lapsed, warrenguard_config::unix_now()),
+            "the sweep test needs an entry that is already past its expiry"
+        );
+
+        let registry: Arc<MultihopSessionRegistry<FakeConn>> =
+            Arc::new(MultihopSessionRegistry::default());
+        let live = FakeConn::new();
+        registry.register(lapsed, 100, live.clone());
+
+        spawn_allowlist_expiry_sweep(registry.clone(), allowlist);
+        tokio::time::sleep(SESSION_EXPIRY_SWEEP_INTERVAL * 2).await;
+
+        assert_eq!(
+            live.closes(),
+            1,
+            "a session whose allowlist entry lapsed must be closed by the local \
+             sweep, with no control-plane poll involved"
+        );
+        assert_eq!(registry.live_client_count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_local_expiry_sweep_keeps_a_pubkey_the_allowlist_still_admits() {
+        // The other half of the verdict: the sweep must not close a subscriber
+        // whose entry still admits it, or a control-plane outage would tear down
+        // every healthy session it is supposed to protect.
+        let (allowlist, _rx) = AllowlistHandle::new();
+        let admitted = reg_pk(8);
+        allowlist.apply_snapshot(warrenguard_server::AllowlistSnapshot {
+            generation: 1,
+            pubkeys: std::collections::HashMap::from([(
+                admitted,
+                warrenguard_config::unix_now() + 3_600,
+            )]),
+            fetched_at_unix_secs: warrenguard_config::unix_now(),
+        });
+
+        let registry: Arc<MultihopSessionRegistry<FakeConn>> =
+            Arc::new(MultihopSessionRegistry::default());
+        let live = FakeConn::new();
+        registry.register(admitted, 100, live.clone());
+
+        spawn_allowlist_expiry_sweep(registry.clone(), allowlist);
+        tokio::time::sleep(SESSION_EXPIRY_SWEEP_INTERVAL * 3).await;
+
+        assert_eq!(live.closes(), 0, "an admitted subscriber keeps its tunnel");
+        assert_eq!(registry.live_client_count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_local_expiry_sweep_keeps_an_admitted_v7_token_session() {
+        let (allowlist, _rx) = AllowlistHandle::new();
+        let registry: Arc<MultihopSessionRegistry<FakeConn>> =
+            Arc::new(MultihopSessionRegistry::default());
+        let serial = reg_pk(42);
+        let live = FakeConn::new();
+        registry.register_token(serial, 100, live.clone());
+
+        spawn_allowlist_expiry_sweep(registry.clone(), allowlist);
+        tokio::time::sleep(SESSION_EXPIRY_SWEEP_INTERVAL * 2).await;
+
+        assert_eq!(live.closes(), 0);
+        assert_eq!(registry.live_client_count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_local_expiry_sweep_distinguishes_wallet_and_token_with_equal_bytes() {
+        let (allowlist, _rx) = AllowlistHandle::new();
+        let registry: Arc<MultihopSessionRegistry<FakeConn>> =
+            Arc::new(MultihopSessionRegistry::default());
+        let bytes = reg_pk(43);
+        let wallet = FakeConn::new();
+        let token = FakeConn::new();
+        registry.register(bytes, 100, wallet.clone());
+        registry.register_token(bytes, 101, token.clone());
+
+        spawn_allowlist_expiry_sweep(registry.clone(), allowlist);
+        tokio::time::sleep(SESSION_EXPIRY_SWEEP_INTERVAL * 2).await;
+
+        assert_eq!(wallet.closes(), 1);
+        assert_eq!(token.closes(), 0);
+        assert_eq!(registry.live_client_count(), 1);
     }
 
     #[test]

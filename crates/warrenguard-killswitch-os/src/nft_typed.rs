@@ -173,7 +173,12 @@ impl NftRuleset {
 /// `KillswitchOpts` doc). `exit_addrs` is then ignored for this
 /// exception (the exit IP is left to be captured by the tunnel's
 /// split-default route like any other destination). `None` keeps the
-/// legacy destination-based exception.
+/// legacy destination-based exception, which is a documented leak: the
+/// builder still renders it so the layout stays unit-testable, but
+/// [`LinuxKillswitch::install`](crate::LinuxKillswitch::install) refuses
+/// it through
+/// [`KillswitchOpts::validate_linux_carrier_scope`](crate::KillswitchOpts::validate_linux_carrier_scope)
+/// before any rule is loaded.
 #[must_use]
 pub(crate) fn build_killswitch_ruleset(
     table_name: &str,

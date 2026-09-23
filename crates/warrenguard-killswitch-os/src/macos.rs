@@ -61,8 +61,34 @@
 //!    enable state is exactly what it found. It purges every off-policy connection
 //!    on the host it runs on, which is why it is ignored by default, gated on
 //!    `WARREN_KILLSWITCH_ROOT_TEST=1`, and meant for an idle or disposable Mac.
-//! 4. `sudo pfctl -s rules` must show the anchor rules under
+//! 5. `sudo pfctl -s rules` must show the anchor rules under
 //!    [`PF_ANCHOR_PATH`].
+//!
+//! ### Second-process leak test (interface scoping is not identity scoping)
+//!
+//! `IP_BOUND_IF` is available to EVERY process, so a carrier pass scoped only
+//! `on <phys_iface>` can be borrowed by a second one. The install therefore
+//! refuses that shape unless [`carrier_uid`](KillswitchOpts::carrier_uid) is set
+//! too, and the pass then carries `user <uid>`. Confirm the identity scope with a
+//! second process, on an idle or disposable Mac:
+//!
+//! 1. Install with `carrier_uid` set to the uid that owns the tunnel socket (the
+//!    daemon's), transport STOPPED.
+//! 2. Capture outbound UDP at the exit host (or a controlled gateway on the
+//!    physical path), filtered to `<client-ip> -> <exit-ip>:<exit-port>`.
+//!    A local `tcpdump -ni <phys_iface>` capture can help diagnose, but the
+//!    remote capture is the decisive observation that a packet left the host.
+//! 3. As a DIFFERENT uid, bind the physical interface and send a unique UDP
+//!    payload to the configured exit endpoint (Darwin `IP_BOUND_IF` is option
+//!    25, `IPV6_BOUND_IF` is 125):
+//!    ``sudo -u nobody python3 -c 'import socket,struct;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.setsockopt(socket.IPPROTO_IP,25,struct.pack("I",socket.if_nametoindex("en0")));s.sendto(b"pf-foreign-uid",("<exit-ip>",<exit-port>))'``
+//!    The remote capture must contain no matching packet. A receive timeout is
+//!    inconclusive because a QUIC endpoint can silently discard arbitrary UDP.
+//! 4. Send `b"pf-carrier-uid"` with the SAME command as the daemon's uid. The
+//!    remote capture must now show the packet. Use a dedicated daemon uid: pf's
+//!    `user` predicate distinguishes socket owners, not processes sharing one
+//!    uid.
+//! 5. Only then re-enable the transport, and confirm the tunnel comes up.
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -90,6 +116,13 @@ struct PfRuleSpec {
     udp: bool,
     v6: bool,
     dest: Option<PfDest>,
+    /// `user <uid>` criterion: pf matches it against the owner of the socket
+    /// the packet came from. Set on the exit-carrier pass (from
+    /// [`KillswitchOpts::carrier_uid`]) so the exception belongs to the
+    /// daemon's process identity. `IP_BOUND_IF` alone does NOT do that -
+    /// every process may bind an interface - so the interface scope and this
+    /// identity scope are two distinct, both-required criteria.
+    uid: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -109,6 +142,7 @@ fn pf_rule_specs(opts: &KillswitchOpts) -> Vec<PfRuleSpec> {
         udp,
         v6,
         dest,
+        uid: None,
     };
     let mut specs = vec![
         // Default block, first but NON-quick (see [`PfRuleSpec`]); a partial
@@ -120,6 +154,7 @@ fn pf_rule_specs(opts: &KillswitchOpts) -> Vec<PfRuleSpec> {
             udp: false,
             v6: false,
             dest: None,
+            uid: None,
         },
         // Loopback.
         pass(Some("lo0".into()), false, false, None),
@@ -127,22 +162,32 @@ fn pf_rule_specs(opts: &KillswitchOpts) -> Vec<PfRuleSpec> {
         pass(Some(opts.tun_name.clone()), false, false, None),
     ];
 
-    // The exit carrier (QUIC/UDP to each exit IP). Scoped to the physical
-    // interface when the carrier socket is IP_BOUND_IF-bound (Port Fail /
-    // TunnelCrack ServerIP fix: an unscoped rule would let ANY app dialing the
-    // exit IP escape the tunnel). Unscoped in the macOS unbound-carrier model,
-    // which instead escapes via a <exit>/32 physical host route.
+    // The exit carrier (QUIC/UDP to each exit IP), scoped by BOTH criteria the
+    // caller supplied: `on <phys_iface>` when the carrier socket is
+    // IP_BOUND_IF-bound, and `user <carrier_uid>` so the pass belongs to the
+    // daemon's process identity. Interface scoping alone is NOT a socket
+    // scope: `IP_BOUND_IF` is available to every process, so an
+    // interface-only pass still lets a second process that binds the same
+    // interface dial the exit IP and escape off tunnel (Port Fail /
+    // TunnelCrack-ServerIP). Both are enforced by
+    // [`KillswitchOpts::validate_macos_carrier_scope`] before this ruleset is
+    // ever loaded. In the macOS unbound-carrier model (`phys_iface: None`,
+    // the carrier instead escapes via a `<exit>/32` physical host route) the
+    // rule is unscoped, which is exactly the leak the install now refuses.
     for addr in &opts.exit_addrs {
         let net = match addr {
             IpAddr::V4(v4) => IpNetwork::V4(Ipv4Network::new(*v4, 32).expect("single-host mask")),
             IpAddr::V6(v6) => IpNetwork::V6(Ipv6Network::new(*v6, 128).expect("single-host mask")),
         };
-        specs.push(pass(
-            opts.phys_iface.clone(),
-            true,
-            addr.is_ipv6(),
-            Some(PfDest::Net(net)),
-        ));
+        specs.push(PfRuleSpec {
+            pass: true,
+            quick: true,
+            iface: opts.phys_iface.clone(),
+            udp: true,
+            v6: addr.is_ipv6(),
+            dest: Some(PfDest::Net(net)),
+            uid: opts.carrier_uid,
+        });
     }
 
     if opts.allow_lan {
@@ -190,6 +235,13 @@ fn spec_to_filter_rule(spec: &PfRuleSpec) -> Result<FilterRule, KillswitchError>
     }
     if spec.v6 {
         b.af(pfctl::AddrFamily::Ipv6);
+    }
+    if let Some(uid) = spec.uid {
+        // `user <uid>`: pf matches the owner of the socket behind a locally
+        // generated packet, which is what turns the carrier pass into the
+        // daemon's own exception instead of one any process can borrow by
+        // calling `IP_BOUND_IF`.
+        b.user(uid);
     }
     match &spec.dest {
         Some(PfDest::Net(net)) => {
@@ -255,7 +307,10 @@ struct PermittedFlow {
     /// interface the packet left by: pf treats the two as distinct criteria, which
     /// is why Apple's guidance is to select an interface with `IP_BOUND_IF` rather
     /// than rely on the address. So such a pass cannot be shown to match a state,
-    /// and the state is treated as a bypass candidate.
+    /// and the state is treated as a bypass candidate. The carrier pass's `user
+    /// <uid>` criterion is unprovable from a state entry for the same reason
+    /// (`pfctl::State` carries no owner), so it does not weaken this decision: the
+    /// carrier states are killed either way, the fail-closed direction.
     iface_scoped: bool,
 }
 
@@ -674,8 +729,10 @@ impl MacosKillswitch {
     /// # Errors
     ///
     /// [`KillswitchError::InvalidInput`] or [`KillswitchError::Pf`]. The
-    /// `Pf` cases include a failed pre-load anchor flush and an
-    /// unverifiable state purge.
+    /// `InvalidInput` cases cover a suspicious TUN name and a carrier
+    /// exception that is not scoped to the daemon's process identity
+    /// ([`KillswitchOpts::validate_macos_carrier_scope`]). The `Pf` cases
+    /// include a failed pre-load anchor flush and an unverifiable state purge.
     pub async fn install(opts: &KillswitchOpts) -> Result<Self, KillswitchError> {
         Self::install_with_ops(opts, std::sync::Arc::new(RealPfOps)).await
     }
@@ -687,6 +744,11 @@ impl MacosKillswitch {
         ops: std::sync::Arc<dyn PfOps>,
     ) -> Result<Self, KillswitchError> {
         validate_tun_name(&opts.tun_name)?;
+        // Refuse an exception that is not scoped to the daemon's process
+        // identity before anything is loaded: `IP_BOUND_IF` is usable by any
+        // process, so an interface-only (or unscoped) carrier pass is a leak
+        // (see `validate_macos_carrier_scope`).
+        opts.validate_macos_carrier_scope()?;
         let rules = build_pf_rules(opts)?;
         let permitted = PermittedFlows::from_opts(opts);
 
@@ -890,6 +952,21 @@ mod tests {
             allow_dhcp: false,
             socket_mark: None,
             phys_iface: None,
+            carrier_uid: None,
+        }
+    }
+
+    /// The carrier-scoped options a macOS INSTALL accepts: the physical
+    /// interface the carrier socket is `IP_BOUND_IF`-bound to, plus the uid of
+    /// the process that owns it (the pf pass carries `user <uid>`). Every
+    /// lifecycle test installs through this, because
+    /// [`KillswitchOpts::validate_macos_carrier_scope`] refuses the unscoped
+    /// [`opts_minimal`] configuration.
+    fn opts_scoped() -> KillswitchOpts {
+        KillswitchOpts {
+            phys_iface: Some("en0".into()),
+            carrier_uid: Some(501),
+            ..opts_minimal()
         }
     }
 
@@ -1014,11 +1091,12 @@ mod tests {
 
     #[test]
     fn build_rules_with_phys_iface_scopes_exit_rule_to_interface() {
-        // Port Fail / TunnelCrack-ServerIP fix: scoping the exit-IP
-        // pass rule to the physical interface means only the daemon's
-        // IP_BOUND_IF-bound socket can still match it; every other
-        // process dialing the exit IP now gets captured into the
-        // tunnel by the split-default route instead.
+        // Port Fail / TunnelCrack-ServerIP: the exit-IP pass rule must be
+        // pinned to the physical interface the carrier socket is bound to. That
+        // is only HALF the fix - `IP_BOUND_IF` is available to any process, so
+        // the pass also carries `user <uid>` (see
+        // `build_rules_carries_the_carrier_process_identity`); the install
+        // refuses a configuration that supplies only one of the two.
         let mut o = opts_minimal();
         o.phys_iface = Some("en0".into());
         let rules = build_pf_rules(&o).unwrap();
@@ -1050,6 +1128,82 @@ mod tests {
             rules[0], expected_block_all,
             "the block-all default is first but NON-quick (so the quick pass \
              exceptions override it), regardless of phys_iface"
+        );
+    }
+
+    #[test]
+    fn build_rules_carries_the_carrier_process_identity() {
+        // The audit finding: an interface-scoped pass is still usable by a
+        // second process that calls `IP_BOUND_IF` and dials the exit IP. The pf
+        // rule must therefore also carry the socket owner's uid.
+        let rules = build_pf_rules(&opts_scoped()).unwrap();
+        let exit_v4 = Ipv4Addr::new(1, 2, 3, 4);
+        let ip_net = IpNetwork::V4(Ipv4Network::new(exit_v4, 32).expect("single-host mask"));
+        let expected = FilterRuleBuilder::default()
+            .action(FilterRuleAction::Pass)
+            .direction(pfctl::Direction::Out)
+            .quick(true)
+            .proto(pfctl::Proto::Udp)
+            .to(pfctl::Endpoint::new(ip_net, pfctl::Port::Any))
+            .interface(pfctl::Interface::from("en0"))
+            .user(501u32)
+            .build()
+            .expect("expected the uid-scoped carrier rule");
+        assert!(
+            rules.contains(&expected),
+            "the carrier pass must carry `user 501` so it belongs to the daemon \
+             rather than to any process that can bind en0; rules: {rules:#?}"
+        );
+
+        // The block-all default must NOT be uid-scoped: it has to keep matching
+        // every local process.
+        let expected_block_all = FilterRuleBuilder::default()
+            .action(FilterRuleAction::Drop(pfctl::DropAction::Return))
+            .direction(pfctl::Direction::Out)
+            .quick(false)
+            .build()
+            .expect("expected block-all rule");
+        assert_eq!(
+            rules[0], expected_block_all,
+            "the default block must stay unscoped (uid Any), else it would stop \
+             blocking every other process"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_refuses_an_unscoped_carrier_before_touching_pf() {
+        let pf = Arc::new(MockPf::default());
+        let err = MacosKillswitch::install_with_ops(&opts_minimal(), pf.clone())
+            .await
+            .expect_err("an unscoped carrier exception must be refused");
+        assert!(
+            matches!(err, KillswitchError::InvalidInput(_)),
+            "got {err:?}"
+        );
+        assert!(
+            pf.recorded().is_empty(),
+            "the refusal must precede every pf operation, else a leaky anchor \
+             could already be loaded: {:?}",
+            pf.recorded()
+        );
+    }
+
+    #[tokio::test]
+    async fn install_refuses_an_interface_only_carrier_before_touching_pf() {
+        let pf = Arc::new(MockPf::default());
+        let mut o = opts_scoped();
+        o.carrier_uid = None;
+        let err = MacosKillswitch::install_with_ops(&o, pf.clone())
+            .await
+            .expect_err("phys_iface without carrier_uid must be refused");
+        assert!(
+            matches!(err, KillswitchError::InvalidInput(_)),
+            "got {err:?}"
+        );
+        assert!(
+            pf.recorded().is_empty(),
+            "the refusal must precede every pf operation: {:?}",
+            pf.recorded()
         );
     }
 
@@ -1230,7 +1384,7 @@ mod tests {
         // isolate the anchor-flush assertion on `ops.last()`.
         let pf = Arc::new(MockPf::starting_enabled(true));
         {
-            let _guard = MacosKillswitch::install_with_ops(&opts_minimal(), pf.clone())
+            let _guard = MacosKillswitch::install_with_ops(&opts_scoped(), pf.clone())
                 .await
                 .expect("install through mock pf");
         } // <- dropped without explicit uninstall
@@ -1259,7 +1413,7 @@ mod tests {
         // back the state WE just set and the restore below is a no-op no
         // matter what the host's real prior state was.
         let pf = Arc::new(MockPf::starting_enabled(false));
-        let _guard = MacosKillswitch::install_with_ops(&opts_minimal(), pf.clone())
+        let _guard = MacosKillswitch::install_with_ops(&opts_scoped(), pf.clone())
             .await
             .expect("install");
         let ops = pf.recorded();
@@ -1280,7 +1434,7 @@ mod tests {
     #[tokio::test]
     async fn uninstall_disables_pf_when_it_was_off_before_install() {
         let pf = Arc::new(MockPf::starting_enabled(false));
-        let guard = MacosKillswitch::install_with_ops(&opts_minimal(), pf.clone())
+        let guard = MacosKillswitch::install_with_ops(&opts_scoped(), pf.clone())
             .await
             .expect("install");
         guard.uninstall().await.expect("uninstall");
@@ -1295,7 +1449,7 @@ mod tests {
     #[tokio::test]
     async fn uninstall_leaves_pf_enabled_when_it_was_already_on_before_install() {
         let pf = Arc::new(MockPf::starting_enabled(true));
-        let guard = MacosKillswitch::install_with_ops(&opts_minimal(), pf.clone())
+        let guard = MacosKillswitch::install_with_ops(&opts_scoped(), pf.clone())
             .await
             .expect("install");
         guard.uninstall().await.expect("uninstall");
@@ -1311,7 +1465,7 @@ mod tests {
     async fn drop_restores_pf_disabled_state_without_explicit_uninstall() {
         let pf = Arc::new(MockPf::starting_enabled(false));
         {
-            let _guard = MacosKillswitch::install_with_ops(&opts_minimal(), pf.clone())
+            let _guard = MacosKillswitch::install_with_ops(&opts_scoped(), pf.clone())
                 .await
                 .expect("install");
         } // <- dropped without explicit uninstall
@@ -1327,7 +1481,7 @@ mod tests {
     async fn drop_does_not_disable_pf_when_it_was_already_on_before_install() {
         let pf = Arc::new(MockPf::starting_enabled(true));
         {
-            let _guard = MacosKillswitch::install_with_ops(&opts_minimal(), pf.clone())
+            let _guard = MacosKillswitch::install_with_ops(&opts_scoped(), pf.clone())
                 .await
                 .expect("install");
         }
@@ -1346,7 +1500,7 @@ mod tests {
         // returning without a rollback would leave the host blocked
         // with no guard to clean up.
         let pf = Arc::new(MockPf::failing_at_rule(2));
-        let err = MacosKillswitch::install_with_ops(&opts_minimal(), pf.clone())
+        let err = MacosKillswitch::install_with_ops(&opts_scoped(), pf.clone())
             .await
             .expect_err("install must surface the add_rule failure");
         assert!(matches!(err, KillswitchError::Pf(_)), "got {err:?}");
@@ -1372,7 +1526,7 @@ mod tests {
     #[tokio::test]
     async fn explicit_uninstall_then_drop_flushes_exactly_once() {
         let pf = Arc::new(MockPf::default());
-        let guard = MacosKillswitch::install_with_ops(&opts_minimal(), pf.clone())
+        let guard = MacosKillswitch::install_with_ops(&opts_scoped(), pf.clone())
             .await
             .expect("install");
         guard.uninstall().await.expect("explicit uninstall");
@@ -1615,7 +1769,7 @@ mod tests {
         // connection is a flow the policy passes; without it, the same connection is
         // a bypass candidate.
         let pf = Arc::new(MockPf::default());
-        let mut open = opts_minimal();
+        let mut open = opts_scoped();
         open.allow_lan = true;
         let guard = MacosKillswitch::install_with_ops(&open, pf.clone())
             .await
@@ -1628,7 +1782,7 @@ mod tests {
         drop(guard);
 
         let pf = Arc::new(MockPf::default());
-        let guard = MacosKillswitch::install_with_ops(&opts_minimal(), pf.clone())
+        let guard = MacosKillswitch::install_with_ops(&opts_scoped(), pf.clone())
             .await
             .expect("install with the LAN blocked");
         assert!(
@@ -1641,7 +1795,7 @@ mod tests {
     #[tokio::test]
     async fn purge_runs_after_the_rules_are_loaded_and_before_the_guard() {
         let pf = Arc::new(MockPf::default());
-        let guard = MacosKillswitch::install_with_ops(&opts_minimal(), pf.clone())
+        let guard = MacosKillswitch::install_with_ops(&opts_scoped(), pf.clone())
             .await
             .expect("install");
         let ops = pf.recorded();
@@ -1679,7 +1833,7 @@ mod tests {
         // guarantee here is about the rules, not about connections.
         let local: SocketAddr = (Ipv4Addr::new(192, 0, 2, 10), 5000).into();
         let carrier: SocketAddr = (EXIT_V4, 443).into();
-        let mut o = opts_minimal();
+        let mut o = opts_scoped();
         o.phys_iface = Some("en0".into());
         let pf = Arc::new(MockPf::reporting_preflight_survivors(vec![Survivor::Read(
             view(local, carrier, Proto::Udp),
@@ -1715,7 +1869,7 @@ mod tests {
     #[tokio::test]
     async fn a_preflight_purge_error_refuses_before_the_rules_are_touched() {
         let pf = Arc::new(MockPf::failing_purge_on(0));
-        let err = MacosKillswitch::install_with_ops(&opts_minimal(), pf.clone())
+        let err = MacosKillswitch::install_with_ops(&opts_scoped(), pf.clone())
             .await
             .expect_err("a pre-flight that cannot read the table must refuse the install");
         assert!(matches!(err, KillswitchError::Pf(_)), "got {err:?}");
@@ -1731,7 +1885,7 @@ mod tests {
         // The pre-flight succeeded, so the failure comes from the confirmation
         // purge after the anchor is loaded: the rollback has to run.
         let pf = Arc::new(MockPf::failing_purge_on(1));
-        let err = MacosKillswitch::install_with_ops(&opts_minimal(), pf.clone())
+        let err = MacosKillswitch::install_with_ops(&opts_scoped(), pf.clone())
             .await
             .expect_err("a failed confirmation purge must fail the install, not warn");
         assert!(matches!(err, KillswitchError::Pf(_)), "got {err:?}");
@@ -1767,7 +1921,7 @@ mod tests {
             Proto::Tcp,
         ))]));
 
-        let err = MacosKillswitch::install_with_ops(&opts_minimal(), pf.clone())
+        let err = MacosKillswitch::install_with_ops(&opts_scoped(), pf.clone())
             .await
             .expect_err("a pre-existing state that survived must fail the install");
         assert!(matches!(err, KillswitchError::Pf(_)), "got {err:?}");
@@ -1791,7 +1945,7 @@ mod tests {
             initially_enabled: true,
             ..MockPf::default()
         });
-        let err = MacosKillswitch::install_with_ops(&opts_minimal(), pf.clone())
+        let err = MacosKillswitch::install_with_ops(&opts_scoped(), pf.clone())
             .await
             .expect_err("purge failure must surface");
         assert!(matches!(err, KillswitchError::Pf(_)), "got {err:?}");
@@ -1814,7 +1968,7 @@ mod tests {
         // append the new rules to that stale set (a stale pass rule can
         // re-open egress) while still reporting a successful install.
         let pf = Arc::new(MockPf::failing_flush(0));
-        let err = MacosKillswitch::install_with_ops(&opts_minimal(), pf.clone())
+        let err = MacosKillswitch::install_with_ops(&opts_scoped(), pf.clone())
             .await
             .expect_err("a pre-load flush failure must abort the install");
         assert!(matches!(err, KillswitchError::Pf(_)), "got {err:?}");
@@ -1874,7 +2028,12 @@ mod tests {
             allow_lan: true,
             allow_dhcp: true,
             socket_mark: None,
-            phys_iface: None,
+            // The install refuses an unscoped carrier exception, so the root
+            // test uses the accepted shape: a physical interface plus the uid
+            // of the process that owns the carrier socket (the test runs
+            // elevated, hence 0 = root).
+            phys_iface: Some("lo0".into()),
+            carrier_uid: Some(0),
         };
 
         match MacosKillswitch::install(&opts).await {

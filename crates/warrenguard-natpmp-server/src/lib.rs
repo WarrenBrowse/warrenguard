@@ -156,12 +156,15 @@ pub trait PortForwardingBackend: Send + Sync {
     /// Returns `true` iff a matching mapping was found AND belonged
     /// to the requesting client (anti-DoS: Bob cannot delete Alice's
     /// mapping).
+    ///
+    /// # Errors
+    /// Returns a backend error if the kernel rule could not be removed.
     fn release_by_client(
         &self,
         client_ip: Ipv4Addr,
         internal_port: u16,
         proto: Proto,
-    ) -> impl Future<Output = bool> + Send;
+    ) -> impl Future<Output = Result<bool, NatPmpError>> + Send;
 
     /// Reads the current per-source rate-limit budget for `client_ip`
     /// without consuming a slot. The server attaches this to every Map

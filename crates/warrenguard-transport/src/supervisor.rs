@@ -1570,14 +1570,11 @@ impl MultiHopSupervisor {
             return;
         };
         // No-log policy (matches `run_reassign_loop`'s INV-3 in
-        // supervised_pump.rs): the v4 tunnel address is a shared /24-scale
-        // subnet allocation, low sensitivity even logged in full, so it is
-        // printed at INFO for operability; the v6 allocation is a
-        // globally-routable, effectively per-session client identifier, so
-        // only its PRESENCE (`dual_stack`) is logged here, never the value.
+        // supervised_pump.rs): a per-session tunnel address is a correlation
+        // handle across log lines whichever family it belongs to, so NEITHER
+        // value is logged here. Only the prefix length and the PRESENCE of a
+        // v6 allocation (`dual_stack`) are emitted.
         tracing::info!(
-            assigned = %spec.assigned,
-            gateway = %spec.gateway,
             prefix_len = spec.prefix_len,
             dual_stack = spec.assigned_v6.is_some(),
             "setup-stream returned IpAssign; publishing on the IpAssignChannel"
@@ -1644,17 +1641,20 @@ impl MultiHopSupervisor {
                     if spec.assigned == primary_spec.assigned
                         && spec.assigned_v6 == primary_spec.assigned_v6 =>
                 {
-                    tracing::debug!(index, assigned = %spec.assigned, "bonded secondary up");
+                    // No-log (INV-3): the sticky per-session address is not an
+                    // event field; `index` identifies the connection.
+                    tracing::debug!(index, "bonded secondary up");
                     return Some(client);
                 }
-                Some(spec) => {
+                Some(_) => {
                     // Allocator did not honor stickiness (pool churn,
                     // exit restart mid-bond): this connection would
                     // receive downlink for the WRONG address. Close it.
+                    // No-log (INV-3): neither the primary's nor the
+                    // secondary's sticky address is logged; the mismatch
+                    // itself is the actionable signal.
                     tracing::warn!(
                         index,
-                        primary = %primary_spec.assigned,
-                        secondary = %spec.assigned,
                         "bonded secondary got a different sticky IP; closing it"
                     );
                     client.force_close_for_reconnect();

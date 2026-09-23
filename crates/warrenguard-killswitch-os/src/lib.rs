@@ -104,13 +104,39 @@ pub use windows::{
 ///
 /// The fix is to scope the exception to the daemon's *own socket*
 /// instead of the destination: [`socket_mark`](Self::socket_mark) on
-/// Linux (`SO_MARK` + `meta mark <mark> accept`) and
-/// [`phys_iface`](Self::phys_iface) on macOS (`IP_BOUND_IF` +
-/// `on <iface>`). With either set, the split-default route captures
-/// the exit IP into the tunnel like any other destination, and only
-/// the daemon's tagged/bound socket keeps bypassing it. `None`
-/// preserves the legacy destination-based exception for callers that
-/// have not wired up socket tagging yet.
+/// Linux (`SO_MARK` + `meta mark <mark> accept`) and, on macOS,
+/// [`phys_iface`](Self::phys_iface) (`IP_BOUND_IF` + `on <iface>`)
+/// **together with** [`carrier_uid`](Self::carrier_uid) (`user <uid>`).
+/// With them set, the split-default route captures the exit IP into the
+/// tunnel like any other destination, and only the daemon's
+/// tagged/bound socket keeps bypassing it.
+///
+/// ### Interface scoping alone is not socket scoping (macOS)
+///
+/// `IP_BOUND_IF` is available to every process, not only to the daemon.
+/// A pf pass scoped `on <phys_iface> proto udp to <exit>` therefore
+/// still matches a *second* process that binds the same physical
+/// interface and dials the exit IP - it narrows the attack surface from
+/// "any route to the exit" to "any process willing to call
+/// `IP_BOUND_IF`", it does not close it. That is why the macOS install
+/// requires [`carrier_uid`](Self::carrier_uid) as well: the pf pass then
+/// carries `user <uid>`, which pf matches against the socket owner, so
+/// a process outside that identity cannot use the exception at all.
+///
+/// ### Destination-only configurations are refused
+///
+/// `socket_mark: None` (Linux) and `phys_iface`/`carrier_uid: None`
+/// (macOS) keep the legacy destination-based (or interface-only)
+/// exception. That is a documented leak, so the install entry points
+/// refuse it rather than load it:
+/// [`KillswitchOpts::validate_linux_carrier_scope`] and
+/// [`KillswitchOpts::validate_macos_carrier_scope`] are called by
+/// [`LinuxKillswitch::install_with_runner`] and by
+/// `MacosKillswitch::install_with_ops` (the macOS install path; its public
+/// entry point is `MacosKillswitch::install`). The pure
+/// builders ([`build_linux_ruleset`], `build_pf_rules`) still render the
+/// legacy rule, which keeps the layout unit-testable; only the
+/// privileged install refuses to commit it.
 #[derive(Debug, Clone)]
 pub struct KillswitchOpts {
     /// All IP addresses where the Warren exit may be reachable
@@ -151,7 +177,88 @@ pub struct KillswitchOpts {
     /// the macOS pf exit-IP pass rule is scoped `on <iface>` instead of
     /// being interface-agnostic, closing the same Port Fail hole on
     /// macOS. `None` keeps the legacy unscoped exit-address rule.
+    ///
+    /// Not sufficient on its own: `IP_BOUND_IF` is available to every
+    /// process, so [`carrier_uid`](Self::carrier_uid) must be set too
+    /// (see the struct doc). Ignored on Linux.
     pub phys_iface: Option<String>,
+
+    /// Numeric uid of the process that owns the tunnel-establishment
+    /// socket. When `Some(uid)`, the macOS pf exit-carrier pass rule
+    /// also carries `user <uid>`, which pf matches against the socket
+    /// owner: the exception is then scoped to a process identity and not
+    /// merely to a destination or an interface, so a second process
+    /// cannot borrow it (see the struct doc). Ignored on Linux
+    /// ([`socket_mark`](Self::socket_mark) covers that platform).
+    pub carrier_uid: Option<u32>,
+}
+
+impl KillswitchOpts {
+    /// Refuse a destination-based carrier exception on Linux.
+    ///
+    /// Without [`socket_mark`](Self::socket_mark) the nftables ruleset
+    /// falls back to `ip daddr <exit> meta l4proto udp accept`, which is
+    /// a *destination* match: any local process that dials the exit IP
+    /// keeps egressing off tunnel through it (Port Fail /
+    /// TunnelCrack-ServerIP). The install path calls this before it
+    /// touches nftables, so an unwired consumer fails closed at boot
+    /// rather than loading the leaky ruleset.
+    ///
+    /// # Errors
+    ///
+    /// [`KillswitchError::InvalidInput`] when
+    /// [`socket_mark`](Self::socket_mark) is `None`.
+    pub fn validate_linux_carrier_scope(&self) -> Result<(), KillswitchError> {
+        if self.socket_mark.is_none() {
+            return Err(KillswitchError::InvalidInput(
+                "socket_mark is None: the Linux killswitch would fall back to a \
+                 destination-based exit exception (`ip daddr <exit> ... accept`), which \
+                 lets any local process dialing the exit IP egress off tunnel (Port Fail \
+                 / TunnelCrack-ServerIP). Set `socket_mark` to the SO_MARK the \
+                 tunnel-establishment socket carries."
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Refuse a carrier exception that is not bound to the daemon's
+    /// process identity on macOS.
+    ///
+    /// `IP_BOUND_IF` is available to every process, so scoping the pf
+    /// pass `on <phys_iface>` does not make it the daemon's own: a second
+    /// process that binds the same interface and dials the exit IP
+    /// matches it too. The pass therefore also carries
+    /// `user <carrier_uid>`, and both options are required here.
+    ///
+    /// # Errors
+    ///
+    /// [`KillswitchError::InvalidInput`] when
+    /// [`phys_iface`](Self::phys_iface) or
+    /// [`carrier_uid`](Self::carrier_uid) is `None`.
+    pub fn validate_macos_carrier_scope(&self) -> Result<(), KillswitchError> {
+        if self.phys_iface.is_none() {
+            return Err(KillswitchError::InvalidInput(
+                "phys_iface is None: the macOS killswitch would fall back to an \
+                 interface-agnostic exit exception (`pass proto udp to <exit>`), which \
+                 lets any local process dialing the exit IP egress off tunnel (Port Fail \
+                 / TunnelCrack-ServerIP). Set `phys_iface` to the interface the carrier \
+                 socket is IP_BOUND_IF-bound to."
+                    .to_owned(),
+            ));
+        }
+        if self.carrier_uid.is_none() {
+            return Err(KillswitchError::InvalidInput(
+                "carrier_uid is None: `IP_BOUND_IF` is available to any process, so an \
+                 interface-scoped pass is still usable by a second process that binds \
+                 the same interface and dials the exit IP. Set `carrier_uid` to the uid \
+                 of the process that owns the tunnel-establishment socket, so the pf \
+                 pass carries `user <uid>`."
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Name of the nftables table used by the killswitch. Reserved for
@@ -397,6 +504,9 @@ impl LinuxKillswitch {
     ///
     /// - [`KillswitchError::InvalidInput`] if `opts.tun_name` is not a
     ///   valid identifier.
+    /// - [`KillswitchError::InvalidInput`] if
+    ///   [`KillswitchOpts::validate_linux_carrier_scope`] refuses the
+    ///   destination-based exit exception (`socket_mark: None`).
     /// - [`KillswitchError::Nft`] if `nft` is not in `$PATH`, lacks
     ///   privileges (`CAP_NET_ADMIN`), or rejects the ruleset.
     pub async fn install(opts: &KillswitchOpts) -> Result<Self, KillswitchError> {
@@ -416,6 +526,11 @@ impl LinuxKillswitch {
         runner: std::sync::Arc<dyn CommandRunner>,
     ) -> Result<Self, KillswitchError> {
         validate_tun_name(&opts.tun_name)?;
+        // Refuse the destination-based exit exception before touching nft:
+        // see `validate_linux_carrier_scope`. A consumer that has not wired
+        // SO_MARK tagging gets a hard failure here (fail closed) instead of a
+        // ruleset any local process can borrow to egress off tunnel.
+        opts.validate_linux_carrier_scope()?;
         let ruleset = build_linux_ruleset(opts);
         run_nft_with_stdin(runner.clone(), ruleset).await?;
         tracing::info!(
@@ -574,6 +689,20 @@ mod tests {
             allow_dhcp: false,
             socket_mark: None,
             phys_iface: None,
+            carrier_uid: None,
+        }
+    }
+
+    /// The carrier-scoped options the INSTALL path accepts: the pure
+    /// ruleset tests keep using [`opts_minimal`] to exercise the legacy
+    /// destination-based layout, but a privileged install refuses it (see
+    /// [`KillswitchOpts::validate_linux_carrier_scope`]).
+    fn opts_scoped() -> KillswitchOpts {
+        KillswitchOpts {
+            socket_mark: Some(0x7761_7272),
+            phys_iface: Some("en0".into()),
+            carrier_uid: Some(501),
+            ..opts_minimal()
         }
     }
 
@@ -808,6 +937,82 @@ mod tests {
         }
     }
 
+    // ---- carrier scoping (Port Fail / TunnelCrack-ServerIP) ----------
+
+    #[test]
+    fn linux_carrier_scope_accepts_a_marked_socket() {
+        opts_scoped()
+            .validate_linux_carrier_scope()
+            .expect("a socket_mark-scoped carrier is the accepted configuration");
+    }
+
+    #[test]
+    fn linux_carrier_scope_refuses_the_destination_only_exception() {
+        let err = opts_minimal()
+            .validate_linux_carrier_scope()
+            .expect_err("socket_mark: None must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("socket_mark") && msg.contains("destination-based"),
+            "the refusal must name the option and the reason: {msg}"
+        );
+        assert!(
+            matches!(err, KillswitchError::InvalidInput(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn macos_carrier_scope_accepts_interface_plus_process_identity() {
+        opts_scoped()
+            .validate_macos_carrier_scope()
+            .expect("phys_iface + carrier_uid is the accepted configuration");
+    }
+
+    #[test]
+    fn macos_carrier_scope_refuses_an_unscoped_carrier() {
+        let err = opts_minimal()
+            .validate_macos_carrier_scope()
+            .expect_err("phys_iface: None must be refused");
+        assert!(
+            err.to_string().contains("phys_iface"),
+            "the refusal must name the missing option: {err}"
+        );
+    }
+
+    #[test]
+    fn macos_carrier_scope_refuses_an_interface_only_carrier() {
+        // The audit finding: `IP_BOUND_IF` is available to any process, so an
+        // interface-scoped pass is not the daemon's own socket. The process
+        // identity is required on top of it.
+        let mut o = opts_scoped();
+        o.carrier_uid = None;
+        let err = o
+            .validate_macos_carrier_scope()
+            .expect_err("carrier_uid: None must be refused even with phys_iface set");
+        assert!(
+            err.to_string().contains("carrier_uid"),
+            "the refusal must name the missing option: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_refuses_the_destination_only_carrier_exception_before_nft_spawn() {
+        let runner = Arc::new(RecordingRunner::default());
+        let err = LinuxKillswitch::install_with_runner(&opts_minimal(), runner.clone())
+            .await
+            .expect_err("install must refuse socket_mark: None");
+        assert!(
+            matches!(err, KillswitchError::InvalidInput(_)),
+            "got {err:?}"
+        );
+        assert!(
+            runner.calls().is_empty(),
+            "the refusal must happen BEFORE any nft invocation, otherwise a leaky \
+             ruleset could already have been committed"
+        );
+    }
+
     // ---- install / uninstall error paths ----------------------------
     //
     // These exercise the error paths that bail BEFORE spawning `nft`,
@@ -907,7 +1112,7 @@ mod tests {
     async fn drop_invokes_the_exact_nft_teardown_command() {
         let runner = Arc::new(RecordingRunner::default());
         {
-            let _guard = LinuxKillswitch::install_with_runner(&opts_minimal(), runner.clone())
+            let _guard = LinuxKillswitch::install_with_runner(&opts_scoped(), runner.clone())
                 .await
                 .expect("install through mock runner");
         } // <- guard dropped without explicit uninstall
@@ -940,7 +1145,7 @@ mod tests {
     #[tokio::test]
     async fn failed_install_constructs_no_guard_and_runs_no_teardown() {
         let runner = Arc::new(RecordingRunner::failing("Operation not permitted"));
-        let err = LinuxKillswitch::install_with_runner(&opts_minimal(), runner.clone())
+        let err = LinuxKillswitch::install_with_runner(&opts_scoped(), runner.clone())
             .await
             .expect_err("install must surface the nft failure");
         assert!(matches!(err, KillswitchError::Nft(_)), "got {err:?}");
@@ -958,7 +1163,7 @@ mod tests {
     #[tokio::test]
     async fn explicit_uninstall_then_drop_tears_down_exactly_once() {
         let runner = Arc::new(RecordingRunner::default());
-        let guard = LinuxKillswitch::install_with_runner(&opts_minimal(), runner.clone())
+        let guard = LinuxKillswitch::install_with_runner(&opts_scoped(), runner.clone())
             .await
             .expect("install");
         guard.uninstall().await.expect("explicit uninstall");

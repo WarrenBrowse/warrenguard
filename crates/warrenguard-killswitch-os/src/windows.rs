@@ -1705,6 +1705,10 @@ mod tests {
             allow_dhcp: false,
             socket_mark: None,
             phys_iface: None,
+            // Unused on Windows: the outbound exceptions are scoped by the
+            // daemon's own executable path (app-id), which is the Windows
+            // equivalent of the pf `user <uid>` / Linux `SO_MARK` scope.
+            carrier_uid: None,
         }
     }
 

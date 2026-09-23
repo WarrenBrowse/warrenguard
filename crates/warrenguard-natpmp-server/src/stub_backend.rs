@@ -91,12 +91,12 @@ impl PortForwardingBackend for StubBackend {
         client_ip: Ipv4Addr,
         internal_port: u16,
         proto: Proto,
-    ) -> impl Future<Output = bool> + Send {
+    ) -> impl Future<Output = Result<bool, NatPmpError>> + Send {
         let allocator = Arc::clone(&self.allocator);
         async move {
-            allocator
+            Ok(allocator
                 .release_by_client(client_ip, internal_port, proto)
-                .is_some()
+                .is_some())
         }
     }
 
