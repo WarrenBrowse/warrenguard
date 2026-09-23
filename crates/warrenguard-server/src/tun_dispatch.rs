@@ -34,6 +34,25 @@ use warrenguard_daita::daita::{DaitaEvent, DaitaState};
 use warrenguard_transport_core::PacketDevice;
 use warrenguard_transport_core::error::{Result, TunnelError};
 
+/// Most connections one tunnel address may register. A client bonds at most 8
+/// connections into one session; the headroom covers the overlap of a sticky
+/// reconnect, when the dying generation is still registered as the fresh one
+/// registers.
+pub const MAX_CONNS_PER_SLOT: usize = 16;
+
+/// Why [`TunDownlinkTable::register`] did not register a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum RegisterRefused {
+    /// The address is not a client host of the pool (outside it, or its
+    /// network, gateway or broadcast address).
+    #[error("the tunnel address is not a client address of the pool")]
+    OutsidePool,
+    /// The address already carries [`MAX_CONNS_PER_SLOT`] open connections.
+    #[error("the tunnel address already carries the most connections it may")]
+    SlotFull,
+}
+
 #[must_use]
 pub(crate) fn pool_offset(ip: Ipv4Addr) -> Option<u16> {
     let octets = ip.octets();
@@ -138,13 +157,26 @@ impl DispatchSlot {
         }
     }
 
+    /// Adds `conn`, or refuses it when the slot already carries
+    /// [`MAX_CONNS_PER_SLOT`] open connections. At the cap the connections
+    /// that have closed are dropped first: a slot filled with the dead
+    /// generations of a reconnect storm, whose unregistration lags, must not
+    /// lock out the live client. That scan reads each connection's state
+    /// under the table lock, which is why it runs only at the cap.
+    #[must_use]
     pub(crate) fn add_conn(
         &mut self,
         conn: Connection,
         client_id: WarrenPubkey,
         daita: Option<Arc<SharedDaitaState>>,
         metrics: Option<Arc<warrenguard_transport_core::client_metrics::ClientMetrics>>,
-    ) {
+    ) -> bool {
+        if self.conns.len() >= MAX_CONNS_PER_SLOT {
+            self.conns.retain(|c| c.close_reason().is_none());
+            if self.conns.len() >= MAX_CONNS_PER_SLOT {
+                return false;
+            }
+        }
         self.conns.push(conn);
         self.client_id = client_id;
         if daita.is_some() {
@@ -153,6 +185,7 @@ impl DispatchSlot {
         if metrics.is_some() {
             self.metrics = metrics;
         }
+        true
     }
 
     pub(crate) fn remove_conn(&mut self, conn: &Connection) {
@@ -233,6 +266,13 @@ impl TunDownlinkTable {
     /// number of connections now registered on this slot (1 = this is
     /// the session's first/only connection), so callers can attach
     /// session-wide observability exactly once per session.
+    ///
+    /// # Errors
+    ///
+    /// [`RegisterRefused::OutsidePool`] for an address that is not a client
+    /// host of the pool, [`RegisterRefused::SlotFull`] when the address
+    /// already carries [`MAX_CONNS_PER_SLOT`] open connections. Nothing is
+    /// registered in either case.
     pub fn register(
         &self,
         ipv4: Ipv4Addr,
@@ -241,14 +281,14 @@ impl TunDownlinkTable {
         client_id: WarrenPubkey,
         daita: Option<Arc<SharedDaitaState>>,
         metrics: Option<Arc<warrenguard_transport_core::client_metrics::ClientMetrics>>,
-    ) -> usize {
-        let Some(offset) = pool_offset(ipv4) else {
-            return 0;
-        };
+    ) -> std::result::Result<usize, RegisterRefused> {
+        let offset = pool_offset(ipv4).ok_or(RegisterRefused::OutsidePool)?;
         let mut slots = self.slots.write();
         let count = match &mut slots[offset as usize] {
             Some(slot) => {
-                slot.add_conn(conn, client_id, daita, metrics);
+                if !slot.add_conn(conn, client_id, daita, metrics) {
+                    return Err(RegisterRefused::SlotFull);
+                }
                 slot.conn_count()
             }
             entry @ None => {
@@ -261,7 +301,7 @@ impl TunDownlinkTable {
         if let Some(v6) = ipv6 {
             self.ipv6_to_offset.write().insert(v6, offset);
         }
-        count
+        Ok(count)
     }
 
     /// Unregisters a connection. Removes the slot if no connections remain.
@@ -723,6 +763,118 @@ mod tests {
         let table = TunDownlinkTable::new();
         let pkt = vec![0xFFu8; 40];
         assert!(matches!(table.dispatch_packet(&pkt), Ok(false)));
+    }
+
+    /// Live QUIC connections over loopback. The peer ends and the endpoints
+    /// are held so the connections stay open as long as this lives.
+    struct Loopback {
+        conns: Vec<Connection>,
+        _peers: Vec<Connection>,
+        _endpoints: [quinn::Endpoint; 2],
+    }
+
+    async fn loopback_connections(n: usize) -> Loopback {
+        let exit_key = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        let provider = warrenguard_tls::default_crypto_provider();
+        let alpns: &[&[u8]] = &[warrenguard_config::ALPN_H3];
+        let server_config = warrenguard_tls::make_server_config(&exit_key, provider.clone(), alpns)
+            .expect("server config builds");
+        let server = quinn::Endpoint::server(server_config, (Ipv4Addr::LOCALHOST, 0).into())
+            .expect("server endpoint binds");
+        let mut client =
+            quinn::Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).expect("client binds");
+        client.set_default_client_config(
+            warrenguard_tls::make_client_config(provider, alpns).expect("client config builds"),
+        );
+        let sni = warrenguard_tls::name::encode(WarrenPubkey::from_bytes(
+            *exit_key.verifying_key().as_bytes(),
+        ));
+        let server_addr = server.local_addr().expect("server addr");
+        let mut conns = Vec::with_capacity(n);
+        let mut peers = Vec::with_capacity(n);
+        for _ in 0..n {
+            let connecting = client.connect(server_addr, &sni).expect("connect starts");
+            let accepting = async { server.accept().await.expect("server accepts").await };
+            let (conn, peer) = tokio::join!(connecting, accepting);
+            conns.push(conn.expect("client handshake"));
+            peers.push(peer.expect("server handshake"));
+        }
+        Loopback {
+            conns,
+            _peers: peers,
+            _endpoints: [server, client],
+        }
+    }
+
+    fn client_id() -> WarrenPubkey {
+        WarrenPubkey::from_bytes([7; 32])
+    }
+
+    #[tokio::test]
+    async fn a_slot_refuses_a_connection_past_its_cap() {
+        let Loopback { conns, .. } = &loopback_connections(MAX_CONNS_PER_SLOT + 1).await;
+        let table = TunDownlinkTable::new();
+        let ip = Ipv4Addr::new(10, 66, 0, 9);
+
+        for (registered, conn) in conns[..MAX_CONNS_PER_SLOT].iter().enumerate() {
+            assert_eq!(
+                table.register(ip, None, conn.clone(), client_id(), None, None),
+                Ok(registered + 1)
+            );
+        }
+        let refused = table.register(
+            ip,
+            None,
+            conns[MAX_CONNS_PER_SLOT].clone(),
+            client_id(),
+            None,
+            None,
+        );
+
+        assert_eq!(refused, Err(RegisterRefused::SlotFull));
+    }
+
+    #[tokio::test]
+    async fn a_full_slot_makes_room_by_dropping_its_closed_connections() {
+        let Loopback { conns, .. } = &loopback_connections(MAX_CONNS_PER_SLOT + 1).await;
+        let table = TunDownlinkTable::new();
+        let ip = Ipv4Addr::new(10, 66, 0, 9);
+        for conn in &conns[..MAX_CONNS_PER_SLOT] {
+            table
+                .register(ip, None, conn.clone(), client_id(), None, None)
+                .expect("under the cap");
+        }
+        conns[0].close(0u32.into(), b"");
+        conns[1].close(0u32.into(), b"");
+
+        let registered = table.register(
+            ip,
+            None,
+            conns[MAX_CONNS_PER_SLOT].clone(),
+            client_id(),
+            None,
+            None,
+        );
+
+        assert_eq!(registered, Ok(MAX_CONNS_PER_SLOT - 1));
+    }
+
+    #[tokio::test]
+    async fn an_address_outside_the_client_pool_is_refused() {
+        let Loopback { conns, .. } = &loopback_connections(1).await;
+        let table = TunDownlinkTable::new();
+
+        let refused = table.register(
+            Ipv4Addr::new(10, 66, 0, 1),
+            None,
+            conns[0].clone(),
+            client_id(),
+            None,
+            None,
+        );
+
+        assert_eq!(refused, Err(RegisterRefused::OutsidePool));
+        assert_eq!(table.active_count(), 0);
     }
 
     // --- Source IP extraction (anti-spoofing) ---

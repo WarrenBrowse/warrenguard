@@ -33,6 +33,7 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 ed25519-dalek = { workspace = true }
 parking_lot = { workspace = true }
+thiserror = { workspace = true }
 # SO_REUSEPORT multi-endpoint datapath: bind N UDP sockets on one port so the
 # kernel 4-tuple-hashes inbound QUIC flows across N endpoint drivers. `all`
 # gates the reuse-port setter. Already in the tree via quinn-udp.
