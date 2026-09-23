@@ -368,10 +368,27 @@ mod tests {
 
     #[test]
     fn a_non_canonical_blind_signature_is_never_released() {
-        let (sk, request) = issuer_and_request();
-        // Above the modulus: not the canonical representative of any residue.
+        let (sk, _) = issuer_and_request();
+        let key: &RsaPublicKey = sk.public.inner.as_ref();
+        let bits = key.n_bits_precision();
+        // The request whose signature is 2, so that `2 + n` still fits in the
+        // modulus width.
+        let two = BoxedUint::from_be_slice(&[2], bits).expect("encode");
+        let request = rsa_encrypt(key, &two).expect("encrypt").to_be_bytes();
+        assert_eq!(
+            sk.blind_sign(&request).expect("sign"),
+            two.to_be_bytes().into_vec()
+        );
+
+        // `2 + n` is congruent to the genuine signature, so it passes the
+        // exponent check on its own: only the range guard refuses it.
+        let (lifted, overflow) = two.overflowing_add(key.n().as_ref());
+        assert!(!bool::from(overflow));
+        let expected = BoxedUint::from_be_slice(&request, bits).expect("decode");
+        assert!(rsa_encrypt(key, &lifted).is_ok_and(|m| m == expected));
+
         assert!(matches!(
-            sk.release_if_valid(&request, vec![0xFF; AUTHENTICATOR_LEN]),
+            sk.release_if_valid(&request, lifted.to_be_bytes().into_vec()),
             Err(TokenError::BlindOperation)
         ));
     }

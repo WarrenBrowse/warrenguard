@@ -248,9 +248,41 @@ fn issuer_key_der_roundtrip_preserves_key_id() {
     reloaded.public_key().verify_token(&token).unwrap();
 }
 
-/// Blinded request built by `blind_token` under the fixed issuer key of
-/// `edge_js_token_vector.rs` (seed `0xED9E5EED`), challenge
-/// `("api.warrenbrowse.com", [0x33; 32])`, client RNG seed `0xB11D5160`.
+/// PKCS#8 DER of a 2048-bit test issuer key (the one `edge_js_token_vector.rs`
+/// derives from seed `0xED9E5EED`), frozen so the known answer below does not
+/// depend on key generation staying reproducible across dependency versions.
+const KAT_ISSUER_KEY_DER_HEX: &str = concat!(
+    "308204bf020100300d06092a864886f70d0101010500048204a9308204a50201000282010100b2a9ec6c63bbdecfe566",
+    "5f484756a99b7938cceaee171972d58128f1285af7525f1a374ace320d0dc071bf1aa2be300a3874abce3a63761cf450",
+    "f07c9d21e8fb68513d739ac978f977a173f006210696d762c28b657209a4e458476ab034e67881a0098f9fcbc62aa563",
+    "ab2ee7ac92b14d97c870b500e54aaeaae705ab9c29e05d040fd067fc03b79aba6cbbfa89f167d445daa1a73730143b1e",
+    "510439a628346279e6d30bfdbba898d72333b9f13343f6246bcb7d2ca83366f5bf70cd72cb1e13a1daa793ce8a40d966",
+    "235d34925ad8e2b67d70fe91d8278f84c8f89b271663c6e44e5eae2f8879eab42425de39bd81c71730c7f4cc969e81c0",
+    "dee81bacd549020301000102820101009189ce27b54eb3005374832593c74abe758f098e4e88ce9836c7d21c30ad794e",
+    "c65dcab0cb2b066b2f5af93baf5a9233a12d994e934db6477bd5fb30e7a759ec825bbb5d52b7d02e177f93bbf0a23285",
+    "e9ca6f83b20da54187294a73e43a138c12bbd54e03f3b0e7c8765a5a092b110c1193151a8ab7c210861c7db8a6c4bd6e",
+    "c4a840ae20fef1367ea42018e5258d9c81b83b2c03ffd344ff09056817e463c44bd4504d2923704bc3eb945d7502ac48",
+    "886ad3bdeafe3827bed71b7715258bc8a9b9fa6fdf1cfab57f5fbf4e4a429651cde13dc67b690cfd9074f384e7203a22",
+    "ab29168996d3bf89c919031ff8e757af3676db2b0775f1375910844aefed1d2902818100d66ecce05d260b9d48c771cc",
+    "19d3392afd32a2fe3951e398edb3bfc64a88d7099ce8b462e6af1672a624fdd6cb441439cffc6713f4acd5d657b8b3b0",
+    "e86a1e261dc94a5de1b559afc5d9ecfdc96f36897e9571629384fcd97e0649afa53140d13ba0b69b61b796a90c29da72",
+    "27a5bdc4bb6ac4eb57d9c37037bc03f3fd9697e302818100d54c16c30918447992ee7d022ba95db3e8e67b9af489b3ff",
+    "755c5a2120a0cb963ec28055b9fc7edf222e862f1c9d409753ef5b583810189d436a9be9dc21804695f9d78bd58a7951",
+    "73cfbc6dd0e37a24bb437d03d0a031ac9fbf7b95713173d9a94139b48fa4ceadadb877194e379ec41596fcfeeccb6c7d",
+    "24209f79ca0dede3028180706ba09fd45618eab9f84e71f9ec2261a66340ced5d057e99a5d8da270fb32fa08387c3209",
+    "cd2b90aa0864c892c2bb73dfd5ed58aa035f0cc3eac2d271d708bd650a5e21c02eaab99b99f844c9b1b3befc0d6f6785",
+    "fdc7ee62c2fb28ca0b7b76f6b2f869981e7f2f5b8029d58571c07efedf2824566785ae349a2edc614bed8f02818100bf",
+    "ffc30983394e0225a9f9eb274448adb6fb29ce9d4b0b34ebfedabeb1312cb1ad02c624e4cb0da56b8e778916f7d279a5",
+    "bb72fd215213e61416760c77f3cc153dd16d1e597551a9695758a57d8016a5d3cf774c24d2de84263466596a4ffa99b6",
+    "8a991818a960c5e3f78575c8fbb63589bda53510103933187f292ea71c0cc3028181008ad13f8e63c4160cd6bcec9db9",
+    "bb62d664ce9ca38859cb88232745778ad54f59a15888bb2278189090e238a8d67f5de2d36c24af2b7191f07b3b41794a",
+    "9eeef185c866e9038fc2d8c89c81ab7220571d15e0f05a83e1ff2f3d0b091c06e7048f2d9f69542e34e0bb8598754724",
+    "825f3bde2851d60e12869c1ef346efd5314986",
+);
+
+/// Blinded request built by `blind_token` under [`KAT_ISSUER_KEY_DER_HEX`],
+/// challenge `("api.warrenbrowse.com", [0x33; 32])`, client RNG seed
+/// `0xB11D5160`.
 const KAT_BLINDED_REQUEST_HEX: &str = concat!(
     "1585af18ec271450eafc37a91e36681500abe98c58af9bf9c68633799edfed8d16f70685d9d56d2a45a560faa33c89e198a512e215c719417a22917472ef73e1",
     "0b94ff2fd56b26366ca8ab5daeb5841ee3d58bc4bc08aadbb47defb7eeb818718d60be1b9a60900e52b10caf4391a10a7af674669ddb6565a5e14099760e87e3",
@@ -270,7 +302,8 @@ const KAT_BLIND_SIGNATURE_HEX: &str = concat!(
 
 #[test]
 fn blind_signature_over_a_fixed_request_is_frozen() {
-    let sk = IssuerSecretKey::generate(&mut StdRng::seed_from_u64(0xED9E_5EED)).expect("keygen");
+    let der = hex::decode(KAT_ISSUER_KEY_DER_HEX).expect("valid hex");
+    let sk = IssuerSecretKey::from_der(&der).expect("valid key");
     let request = hex::decode(KAT_BLINDED_REQUEST_HEX).expect("valid hex");
     let expected = hex::decode(KAT_BLIND_SIGNATURE_HEX).expect("valid hex");
 

@@ -68,7 +68,10 @@ blind-rsa-signatures = "0.17"
 # The RSA crate blind-rsa-signatures signs with, named directly so the issuer
 # can re-verify each blind signature before releasing it. Must resolve to the
 # same version blind-rsa-signatures uses, or its key types stop unifying.
-rsa = { version = "0.10.0-rc.18", default-features = false, features = ["hazmat"] }
+# Pinned exactly: docs/97-BLIND-RSA-ISSUER-TIMING.md analyses this release, so
+# moving it (or a blind-rsa-signatures release that needs another one) is a
+# deliberate step that revisits that analysis.
+rsa = { version = "=0.10.0-rc.18", default-features = false, features = ["hazmat"] }
 # AES for QUIC Initial packet protection (RFC 9001): AES-128-GCM payload +
 # AES-128 (single-block ECB) header-protection mask. Used by warrenguard-ja4.
 aes = "0.8"

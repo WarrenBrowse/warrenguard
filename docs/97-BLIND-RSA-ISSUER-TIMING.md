@@ -191,15 +191,18 @@ In `crates/warrenguard-token`:
 - `issuer::tests::every_signature_draws_a_fresh_modulus_sized_blinding_factor`:
   each signature consumes at least a modulus of randomness from the RNG the
   issuer passes, and the output stays identical.
-- `issuer::tests::a_blind_signature_that_does_not_verify_is_never_released`
-  and `a_non_canonical_blind_signature_is_never_released`: the release gate.
+- `issuer::tests::a_blind_signature_that_does_not_verify_is_never_released`:
+  the release gate refuses a corrupted signature.
+- `issuer::tests::a_non_canonical_blind_signature_is_never_released`: the gate
+  refuses `sig + n`, which passes the exponent check on its own.
 - `tests/privacy_pass.rs` `blind_signature_over_a_fixed_request_is_frozen`: a
-  known-answer blind signature under a fixed key, captured before this change,
-  so the RNG and gate changes are proven byte-identical on the wire.
+  known-answer blind signature under a fixed DER key, captured before the RNG
+  and gate changes, which are therefore byte-identical on the wire.
 
 ## Advisory handling
 
 RUSTSEC-2023-0071 stays ignored in `deny.toml` and `.cargo/audit.toml`, with a
-justification pointing here. Revisit it when an `rsa` release is marked patched,
-when either crate is upgraded, or if the engine ever adds RSA decryption with
+justification pointing here, and the workspace pins `rsa` to exactly the
+analysed release. Revisit it when an `rsa` release is marked patched, when
+either crate is upgraded, or if the engine ever adds RSA decryption with
 padding.
