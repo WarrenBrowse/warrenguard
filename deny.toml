@@ -14,9 +14,6 @@ ignore = [
     # paste: unmaintained, transitive via the netlink chain. No drop-in
     # replacement exists. Attack surface is compile-time generated code only.
     "RUSTSEC-2024-0436",
-    # atomic-polyfill: unmaintained, transitive via portable-atomic-util. No
-    # user-facing surface, just an atomic trampoline.
-    "RUSTSEC-2023-0089",
     # bincode 1.3.3: unmaintained after the upstream team ceased development.
     # Reached transitively as maybenot-machines -> bincode, used only to decode
     # machine spec blobs at parse time. The engine never feeds
