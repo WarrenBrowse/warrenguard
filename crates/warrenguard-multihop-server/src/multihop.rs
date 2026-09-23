@@ -4761,13 +4761,9 @@ async fn serve_pq_datagram_pump<T>(
                     }
                 }
             };
-            // Record the key of the session actually in use so the keepalive
-            // task can refresh it: an idle gap over the cache TTL would
-            // otherwise silently evict a still-connected session (see
-            // `PqSessionCache::refresh`).
-            *current_key_rx.lock() = Some(frame.encapsulated_key);
             let session = handle.session;
-            let (frame_seq, frame_epoch) = (frame.seq, frame.epoch);
+            let (frame_seq, frame_epoch, frame_key) =
+                (frame.seq, frame.epoch, frame.encapsulated_key);
             let mut plaintext = match session.open(&frame) {
                 Ok(p) => p,
                 Err(_) => {
@@ -4784,6 +4780,12 @@ async fn serve_pq_datagram_pump<T>(
                 report.replays += 1;
                 continue;
             }
+            // Record the key of the session actually in use so the keepalive
+            // task can refresh it: an idle gap over the cache TTL would
+            // otherwise silently evict a still-connected session (see
+            // `PqSessionCache::refresh`). Only once the frame authenticated: a
+            // forged one could otherwise point the keepalive elsewhere.
+            *current_key_rx.lock() = Some(frame_key);
             *current_rx.lock() = (session, frame_epoch);
             // Authenticated: this datagram really is the client's uplink, so
             // from here on failing to reach the TUN is a black-hole and not
@@ -9123,33 +9125,63 @@ mod tests {
         );
     }
 
-    /// The `/v2` pump runs the same uplink gate as the classical one: a
-    /// capped PQ session must drop its over-budget DATA packets before the
-    /// TUN.
+    /// A `/v2` client admitted through a real setup exchange, sending DATA
+    /// datagrams over its own QUIC connection to a real accept loop.
     #[cfg(feature = "pq-hpke")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn pq_uplink_over_budget_is_dropped() {
-        let policy = SessionRatePolicy::new();
-        policy.set_policy(RateSpec::new(250, 1), std::iter::empty());
-        let tun = warrenguard_transport_core::FakeTun::new();
+    struct PqDataClient {
+        harness: ExitHarness,
+        _endpoint: Endpoint,
+        conn: Connection,
+        session: warrenguard_multihop::PqClientSession,
+        assigned: Ipv4Addr,
+    }
 
+    #[cfg(feature = "pq-hpke")]
+    impl PqDataClient {
+        /// A 100-byte uplink packet from the assigned address.
+        fn packet(&self, src_port: u16) -> Vec<u8> {
+            let mut pkt = ipv4_tcp_full(self.assigned, RATE_PEER, src_port, 443);
+            pkt.resize(100, 0);
+            pkt
+        }
+
+        fn send(&self, frame: &warrenguard_multihop::WarrenMultihopFrameV2) {
+            let bytes = encode_frame_v2(frame).expect("encode v2 data frame");
+            self.conn
+                .send_datagram(bytes.into())
+                .expect("send v2 datagram");
+        }
+
+        fn send_data(&self, seq: u64, pkt: &[u8]) {
+            let frame = self.session.seal(pkt, 0, seq).expect("seal v2 data frame");
+            self.send(&frame);
+        }
+    }
+
+    #[cfg(feature = "pq-hpke")]
+    async fn pq_data_client(
+        policy: Option<SessionRatePolicy>,
+        tun: warrenguard_transport_core::FakeTun,
+    ) -> PqDataClient {
         let exit_key = SigningKey::from_bytes(&[0x42; 32]);
         let x25519_ikm = derive_x25519_ikm_from_ed25519(&exit_key);
         let (privkey, exit_pub) = derive_x25519_keypair(&x25519_ikm).expect("x25519 keypair");
         let (xwing_secret, mlkem_ek) =
             derive_exit_xwing_from_identity(&exit_key).expect("xwing derive");
-        let ctx = ExitTerminateCtx::new(
+        let mut ctx = ExitTerminateCtx::new(
             privkey,
             ExitId::from_bytes(ANTI_ORACLE_EXIT_ID),
-            tun.clone(),
+            tun,
             None,
             None,
             v4_alloc(),
             None,
             None,
         )
-        .with_xwing_secret(Arc::new(xwing_secret))
-        .with_session_rate_policy(policy);
+        .with_xwing_secret(Arc::new(xwing_secret));
+        if let Some(policy) = policy {
+            ctx = ctx.with_session_rate_policy(policy);
+        }
         let harness = spawn_exit_accept_loop(&exit_key, ctx);
 
         let provider = warrenguard_tls::default_crypto_provider();
@@ -9199,21 +9231,70 @@ mod tests {
         let Some(WarrenControlMessage::IpAssign { ipv4, .. }) = detail else {
             panic!("expected a PQ IpAssign, got {detail:?}");
         };
-        let assigned = Ipv4Addr::from(ipv4);
+        PqDataClient {
+            harness,
+            _endpoint: endpoint,
+            conn,
+            session,
+            assigned: Ipv4Addr::from(ipv4),
+        }
+    }
+
+    /// The `/v2` pump runs the same uplink gate as the classical one: a
+    /// capped PQ session must drop its over-budget DATA packets before the
+    /// TUN.
+    #[cfg(feature = "pq-hpke")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pq_uplink_over_budget_is_dropped() {
+        let policy = SessionRatePolicy::new();
+        policy.set_policy(RateSpec::new(250, 1), std::iter::empty());
+        let tun = warrenguard_transport_core::FakeTun::new();
+        let client = pq_data_client(Some(policy), tun.clone()).await;
 
         for seq in 1..=5u64 {
-            let mut pkt = ipv4_tcp_full(assigned, RATE_PEER, 51_000, 443);
-            pkt.resize(100, 0);
-            let frame = session.seal(&pkt, 0, seq).expect("seal v2 data frame");
-            let bytes = encode_frame_v2(&frame).expect("encode v2 data frame");
-            conn.send_datagram(bytes.into()).expect("send v2 datagram");
+            client.send_data(seq, &client.packet(51_000));
         }
         let got = settled_tun_outbound(&tun, 2, Duration::from_secs(5)).await;
-        harness.accept_task.abort();
+        client.harness.accept_task.abort();
         assert_eq!(
             got.len(),
             2,
             "a 250 B budget must admit exactly two 100 B PQ packets"
+        );
+    }
+
+    /// Only an authenticated datagram may choose the session the
+    /// connection's keepalive refreshes. A forged one (a fresh
+    /// `encapsulated_key` with a junk ML-KEM ciphertext, which builds a
+    /// throwaway session and then fails the AEAD) must leave the keepalive
+    /// on the client's real session; otherwise an idle gap longer than the
+    /// cache TTL evicts that session and black-holes the client's next
+    /// packet.
+    #[cfg(feature = "pq-hpke")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pq_forged_frame_does_not_steer_the_session_keepalive() {
+        let tun = warrenguard_transport_core::FakeTun::new();
+        let client = pq_data_client(None, tun.clone()).await;
+        client.send_data(1, &client.packet(51_001));
+        let got = settled_tun_outbound(&tun, 1, Duration::from_secs(5)).await;
+        assert_eq!(got.len(), 1, "the authenticated packet is delivered");
+
+        let mut forged = client
+            .session
+            .seal(&client.packet(51_002), 0, 2)
+            .expect("seal");
+        forged.encapsulated_key = [0x77; 32];
+        forged.pq_ct = vec![0x55; client.session.pq_ct().len()];
+        client.send(&forged);
+
+        tokio::time::sleep(SESSION_CACHE_TTL + Duration::from_secs(1)).await;
+        client.send_data(3, &client.packet(51_003));
+        let got = settled_tun_outbound(&tun, 1, Duration::from_secs(5)).await;
+        client.harness.accept_task.abort();
+        assert_eq!(
+            got.len(),
+            1,
+            "the real session must survive the idle gap on the keepalive alone"
         );
     }
 
