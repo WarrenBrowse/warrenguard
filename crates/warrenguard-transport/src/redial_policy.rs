@@ -25,12 +25,19 @@ pub const REDIAL_BACKOFF: Backoff = Backoff::HANDSHAKE;
 /// against a flapping exit.
 pub const MIN_HEALTHY_UPTIME: Duration = Duration::from_secs(5);
 
+/// The healthy-vs-flapping verdict on a session that just ended: `true` when
+/// it stayed up for at least [`MIN_HEALTHY_UPTIME`].
+#[must_use]
+pub fn is_healthy_uptime(uptime: Duration) -> bool {
+    uptime >= MIN_HEALTHY_UPTIME
+}
+
 /// Applies the post-session verdict to `backoff` and returns the delay to
 /// wait before the next redial: a healthy uptime resets the schedule and
 /// redials immediately; a flap draws the next escalating delay.
 #[must_use]
 pub fn delay_after_session(uptime: Duration, backoff: &mut JitterBackoff) -> Duration {
-    if uptime >= MIN_HEALTHY_UPTIME {
+    if is_healthy_uptime(uptime) {
         backoff.reset();
         Duration::ZERO
     } else {
@@ -56,6 +63,18 @@ mod tests {
             REDIAL_BACKOFF.max,
             Duration::from_secs(15),
             "client redial ceiling must be the shared HANDSHAKE preset's 15 s"
+        );
+    }
+
+    #[test]
+    fn the_healthy_verdict_starts_at_the_minimum_uptime() {
+        assert!(
+            is_healthy_uptime(MIN_HEALTHY_UPTIME),
+            "a session that lasted exactly the minimum uptime is healthy"
+        );
+        assert!(
+            !is_healthy_uptime(MIN_HEALTHY_UPTIME - Duration::from_millis(1)),
+            "a session that died a millisecond sooner is a flap"
         );
     }
 

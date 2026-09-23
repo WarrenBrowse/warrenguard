@@ -8,12 +8,15 @@
 //! `max_idle_timeout` window), the supervisor:
 //!
 //! 1. Publishes `None` so pumps can drop in-flight packets cleanly,
-//! 2. Retries the dial via [`MultiHopClient::connect_with_retry`]-style
-//!    semantics, recycling the [`warrenguard_backoff::Backoff`] iterator so
-//!    a long-lived disconnect (router restart, WiFi <-> 4G handover) is
-//!    survivable,
+//! 2. Retries the dial under one unbounded [`warrenguard_backoff::Backoff`]
+//!    schedule that survives across reconnect cycles, so a long-lived
+//!    disconnect (router restart, WiFi <-> 4G handover) is survivable and
+//!    an exit that refuses or drops every session is not hammered: only a
+//!    session that served for the healthy uptime
+//!    ([`crate::redial_policy::MIN_HEALTHY_UPTIME`]) resets it,
 //! 3. Publishes the freshly-dialed `Some(Arc<MultiHopClient>)` so the
-//!    pump resumes.
+//!    pump resumes, and only once the exit assigned the session its inner
+//!    address: a setup that ends without an `IpAssign` is a failed dial.
 //!
 //! Throughout the reconnect window, **the supervisor does not touch the
 //! killswitch, the TUN device, or any routing guard**. Those handles
@@ -31,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use tokio::sync::{Notify, watch};
-use warrenguard_backoff::Backoff;
+use warrenguard_backoff::{Backoff, JitterBackoff};
 use warrenguard_multihop::{ExitId, RejectionReason, RelayDescriptorSigned, WarrenControlMessage};
 use warrenguard_socket_bypass::SocketBypass;
 use warrenguard_wire::SessionToken;
@@ -183,9 +186,12 @@ pub struct SupervisorConfig {
     /// is off whenever `enable_daita` is on). `false` keeps the fixed keep-alive
     /// beacon, byte-identical to the pre-ADR-0006 dial.
     pub idle_cover: bool,
-    /// Exponential backoff schedule for retries. `Backoff::HANDSHAKE`
+    /// Exponential backoff schedule for redials. `Backoff::HANDSHAKE`
     /// (base 500 ms, max 15 s) is the default and matches the
     /// cold-start retry profile of [`MultiHopClient::connect_with_retry`].
+    /// One schedule runs for the supervisor's whole life: failed dials,
+    /// refused setups and sessions that die before the healthy uptime all
+    /// escalate it, and only a healthy session resets it.
     pub backoff: Backoff,
     /// Optional observer invoked once per successful reconnect (NOT on
     /// the initial connect). `None` is the test-only default; a
@@ -577,6 +583,9 @@ enum Established {
     /// The setup round-trip got nothing back before
     /// [`SETUP_ROUND_TRIP_TIMEOUT`].
     SetupTimedOut,
+    /// The setup round-trip ended without an `IpAssign` (see
+    /// [`SetupOutcome::Failed`]), already reported.
+    SetupFailed,
 }
 
 /// Ceiling on the setup round-trip, measured from a completed handshake.
@@ -593,12 +602,17 @@ const SETUP_ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// What one setup round-trip produced.
 enum SetupOutcome {
-    /// The exit answered; `Some` when the reply carried an `IpAssign`.
-    Assigned(Option<IpAssignSpec>),
+    /// The exit assigned the session its inner address.
+    Assigned(IpAssignSpec),
     /// The exit refused the session. A redial hits the same refusal.
     Rejected(RejectionReason),
     /// Nothing came back within [`SETUP_ROUND_TRIP_TIMEOUT`].
     TimedOut,
+    /// The round-trip ended without an `IpAssign`: the connection closed or
+    /// the stream failed (`Some`, a drained exit refuses this way), or the
+    /// exit answered something else (`None`). The session has no address
+    /// the exit routes to, so it is never published.
+    Failed(Option<MultiHopError>),
 }
 
 impl MultiHopSupervisor {
@@ -757,6 +771,7 @@ impl MultiHopSupervisor {
     pub async fn run(self) -> Result<(), MultiHopError> {
         let mut first_session = true;
         let mut dead_path_escalation = DeadPathEscalation::default();
+        let mut redial = self.config.backoff.forever();
         loop {
             // Non-racy shutdown check: if every pump receiver is already
             // gone (the tunnel monitor tore down and aborted the pumps),
@@ -783,7 +798,7 @@ impl MultiHopSupervisor {
                     );
                     return Ok(());
                 }
-                result = self.connect_with_unbounded_retry() => result?,
+                result = self.connect_with_unbounded_retry(&mut redial) => result?,
             };
             let primary = Arc::new(client);
 
@@ -830,6 +845,13 @@ impl MultiHopSupervisor {
                         timeout_secs = SETUP_ROUND_TRIP_TIMEOUT.as_secs(),
                         "multi-hop setup round-trip answered nothing; redialling"
                     );
+                    drop(primary);
+                    continue;
+                }
+                SetupOutcome::Failed(error) => {
+                    // Never published: the redial draws the next backoff
+                    // delay, since nothing reset the schedule.
+                    self.report_setup_failure(&primary, error.as_ref());
                     drop(primary);
                     continue;
                 }
@@ -1025,6 +1047,14 @@ impl MultiHopSupervisor {
                     return Err(MultiHopError::Rejected(reason));
                 }
 
+                // Only a session that served for the healthy uptime earns an
+                // immediate redial; one that died sooner leaves the schedule
+                // escalating, so an exit that drops every session right after
+                // setup is not answered with back-to-back handshakes.
+                if crate::redial_policy::is_healthy_uptime(session_established.elapsed()) {
+                    redial.reset();
+                }
+
                 // Feed the carrier-first verdict: a UDP session that a watchdog
                 // killed within a minute of establishing is one post-handshake
                 // kill, and enough of them in a row make the next dial try the
@@ -1184,16 +1214,12 @@ impl MultiHopSupervisor {
         primary: &Arc<MultiHopClient>,
         session_tokens: Option<&[SessionToken]>,
     ) -> SetupOutcome {
-        match tokio::time::timeout(
+        tokio::time::timeout(
             SETUP_ROUND_TRIP_TIMEOUT,
             self.setup_primary_unbounded(primary, session_tokens),
         )
         .await
-        {
-            Ok(Ok(assign)) => SetupOutcome::Assigned(assign),
-            Ok(Err(reason)) => SetupOutcome::Rejected(reason),
-            Err(_) => SetupOutcome::TimedOut,
-        }
+        .unwrap_or(SetupOutcome::TimedOut)
     }
 
     /// [`Self::setup_primary`] without the deadline. Split out so the timeout
@@ -1202,7 +1228,7 @@ impl MultiHopSupervisor {
         &self,
         primary: &Arc<MultiHopClient>,
         session_tokens: Option<&[SessionToken]>,
-    ) -> Result<Option<IpAssignSpec>, RejectionReason> {
+    ) -> SetupOutcome {
         // The first multi-hop frame carries the HPKE `encapsulated_key`; on a
         // warming path the first datagram is frequently lost, so the SETUP
         // round-trip rides a reliable bidi stream (converges in one call). The
@@ -1230,28 +1256,53 @@ impl MultiHopSupervisor {
             .ok()
             .and_then(|reply| Self::decode_sealed_rejection(reply));
         if let Some(reason) = sealed_detail.or_else(|| primary.rejection_reason()) {
-            return Err(reason);
+            return SetupOutcome::Rejected(reason);
         }
-        Ok(match setup_result {
-            Ok(reply) => {
-                let spec = Self::decode_ip_assign(&reply);
-                if let Some(spec) = &spec {
-                    self.publish_setup_ip_assign(spec);
-                    *self
-                        .last_assigned_v4
-                        .lock()
-                        .expect("last_assigned_v4 lock poisoned") = Some(spec.assigned);
+        let reply = match setup_result {
+            Ok(reply) => reply,
+            Err(e) => return SetupOutcome::Failed(Some(e)),
+        };
+        let Some(spec) = Self::decode_ip_assign(&reply) else {
+            return SetupOutcome::Failed(None);
+        };
+        self.publish_setup_ip_assign(&spec);
+        *self
+            .last_assigned_v4
+            .lock()
+            .expect("last_assigned_v4 lock poisoned") = Some(spec.assigned);
+        SetupOutcome::Assigned(spec)
+    }
+
+    /// Account for a setup round-trip that ended without an `IpAssign`: close
+    /// the connection so the exit frees whatever it holds for it, report a
+    /// deliberate refusal to [`SupervisorConfig::on_dial_refused`] like one
+    /// met at the handshake (so the deployer reselects instead of waiting the
+    /// drain out), and say which of the three it was. The close code, when
+    /// there is one, rides in the error; no address or identity does.
+    fn report_setup_failure(&self, primary: &MultiHopClient, error: Option<&MultiHopError>) {
+        primary.force_close_for_reconnect();
+        match error {
+            Some(e) => match e.dial_refusal() {
+                Some(hop) => {
+                    tracing::warn!(
+                        error = %e,
+                        refused_by = hop.as_str(),
+                        "multi-hop setup refused after the handshake (drained node); \
+                         session not published, refusal reported, redialling after backoff"
+                    );
+                    self.notify_dial_refused(e);
                 }
-                spec
-            }
-            Err(e) => {
-                tracing::warn!(
+                None => tracing::warn!(
                     error = %e,
-                    "multi-hop setup-stream round-trip failed; session falls back to its bootstrap IP"
-                );
-                None
-            }
-        })
+                    "multi-hop setup round-trip failed; session not published, \
+                     redialling after backoff"
+                ),
+            },
+            None => tracing::warn!(
+                "multi-hop setup reply carried no IpAssign; session not published, \
+                 redialling after backoff"
+            ),
+        }
     }
 
     /// Dial the `want - 1` bonded secondaries in parallel and return
@@ -1315,24 +1366,13 @@ impl MultiHopSupervisor {
     fn spawn_background_bond(
         &self,
         bundle: &Arc<MultiHopBundle>,
-        primary_assign: Option<IpAssignSpec>,
+        primary_spec: IpAssignSpec,
         session_tokens: Option<Vec<SessionToken>>,
     ) {
         let want = resolve_bonded_want(
             self.config.n_connections,
             warrenguard_config::knobs::multihop_conns_override(),
         );
-        let Some(primary_spec) = primary_assign else {
-            if want > 1 {
-                tracing::warn!(
-                    requested = want,
-                    "bonding requested but the exit returned no IpAssign; \
-                     staying on a single connection"
-                );
-            }
-            bundle.seal();
-            return;
-        };
         if want <= 1 {
             bundle.seal();
             return;
@@ -1390,49 +1430,44 @@ impl MultiHopSupervisor {
     async fn establish_session(&self, primary: Arc<MultiHopClient>) -> Established {
         // One token stack for this whole session (primary + secondaries).
         let session_tokens = self.select_session_tokens();
-        let primary_assign = match self
+        let primary_spec = match self
             .setup_primary(&primary, session_tokens.as_deref())
             .await
         {
-            SetupOutcome::Assigned(assign) => assign,
+            SetupOutcome::Assigned(spec) => spec,
             SetupOutcome::Rejected(reason) => return Established::Rejected(reason),
             SetupOutcome::TimedOut => return Established::SetupTimedOut,
+            SetupOutcome::Failed(error) => {
+                self.report_setup_failure(&primary, error.as_ref());
+                return Established::SetupFailed;
+            }
         };
 
         // Bonded secondaries: best-effort extra connections under the same
         // identity (the exit's sticky allocator gives them ONE inner IP).
-        // Requires the primary's `IpAssign` as the stickiness witness.
+        // The primary's `IpAssign` is the stickiness witness.
         let mut clients = vec![primary.clone()];
         let want = resolve_bonded_want(
             self.config.n_connections,
             warrenguard_config::knobs::multihop_conns_override(),
         );
         if want > 1 {
-            match primary_assign {
-                Some(primary_spec) => {
-                    let target = self.current_target();
-                    clients.extend(
-                        Self::bond_secondaries(
-                            &self.config,
-                            &target,
-                            primary_spec,
-                            want,
-                            session_tokens.clone(),
-                        )
-                        .await,
-                    );
-                    tracing::info!(
-                        bonded = clients.len(),
-                        requested = want,
-                        "multi-hop bonded session assembled"
-                    );
-                }
-                None => tracing::warn!(
-                    requested = want,
-                    "bonding requested but the exit returned no IpAssign; \
-                     staying on a single connection"
-                ),
-            }
+            let target = self.current_target();
+            clients.extend(
+                Self::bond_secondaries(
+                    &self.config,
+                    &target,
+                    primary_spec,
+                    want,
+                    session_tokens.clone(),
+                )
+                .await,
+            );
+            tracing::info!(
+                bonded = clients.len(),
+                requested = want,
+                "multi-hop bonded session assembled"
+            );
         }
         Established::Session {
             bundle: MultiHopBundle::new(clients),
@@ -1467,6 +1502,8 @@ impl MultiHopSupervisor {
                 tracing::warn!("overlap dial setup answered nothing; keeping the current session");
                 None
             }
+            // Already logged and reported by `establish_session`.
+            Established::SetupFailed => None,
         }
     }
 
@@ -1633,6 +1670,11 @@ impl MultiHopSupervisor {
                 Ok(reply) => Self::decode_ip_assign(&reply),
                 Err(e) => {
                     tracing::warn!(index, attempt, error = %e, "bonded secondary setup failed");
+                    // Same verdict as a refused dial: the next attempt would
+                    // be refused too.
+                    if e.dial_refusal().is_some() {
+                        return None;
+                    }
                     continue;
                 }
             };
@@ -1699,9 +1741,12 @@ impl MultiHopSupervisor {
     }
 
     /// Drive [`MultiHopClient::connect`] /
-    /// [`MultiHopClient::connect_with_warren_obfuscation`] with the
-    /// configured backoff, recycling the iterator after each exhaustion
-    /// so a long network outage stays survivable.
+    /// [`MultiHopClient::connect_with_warren_obfuscation`] until a dial
+    /// succeeds, waiting `redial`'s next delay before every attempt. The
+    /// schedule is the supervisor's, not this call's: it arrives escalated
+    /// after a refused setup or a session that died young, and reset after
+    /// a healthy one, so the first attempt of a cycle is immediate only when
+    /// the previous session earned it.
     ///
     /// Non-retriable errors propagate after the first occurrence so an
     /// operator misconfiguration (rotated operational pubkey, broken
@@ -1709,34 +1754,26 @@ impl MultiHopSupervisor {
     /// in a retry loop.
     async fn connect_with_unbounded_retry(
         &self,
+        redial: &mut JitterBackoff,
     ) -> Result<(MultiHopClient, [u8; 32]), MultiHopError> {
+        let mut attempt_count = 0u64;
         loop {
-            let mut attempt_count = 0u64;
-            for delay in self.config.backoff.take(usize::MAX) {
-                if !delay.is_zero() {
-                    tokio::time::sleep(delay).await;
+            let delay = redial.next_delay();
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            attempt_count = attempt_count.saturating_add(1);
+            match self.connect_once().await {
+                Ok(c) => return Ok(c),
+                Err(e) if e.is_retriable() => {
+                    self.notify_dial_refused(&e);
+                    tracing::warn!(
+                        error = %e,
+                        attempt = attempt_count,
+                        "supervisor reconnect attempt failed, retrying after backoff"
+                    );
                 }
-                attempt_count += 1;
-                let result = self.connect_once().await;
-                match result {
-                    Ok(c) => return Ok(c),
-                    Err(e) if e.is_retriable() => {
-                        self.notify_dial_refused(&e);
-                        tracing::warn!(
-                            error = %e,
-                            attempt = attempt_count,
-                            "supervisor reconnect attempt failed, retrying after backoff"
-                        );
-                    }
-                    Err(e) => return Err(e),
-                }
-                // Safety belt: the outer `loop` recycles the iterator
-                // if Backoff::take(usize::MAX) ever yields finite
-                // results (it does not in the current impl, but pinning
-                // this guards against silent semantic drift).
-                if attempt_count == u64::MAX {
-                    break;
-                }
+                Err(e) => return Err(e),
             }
         }
     }
@@ -2899,6 +2936,191 @@ mod run_tests {
 
         drop(first);
         drop(second);
+        drop(rx);
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    /// A fixed-width redial schedule for the timing tests below: every draw
+    /// after the first immediate one lands in 100 to 200 ms, far above what a
+    /// loopback handshake takes, so an un-backed-off redial is unmistakable.
+    const TEST_BACKOFF: Backoff = Backoff {
+        base: Duration::from_millis(200),
+        max: Duration::from_millis(200),
+    };
+
+    /// Floor of every [`TEST_BACKOFF`] draw, less a margin for the handshake
+    /// time that separates a dial from the exit's accept.
+    const TEST_BACKOFF_FLOOR: Duration = Duration::from_millis(95);
+
+    /// Waits until the fake exit has accepted `n` connections.
+    async fn wait_for_accepts(exit: &FakeMultihopExit, n: usize, within: Duration) {
+        tokio::time::timeout(within, async {
+            while exit.accepted_at.lock().len() < n {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the fake exit must accept {n} connections within {within:?}"));
+    }
+
+    /// Spacing between consecutive connections the fake exit accepted.
+    fn redial_gaps(exit: &FakeMultihopExit) -> Vec<Duration> {
+        exit.accepted_at
+            .lock()
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .collect()
+    }
+
+    /// A setup the exit refuses after the QUIC handshake (here the drain close
+    /// a draining node answers every new session with) is a failed dial:
+    /// nothing is published, the refusal reaches `on_dial_refused` naming the
+    /// exit as the refusing hop, and the redials wait for the backoff instead
+    /// of hammering the node. Once the exit admits again, the session is
+    /// published.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_setup_refused_by_a_draining_exit_is_reported_backed_off_and_never_published() {
+        let operational_key = SigningKey::from_bytes(&[0x47; 32]);
+        let exit_id = ExitId::from_bytes([0x57; 16]);
+        let exit = spawn_fake_multihop_exit(&operational_key, exit_id);
+        exit.refuse_setup.store(
+            warrenguard_multihop::WARREN_MH_DRAINING,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        type Reports = Vec<(multihop::DialRefusedHop, [u8; 16], [u8; 16])>;
+        let reports: Arc<Mutex<Reports>> = Arc::new(Mutex::new(Vec::new()));
+        let mut config = config_with_fake_exit(&exit, &operational_key);
+        config.backoff = TEST_BACKOFF;
+        config.on_dial_refused = Some(Arc::new({
+            let reports = reports.clone();
+            move |hop, relay_id, exit_id| {
+                reports
+                    .lock()
+                    .expect("reports lock")
+                    .push((hop, relay_id, exit_id));
+            }
+        }));
+        let (supervisor, mut rx) = MultiHopSupervisor::new(config);
+        let task = tokio::spawn(supervisor.run());
+
+        let published = tokio::time::timeout(Duration::from_millis(1500), rx.changed()).await;
+        assert!(
+            published.is_err(),
+            "a refused setup must never be published as a session"
+        );
+        let gaps = redial_gaps(&exit);
+        assert!(
+            gaps.len() >= 2,
+            "the supervisor keeps redialling a refusing exit, got {} dials",
+            gaps.len() + 1
+        );
+        assert!(
+            gaps.iter().all(|gap| *gap >= TEST_BACKOFF_FLOOR),
+            "every redial after a refusal must wait for the backoff, got {gaps:?}"
+        );
+        let reports = reports.lock().expect("reports lock").clone();
+        assert!(
+            !reports.is_empty(),
+            "a refusal at setup must reach on_dial_refused"
+        );
+        assert!(
+            reports.iter().all(|report| *report
+                == (
+                    multihop::DialRefusedHop::Exit,
+                    exit.relay.relay_id,
+                    *exit_id.as_bytes()
+                )),
+            "each report must name the exit as the refusing hop of the dialed circuit, got {reports:?}"
+        );
+
+        exit.refuse_setup
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(5), rx.changed())
+            .await
+            .expect("once the exit admits again, a session must be published")
+            .expect("watch sender alive");
+        assert!(
+            rx.borrow_and_update().is_some(),
+            "the first publication is the admitted session"
+        );
+
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    /// A session that dies right after it was established is a flap: the
+    /// redial waits for the backoff instead of running full handshakes back to
+    /// back against an exit that keeps dropping it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_session_that_dies_right_after_setup_backs_off_before_the_redial() {
+        let operational_key = SigningKey::from_bytes(&[0x48; 32]);
+        let exit_id = ExitId::from_bytes([0x58; 16]);
+        let exit = spawn_fake_multihop_exit(&operational_key, exit_id);
+        exit.close_after_setup
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut config = config_with_fake_exit(&exit, &operational_key);
+        config.backoff = TEST_BACKOFF;
+        let (supervisor, rx) = MultiHopSupervisor::new(config);
+        let task = tokio::spawn(supervisor.run());
+
+        wait_for_accepts(&exit, 4, Duration::from_secs(5)).await;
+        let gaps = redial_gaps(&exit);
+        assert!(
+            gaps.iter().all(|gap| *gap >= TEST_BACKOFF_FLOOR),
+            "a flapping session must be redialled after the backoff, got {gaps:?}"
+        );
+
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    /// A session that served for the healthy uptime clears the escalation its
+    /// predecessors built up: its death is redialled at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_session_that_served_long_enough_is_redialled_at_once_after_flaps() {
+        // Every escalated draw of this schedule waits at least a second, so a
+        // redial that skipped the reset cannot pass for an immediate one even
+        // on a loaded machine.
+        const SLOW_BACKOFF: Backoff = Backoff {
+            base: Duration::from_secs(2),
+            max: Duration::from_secs(2),
+        };
+        let operational_key = SigningKey::from_bytes(&[0x49; 32]);
+        let exit_id = ExitId::from_bytes([0x59; 16]);
+        let exit = spawn_fake_multihop_exit(&operational_key, exit_id);
+        exit.close_after_setup
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut config = config_with_fake_exit(&exit, &operational_key);
+        config.backoff = SLOW_BACKOFF;
+        let (supervisor, rx) = MultiHopSupervisor::new(config);
+        let handle = supervisor.handle();
+        let task = tokio::spawn(supervisor.run());
+
+        wait_for_accepts(&exit, 2, Duration::from_secs(5)).await;
+        // From here on the exit keeps every session; the one it keeps is up
+        // within one escalated draw and must then serve the healthy uptime.
+        exit.close_after_setup
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        tokio::time::sleep(
+            SLOW_BACKOFF.max + crate::redial_policy::MIN_HEALTHY_UPTIME + Duration::from_secs(1),
+        )
+        .await;
+        let accepted_before = exit.accepted_at.lock().len();
+        let killed_at = Instant::now();
+        assert!(handle.force_reconnect(), "the healthy session is live");
+        wait_for_accepts(&exit, accepted_before + 1, Duration::from_secs(5)).await;
+        let redial_at = *exit
+            .accepted_at
+            .lock()
+            .last()
+            .expect("the redial was accepted");
+        assert!(
+            redial_at - killed_at < Duration::from_millis(500),
+            "a healthy session's death must be redialled without waiting, took {:?}",
+            redial_at - killed_at
+        );
+
         drop(rx);
         drop(handle);
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;

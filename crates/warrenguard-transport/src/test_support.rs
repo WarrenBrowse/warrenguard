@@ -13,7 +13,8 @@
 //! declaration in `lib.rs`.)
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use std::time::Instant;
 
 use ed25519_dalek::{Signer, SigningKey};
 use quinn::{Connection, Endpoint};
@@ -419,7 +420,29 @@ pub(crate) struct FakeMultihopExit {
     /// connection is held open. The censor shape reported from Russia on
     /// 2026-09-10: the handshake passes, the setup reply never comes back.
     pub(crate) swallow_setup: Arc<AtomicBool>,
+    /// When non-zero, the setup request is read and the connection is closed
+    /// with this application code instead of a reply: what a draining exit
+    /// answers every new session after the QUIC handshake.
+    pub(crate) refuse_setup: Arc<AtomicU32>,
+    /// When set, the connection is closed right after the `IpAssign` reply: a
+    /// session that is established and dies at once.
+    pub(crate) close_after_setup: Arc<AtomicBool>,
+    /// When each connection was accepted, in order, so a test can measure the
+    /// spacing of the client's redials.
+    pub(crate) accepted_at: Arc<parking_lot::Mutex<Vec<Instant>>>,
     _server_ep: Endpoint,
+}
+
+/// How the fake exit answers the connections it accepts, read afresh for each
+/// connection so a test can change it between dials.
+#[derive(Clone)]
+struct FakeExitBehaviour {
+    reject: Arc<AtomicBool>,
+    reject_banned: Arc<AtomicBool>,
+    ban_reason_code: Arc<AtomicU8>,
+    swallow_setup: Arc<AtomicBool>,
+    refuse_setup: Arc<AtomicU32>,
+    close_after_setup: Arc<AtomicBool>,
 }
 
 const FAKE_EXIT_IKM: [u8; 32] = [0x99; 32];
@@ -430,10 +453,7 @@ const FAKE_EXIT_IKM: [u8; 32] = [0x99; 32];
 async fn serve_one_fake_exit_connection(
     conn: Connection,
     exit_id: ExitId,
-    reject: Arc<AtomicBool>,
-    reject_banned: Arc<AtomicBool>,
-    ban_reason_code: Arc<AtomicU8>,
-    swallow_setup: Arc<AtomicBool>,
+    behaviour: FakeExitBehaviour,
 ) {
     let Ok((mut send, mut recv)) = conn.accept_bi().await else {
         return;
@@ -445,8 +465,13 @@ async fn serve_one_fake_exit_connection(
     // the reply never travels. Holding the connection open (rather than
     // closing it) is what the client sees on such a network, so the client
     // stalls in its own read instead of taking a connection error.
-    if swallow_setup.load(Ordering::Relaxed) {
+    if behaviour.swallow_setup.load(Ordering::Relaxed) {
         conn.closed().await;
+        return;
+    }
+    let refuse_code = behaviour.refuse_setup.load(Ordering::Relaxed);
+    if refuse_code != 0 {
+        conn.close(quinn::VarInt::from_u32(refuse_code), &[]);
         return;
     }
     let Ok(frame) = decode_frame(&bytes) else {
@@ -463,11 +488,11 @@ async fn serve_one_fake_exit_connection(
     if exit_session.open(&frame).is_err() {
         return;
     }
-    let reply_msg = if reject_banned.load(Ordering::Relaxed) {
+    let reply_msg = if behaviour.reject_banned.load(Ordering::Relaxed) {
         WarrenControlMessage::RejectedBanned {
-            reason_code: ban_reason_code.load(Ordering::Relaxed),
+            reason_code: behaviour.ban_reason_code.load(Ordering::Relaxed),
         }
-    } else if reject.load(Ordering::Relaxed) {
+    } else if behaviour.reject.load(Ordering::Relaxed) {
         WarrenControlMessage::Rejected
     } else {
         WarrenControlMessage::IpAssign {
@@ -493,6 +518,12 @@ async fn serve_one_fake_exit_connection(
         return;
     }
     let _ = send.finish();
+    if behaviour.close_after_setup.load(Ordering::Relaxed) {
+        // Let the reply reach the client before the close overtakes it.
+        let _ = send.stopped().await;
+        conn.close(quinn::VarInt::from_u32(0), b"fake exit closed the session");
+        return;
+    }
 
     loop {
         if conn.read_datagram().await.is_err() {
@@ -558,17 +589,20 @@ pub(crate) fn spawn_fake_multihop_exit_on(
     let exit_x25519_pubkey = warrenguard_multihop::test_support::pubkey_to_bytes(&exit_pub);
 
     let accepted = Arc::new(AtomicUsize::new(0));
-    let reject = Arc::new(AtomicBool::new(false));
-    let reject_banned = Arc::new(AtomicBool::new(false));
-    let ban_reason_code = Arc::new(AtomicU8::new(0));
-    let swallow_setup = Arc::new(AtomicBool::new(false));
+    let accepted_at = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let behaviour = FakeExitBehaviour {
+        reject: Arc::new(AtomicBool::new(false)),
+        reject_banned: Arc::new(AtomicBool::new(false)),
+        ban_reason_code: Arc::new(AtomicU8::new(0)),
+        swallow_setup: Arc::new(AtomicBool::new(false)),
+        refuse_setup: Arc::new(AtomicU32::new(0)),
+        close_after_setup: Arc::new(AtomicBool::new(false)),
+    };
 
     let accept_loop_ep = server_ep.clone();
     let accept_loop_accepted = accepted.clone();
-    let accept_loop_reject = reject.clone();
-    let accept_loop_reject_banned = reject_banned.clone();
-    let accept_loop_ban_reason_code = ban_reason_code.clone();
-    let accept_loop_swallow_setup = swallow_setup.clone();
+    let accept_loop_accepted_at = accepted_at.clone();
+    let accept_loop_behaviour = behaviour.clone();
     tokio::spawn(async move {
         loop {
             let Some(incoming) = accept_loop_ep.accept().await else {
@@ -577,20 +611,15 @@ pub(crate) fn spawn_fake_multihop_exit_on(
             let Ok(conn) = incoming.await else {
                 continue;
             };
+            accept_loop_accepted_at.lock().push(Instant::now());
             accept_loop_accepted.fetch_add(1, Ordering::Relaxed);
-            let swallow = accept_loop_swallow_setup.clone();
-            let served = serve_one_fake_exit_connection(
-                conn,
-                exit_id,
-                accept_loop_reject.clone(),
-                accept_loop_reject_banned.clone(),
-                accept_loop_ban_reason_code.clone(),
-                swallow.clone(),
-            );
+            let swallow = accept_loop_behaviour.swallow_setup.load(Ordering::Relaxed);
+            let served =
+                serve_one_fake_exit_connection(conn, exit_id, accept_loop_behaviour.clone());
             // A swallowed setup holds its connection open until the client
             // gives up, so serving it inline would stall the accept loop and
             // the client's next dial would never be answered.
-            if swallow.load(Ordering::Relaxed) {
+            if swallow {
                 tokio::spawn(served);
             } else {
                 served.await;
@@ -603,10 +632,13 @@ pub(crate) fn spawn_fake_multihop_exit_on(
         exit_id,
         exit_x25519_pubkey,
         accepted,
-        reject,
-        reject_banned,
-        ban_reason_code,
-        swallow_setup,
+        reject: behaviour.reject,
+        reject_banned: behaviour.reject_banned,
+        ban_reason_code: behaviour.ban_reason_code,
+        swallow_setup: behaviour.swallow_setup,
+        refuse_setup: behaviour.refuse_setup,
+        close_after_setup: behaviour.close_after_setup,
+        accepted_at,
         _server_ep: server_ep,
     })
 }

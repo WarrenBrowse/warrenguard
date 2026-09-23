@@ -148,6 +148,13 @@ pub enum MultiHopError {
         /// to a string at the boundary).
         detail: String,
     },
+    /// The connection closed during the setup round-trip, after a
+    /// successful QUIC handshake: the peer's close is kept whole so its
+    /// code can be classified (a drained exit refuses every new session
+    /// this way, see [`Self::dial_refusal`]). Carries no address or
+    /// identity material.
+    #[error("connection closed during the setup round-trip: {0}")]
+    SetupClosed(#[source] quinn::ConnectionError),
     /// The peer closed the connection before a datagram could be read.
     #[error("read datagram failed: {0}")]
     Recv(#[source] quinn::ConnectionError),
@@ -219,14 +226,16 @@ impl MultiHopError {
     ///   ([`WARREN_MH_DRAINING`]), which by design never maps to a
     ///   [`RejectionReason`] (a drain is maintenance, not policy).
     ///
-    /// The exit's drain refusal can also surface post-handshake on the
-    /// setup stream; that path flattens the close into a string
-    /// ([`MultiHopError::SetupStream`]) and is deliberately not matched
-    /// here (fragile), the redial then re-hits the refusal at dial time
-    /// where this classification catches it.
+    /// Either close counts whether it ends the handshake, a live session
+    /// ([`MultiHopError::Recv`]) or the setup round-trip that follows a
+    /// successful handshake ([`MultiHopError::SetupClosed`]), which is
+    /// where a drained exit refuses every new session.
     #[must_use]
     pub fn dial_refusal(&self) -> Option<DialRefusedHop> {
-        let (MultiHopError::Handshake(err) | MultiHopError::Recv(err)) = self else {
+        let (MultiHopError::Handshake(err)
+        | MultiHopError::Recv(err)
+        | MultiHopError::SetupClosed(err)) = self
+        else {
             return None;
         };
         match err {
@@ -274,6 +283,17 @@ pub enum DialRefusedHop {
     Entry,
     /// The exit refused the session with its drain close code.
     Exit,
+}
+
+impl DialRefusedHop {
+    /// Stable label for logs.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Entry => "entry",
+            Self::Exit => "exit",
+        }
+    }
 }
 
 /// Whether the TLS-over-TCP fallback carrier is armed for `relay`: it both
@@ -1592,10 +1612,13 @@ impl MultiHopClient {
         // (rather than the client) so the same emit path is safe on the unified
         // dispatcher's relay->exit C2 connections, whose dialer just never
         // accepts the stream. We read the proof from the recv half.
+        // A connection error here means the peer closed the connection
+        // before proving anything; its close code, kept whole, is what tells
+        // a drain refusal from any other close.
         let (mut send, mut recv) = tokio::time::timeout(timeout, conn.accept_bi())
             .await
             .map_err(|_| MultiHopError::RelayIdentity("timed out awaiting relay-auth stream"))?
-            .map_err(|_| MultiHopError::RelayIdentity("relay opened no auth stream"))?;
+            .map_err(MultiHopError::SetupClosed)?;
         let _ = send.finish();
         let bytes = tokio::time::timeout(timeout, recv.read_to_end(RELAY_AUTH_PROOF_LEN))
             .await
@@ -2266,8 +2289,11 @@ impl MultiHopClient {
     ///
     /// # Errors
     ///
-    /// - [`MultiHopError::SetupStream`] on any stream open/write/finish/read
-    ///   failure (reliable transport: a failure is fatal, not droppable).
+    /// - [`MultiHopError::SetupClosed`] when the connection closed during the
+    ///   round-trip (a drained exit refuses this way), carrying the close.
+    /// - [`MultiHopError::SetupStream`] on any other stream
+    ///   open/write/finish/read failure (reliable transport: a failure is
+    ///   fatal, not droppable).
     /// - [`MultiHopError::Session`] / [`MultiHopError::Encode`] if sealing
     ///   the request frame fails.
     /// - The decode/open/replay/exit_id errors from the shared reply path
@@ -2351,24 +2377,16 @@ impl MultiHopClient {
         })?;
         let request = self.seal_setup_stream_request(&plaintext)?;
 
-        let (mut send, mut recv) =
-            self.conn
-                .open_bi()
-                .await
-                .map_err(|e| MultiHopError::SetupStream {
-                    context: "open_bi",
-                    detail: e.to_string(),
-                })?;
+        let (mut send, mut recv) = self
+            .conn
+            .open_bi()
+            .await
+            .map_err(|e| self.setup_stream_error("open_bi", &e))?;
         send.write_all(&request)
             .await
-            .map_err(|e| MultiHopError::SetupStream {
-                context: "write request",
-                detail: e.to_string(),
-            })?;
-        send.finish().map_err(|e| MultiHopError::SetupStream {
-            context: "finish request",
-            detail: e.to_string(),
-        })?;
+            .map_err(|e| self.setup_stream_error("write request", &e))?;
+        send.finish()
+            .map_err(|e| self.setup_stream_error("finish request", &e))?;
 
         // In X.509 cover-domain mode, now that the setup frame is on
         // the wire (so the relay knows we are a Warren client and has emitted
@@ -2385,10 +2403,7 @@ impl MultiHopClient {
         let reply = recv
             .read_to_end(MAX_MULTIHOP_SETUP_FRAME_BYTES)
             .await
-            .map_err(|e| MultiHopError::SetupStream {
-                context: "read reply",
-                detail: e.to_string(),
-            })?;
+            .map_err(|e| self.setup_stream_error("read reply", &e))?;
 
         // The setup frame consumed one forward-direction seq via
         // `seal_next_forward_frame`; mirror the data path's per-frame
@@ -2439,6 +2454,23 @@ impl MultiHopClient {
             *self.assignment.lock() = Some(assignment);
         }
         Ok(opened)
+    }
+
+    /// A failed setup-stream step, as [`MultiHopError::SetupClosed`] when the
+    /// connection itself has closed (so the peer's close code survives for
+    /// classification) and as [`MultiHopError::SetupStream`] otherwise.
+    fn setup_stream_error(
+        &self,
+        context: &'static str,
+        error: &dyn std::fmt::Display,
+    ) -> MultiHopError {
+        match self.conn.close_reason() {
+            Some(close) => MultiHopError::SetupClosed(close),
+            None => MultiHopError::SetupStream {
+                context,
+                detail: error.to_string(),
+            },
+        }
     }
 
     /// The exit's IP allocation, captured during [`Self::setup_over_stream`].
@@ -2989,6 +3021,9 @@ mod tests {
         Garbage,
         /// Nothing: the relay never produces a proof.
         Silent,
+        /// The node closes the connection with this application code
+        /// instead of proving anything: a drained node's refusal.
+        Closes(u32),
     }
 
     /// Spins up an RPK loopback (the proof exchange is independent of the TLS
@@ -3023,6 +3058,10 @@ mod tests {
                     // Hold the connection open without ever answering the
                     // client's auth stream, so the client must time out.
                     tokio::time::sleep(Duration::from_secs(30)).await;
+                    return;
+                }
+                MockProof::Closes(code) => {
+                    conn.close(quinn::VarInt::from_u32(code), &[]);
                     return;
                 }
             };
@@ -3091,6 +3130,32 @@ mod tests {
         assert!(
             matches!(err, MultiHopError::RelayIdentity(_)),
             "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_node_that_closes_instead_of_proving_is_classified_by_its_close_code() {
+        // A drained node refuses every new session by closing the connection
+        // right after the handshake, before any identity proof. That close is
+        // a refusal the supervisor must act on (reselect), so it keeps its
+        // code instead of reading as a failed identity check.
+        let expected = WarrenPubkey::from_bytes(
+            ed25519_dalek::SigningKey::from_bytes(&[0x51; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let (conn, _s, _c) = loopback_with_mock_proof(MockProof::Closes(WARREN_MH_DRAINING)).await;
+        let err = MultiHopClient::verify_relay_proof(&conn, &expected)
+            .await
+            .expect_err("a closed connection proves nothing");
+        assert!(
+            matches!(err, MultiHopError::SetupClosed(_)),
+            "the close must be kept whole, got {err:?}"
+        );
+        assert_eq!(
+            err.dial_refusal(),
+            Some(DialRefusedHop::Exit),
+            "the drain close is an exit refusal"
         );
     }
 
