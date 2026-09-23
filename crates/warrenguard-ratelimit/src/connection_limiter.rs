@@ -80,8 +80,8 @@ impl<K: Eq + Hash + Clone> ConnectionRateLimiter<K> {
         Self::with_max_tracked(burst, refill_interval, MAX_TRACKED_KEYS)
     }
 
-    /// Same as [`Self::new`] with a tighter cap than the default backstop on
-    /// the number of tracked keys.
+    /// Same as [`Self::new`] with a different cap on the number of tracked
+    /// keys than the default backstop.
     ///
     /// # Panics
     ///
@@ -183,6 +183,7 @@ impl<K: Eq + Hash + Clone> ConnectionRateLimiter<K> {
         let mut w = self.state.write();
         w.keys
             .retain(|_, st| now.saturating_duration_since(st.last_refill) < idle);
+        crate::shrink_if_sparse(&mut w.keys);
     }
 }
 
@@ -323,6 +324,23 @@ mod tests {
         let next_walk = t0 + RECLAIM_MIN_INTERVAL;
         assert!(lim.try_acquire_at(&"erin", next_walk));
         assert_eq!(lim.tracked_count(), 1);
+    }
+
+    #[test]
+    fn a_sweep_that_empties_the_map_returns_its_memory() {
+        let lim: ConnectionRateLimiter<u32> =
+            ConnectionRateLimiter::new(1, Duration::from_millis(10));
+        let t0 = Instant::now();
+        for key in 0..20_000u32 {
+            assert!(lim.try_acquire_at(&key, t0));
+        }
+        let peak = lim.state.read().keys.capacity();
+        lim.retain_active(Duration::from_secs(1), t0 + Duration::from_secs(5));
+        assert_eq!(lim.tracked_count(), 0);
+        assert!(
+            lim.state.read().keys.capacity() < peak / 4,
+            "a flood's peak allocation must not outlive the sweep"
+        );
     }
 
     #[test]

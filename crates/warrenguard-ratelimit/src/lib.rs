@@ -20,6 +20,8 @@
 
 #![warn(missing_docs)]
 
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::time::Instant;
 
 use parking_lot::Mutex;
@@ -31,6 +33,19 @@ mod registry;
 pub use connection_limiter::ConnectionRateLimiter;
 pub use policy::{RateOverride, RatePolicyHandle, RateSpec};
 pub use registry::{Admission, DEFAULT_MAX_TRACKED_IDENTITIES, IdentityLimiter};
+
+/// Size under which a swept map keeps its allocation: shrinking a small map
+/// buys nothing and reallocates on the next few inserts.
+const SHRINK_FLOOR: usize = 1024;
+
+/// Returns memory to the allocator once a sweep has left `map` mostly empty.
+/// `HashMap::retain` never shrinks, so without this one flood of distinct keys
+/// would keep its peak allocation for the life of the process.
+fn shrink_if_sparse<K: Eq + Hash, V>(map: &mut HashMap<K, V>) {
+    if map.capacity() > map.len().max(SHRINK_FLOOR).saturating_mul(4) {
+        map.shrink_to(map.len().saturating_mul(2));
+    }
+}
 
 /// Pure token bucket. Thread-safe via internal `Mutex`; we assume the
 /// hot path is fast readers/writers (Mutex overhead << network I/O

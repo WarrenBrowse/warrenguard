@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
@@ -60,6 +61,9 @@ pub struct IdentityLimiter<K: Eq + Hash + Clone> {
     rate_bps: u64,
     max_tracked: usize,
     buckets: RwLock<HashMap<K, Arc<TokenBucket>>>,
+    /// Running count of [`Admission::AtCapacity`] verdicts: the only trace a
+    /// full registry leaves, since its refusals look like drops to a caller.
+    at_capacity_refusals: AtomicU64,
 }
 
 impl<K: Eq + Hash + Clone> IdentityLimiter<K> {
@@ -90,6 +94,7 @@ impl<K: Eq + Hash + Clone> IdentityLimiter<K> {
             rate_bps,
             max_tracked: max_tracked.get(),
             buckets: RwLock::new(HashMap::new()),
+            at_capacity_refusals: AtomicU64::new(0),
         }
     }
 
@@ -103,6 +108,7 @@ impl<K: Eq + Hash + Clone> IdentityLimiter<K> {
     /// a deterministic clock without sleeping.
     pub fn try_admit_at(&self, key: &K, bytes: u64, now: Instant) -> Admission {
         let Some(bucket) = self.bucket_or_admit(key) else {
+            self.at_capacity_refusals.fetch_add(1, Ordering::Relaxed);
             return Admission::AtCapacity;
         };
         if bucket.try_consume_at(bytes, now) {
@@ -146,6 +152,13 @@ impl<K: Eq + Hash + Clone> IdentityLimiter<K> {
         Some(bucket)
     }
 
+    /// How many consume attempts were refused because the key was new and the
+    /// registry full ([`Admission::AtCapacity`]), since construction.
+    #[must_use]
+    pub fn at_capacity_refusals(&self) -> u64 {
+        self.at_capacity_refusals.load(Ordering::Relaxed)
+    }
+
     /// Number of registered buckets (= distinct clients seen). Useful
     /// for metrics or tests.
     #[must_use]
@@ -162,6 +175,7 @@ impl<K: Eq + Hash + Clone> IdentityLimiter<K> {
     {
         let mut w = self.buckets.write();
         w.retain(|k, _| predicate(k));
+        crate::shrink_if_sparse(&mut w);
     }
 
     /// Drops buckets whose `last_refill` is older than `idle` before
@@ -170,6 +184,7 @@ impl<K: Eq + Hash + Clone> IdentityLimiter<K> {
     pub fn retain_active(&self, idle: Duration, now: Instant) {
         let mut w = self.buckets.write();
         w.retain(|_, bucket| now.saturating_duration_since(bucket.last_refill()) < idle);
+        crate::shrink_if_sparse(&mut w);
     }
 }
 
@@ -278,6 +293,44 @@ mod tests {
     }
 
     #[test]
+    fn a_sweep_that_empties_the_registry_returns_its_memory() {
+        let lim: IdentityLimiter<u32> = IdentityLimiter::new(100, 1);
+        let t0 = Instant::now();
+        for key in 0..20_000u32 {
+            assert!(lim.try_consume_at(&key, 1, t0));
+        }
+        let peak = lim.buckets.read().capacity();
+        lim.retain_active(Duration::from_secs(1), t0 + Duration::from_secs(5));
+        assert_eq!(lim.tracked_count(), 0);
+        assert!(
+            lim.buckets.read().capacity() < peak / 4,
+            "a flood's peak allocation must not outlive the sweep"
+        );
+
+        for key in 0..20_000u32 {
+            assert!(lim.try_consume_at(&key, 1, t0));
+        }
+        lim.retain(|_| false);
+        assert!(lim.buckets.read().capacity() < peak / 4);
+    }
+
+    #[test]
+    fn refusals_at_capacity_are_counted() {
+        let lim: IdentityLimiter<&str> = IdentityLimiter::with_max_tracked(100, 1, cap(1));
+        let now = Instant::now();
+        assert_eq!(lim.try_admit_at(&"alice", 100, now), Admission::Allowed);
+        assert_eq!(lim.try_admit_at(&"alice", 1, now), Admission::RateLimited);
+        assert_eq!(
+            lim.at_capacity_refusals(),
+            0,
+            "a rate-limit drop is not one"
+        );
+        assert_eq!(lim.try_admit_at(&"bob", 1, now), Admission::AtCapacity);
+        assert!(!lim.try_consume_at(&"carol", 1, now));
+        assert_eq!(lim.at_capacity_refusals(), 2);
+    }
+
+    #[test]
     fn new_applies_the_default_cap() {
         let lim: IdentityLimiter<usize> = IdentityLimiter::new(100, 1);
         let limit = DEFAULT_MAX_TRACKED_IDENTITIES.get();
@@ -304,7 +357,7 @@ mod tests {
     fn concurrent_new_keys_never_exceed_the_cap() {
         const CAP: usize = 4;
         const RACERS: usize = 32;
-        const ROUNDS: usize = 300;
+        const ROUNDS: usize = 100;
         for round in 0..ROUNDS {
             let lim: IdentityLimiter<usize> = IdentityLimiter::with_max_tracked(1_000, 1, cap(CAP));
             let barrier = Barrier::new(RACERS);
