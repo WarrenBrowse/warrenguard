@@ -1019,7 +1019,7 @@ impl MultiHopSupervisor {
                                     return Ok(());
                                 }
                                 if let Some(observer) = self.config.on_overlap_swapped.as_ref() {
-                                    observer(&self.current_target());
+                                    observer(&new_target);
                                 }
                                 drop(warrenguard_transport_core::spawn_path_probe(
                                     "client-mh",
@@ -1175,8 +1175,8 @@ impl MultiHopSupervisor {
     /// best-effort single attempt) both build on this, each with one
     /// [`Self::current_target`] snapshot per attempt that the attempt keeps:
     /// a `migrate_to` landing mid-dial redirects the NEXT attempt, and every
-    /// report about this one (a refusal, the RTT samples) names the circuit
-    /// it actually dialled.
+    /// report about this one (a refusal, the RTT samples, the circuit an
+    /// overlap swap landed on) names the circuit it actually dialled.
     async fn connect_once(&self, target: &CircuitTarget) -> Result<MultiHopClient, MultiHopError> {
         Self::dial_target(&self.config, target, self.config.bind_addr).await
     }
@@ -3395,6 +3395,54 @@ mod run_tests {
             presented.lock().expect("presented lock")[0],
             vec![next.exit_id; 2],
             "every connection of the overlap's bond goes to the exit its primary dialled"
+        );
+
+        drop(rx);
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    /// The swap observer is told the circuit the session landed on. A retarget
+    /// that lands during the overlap only queues the next move: reporting it
+    /// here would have a deployer act on an exit the session is not on (the
+    /// forwarded ports it re-maps after a swap, above all).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_overlap_swap_reports_the_circuit_the_session_landed_on() {
+        let operational_key = SigningKey::from_bytes(&[0x50; 32]);
+        let serving = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x65; 16]));
+        let next = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x66; 16]));
+        let elsewhere = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x67; 16]));
+        let swapped: Arc<Mutex<Vec<ExitId>>> = Arc::default();
+        let mut config = config_with_fake_exit(&serving, &operational_key);
+        config.on_overlap_swapped = Some(Arc::new({
+            let swapped = swapped.clone();
+            move |target: &CircuitTarget| {
+                swapped.lock().expect("swapped lock").push(target.exit_id);
+            }
+        }));
+        let (supervisor, mut rx) = MultiHopSupervisor::new(config);
+        let handle = supervisor.handle();
+        let migrate = supervisor.migrate_handle();
+        let task = tokio::spawn(supervisor.run());
+        tokio::time::timeout(Duration::from_secs(5), rx.changed())
+            .await
+            .expect("the cold dial publishes a session")
+            .expect("watch sender alive");
+
+        let moved_to = circuit_to(&elsewhere, elsewhere.relay.relay_id, &operational_key);
+        next.on_next_dial(move || migrate.migrate_to(moved_to));
+        handle.migrate_to(circuit_to(&next, next.relay.relay_id, &operational_key));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while swapped.lock().expect("swapped lock").is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the overlap swaps the session");
+        assert_eq!(
+            swapped.lock().expect("swapped lock")[0],
+            next.exit_id,
+            "the first swap landed on the exit its overlap dialled"
         );
 
         drop(rx);
