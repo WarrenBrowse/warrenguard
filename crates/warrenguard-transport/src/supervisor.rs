@@ -517,14 +517,17 @@ pub struct MultiHopSupervisor {
     /// make-before-break overlap then swaps in gap-free (cross-exit
     /// migration). `SupervisorHandle`s share the same `Arc<Mutex<_>>`.
     target: Arc<Mutex<CircuitTarget>>,
-    /// Inner IPv4 the exit assigned to the LAST established session.
-    /// Redials send it as the `prefer_ipv4` session-placement hint so the
-    /// exit keeps the session on its address (overlap and fast reconnects
-    /// join the predecessor instead of minting a new IP); a first session
-    /// sends the 0.0.0.0 session-fresh sentinel instead, which is what
-    /// stops two independent same-wallet sessions from sharing one inner
-    /// IP and stealing each other's downlink.
-    last_assigned_v4: Mutex<Option<std::net::Ipv4Addr>>,
+    /// Inner IPv4 the exit assigned to the LAST established session, with
+    /// the exit that assigned it. Redials to that exit send it as the
+    /// `prefer_ipv4` session-placement hint so the exit keeps the session on
+    /// its address (overlap and fast reconnects join the predecessor instead
+    /// of minting a new IP, and a restarted exit hands it back); a first
+    /// session, or a dial to any other exit, sends the 0.0.0.0 session-fresh
+    /// sentinel instead. The sentinel is what stops two independent
+    /// same-wallet sessions from sharing one inner IP and stealing each
+    /// other's downlink, and it keeps one exit's allocation from being
+    /// disclosed to, or reproduced by, another.
+    last_assigned_v4: Mutex<Option<(ExitId, std::net::Ipv4Addr)>>,
     /// Shared state of the goodput prober ([`crate::path_health`]):
     /// tracker episode memory, reply stream and probe tap. The tap is
     /// installed on every published bundle; one prober task runs per
@@ -657,6 +660,8 @@ impl MultiHopSupervisor {
     /// Continue the session that `assigned_v4` belongs to instead of starting
     /// an independent one, for a supervisor built to REPLACE a previous one
     /// (a deployer that rebuilds its whole tunnel rather than redialing).
+    /// `assigned_v4` must come from the exit this supervisor is configured
+    /// for ([`SupervisorConfig::exit_id`]): it is named to that exit only.
     /// Call before [`Self::run`].
     ///
     /// A supervisor learns its session's address from the exit and names it on
@@ -674,19 +679,22 @@ impl MultiHopSupervisor {
         *self
             .last_assigned_v4
             .lock()
-            .expect("last_assigned_v4 lock poisoned") = Some(assigned_v4);
+            .expect("last_assigned_v4 lock poisoned") = Some((self.config.exit_id, assigned_v4));
     }
 
-    /// Session-placement hint for the next setup request: the address this
-    /// session already holds, or the all-zero session-fresh sentinel when
-    /// there is no predecessor to continue.
-    fn session_placement_hint(&self) -> Option<std::net::Ipv4Addr> {
-        Some(
-            self.last_assigned_v4
-                .lock()
-                .expect("last_assigned_v4 lock poisoned")
-                .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
-        )
+    /// Session-placement hint for the next setup request to `exit_id`: the
+    /// address this session already holds there, or the all-zero
+    /// session-fresh sentinel when there is no predecessor on that exit to
+    /// continue.
+    fn session_placement_hint(&self, exit_id: ExitId) -> Option<std::net::Ipv4Addr> {
+        let last = *self
+            .last_assigned_v4
+            .lock()
+            .expect("last_assigned_v4 lock poisoned");
+        Some(match last {
+            Some((assigning_exit, addr)) if assigning_exit == exit_id => addr,
+            _ => std::net::Ipv4Addr::UNSPECIFIED,
+        })
     }
 
     /// Subscribe to the dead-datapath escalation signal. The receiver
@@ -1240,7 +1248,7 @@ impl MultiHopSupervisor {
         // the predecessor); a first session sends the session-fresh
         // sentinel so it can never be co-housed with another live session
         // of the same identity. Exits predating the hint ignore it.
-        let placement = self.session_placement_hint();
+        let placement = self.session_placement_hint(primary.exit_id());
         let setup_result = primary
             .setup_over_stream_with_options(
                 Some(&self.config.client_signing),
@@ -1265,11 +1273,24 @@ impl MultiHopSupervisor {
         let Some(spec) = Self::decode_ip_assign(&reply) else {
             return SetupOutcome::Failed(None);
         };
+        // Whether the exit kept the address this session named: `moved` is
+        // a tunnel rebuild on the client, and after an exit restart `kept` is
+        // the exit handing the session back its address. The address itself
+        // never reaches a log.
+        let named = placement.filter(|named| !named.is_unspecified());
+        tracing::info!(
+            placement = match named {
+                Some(named) if named == spec.assigned => "kept",
+                Some(_) => "moved",
+                None => "new",
+            },
+            "multi-hop setup assigned the session its inner address"
+        );
         self.publish_setup_ip_assign(&spec);
         *self
             .last_assigned_v4
             .lock()
-            .expect("last_assigned_v4 lock poisoned") = Some(spec.assigned);
+            .expect("last_assigned_v4 lock poisoned") = Some((primary.exit_id(), spec.assigned));
         SetupOutcome::Assigned(spec)
     }
 
@@ -2346,9 +2367,11 @@ mod tests {
 
     #[test]
     fn a_fresh_supervisor_asks_the_exit_for_a_session_of_its_own() {
-        let (supervisor, _rx) = MultiHopSupervisor::new(dummy_config());
+        let config = dummy_config();
+        let exit_id = config.exit_id;
+        let (supervisor, _rx) = MultiHopSupervisor::new(config);
         assert_eq!(
-            supervisor.session_placement_hint(),
+            supervisor.session_placement_hint(exit_id),
             Some(std::net::Ipv4Addr::UNSPECIFIED),
             "with no predecessor to name, the hint must be the session-fresh sentinel"
         );
@@ -2356,12 +2379,36 @@ mod tests {
 
     #[test]
     fn a_resumed_supervisor_names_its_predecessors_address() {
-        let (supervisor, _rx) = MultiHopSupervisor::new(dummy_config());
+        let config = dummy_config();
+        let exit_id = config.exit_id;
+        let (supervisor, _rx) = MultiHopSupervisor::new(config);
         supervisor.resume_session_placement(std::net::Ipv4Addr::new(10, 66, 0, 7));
         assert_eq!(
-            supervisor.session_placement_hint(),
+            supervisor.session_placement_hint(exit_id),
             Some(std::net::Ipv4Addr::new(10, 66, 0, 7)),
             "a rebuilt tunnel must keep its session on the address it already holds"
+        );
+    }
+
+    #[test]
+    fn a_supervisor_names_an_address_only_to_the_exit_that_assigned_it() {
+        // An address is one exit's allocation. Naming it to another exit
+        // tells that exit something about the session elsewhere, and a
+        // freshly restarted exit would even hand it over, carrying one inner
+        // address across exits.
+        let config = dummy_config();
+        let assigning_exit = config.exit_id;
+        let (supervisor, _rx) = MultiHopSupervisor::new(config);
+        supervisor.resume_session_placement(std::net::Ipv4Addr::new(10, 66, 0, 7));
+        assert_eq!(
+            supervisor.session_placement_hint(ExitId::from_bytes([0x7E; 16])),
+            Some(std::net::Ipv4Addr::UNSPECIFIED),
+            "a dial to another exit must start a fresh session"
+        );
+        assert_eq!(
+            supervisor.session_placement_hint(assigning_exit),
+            Some(std::net::Ipv4Addr::new(10, 66, 0, 7)),
+            "the assigning exit is still named its address"
         );
     }
 
