@@ -10,13 +10,17 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Only under `experimental-tun`: the gateway probes run `ip` / `netstat`,
+# resolved from fixed system locations rather than the caller's PATH.
+warrenguard-systool = { path = "../warrenguard-systool", optional = true }
 
 [features]
 # Gates the live-host routing-table probes (`gateway::discover_default_gateway`
-# runs `ip` / `netstat`). No privileged code and no extra dependencies: the gate
-# just keeps the process-calling helpers out of a pure userland build's surface,
-# mirroring the `warrenguard-tun-device` feature of the same name.
-experimental-tun = []
+# runs `ip` / `netstat`). No privileged code, and the default build stays
+# dependency-free: the gate keeps the process-calling helpers out of a pure
+# userland build's surface, mirroring the `warrenguard-tun-device` feature of the
+# same name.
+experimental-tun = ["dep:warrenguard-systool"]
 
 [lints.rust]
 unsafe_code = "forbid"

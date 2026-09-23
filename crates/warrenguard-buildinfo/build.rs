@@ -126,6 +126,12 @@ fn resolve_build_time() -> String {
     )
 }
 
+// Runs `git` / `date` at compile time, as the account building the crate and
+// with its own PATH: no privilege boundary is crossed here.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "build-time tool of the builder's own toolchain"
+)]
 fn run(cmd: &str, args: &[&str]) -> Option<String> {
     let out = Command::new(cmd).args(args).output().ok()?;
     if !out.status.success() {

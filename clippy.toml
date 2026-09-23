@@ -1,0 +1,6 @@
+# A process that embeds the engine often runs as root, and resolving a tool by
+# its bare name hands that choice to the PATH of whoever launched it.
+disallowed-methods = [
+    { path = "std::process::Command::new", reason = "start an operating-system tool through warrenguard_systool::SystemTool, which never reads the caller's PATH" },
+    { path = "tokio::process::Command::new", reason = "start an operating-system tool through warrenguard_systool::SystemTool, which never reads the caller's PATH" },
+]

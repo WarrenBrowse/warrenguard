@@ -1,0 +1,43 @@
+[package]
+name = "warrenguard-systool"
+description = "Resolves the operating-system tools the WarrenGuard engine runs (ip, nft, route, networksetup, powershell.exe...) from fixed system locations, never from the PATH of the process that embeds the engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+# `SystemTool::tokio_command`, for the async call sites.
+tokio = ["dep:tokio"]
+
+[dependencies]
+tokio = { workspace = true, optional = true }
+
+# Windows only: `GetSystemDirectoryW`, the one trustworthy source for where
+# System32 lives. The environment (`SystemRoot`, `windir`) is set by whoever
+# launched the process, which is exactly the input this crate refuses to trust.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
+
+[lints.rust]
+# One FFI call on Windows (`GetSystemDirectoryW`) needs unsafe; the crate
+# downgrades the workspace `forbid` to `deny` and admits it only there, through
+# the documented `cfg_attr` allow in lib.rs, mirroring `warrenguard-winroute`.
+# Every other build of this crate contains no unsafe.
+unsafe_code = "deny"
+missing_docs = "warn"
+unreachable_pub = "warn"
+unused_imports = "warn"
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+must_use_candidate = "warn"
+needless_pass_by_value = "warn"
+explicit_iter_loop = "warn"

@@ -40,8 +40,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::{LazyLock, Mutex, PoisonError};
 
 use anyhow::{Context, Result, anyhow};
-use tokio::process::Command;
 use warrenguard_killswitch_os::validate_tun_name as ks_validate_tun_name;
+use warrenguard_systool::SystemTool;
 
 /// The split-default `/1` pair. A leaked split that outlives its guard
 /// blackholes the *next* connect's relay dial (the relay is not in the
@@ -125,11 +125,13 @@ fn owned_tuns_v6() -> HashSet<String> {
 /// On timeout the child is killed and the call reports failure.
 const SYNC_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Spawn `program args...`, capture its output, and wait at most
+/// Spawn `tool args...`, capture its output, and wait at most
 /// [`SYNC_CLEANUP_TIMEOUT`] for it. Returns `None` on spawn failure or timeout
 /// (the child is killed). Best-effort and panic-free, safe to call from `Drop`.
-fn run_blocking_bounded(program: &str, args: &[&str]) -> Option<std::process::Output> {
-    let mut child = std::process::Command::new(program)
+fn run_blocking_bounded(tool: SystemTool, args: &[&str]) -> Option<std::process::Output> {
+    let mut child = tool
+        .command()
+        .ok()?
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -162,13 +164,16 @@ fn run_blocking_bounded(program: &str, args: &[&str]) -> Option<std::process::Ou
 /// by `exit_ip`) so it never touches another product's routes. Best-effort
 /// and panic-free - it can run inside `Drop`.
 fn delete_host_route_blocking(exit_ip: Ipv4Addr) {
-    let _ = run_blocking_bounded("route", &["delete", "-host", &exit_ip.to_string()]);
+    let _ = run_blocking_bounded(
+        SystemTool::Route,
+        &["delete", "-host", &exit_ip.to_string()],
+    );
 }
 
 /// Interface `probe`'s route currently egresses through, via
 /// `route -n get`. `None` when the probe does not resolve.
 fn route_iface(probe: &str) -> Option<String> {
-    let out = run_blocking_bounded("route", &["-n", "get", probe])?;
+    let out = run_blocking_bounded(SystemTool::Route, &["-n", "get", probe])?;
     out.status
         .success()
         .then(|| parse_default_iface(&String::from_utf8_lossy(&out.stdout)))
@@ -179,7 +184,7 @@ fn route_iface(probe: &str) -> Option<String> {
 /// `route -n get -inet6`. The `-inet6` flag is load-bearing - without it the
 /// query hits the v4 table and never sees a leaked `::/1` half.
 fn route_iface_v6(probe: &str) -> Option<String> {
-    let out = run_blocking_bounded("route", &["-n", "get", "-inet6", probe])?;
+    let out = run_blocking_bounded(SystemTool::Route, &["-n", "get", "-inet6", probe])?;
     out.status
         .success()
         .then(|| parse_default_iface(&String::from_utf8_lossy(&out.stdout)))
@@ -188,7 +193,7 @@ fn route_iface_v6(probe: &str) -> Option<String> {
 
 /// Whether `name` is currently a live interface on the host.
 fn iface_exists(name: &str) -> bool {
-    run_blocking_bounded("ifconfig", &[name])
+    run_blocking_bounded(SystemTool::Ifconfig, &[name])
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
@@ -217,7 +222,7 @@ fn reclaim_split_halves(owned: &HashSet<String>) {
         let iface = route_iface(probe);
         let present = iface.as_deref().is_some_and(iface_exists);
         if reclaim_decision(iface.as_deref(), owned, present) {
-            let _ = run_blocking_bounded("route", &["delete", "-net", net]);
+            let _ = run_blocking_bounded(SystemTool::Route, &["delete", "-net", net]);
         }
     }
 }
@@ -258,7 +263,7 @@ fn reclaim_split_halves_v6(owned: &HashSet<String>) {
         let iface = route_iface_v6(probe);
         let present = iface.as_deref().is_some_and(iface_exists);
         if reclaim_decision(iface.as_deref(), owned, present) {
-            let _ = run_blocking_bounded("route", &["delete", "-inet6", "-net", net]);
+            let _ = run_blocking_bounded(SystemTool::Route, &["delete", "-inet6", "-net", net]);
         }
     }
 }
@@ -288,7 +293,7 @@ pub fn force_cleanup_all_v6() {
     for (_, exit) in &entries {
         if let Some(exit_ip) = exit {
             let _ = run_blocking_bounded(
-                "route",
+                SystemTool::Route,
                 &["delete", "-inet6", "-host", &exit_ip.to_string()],
             );
         }
@@ -405,7 +410,9 @@ fn build_scoped_default_add_v6(pif: &str, router: &str) -> Vec<String> {
 /// deadlock does not apply.
 fn scutil_show(key: &str) -> Option<String> {
     use std::io::Write;
-    let mut child = std::process::Command::new("scutil")
+    let mut child = SystemTool::Scutil
+        .command()
+        .ok()?
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -516,7 +523,7 @@ pub fn restore_primary_defaults_v6() {
     let Some(global) = scutil_show("State:/Network/Global/IPv6") else {
         return;
     };
-    let Some(table) = run_blocking_bounded("netstat", &["-rn", "-f", "inet6"])
+    let Some(table) = run_blocking_bounded(SystemTool::Netstat, &["-rn", "-f", "inet6"])
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
     else {
         return;
@@ -533,7 +540,7 @@ pub fn restore_primary_defaults_v6() {
             "No unscoped IPv6 default survived tunnel teardown; restoring from SC's primary router so native IPv6 recovers before the next RA"
         );
         let args: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let _ = run_blocking_bounded("route", &args);
+        let _ = run_blocking_bounded(SystemTool::Route, &args);
     }
     if let Some(argv) = &plan.scoped_add {
         tracing::warn!(
@@ -541,19 +548,19 @@ pub fn restore_primary_defaults_v6() {
             "Primary interface lost its scoped IPv6 default route at tunnel teardown; restoring so the scoped DNS resolver is reachable again"
         );
         let args: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let _ = run_blocking_bounded("route", &args);
+        let _ = run_blocking_bounded(SystemTool::Route, &args);
     }
     // Nudge the resolvers to re-evaluate reachability of the now-routable DNS
     // server (SCNetworkReachability caches the stale "unreachable" verdict).
-    let _ = run_blocking_bounded("dscacheutil", &["-flushcache"]);
-    let _ = run_blocking_bounded("killall", &["-HUP", "mDNSResponder"]);
+    let _ = run_blocking_bounded(SystemTool::Dscacheutil, &["-flushcache"]);
+    let _ = run_blocking_bounded(SystemTool::Killall, &["-HUP", "mDNSResponder"]);
 }
 
 /// Argv vector for the two split-default `route add -net /1 -interface
 /// <tun>` lines, in install order.
 ///
-/// The `route` binary path is **not** included; the caller invokes it
-/// with `Command::new("route")`.
+/// The `route` binary path is **not** included; the caller runs it as
+/// [`SystemTool::Route`].
 ///
 /// No exit host-route exception is built here (and none is needed): the
 /// exit's carrier socket stays on the physical link via `IP_BOUND_IF` (set
@@ -610,8 +617,8 @@ const SPLIT_NET_PROBES_V6: [(&str, &str); 2] = [("::/1", "100::"), ("8000::/1", 
 /// tunnel. When the exit is dialed over IPv4 (`None`), the v6 split cannot
 /// capture the v4 socket, so no exception is emitted.
 ///
-/// The `route` binary path is not included; the caller invokes it with
-/// `Command::new("route")`.
+/// The `route` binary path is not included; the caller runs it as
+/// [`SystemTool::Route`].
 #[must_use]
 pub fn build_install_commands_v6(
     _exit_ip_v6: Option<Ipv6Addr>,
@@ -728,7 +735,7 @@ pub fn parse_route_is_reject(out: &str) -> bool {
 
 /// Whether `probe` currently resolves through a reject route.
 fn route_is_reject_v6(probe: &str) -> bool {
-    run_blocking_bounded("route", &["-n", "get", "-inet6", probe])
+    run_blocking_bounded(SystemTool::Route, &["-n", "get", "-inet6", probe])
         .filter(|out| out.status.success())
         .is_some_and(|out| parse_route_is_reject(&String::from_utf8_lossy(&out.stdout)))
 }
@@ -739,7 +746,7 @@ fn route_is_reject_v6(probe: &str) -> bool {
 fn remove_v6_unreachable_halves() {
     for (net, probe) in SPLIT_NET_PROBES_V6 {
         if route_is_reject_v6(probe) {
-            let _ = run_blocking_bounded("route", &["delete", "-inet6", "-net", net]);
+            let _ = run_blocking_bounded(SystemTool::Route, &["delete", "-inet6", "-net", net]);
         }
     }
 }
@@ -1023,7 +1030,9 @@ fn ifindex_from_name(name: &str) -> Result<u32> {
 /// Best-effort raw stdout of `route -n get default`. Returns `None`
 /// (rather than erroring) so the caller can fall back to scutil.
 async fn route_get_default_raw() -> Option<String> {
-    let out = Command::new("route")
+    let out = SystemTool::Route
+        .tokio_command()
+        .ok()?
         .args(["-n", "get", "default"])
         .output()
         .await
@@ -1037,7 +1046,9 @@ async fn route_get_default_raw() -> Option<String> {
 /// (parsed for both `PrimaryInterface` and `Router`). Returns `None` on
 /// any failure so the pure resolvers surface a single clear diagnostic.
 async fn scutil_global_ipv4_raw() -> Option<String> {
-    let out = Command::new("sh")
+    let out = SystemTool::Sh
+        .tokio_command()
+        .ok()?
         .args(["-c", "echo 'show State:/Network/Global/IPv4' | scutil"])
         .output()
         .await
@@ -1253,8 +1264,10 @@ impl Drop for DefaultRouteSplitV6Guard {
         let owned = owned_tuns_v6();
         reclaim_split_halves_v6(&owned);
         if let Some(exit) = self.exit_ip_v6 {
-            let _ =
-                run_blocking_bounded("route", &["delete", "-inet6", "-host", &exit.to_string()]);
+            let _ = run_blocking_bounded(
+                SystemTool::Route,
+                &["delete", "-inet6", "-host", &exit.to_string()],
+            );
         }
         registry_remove_v6(&self.tun_name);
         self.installed = false;
@@ -1265,7 +1278,8 @@ impl Drop for DefaultRouteSplitV6Guard {
 /// install when a previous run left an entry behind).
 async fn run_route_tolerant_exists(args: &[String]) -> Result<()> {
     let str_args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = Command::new("route")
+    let out = SystemTool::Route
+        .tokio_command()?
         .args(&str_args)
         .output()
         .await
@@ -1293,7 +1307,8 @@ async fn run_route_tolerant_exists(args: &[String]) -> Result<()> {
 /// (idempotent uninstall when the entry was already removed).
 async fn run_route_tolerant_no_such(args: &[String]) -> Result<()> {
     let str_args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = Command::new("route")
+    let out = SystemTool::Route
+        .tokio_command()?
         .args(&str_args)
         .output()
         .await
@@ -1333,16 +1348,37 @@ mod tests {
     /// (measured on the production daemon).
     #[test]
     fn bounded_run_completes_a_short_child_promptly() {
-        // Warm-up: exclude one-time process-spawn amortization (dyld
-        // cache etc.) from the measured run.
-        let _ = run_blocking_bounded("/bin/sleep", &["0"]);
-        let started = std::time::Instant::now();
-        let out = run_blocking_bounded("/bin/sleep", &["0.01"]);
-        let elapsed = started.elapsed();
-        assert!(out.is_some(), "child must complete");
+        // The fastest of several runs, so a loaded host's spawn noise does
+        // not decide the verdict; the first run also absorbs the one-time
+        // spawn warm-up.
+        fn fastest(run: impl Fn()) -> std::time::Duration {
+            (0..5)
+                .map(|_| {
+                    let started = std::time::Instant::now();
+                    run();
+                    started.elapsed()
+                })
+                .min()
+                .expect("five runs")
+        }
+        let args = ["-c", ":"];
+        let direct = fastest(|| {
+            let _ = SystemTool::Sh
+                .command()
+                .expect("every macOS host has a shell")
+                .args(args)
+                .output();
+        });
+        let bounded = fastest(|| {
+            assert!(
+                run_blocking_bounded(SystemTool::Sh, &args).is_some(),
+                "child must complete"
+            );
+        });
         assert!(
-            elapsed < std::time::Duration::from_millis(20),
-            "a ~10 ms child must not pay a full coarse poll period, took {elapsed:?}"
+            bounded < direct + std::time::Duration::from_millis(8),
+            "a child that exits at once must not wait out a coarse poll period: \
+             bounded {bounded:?}, direct {direct:?}"
         );
     }
 

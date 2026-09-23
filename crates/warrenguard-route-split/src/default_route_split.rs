@@ -59,8 +59,8 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use anyhow::{Context, Result, anyhow};
-use tokio::process::Command;
 use warrenguard_killswitch_os::validate_tun_name as ks_validate_tun_name;
+use warrenguard_systool::SystemTool;
 use warrenguard_tun_core::WARREN_TUNNEL_FWMARK;
 
 pub use crate::bypass_cidr::BypassCidr;
@@ -698,13 +698,15 @@ const SYNC_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// `await`. Tolerates "already gone" stderr, bounds its own runtime, and never
 /// panics, so it is safe to call from `Drop` and during shutdown.
 fn run_ip_sync_tolerant(args: &[String]) {
-    let mut child = match std::process::Command::new("ip")
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
+    let spawned = SystemTool::Ip.command().and_then(|mut command| {
+        command
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+    });
+    let mut child = match spawned {
         Ok(child) => child,
         Err(e) => {
             tracing::warn!(error = %e, cmd = %args.join(" "), "spawn ip sync cleanup failed (non-fatal)");
@@ -778,7 +780,9 @@ fn wait_sync_command(
 /// `ip rule` database before planning what to reclaim.
 #[cfg(target_os = "linux")]
 fn run_ip_capture_sync(args: &[&str]) -> Option<String> {
-    let mut child = std::process::Command::new("ip")
+    let mut child = SystemTool::Ip
+        .command()
+        .ok()?
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -817,7 +821,8 @@ pub fn force_cleanup_all() {
 
 async fn run_ip_tolerant_exists(args: &[String]) -> Result<()> {
     let str_args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = Command::new("ip")
+    let out = SystemTool::Ip
+        .tokio_command()?
         .args(&str_args)
         .output()
         .await
@@ -834,7 +839,8 @@ async fn run_ip_tolerant_exists(args: &[String]) -> Result<()> {
 
 async fn run_ip_tolerant_no_such(args: &[String]) -> Result<()> {
     let str_args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = Command::new("ip")
+    let out = SystemTool::Ip
+        .tokio_command()?
         .args(&str_args)
         .output()
         .await

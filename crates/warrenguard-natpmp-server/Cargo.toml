@@ -14,6 +14,9 @@ publish.workspace = true
 [dependencies]
 warrenguard-config = { path = "../warrenguard-config" }
 warrenguard-natpmp-protocol = { path = "../warrenguard-natpmp-protocol" }
+# Resolves `nft` from fixed system locations, never from the PATH the exit
+# process inherited.
+warrenguard-systool = { path = "../warrenguard-systool", features = ["tokio"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }

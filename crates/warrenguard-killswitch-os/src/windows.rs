@@ -137,6 +137,9 @@ use std::sync::Arc;
 #[cfg(any(target_os = "windows", test))]
 use std::time::Duration;
 
+#[cfg(any(target_os = "windows", test))]
+use warrenguard_systool::SystemTool;
+
 use crate::{KillswitchError, KillswitchOpts, validate_tun_name};
 
 /// Common display-name prefix on every rule we install. Used by the install to
@@ -1354,8 +1357,8 @@ impl FirewallRunner for PowershellRunner {
     fn sync_teardown(&self, snapshot: &FirewallSnapshot) {
         match sync_teardown_with(&self.gate, snapshot, SYNC_CLEANUP_TIMEOUT, |cmd| {
             sync_command_verdict(
-                "powershell.exe",
-                run_sync_bounded("powershell.exe", cmd, SYNC_CLEANUP_TIMEOUT),
+                SystemTool::PowerShell.name(),
+                run_sync_bounded(SystemTool::PowerShell, cmd, SYNC_CLEANUP_TIMEOUT),
             )
         }) {
             SyncTeardownOutcome::Restored { unfinished } => {
@@ -1561,7 +1564,7 @@ fn sync_teardown_with(
     SyncTeardownOutcome::Restored { unfinished }
 }
 
-/// Runs `program args...` with a reservation held, on a blocking task.
+/// Runs `tool args...` with a reservation held, on a blocking task.
 ///
 /// The reservation is taken BEFORE the task is spawned, so a future cancelled at the
 /// await below cannot lose it: the task still runs the command to completion and
@@ -1572,13 +1575,14 @@ fn sync_teardown_with(
 /// # Errors
 ///
 /// [`KillswitchError::Windows`] when the gate is closed (the teardown has begun),
-/// when `program` cannot be spawned, or when it exits non-zero.
+/// when `tool` is not installed or cannot be spawned, or when it exits non-zero.
 #[cfg(any(target_os = "windows", test))]
 async fn run_gated_command(
     gate: CommandGate,
-    program: &'static str,
+    tool: SystemTool,
     args: Vec<String>,
 ) -> Result<String, KillswitchError> {
+    let program = tool.name();
     let reservation = gate.reserve().ok_or_else(|| {
         KillswitchError::Windows(format!(
             "refused to run {program}: the killswitch teardown has started, and a \
@@ -1588,10 +1592,14 @@ async fn run_gated_command(
     tokio::task::spawn_blocking(move || {
         reservation.run(|| {
             let str_args: Vec<&str> = args.iter().map(String::as_str).collect();
-            let out = std::process::Command::new(program)
-                .args(&str_args)
-                .stdin(std::process::Stdio::null())
-                .output()
+            let out = tool
+                .command()
+                .and_then(|mut command| {
+                    command
+                        .args(&str_args)
+                        .stdin(std::process::Stdio::null())
+                        .output()
+                })
                 .map_err(|e| KillswitchError::Windows(format!("spawn {program}: {e}")))?;
             if !out.status.success() {
                 let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1615,7 +1623,7 @@ async fn run_powershell_capture(
 ) -> Result<String, KillswitchError> {
     run_gated_command(
         gate,
-        "powershell.exe",
+        SystemTool::PowerShell,
         vec!["-NoProfile".into(), "-Command".into(), command.to_owned()],
     )
     .await
@@ -1623,7 +1631,7 @@ async fn run_powershell_capture(
 
 #[cfg(target_os = "windows")]
 async fn run_powershell(gate: CommandGate, args: &[String]) -> Result<(), KillswitchError> {
-    run_gated_command(gate, "powershell.exe", args.to_vec())
+    run_gated_command(gate, SystemTool::PowerShell, args.to_vec())
         .await
         .map(|_| ())
 }
@@ -1664,15 +1672,18 @@ fn wait_child_bounded(
     }
 }
 
-/// Returns `None` if the child cannot start or exceeds the deadline. Output is
-/// discarded because restoration only needs the exit status and may run in `Drop`.
+/// Returns `None` if the tool is not installed, the child cannot start, or it
+/// exceeds the deadline. Output is discarded because restoration only needs the
+/// exit status and may run in `Drop`.
 #[cfg(any(target_os = "windows", test))]
 fn run_sync_bounded(
-    program: &str,
+    tool: SystemTool,
     args: &[String],
     timeout: Duration,
 ) -> Option<std::process::ExitStatus> {
-    let mut child = std::process::Command::new(program)
+    let mut child = tool
+        .command()
+        .ok()?
         .args(args.iter().map(String::as_str))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -3597,7 +3608,7 @@ AllowLocalFirewallRules    : True
         // running and keeps holding its reservation.
         let cancelled = tokio::time::timeout(
             Duration::from_millis(100),
-            run_gated_command(gate.clone(), "/bin/sh", vec!["-c".to_owned(), script]),
+            run_gated_command(gate.clone(), SystemTool::Sh, vec!["-c".to_owned(), script]),
         )
         .await;
         assert!(cancelled.is_err(), "the command was meant to be cancelled");
@@ -3775,14 +3786,18 @@ AllowLocalFirewallRules    : True
 
         #[test]
         fn sync_command_verdict_accepts_a_successful_child() {
-            let out = run_sync_bounded("/bin/echo", &["hello".to_string()], SYNC_CLEANUP_TIMEOUT);
-            assert_eq!(sync_command_verdict("/bin/echo", out), Ok(()));
+            let out = run_sync_bounded(
+                SystemTool::Sh,
+                &["-c".to_string(), "echo hello".to_string()],
+                SYNC_CLEANUP_TIMEOUT,
+            );
+            assert_eq!(sync_command_verdict("sh", out), Ok(()));
         }
 
         #[test]
         fn sync_command_verdict_rejects_a_non_zero_exit_of_a_real_child() {
             let out = run_sync_bounded(
-                "/bin/sh",
+                SystemTool::Sh,
                 &[
                     "-c".to_string(),
                     "echo 'Access is denied' >&2; exit 7".to_string(),
@@ -3791,9 +3806,9 @@ AllowLocalFirewallRules    : True
             )
             .expect("the child exits well within the bound");
             assert!(!out.success());
-            let reason = sync_command_verdict("/bin/sh", Some(out))
+            let reason = sync_command_verdict("sh", Some(out))
                 .expect_err("a non-zero exit means the command restored nothing");
-            assert_eq!(reason, "/bin/sh exited with exit code 7");
+            assert_eq!(reason, "sh exited with exit code 7");
         }
 
         #[test]
@@ -3809,7 +3824,7 @@ AllowLocalFirewallRules    : True
         #[test]
         fn run_sync_bounded_handles_verbose_children() {
             let status = run_sync_bounded(
-                "/bin/sh",
+                SystemTool::Sh,
                 &["-c".to_string(), "head -c 131072 /dev/zero >&2".to_string()],
                 SYNC_CLEANUP_TIMEOUT,
             )
@@ -3824,8 +3839,8 @@ AllowLocalFirewallRules    : True
             // or Drop could hang process teardown indefinitely.
             let started = std::time::Instant::now();
             let out = run_sync_bounded(
-                "/bin/sleep",
-                &["30".to_string()],
+                SystemTool::Sh,
+                &["-c".to_string(), "exec sleep 30".to_string()],
                 Duration::from_millis(200),
             );
             assert!(
@@ -3841,21 +3856,13 @@ AllowLocalFirewallRules    : True
 
         #[test]
         fn run_sync_bounded_reports_a_missing_program_as_failure() {
-            // posix_spawn may defer the exec failure: under emulation (the
-            // CI linux runners are amd64 under Rosetta) the spawn itself
-            // succeeds and the missing program only surfaces as a 127 exit
-            // at wait time, while a native host reports it synchronously as
-            // a spawn failure (None). Both count as "reported as failure,
-            // without wedging or panicking", which is the contract the
-            // killswitch Drop relies on.
-            match run_sync_bounded(
-                "/warren-test-missing-dir/definitely-not-a-real-binary",
-                &[],
-                Duration::from_secs(1),
-            ) {
-                None => {}
-                Some(status) => assert!(!status.success(), "a missing program cannot succeed"),
-            }
+            // No Unix host has powershell.exe, so this is the "not installed"
+            // path: reported as failure, without wedging or panicking, which
+            // is the contract the killswitch Drop relies on.
+            assert_eq!(
+                run_sync_bounded(SystemTool::PowerShell, &[], Duration::from_secs(1)),
+                None
+            );
         }
     }
 }

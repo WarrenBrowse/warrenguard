@@ -73,11 +73,11 @@ means changing the wire format, which requires bumping the schema version.
 
 ## Unsafe code
 
-`#![forbid(unsafe_code)]` is the default. Three crates downgrade it to `deny`
-because they wrap OS FFI: `warrenguard-tun-device`, `warrenguard-winroute` and
-`warrenguard-socket-bypass`. In those, every `unsafe` block carries a `// SAFETY:`
-comment stating the invariant that makes it sound. A block without one will not
-be merged.
+`#![forbid(unsafe_code)]` is the default. Four crates downgrade it to `deny`
+because they wrap OS FFI: `warrenguard-tun-device`, `warrenguard-winroute`,
+`warrenguard-socket-bypass` and `warrenguard-systool` (Windows only). In those,
+every `unsafe` block carries a `// SAFETY:` comment stating the invariant that
+makes it sound. A block without one will not be merged.
 
 ## Before you open a pull request
 

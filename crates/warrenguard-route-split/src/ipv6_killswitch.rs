@@ -119,7 +119,7 @@ mod linux_impl {
 
     use anyhow::{Context, Result, anyhow};
     use tokio::io::AsyncWriteExt;
-    use tokio::process::Command;
+    use warrenguard_systool::SystemTool;
 
     use super::{NFT_TABLE, build_ipv6_block_ruleset};
 
@@ -185,9 +185,9 @@ mod linux_impl {
             // Best-effort sync cleanup. Drop is not async, so we cannot
             // await the tokio version; SIGKILL is unrecoverable but
             // the parent process is also dead so the kernel cleans up.
-            let _ = std::process::Command::new("nft")
-                .args(["delete", "table", "ip6", NFT_TABLE])
-                .output();
+            let _ = SystemTool::Nft.command().and_then(|mut command| {
+                command.args(["delete", "table", "ip6", NFT_TABLE]).output()
+            });
             tracing::warn!(
                 "Warren IPv6 killswitch dropped without explicit uninstall - \
                  synchronous cleanup attempted"
@@ -196,7 +196,8 @@ mod linux_impl {
     }
 
     async fn run_nft_with_stdin(content: &str) -> Result<()> {
-        let mut child = Command::new("nft")
+        let mut child = SystemTool::Nft
+            .tokio_command()?
             .args(["-f", "-"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -221,7 +222,8 @@ mod linux_impl {
     }
 
     async fn run_nft_tolerant_missing(args: &[&str]) -> Result<()> {
-        let out = Command::new("nft")
+        let out = SystemTool::Nft
+            .tokio_command()?
             .args(args)
             .output()
             .await

@@ -11,6 +11,9 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Resolves `nft` / `powershell.exe` from fixed system locations: the killswitch
+# runs as root, and the PATH it inherited belongs to whoever launched it.
+warrenguard-systool = { path = "../warrenguard-systool" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }

@@ -52,11 +52,16 @@ pushing a new tag on `warren-quinn` and bumping the `tag` here.
 ## 4. Code style specifics
 
 - Edition 2024, MSRV 1.89 (pinned by `rust-toolchain.toml`).
-- `#![forbid(unsafe_code)]` everywhere except three crates that downgrade to `deny`
+- `#![forbid(unsafe_code)]` everywhere except four crates that downgrade to `deny`
   with per-block documented `# Safety`: the privileged TUN FFI in
-  `warrenguard-tun-device`, the Win32 IP Helper FFI in `warrenguard-winroute`, and
-  the `setsockopt` FFI in `warrenguard-socket-bypass`. Strict `[workspace.lints]`;
+  `warrenguard-tun-device`, the Win32 IP Helper FFI in `warrenguard-winroute`, the
+  `setsockopt` FFI in `warrenguard-socket-bypass`, and the Windows-only
+  `GetSystemDirectoryW` call in `warrenguard-systool`. Strict `[workspace.lints]`;
   never relax `clippy::correctness`.
+- Start an OS tool (`ip`, `nft`, `route`, `powershell.exe`...) only through
+  `warrenguard_systool::SystemTool`, never `Command::new`: the engine runs as root
+  and a bare name resolves through the PATH of whoever launched it. `clippy.toml`
+  refuses `Command::new` outside that crate.
 - No `unwrap()`/`expect()` without a documented `# Panics` invariant. No
   `format!()` in hot paths. No stringly-typed APIs; newtypes for validated data.
 

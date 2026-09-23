@@ -747,10 +747,11 @@ impl Default for ShellNftExecutor {
 #[cfg(target_os = "linux")]
 impl NftExecutor for ShellNftExecutor {
     fn run_script(&self, script: &str) -> impl Future<Output = Result<(), String>> + Send {
-        use tokio::process::Command;
         let script_owned = script.to_string();
         async move {
-            let mut command = Command::new("nft");
+            let mut command = warrenguard_systool::SystemTool::Nft
+                .tokio_command()
+                .map_err(|e| format!("failed to spawn nft: {e}"))?;
             command.arg("-f").arg("-");
             run_nft_command(command, &script_owned, NFT_COMMAND_TIMEOUT).await
         }
@@ -803,7 +804,9 @@ mod shell_nft_executor_tests {
 
     #[tokio::test]
     async fn a_stalled_nft_process_is_bounded() {
-        let mut command = tokio::process::Command::new("sh");
+        let mut command = warrenguard_systool::SystemTool::Sh
+            .tokio_command()
+            .expect("every Linux host has a shell");
         command.arg("-c").arg("cat >/dev/null; sleep 60");
 
         let result = run_nft_command(command, "test input", Duration::from_millis(50)).await;

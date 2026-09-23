@@ -3524,6 +3524,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "warrenguard-systool",
 ]
 
 [[package]]
@@ -3635,6 +3636,7 @@ dependencies = [
  "tracing",
  "warrenguard-config",
  "warrenguard-natpmp-protocol",
+ "warrenguard-systool",
 ]
 
 [[package]]
@@ -3697,6 +3699,7 @@ dependencies = [
  "tracing",
  "warrenguard-killswitch-os",
  "warrenguard-socket-bypass",
+ "warrenguard-systool",
  "warrenguard-tun-core",
  "warrenguard-winroute",
  "warrenguard-wire",
@@ -3742,6 +3745,14 @@ dependencies = [
  "socket2",
  "warrenguard-tun-core",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "warrenguard-systool"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3857,6 +3868,9 @@ dependencies = [
 [[package]]
 name = "warrenguard-tun-core"
 version = "0.1.0"
+dependencies = [
+ "warrenguard-systool",
+]
 
 [[package]]
 name = "warrenguard-tun-device"

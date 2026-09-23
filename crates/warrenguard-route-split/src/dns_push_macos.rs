@@ -36,7 +36,7 @@
 use std::net::Ipv4Addr;
 
 use anyhow::{Context, Result, anyhow};
-use tokio::process::Command;
+use warrenguard_systool::SystemTool;
 
 /// Per-service DNS configuration as reported by `networksetup
 /// -getdnsservers`. We have to round-trip exactly what we found so the
@@ -264,9 +264,9 @@ impl Drop for DnsPushGuard {
         for (service, original) in &self.backups {
             let args = build_restore_command(service, original);
             let str_args: Vec<&str> = args.iter().map(String::as_str).collect();
-            let _ = std::process::Command::new("networksetup")
-                .args(&str_args)
-                .output();
+            let _ = SystemTool::Networksetup
+                .command()
+                .and_then(|mut command| command.args(&str_args).output());
         }
     }
 }
@@ -274,7 +274,8 @@ impl Drop for DnsPushGuard {
 /// Helper: invoke `networksetup -listallnetworkservices` and parse the
 /// enabled-services list.
 async fn list_enabled_services() -> Result<Vec<String>> {
-    let out = Command::new("networksetup")
+    let out = SystemTool::Networksetup
+        .tokio_command()?
         .arg("-listallnetworkservices")
         .output()
         .await
@@ -293,7 +294,8 @@ async fn list_enabled_services() -> Result<Vec<String>> {
 /// Helper: invoke `networksetup -getdnsservers <service>` and parse
 /// the captured DNS config.
 async fn capture_service_dns(service: &str) -> Result<DnsConfig> {
-    let out = Command::new("networksetup")
+    let out = SystemTool::Networksetup
+        .tokio_command()?
         .args(["-getdnsservers", service])
         .output()
         .await
@@ -313,7 +315,8 @@ async fn capture_service_dns(service: &str) -> Result<DnsConfig> {
 /// stderr verbatim for diagnostics (privilege failures show up here).
 async fn run_networksetup(args: &[String]) -> Result<()> {
     let str_args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = Command::new("networksetup")
+    let out = SystemTool::Networksetup
+        .tokio_command()?
         .args(&str_args)
         .output()
         .await

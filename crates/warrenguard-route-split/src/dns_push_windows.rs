@@ -34,7 +34,7 @@ use std::net::Ipv4Addr;
 #[cfg(target_os = "windows")]
 use anyhow::{Context, Result, anyhow};
 #[cfg(target_os = "windows")]
-use tokio::process::Command;
+use warrenguard_systool::SystemTool;
 
 /// Per-adapter DNS configuration. Captured at install time so the
 /// uninstall path can re-establish DHCP-vs-manual on a per-NIC basis.
@@ -279,16 +279,17 @@ impl Drop for DnsPushGuard {
         );
         for ((_name, ifindex), original) in &self.backups {
             let args = build_restore_command(*ifindex, original);
-            let _ = std::process::Command::new("powershell.exe")
-                .args(args.iter().map(String::as_str))
-                .output();
+            let _ = SystemTool::PowerShell
+                .command()
+                .and_then(|mut command| command.args(args.iter().map(String::as_str)).output());
         }
     }
 }
 
 #[cfg(target_os = "windows")]
 async fn list_up_adapters() -> Result<Vec<(String, u32)>> {
-    let out = Command::new("powershell.exe")
+    let out = SystemTool::PowerShell
+        .tokio_command()?
         .args([
             "-NoProfile",
             "-Command",
@@ -313,7 +314,8 @@ async fn capture_adapter_dns(ifindex: u32) -> Result<DnsConfig> {
         "Get-DnsClientServerAddress -InterfaceIndex {ifindex} \
          -AddressFamily IPv4 | Format-List ServerAddresses"
     );
-    let out = Command::new("powershell.exe")
+    let out = SystemTool::PowerShell
+        .tokio_command()?
         .args(["-NoProfile", "-Command", &ps_command])
         .output()
         .await
@@ -332,7 +334,8 @@ async fn capture_adapter_dns(ifindex: u32) -> Result<DnsConfig> {
 #[cfg(target_os = "windows")]
 async fn run_powershell(args: &[String]) -> Result<()> {
     let str_args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = Command::new("powershell.exe")
+    let out = SystemTool::PowerShell
+        .tokio_command()?
         .args(&str_args)
         .output()
         .await

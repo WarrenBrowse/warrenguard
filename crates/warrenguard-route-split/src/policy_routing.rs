@@ -38,8 +38,8 @@ use std::process::Stdio;
 
 use anyhow::{Context, Result, anyhow};
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 use warrenguard_killswitch_os::validate_tun_name as ks_validate_tun_name;
+use warrenguard_systool::SystemTool;
 
 /// fwmark used by Warren to tag packets incoming via the TUN.
 /// Arbitrary value 0x42, chosen to avoid conflict with classic fwmarks
@@ -160,22 +160,28 @@ impl Drop for PolicyRoutingGuard {
         }
         // Best-effort synchronous cleanup (Drop is not async). On
         // SIGKILL this will not run, the user must clean up manually.
-        let _ = std::process::Command::new("nft")
-            .args(["delete", "table", "inet", NFT_TABLE])
-            .output();
-        let _ = std::process::Command::new("ip")
-            .args(["route", "flush", "table", &ROUTE_TABLE.to_string()])
-            .output();
-        let _ = std::process::Command::new("ip")
-            .args([
-                "rule",
-                "del",
-                "fwmark",
-                &format!("{FWMARK:#x}"),
-                "table",
-                &ROUTE_TABLE.to_string(),
-            ])
-            .output();
+        let _ = SystemTool::Nft.command().and_then(|mut command| {
+            command
+                .args(["delete", "table", "inet", NFT_TABLE])
+                .output()
+        });
+        let _ = SystemTool::Ip.command().and_then(|mut command| {
+            command
+                .args(["route", "flush", "table", &ROUTE_TABLE.to_string()])
+                .output()
+        });
+        let _ = SystemTool::Ip.command().and_then(|mut command| {
+            command
+                .args([
+                    "rule",
+                    "del",
+                    "fwmark",
+                    &format!("{FWMARK:#x}"),
+                    "table",
+                    &ROUTE_TABLE.to_string(),
+                ])
+                .output()
+        });
         tracing::warn!(
             "Warren policy routing dropped without explicit uninstall - \
              synchronous cleanup attempted"
@@ -221,7 +227,8 @@ table inet {NFT_TABLE} {{
 }
 
 async fn run_ip(args: &[&str]) -> Result<()> {
-    let out = Command::new("ip")
+    let out = SystemTool::Ip
+        .tokio_command()?
         .args(args)
         .output()
         .await
@@ -239,7 +246,8 @@ async fn run_ip(args: &[&str]) -> Result<()> {
 }
 
 async fn run_ip_tolerant_exists(args: &[&str]) -> Result<()> {
-    let out = Command::new("ip")
+    let out = SystemTool::Ip
+        .tokio_command()?
         .args(args)
         .output()
         .await
@@ -256,7 +264,8 @@ async fn run_ip_tolerant_exists(args: &[&str]) -> Result<()> {
 }
 
 async fn run_ip_tolerant_no_such(args: &[&str]) -> Result<()> {
-    let out = Command::new("ip")
+    let out = SystemTool::Ip
+        .tokio_command()?
         .args(args)
         .output()
         .await
@@ -272,7 +281,8 @@ async fn run_ip_tolerant_no_such(args: &[&str]) -> Result<()> {
 }
 
 async fn run_nft_tolerant_missing(args: &[&str]) -> Result<()> {
-    let out = Command::new("nft")
+    let out = SystemTool::Nft
+        .tokio_command()?
         .args(args)
         .output()
         .await
@@ -288,7 +298,8 @@ async fn run_nft_tolerant_missing(args: &[&str]) -> Result<()> {
 }
 
 async fn run_nft_with_stdin(args: &[&str], content: &str) -> Result<()> {
-    let mut child = Command::new("nft")
+    let mut child = SystemTool::Nft
+        .tokio_command()?
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

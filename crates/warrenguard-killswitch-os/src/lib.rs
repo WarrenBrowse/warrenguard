@@ -62,6 +62,8 @@
 
 use std::net::IpAddr;
 
+use warrenguard_systool::SystemTool;
+
 // Not part of the public API: a typed builder consumed only by
 // `build_linux_ruleset` below. `pub(crate)` keeps it out of `missing_docs`
 // scope (its structs mirror nftables syntax field-for-field, documenting
@@ -297,33 +299,33 @@ pub trait CommandRunner: Send + Sync + std::fmt::Debug {
     ///
     /// # Errors
     ///
-    /// `std::io::Error` when the process cannot be spawned or its I/O
-    /// pipes fail. A non-zero exit status is NOT an `Err`; it is
-    /// reported through [`CommandOutput::success`].
+    /// `std::io::Error` when the tool is not installed, the process
+    /// cannot be spawned or its I/O pipes fail. A non-zero exit status is
+    /// NOT an `Err`; it is reported through [`CommandOutput::success`].
     fn run(
         &self,
-        program: &str,
+        program: SystemTool,
         args: &[&str],
         stdin: Option<&str>,
     ) -> std::io::Result<CommandOutput>;
 }
 
-/// Production [`CommandRunner`]: spawns the real process via
-/// `std::process::Command`.
+/// Production [`CommandRunner`]: spawns the real tool, resolved from the
+/// system directories by [`SystemTool::command`].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ProcessRunner;
 
 impl CommandRunner for ProcessRunner {
     fn run(
         &self,
-        program: &str,
+        program: SystemTool,
         args: &[&str],
         stdin: Option<&str>,
     ) -> std::io::Result<CommandOutput> {
         use std::io::Write as _;
-        use std::process::{Command, Stdio};
+        use std::process::Stdio;
 
-        let mut cmd = Command::new(program);
+        let mut cmd = program.command()?;
         cmd.args(args)
             .stdin(if stdin.is_some() {
                 Stdio::piped()
@@ -602,7 +604,9 @@ impl Drop for LinuxKillswitch {
         // killswitch is not left active. NOTE: release builds use
         // `panic = "abort"`, so this never runs on an actual panic -
         // the rules then stay installed (fail-closed, cf. module doc).
-        let res = self.runner.run("nft", &NFT_DELETE_TABLE_ARGS, None);
+        let res = self
+            .runner
+            .run(SystemTool::Nft, &NFT_DELETE_TABLE_ARGS, None);
         match res {
             Ok(out) if out.success => {
                 tracing::warn!(
@@ -638,10 +642,12 @@ async fn run_nft_with_stdin(
     runner: std::sync::Arc<dyn CommandRunner>,
     ruleset: String,
 ) -> Result<(), KillswitchError> {
-    let out = tokio::task::spawn_blocking(move || runner.run("nft", &["-f", "-"], Some(&ruleset)))
-        .await
-        .map_err(|e| KillswitchError::Nft(format!("join nft task: {e}")))?
-        .map_err(|e| KillswitchError::Nft(format!("spawn nft: {e}")))?;
+    let out = tokio::task::spawn_blocking(move || {
+        runner.run(SystemTool::Nft, &["-f", "-"], Some(&ruleset))
+    })
+    .await
+    .map_err(|e| KillswitchError::Nft(format!("join nft task: {e}")))?
+    .map_err(|e| KillswitchError::Nft(format!("spawn nft: {e}")))?;
 
     if !out.success {
         return Err(KillswitchError::Nft(format!(
@@ -653,10 +659,12 @@ async fn run_nft_with_stdin(
 }
 
 async fn uninstall_table(runner: std::sync::Arc<dyn CommandRunner>) -> Result<(), KillswitchError> {
-    let out = tokio::task::spawn_blocking(move || runner.run("nft", &NFT_DELETE_TABLE_ARGS, None))
-        .await
-        .map_err(|e| KillswitchError::Nft(format!("join nft task: {e}")))?
-        .map_err(|e| KillswitchError::Nft(format!("spawn nft delete: {e}")))?;
+    let out = tokio::task::spawn_blocking(move || {
+        runner.run(SystemTool::Nft, &NFT_DELETE_TABLE_ARGS, None)
+    })
+    .await
+    .map_err(|e| KillswitchError::Nft(format!("join nft task: {e}")))?
+    .map_err(|e| KillswitchError::Nft(format!("spawn nft delete: {e}")))?;
 
     if out.success {
         tracing::info!("Warren killswitch uninstalled");
@@ -1060,7 +1068,7 @@ mod tests {
     use std::sync::Arc;
 
     /// One recorded runner invocation: (program, args, stdin).
-    type RecordedCall = (String, Vec<String>, Option<String>);
+    type RecordedCall = (SystemTool, Vec<String>, Option<String>);
 
     #[derive(Debug, Default)]
     struct RecordingRunner {
@@ -1086,12 +1094,12 @@ mod tests {
     impl CommandRunner for RecordingRunner {
         fn run(
             &self,
-            program: &str,
+            program: SystemTool,
             args: &[&str],
             stdin: Option<&str>,
         ) -> std::io::Result<CommandOutput> {
             self.calls.lock().expect("runner mutex").push((
-                program.to_owned(),
+                program,
                 args.iter().map(|s| (*s).to_owned()).collect(),
                 stdin.map(str::to_owned),
             ));
@@ -1125,14 +1133,14 @@ mod tests {
              this test exists for) would leave only 1 call"
         );
         let (program, args, stdin) = &calls[0];
-        assert_eq!(program, "nft");
+        assert_eq!(*program, SystemTool::Nft);
         assert_eq!(args, &["-f", "-"], "install pipes the ruleset to nft -f -");
         assert!(
             stdin.as_deref().is_some_and(|s| s.contains(NFT_TABLE_NAME)),
             "the piped ruleset must declare the Warren table"
         );
         let (program, args, stdin) = &calls[1];
-        assert_eq!(program, "nft");
+        assert_eq!(*program, SystemTool::Nft);
         assert_eq!(
             args,
             &["delete", "table", "inet", "warrenguard_killswitch_os"],

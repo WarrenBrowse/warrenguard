@@ -60,7 +60,8 @@ pub fn parse_netstat_default_gateway(netstat_output: &str) -> Option<IpAddr> {
 /// If `ip` cannot be run, or no default route with a gateway is present.
 #[cfg(all(feature = "experimental-tun", target_os = "linux"))]
 pub fn discover_default_gateway() -> std::io::Result<IpAddr> {
-    let out = std::process::Command::new("ip")
+    let out = warrenguard_systool::SystemTool::Ip
+        .command()?
         .args(["route", "show", "default"])
         .output()?;
     if !out.status.success() {
@@ -80,7 +81,8 @@ pub fn discover_default_gateway() -> std::io::Result<IpAddr> {
 pub fn discover_default_gateway() -> std::io::Result<IpAddr> {
     // `netstat -rn` (not `route get default`) so the PHYSICAL gateway is found
     // even when another VPN owns the top default route via an interface.
-    let out = std::process::Command::new("netstat")
+    let out = warrenguard_systool::SystemTool::Netstat
+        .command()?
         .args(["-rn", "-f", "inet"])
         .output()?;
     if !out.status.success() {
