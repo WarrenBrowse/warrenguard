@@ -1308,7 +1308,7 @@ impl MultiHopSupervisor {
                     tracing::warn!(
                         error = %e,
                         refused_by = hop.as_str(),
-                        "multi-hop setup refused after the handshake (drained node); \
+                        "multi-hop setup refused after the handshake by a drained node; \
                          session not published, refusal reported, redialling after backoff"
                     );
                     self.notify_dial_refused(e);
@@ -3021,11 +3021,11 @@ mod run_tests {
     }
 
     /// A setup the exit refuses after the QUIC handshake (here the drain close
-    /// a draining node answers every new session with) is a failed dial:
-    /// nothing is published, the refusal reaches `on_dial_refused` naming the
-    /// exit as the refusing hop, and the redials wait for the backoff instead
-    /// of hammering the node. Once the exit admits again, the session is
-    /// published.
+    /// a draining one-hop node answers every new session with) is a failed
+    /// dial: nothing is published, the refusal reaches `on_dial_refused`
+    /// naming the node the connection terminates at, and the redials wait for
+    /// the backoff instead of hammering it. Once the exit admits again, the
+    /// session is published.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_setup_refused_by_a_draining_exit_is_reported_backed_off_and_never_published() {
         let operational_key = SigningKey::from_bytes(&[0x47; 32]);
@@ -3074,11 +3074,12 @@ mod run_tests {
         assert!(
             reports.iter().all(|report| *report
                 == (
-                    multihop::DialRefusedHop::Exit,
+                    multihop::DialRefusedHop::Entry,
                     exit.relay.relay_id,
                     *exit_id.as_bytes()
                 )),
-            "each report must name the exit as the refusing hop of the dialed circuit, got {reports:?}"
+            "each report must name the node that closed the setup, the entry of the dialed \
+             circuit, got {reports:?}"
         );
 
         exit.refuse_setup

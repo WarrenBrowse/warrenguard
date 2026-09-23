@@ -229,14 +229,22 @@ impl MultiHopError {
     /// Either close counts whether it ends the handshake, a live session
     /// ([`MultiHopError::Recv`]) or the setup round-trip that follows a
     /// successful handshake ([`MultiHopError::SetupClosed`]), which is
-    /// where a drained exit refuses every new session.
+    /// where a drained one-hop exit refuses every new session.
+    ///
+    /// A close during the setup round-trip always names the entry: it comes
+    /// from the node this connection terminates at (an honest relay never
+    /// passes a drain close through), and by then that node has read the
+    /// cleartext exit id of the setup frame. Naming the exit would let a
+    /// hostile entry relay, or a peer holding only a cover certificate,
+    /// choose which exits the client avoids; naming the entry lets it make
+    /// the client avoid only itself. On a one-hop circuit both are the same
+    /// node.
     #[must_use]
     pub fn dial_refusal(&self) -> Option<DialRefusedHop> {
-        let (MultiHopError::Handshake(err)
-        | MultiHopError::Recv(err)
-        | MultiHopError::SetupClosed(err)) = self
-        else {
-            return None;
+        let (err, drain_hop) = match self {
+            MultiHopError::Handshake(err) | MultiHopError::Recv(err) => (err, DialRefusedHop::Exit),
+            MultiHopError::SetupClosed(err) => (err, DialRefusedHop::Entry),
+            _ => return None,
         };
         match err {
             quinn::ConnectionError::ConnectionClosed(close)
@@ -247,7 +255,7 @@ impl MultiHopError {
             quinn::ConnectionError::ApplicationClosed(ac)
                 if u64::from(ac.error_code) == u64::from(WARREN_MH_DRAINING) =>
             {
-                Some(DialRefusedHop::Exit)
+                Some(drain_hop)
             }
             _ => None,
         }
@@ -1623,7 +1631,10 @@ impl MultiHopClient {
         let bytes = tokio::time::timeout(timeout, recv.read_to_end(RELAY_AUTH_PROOF_LEN))
             .await
             .map_err(|_| MultiHopError::RelayIdentity("timed out reading relay-auth proof"))?
-            .map_err(|_| MultiHopError::RelayIdentity("short or oversized relay-auth proof"))?;
+            .map_err(|_| match conn.close_reason() {
+                Some(close) => MultiHopError::SetupClosed(close),
+                None => MultiHopError::RelayIdentity("short or oversized relay-auth proof"),
+            })?;
         let sig = decode_relay_auth_proof(&bytes)
             .map_err(|_| MultiHopError::RelayIdentity("malformed relay-auth proof"))?;
         if !verify_relay_auth(expected_relay_pubkey, &cb, &sig) {
@@ -3154,8 +3165,8 @@ mod tests {
         );
         assert_eq!(
             err.dial_refusal(),
-            Some(DialRefusedHop::Exit),
-            "the drain close is an exit refusal"
+            Some(DialRefusedHop::Entry),
+            "a close before the proof is the connected node refusing, never a named exit"
         );
     }
 
@@ -3356,6 +3367,12 @@ mod tests {
             ));
             assert_eq!(err.dial_refusal(), Some(DialRefusedHop::Exit));
         }
+    }
+
+    #[test]
+    fn dial_refused_hops_have_stable_log_labels() {
+        assert_eq!(DialRefusedHop::Entry.as_str(), "entry");
+        assert_eq!(DialRefusedHop::Exit.as_str(), "exit");
     }
 
     #[test]
