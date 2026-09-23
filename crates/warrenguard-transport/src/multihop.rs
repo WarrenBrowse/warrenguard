@@ -220,9 +220,9 @@ impl MultiHopError {
     /// or stop hammering instead of treating it like a transient blip.
     ///
     /// Detected refusals:
-    /// - the entry relay's QUIC `CONNECTION_REFUSED` transport close
-    ///   (its listener refuses every new connection while drained),
-    /// - the exit's maintenance-drain application close code
+    /// - the QUIC `CONNECTION_REFUSED` transport close (a drained entry
+    ///   relay's listener refuses every new connection),
+    /// - the maintenance-drain application close code
     ///   ([`WARREN_MH_DRAINING`]), which by design never maps to a
     ///   [`RejectionReason`] (a drain is maintenance, not policy).
     ///
@@ -231,20 +231,20 @@ impl MultiHopError {
     /// successful handshake ([`MultiHopError::SetupClosed`]), which is
     /// where a drained one-hop exit refuses every new session.
     ///
-    /// A close during the setup round-trip always names the entry: it comes
-    /// from the node this connection terminates at (an honest relay never
-    /// passes a drain close through), and by then that node has read the
-    /// cleartext exit id of the setup frame. Naming the exit would let a
-    /// hostile entry relay, or a peer holding only a cover certificate,
-    /// choose which exits the client avoids; naming the entry lets it make
-    /// the client avoid only itself. On a one-hop circuit both are the same
-    /// node.
+    /// Both always name the entry. A close comes from the node this
+    /// connection terminates at (an honest relay never passes a drain close
+    /// through), and during setup that node has read the cleartext exit id.
+    /// Naming the exit would let a hostile entry relay, or a peer holding
+    /// only a cover certificate, choose which exits the client avoids;
+    /// naming the entry lets it make the client avoid only itself. On a
+    /// one-hop circuit both are the same node.
     #[must_use]
     pub fn dial_refusal(&self) -> Option<DialRefusedHop> {
-        let (err, drain_hop) = match self {
-            MultiHopError::Handshake(err) | MultiHopError::Recv(err) => (err, DialRefusedHop::Exit),
-            MultiHopError::SetupClosed(err) => (err, DialRefusedHop::Entry),
-            _ => return None,
+        let (MultiHopError::Handshake(err)
+        | MultiHopError::Recv(err)
+        | MultiHopError::SetupClosed(err)) = self
+        else {
+            return None;
         };
         match err {
             quinn::ConnectionError::ConnectionClosed(close)
@@ -255,7 +255,7 @@ impl MultiHopError {
             quinn::ConnectionError::ApplicationClosed(ac)
                 if u64::from(ac.error_code) == u64::from(WARREN_MH_DRAINING) =>
             {
-                Some(drain_hop)
+                Some(DialRefusedHop::Entry)
             }
             _ => None,
         }
@@ -287,9 +287,12 @@ impl MultiHopError {
 /// [`MultiHopError::dial_refusal`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DialRefusedHop {
-    /// The entry relay refused the QUIC connection outright.
+    /// The node the client's connection terminates at refused it: the entry
+    /// relay, which on a one-hop circuit is the exit itself.
     Entry,
-    /// The exit refused the session with its drain close code.
+    /// The exit beyond the entry refused the session. A close code cannot
+    /// say so on its own authority (see [`MultiHopError::dial_refusal`]), so
+    /// the engine does not report this today.
     Exit,
 }
 
@@ -3355,17 +3358,22 @@ mod tests {
     }
 
     #[test]
-    fn dial_refusal_classifies_the_exit_drain_close_on_dial_and_recv() {
-        // The exit's maintenance-drain close is a refusal for a NEW dial
-        // whether it surfaces during the handshake or on the first read.
-        for make in [MultiHopError::Handshake, MultiHopError::Recv] {
+    fn dial_refusal_names_the_connected_node_for_a_drain_close() {
+        // The maintenance-drain close is a refusal for a NEW dial whether it
+        // surfaces during the handshake, the setup or the first read, and it
+        // is always the node the connection terminates at that sent it.
+        for make in [
+            MultiHopError::Handshake,
+            MultiHopError::Recv,
+            MultiHopError::SetupClosed,
+        ] {
             let err = make(quinn::ConnectionError::ApplicationClosed(
                 quinn::ApplicationClose {
                     error_code: quinn::VarInt::from_u32(warrenguard_multihop::WARREN_MH_DRAINING),
                     reason: bytes::Bytes::from_static(b""),
                 },
             ));
-            assert_eq!(err.dial_refusal(), Some(DialRefusedHop::Exit));
+            assert_eq!(err.dial_refusal(), Some(DialRefusedHop::Entry));
         }
     }
 
