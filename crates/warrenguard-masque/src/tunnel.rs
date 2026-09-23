@@ -81,6 +81,39 @@ where
     tokio::join!(client_to_upstream, upstream_to_client);
 }
 
+/// The HTTP Datagram route of one CONNECT-UDP stream: registered on
+/// [`Self::open`], unregistered on drop.
+///
+/// It is opened before the tunnel's target is dialed. A client may send its
+/// first datagrams right after the request (RFC 9298 section 5), and a
+/// datagram for a stream with no route is dropped, so the route has to exist
+/// before the 200 can reach the client; until the pump runs, the channel
+/// holds what arrives.
+pub(crate) struct UdpRoute {
+    state: Arc<ConnState>,
+    quarter_stream_id: u64,
+    datagrams: mpsc::Receiver<Bytes>,
+}
+
+impl UdpRoute {
+    pub(crate) fn open(state: &Arc<ConnState>, stream_id: u64) -> Self {
+        let (tx, datagrams) = mpsc::channel::<Bytes>(256);
+        let quarter_stream_id = stream_id >> 2;
+        state.routes().register(quarter_stream_id, tx);
+        Self {
+            state: Arc::clone(state),
+            quarter_stream_id,
+            datagrams,
+        }
+    }
+}
+
+impl Drop for UdpRoute {
+    fn drop(&mut self) {
+        self.state.routes().unregister(self.quarter_stream_id);
+    }
+}
+
 /// Relays a CONNECT-UDP tunnel: HTTP Datagrams for the request stream (and
 /// DATAGRAM capsules on it) go to `socket`, and what the socket receives is
 /// sent back as HTTP Datagrams, until the client ends the stream or the
@@ -91,15 +124,13 @@ pub(crate) async fn pump_udp(
     mut send: SendStream,
     mut reader: FrameReader,
     socket: UdpSocket,
+    mut route: UdpRoute,
 ) {
-    let (tx, mut rx) = mpsc::channel::<Bytes>(256);
-    let quarter_stream_id = stream_id >> 2;
-    state.routes().register(quarter_stream_id, tx);
     let mut udp_buf = vec![0u8; UDP_READ];
     let mut capsules = CapsuleBuffer::default();
     loop {
         tokio::select! {
-            from_client = rx.recv() => {
+            from_client = route.datagrams.recv() => {
                 let Some(payload) = from_client else { break };
                 // A send failure (an ICMP unreachable surfacing) is the
                 // destination's business, not a reason to end the tunnel.
@@ -124,7 +155,7 @@ pub(crate) async fn pump_udp(
             }
         }
     }
-    state.routes().unregister(quarter_stream_id);
+    drop(route);
     let _ = send.finish();
     let _ = reader.recv_mut().stop(H3_NO_ERROR);
 }

@@ -64,7 +64,7 @@ pub use warrenguard_server::{SessionTokenAdmitter, TokenAdmission};
 
 use connection::ConnState;
 use frames::{FrameReader, MAX_CONTROL_FRAME_BYTES};
-use tunnel::{abort, pump_tcp, pump_udp, respond_and_close};
+use tunnel::{UdpRoute, abort, pump_tcp, pump_udp, respond_and_close};
 
 /// QPACK encoder stream type (RFC 9204 section 4.2).
 const QPACK_STREAM_ENCODER: u64 = 0x02;
@@ -411,7 +411,10 @@ where
                 if let Some(response) = self.admit(&state, credential).await {
                     return respond_and_close(&mut send, reader.recv_mut(), &response).await;
                 }
+                let stream_id = u64::from(send.id());
+                let route = UdpRoute::open(&state, stream_id);
                 let Ok(socket) = self.udp.dial(&target).await else {
+                    drop(route);
                     let response = encode_response_headers(502, &[]);
                     return respond_and_close(&mut send, reader.recv_mut(), &response).await;
                 };
@@ -422,9 +425,8 @@ where
                 {
                     return;
                 }
-                let stream_id = u64::from(send.id());
                 tracing::trace!(conn = state.id(), "masque: udp tunnel opened");
-                pump_udp(state, stream_id, send, reader, socket).await;
+                pump_udp(state, stream_id, send, reader, socket, route).await;
             }
             ProxyRequest::Other => {}
         }

@@ -98,6 +98,15 @@ impl EgressPolicy for Policy {
 struct Dialer {
     target: Option<SocketAddr>,
     dialed: Mutex<Vec<String>>,
+    /// `Some`: a UDP dial announces itself and waits to be let through.
+    udp_pause: Option<DialPause>,
+}
+
+/// Holds a UDP dial open so a test can act while it is in flight.
+#[derive(Default)]
+struct DialPause {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 impl Dialer {
@@ -105,12 +114,20 @@ impl Dialer {
         Self {
             target: Some(target),
             dialed: Mutex::new(Vec::new()),
+            udp_pause: None,
         }
     }
     fn refusing() -> Self {
         Self {
             target: None,
             dialed: Mutex::new(Vec::new()),
+            udp_pause: None,
+        }
+    }
+    fn pausing_udp(target: SocketAddr) -> Self {
+        Self {
+            udp_pause: Some(DialPause::default()),
+            ..Self::to(target)
         }
     }
     fn dials(&self) -> usize {
@@ -138,6 +155,10 @@ impl ConnectUdpDialer for Dialer {
             .lock()
             .unwrap()
             .push(format!("{}:{}", target.host(), target.port()));
+        if let Some(pause) = &self.udp_pause {
+            pause.started.notify_one();
+            pause.release.notified().await;
+        }
         match self.target {
             Some(addr) => {
                 let socket = UdpSocket::bind("127.0.0.1:0").await?;
@@ -328,8 +349,13 @@ struct Exchange {
 }
 
 async fn request(conn: &Connection, head: &[u8]) -> Exchange {
-    let (mut send, mut recv) = conn.open_bi().await.expect("open request");
+    let (mut send, recv) = conn.open_bi().await.expect("open request");
     send.write_all(head).await.expect("write head");
+    response(send, recv).await
+}
+
+/// Reads the response HEADERS of a request whose head is already written.
+async fn response(send: SendStream, mut recv: RecvStream) -> Exchange {
     let mut buf = Vec::new();
     let (frame, used) = loop {
         if let Some((frame, used)) = read_frame(&buf) {
@@ -534,6 +560,58 @@ async fn concurrent_first_requests_on_one_connection_spend_one_credential() {
         1,
         "one connection spends one credential"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_datagram_sent_before_the_connect_udp_response_is_relayed() {
+    // RFC 9298 lets a client send its first datagrams without waiting for the
+    // 200, and a browser does. One that reaches the ingress while the tunnel
+    // is still being set up must be relayed once it is up, not dropped for
+    // want of a route.
+    let tcp = tcp_echo().await;
+    let udp = udp_echo().await;
+    let udp_dialer = Arc::new(Dialer::pausing_udp(udp));
+    let ingress = Arc::new(MasqueIngress::new(
+        StubAdmitter::admitting(),
+        Policy(true),
+        Arc::new(Dialer::to(tcp)),
+        udp_dialer.clone(),
+        MasqueConfig::default(),
+    ));
+    let (addr, root) = spawn_server(ingress);
+    let conn = connect(addr, &root).await;
+    let _ctrl = open_control(&conn, true).await;
+    let prime = request(
+        &conn,
+        &connect_head("prime.example:443", Some(&credential())),
+    )
+    .await;
+    assert_eq!(prime.status, 200);
+    let pause = udp_dialer.udp_pause.as_ref().expect("a pausing dialer");
+
+    let (mut send, recv) = conn.open_bi().await.expect("open request");
+    send.write_all(&connect_udp_head(
+        "/.well-known/masque/udp/example.com/443/",
+        None,
+    ))
+    .await
+    .expect("write head");
+    tokio::time::timeout(Duration::from_secs(5), pause.started.notified())
+        .await
+        .expect("the ingress dials the target");
+    let stream_id = u64::from(send.id());
+    conn.send_datagram(Bytes::from(encode_masque_datagram(stream_id, b"early")))
+        .expect("send datagram");
+    pause.release.notify_one();
+
+    let x = response(send, recv).await;
+    assert_eq!(x.status, 200);
+    let reply = tokio::time::timeout(Duration::from_secs(5), conn.read_datagram())
+        .await
+        .expect("the early datagram comes back through the echo")
+        .expect("datagram");
+    let (_, _, payload) = read_masque_datagram(&reply).expect("well-formed");
+    assert_eq!(payload, b"early");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
