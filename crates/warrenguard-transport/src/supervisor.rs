@@ -902,7 +902,7 @@ impl MultiHopSupervisor {
                 self.prober.clone(),
                 self.overlap.clone(),
             ));
-            self.spawn_background_bond(&bundle, assign, session_tokens);
+            self.spawn_background_bond(&bundle, &session_target, assign, session_tokens);
             self.notify_on_reconnect(first_session);
             self.notify_path_rtt(
                 session_target.relay.relay_ed25519_pubkey,
@@ -1361,10 +1361,11 @@ impl MultiHopSupervisor {
     /// the ones that came up with the primary's sticky IP, in index
     /// order. Best-effort: bonding failures only reduce capacity.
     ///
-    /// Bond secondaries to the SAME circuit the primary just dialed. A
-    /// migration racing in here would change the snapshot, but a
-    /// secondary on a different exit fails `dial_secondary`'s sticky
-    /// IpAssign check and is skipped (safe).
+    /// `target` is the circuit the primary dialled, never a fresh read of
+    /// the live target: a secondary names the primary's address as its join
+    /// hint, which another exit may hand out as well, so a secondary sent to
+    /// a target that moved during the primary's setup can pass the sticky
+    /// check and leave one bond spanning two exits.
     async fn bond_secondaries(
         config: &SupervisorConfig,
         target: &CircuitTarget,
@@ -1415,9 +1416,13 @@ impl MultiHopSupervisor {
     /// closed instead of leaking as a zombie exit slot (and a secondary
     /// attached in the race between `force_close_for_reconnect` and the
     /// final drop is closed by the bundle's `Drop`).
+    ///
+    /// `dialled` is the circuit the primary dialled, for the reason given on
+    /// [`Self::bond_secondaries`].
     fn spawn_background_bond(
         &self,
         bundle: &Arc<MultiHopBundle>,
+        dialled: &CircuitTarget,
         primary_spec: IpAssignSpec,
         session_tokens: Option<Vec<SessionToken>>,
     ) {
@@ -1431,7 +1436,7 @@ impl MultiHopSupervisor {
         }
         let weak = Arc::downgrade(bundle);
         let config = self.config.clone();
-        let target = self.current_target();
+        let target = dialled.clone();
         tokio::spawn(async move {
             let mut dials = tokio::task::JoinSet::new();
             for index in 1..want {
@@ -1508,11 +1513,10 @@ impl MultiHopSupervisor {
             warrenguard_config::knobs::multihop_conns_override(),
         );
         if want > 1 {
-            let target = self.current_target();
             clients.extend(
                 Self::bond_secondaries(
                     &self.config,
-                    &target,
+                    dialled,
                     primary_spec,
                     want,
                     session_tokens.clone(),
@@ -3293,6 +3297,109 @@ mod run_tests {
             )],
             "the refused setup is charged to the circuit it dialled"
         );
+    }
+
+    /// The exit each connection of `bundle` terminates at, primary first.
+    fn exits_of(bundle: &MultiHopBundle) -> Vec<ExitId> {
+        bundle.clients().iter().map(|c| c.exit_id()).collect()
+    }
+
+    /// Every connection of a bonded session terminates at the exit its primary
+    /// dialled, even when the target moves while that primary is being set up.
+    /// A secondary dialled to the new target would name the primary's address
+    /// to another exit, and one bond would then span two exits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cold_dial_bonds_its_secondaries_to_the_exit_its_primary_dialled() {
+        let operational_key = SigningKey::from_bytes(&[0x4E; 32]);
+        let dialled = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x60; 16]));
+        let elsewhere = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x61; 16]));
+        let mut config = config_with_fake_exit(&dialled, &operational_key);
+        config.n_connections = 2;
+        // Every overlap is refused, so the cold session stays the published
+        // one while the retarget below queues an overlap behind it.
+        config.pre_swap_check = Some(Arc::new(|_| Box::pin(async { false })));
+        let (supervisor, mut rx) = MultiHopSupervisor::new(config);
+        let migrate = supervisor.migrate_handle();
+        let moved_to = circuit_to(&elsewhere, elsewhere.relay.relay_id, &operational_key);
+        dialled.on_next_dial(move || migrate.migrate_to(moved_to));
+        let task = tokio::spawn(supervisor.run());
+
+        tokio::time::timeout(Duration::from_secs(5), rx.changed())
+            .await
+            .expect("the cold dial publishes a session")
+            .expect("watch sender alive");
+        let bundle = rx
+            .borrow_and_update()
+            .clone()
+            .expect("a session was published");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while bundle.num_connections() < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the secondary bonds onto the published session");
+        assert_eq!(
+            exits_of(&bundle),
+            vec![dialled.exit_id; 2],
+            "the secondary is dialled to the exit of its primary"
+        );
+
+        drop(bundle);
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    /// The overlap dial assembles its full bond before the swap: every
+    /// secondary goes to the exit the overlap's primary dialled, whatever
+    /// retarget lands during that primary's setup.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_overlap_bonds_its_secondaries_to_the_exit_its_primary_dialled() {
+        let operational_key = SigningKey::from_bytes(&[0x4F; 32]);
+        let serving = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x62; 16]));
+        let next = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x63; 16]));
+        let elsewhere = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x64; 16]));
+        let presented: Arc<Mutex<Vec<Vec<ExitId>>>> = Arc::default();
+        let mut config = config_with_fake_exit(&serving, &operational_key);
+        config.n_connections = 2;
+        config.pre_swap_check = Some(Arc::new({
+            let presented = presented.clone();
+            move |bundle: Arc<MultiHopBundle>| {
+                presented
+                    .lock()
+                    .expect("presented lock")
+                    .push(exits_of(&bundle));
+                Box::pin(async { false })
+            }
+        }));
+        let (supervisor, mut rx) = MultiHopSupervisor::new(config);
+        let handle = supervisor.handle();
+        let migrate = supervisor.migrate_handle();
+        let task = tokio::spawn(supervisor.run());
+        tokio::time::timeout(Duration::from_secs(5), rx.changed())
+            .await
+            .expect("the cold dial publishes a session")
+            .expect("watch sender alive");
+
+        let moved_to = circuit_to(&elsewhere, elsewhere.relay.relay_id, &operational_key);
+        next.on_next_dial(move || migrate.migrate_to(moved_to));
+        handle.migrate_to(circuit_to(&next, next.relay.relay_id, &operational_key));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while presented.lock().expect("presented lock").is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the overlap presents its session to the pre-swap check");
+        assert_eq!(
+            presented.lock().expect("presented lock")[0],
+            vec![next.exit_id; 2],
+            "every connection of the overlap's bond goes to the exit its primary dialled"
+        );
+
+        drop(rx);
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
 
     /// A session that dies right after it was established is a flap: the
