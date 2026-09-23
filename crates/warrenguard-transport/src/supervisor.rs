@@ -526,8 +526,9 @@ pub struct MultiHopSupervisor {
     /// sentinel instead. The sentinel is what stops two independent
     /// same-wallet sessions from sharing one inner IP and stealing each
     /// other's downlink, and it keeps one exit's allocation from being
-    /// disclosed to, or reproduced by, another.
-    last_assigned_v4: Mutex<Option<(ExitId, std::net::Ipv4Addr)>>,
+    /// disclosed to, or reproduced by, another. A watch so a deployer can
+    /// follow it ([`Self::placement_rx`]).
+    placement: watch::Sender<Option<(ExitId, std::net::Ipv4Addr)>>,
     /// Shared state of the goodput prober ([`crate::path_health`]):
     /// tracker episode memory, reply stream and probe tap. The tap is
     /// installed on every published bundle; one prober task runs per
@@ -638,7 +639,7 @@ impl MultiHopSupervisor {
             metrics: Arc::new(SupervisorMetrics::default()),
             overlap: Arc::new(Notify::new()),
             target,
-            last_assigned_v4: Mutex::new(None),
+            placement: watch::channel(None).0,
             prober: crate::path_health::ProberShared::new(rand::random()),
         };
         (supervisor, rx)
@@ -680,10 +681,21 @@ impl MultiHopSupervisor {
         assigning_exit: ExitId,
         assigned_v4: std::net::Ipv4Addr,
     ) {
-        *self
-            .last_assigned_v4
-            .lock()
-            .expect("last_assigned_v4 lock poisoned") = Some((assigning_exit, assigned_v4));
+        self.placement
+            .send_replace(Some((assigning_exit, assigned_v4)));
+    }
+
+    /// Subscribe to the session's placement: the inner IPv4 the exit last
+    /// assigned, with the exit that assigned it, which after a migration is
+    /// not the exit the supervisor was built for. It is updated before the
+    /// matching `IpAssign` reaches [`SupervisorConfig::ip_assign_channel`],
+    /// so a deployer reacting to that publication reads the right exit
+    /// here. What a deployer keeps across tunnel rebuilds and hands back
+    /// through [`Self::resume_session_placement`]. Holding the receiver does
+    /// not keep the supervisor alive.
+    #[must_use]
+    pub fn placement_rx(&self) -> watch::Receiver<Option<(ExitId, std::net::Ipv4Addr)>> {
+        self.placement.subscribe()
     }
 
     /// Session-placement hint for the next setup request to `exit_id`: the
@@ -691,10 +703,7 @@ impl MultiHopSupervisor {
     /// session-fresh sentinel when there is no predecessor on that exit to
     /// continue.
     fn session_placement_hint(&self, exit_id: ExitId) -> Option<std::net::Ipv4Addr> {
-        let last = *self
-            .last_assigned_v4
-            .lock()
-            .expect("last_assigned_v4 lock poisoned");
+        let last = *self.placement.borrow();
         Some(match last {
             Some((assigning_exit, addr)) if assigning_exit == exit_id => addr,
             _ => std::net::Ipv4Addr::UNSPECIFIED,
@@ -1299,11 +1308,9 @@ impl MultiHopSupervisor {
             },
             "multi-hop setup assigned the session its inner IPv4"
         );
+        self.placement
+            .send_replace(Some((primary.exit_id(), spec.assigned)));
         self.publish_setup_ip_assign(&spec);
-        *self
-            .last_assigned_v4
-            .lock()
-            .expect("last_assigned_v4 lock poisoned") = Some((primary.exit_id(), spec.assigned));
         SetupOutcome::Assigned(spec)
     }
 
@@ -3000,6 +3007,41 @@ mod run_tests {
         drop(second);
         drop(rx);
         drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    /// A deployer that keeps the session's address across tunnel rebuilds
+    /// must record it with the exit that assigned it, which after a
+    /// migration is not the exit the tunnel was built for. The placement
+    /// watch carries both, and it is already current when the `IpAssign`
+    /// that triggers a rebuild is published.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_placement_watch_names_the_assigning_exit_before_the_ip_assign_is_published() {
+        let operational_key = SigningKey::from_bytes(&[0x4C; 32]);
+        let exit_id = ExitId::from_bytes([0x5C; 16]);
+        let exit = spawn_fake_multihop_exit(&operational_key, exit_id);
+        let channel = IpAssignChannel::new();
+        let mut assigns = channel.subscribe();
+        let mut config = config_with_fake_exit(&exit, &operational_key);
+        config.ip_assign_channel = Some(channel);
+        let (supervisor, rx) = MultiHopSupervisor::new(config);
+        let placement = supervisor.placement_rx();
+        let task = tokio::spawn(supervisor.run());
+
+        tokio::time::timeout(Duration::from_secs(5), assigns.changed())
+            .await
+            .expect("the setup publishes an IpAssign")
+            .expect("channel alive");
+        let spec = assigns
+            .borrow_and_update()
+            .expect("an IpAssign was published");
+        assert_eq!(
+            *placement.borrow(),
+            Some((exit_id, spec.assigned)),
+            "the placement names the assigning exit and address by the time the IpAssign is out"
+        );
+
+        drop(rx);
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
 
