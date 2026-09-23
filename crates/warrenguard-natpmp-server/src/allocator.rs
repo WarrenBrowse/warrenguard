@@ -3,7 +3,6 @@
 //!
 //! **No disk persistence**: reboot = full reset, by design no-log.
 
-use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,10 +33,10 @@ use crate::{Allocation, NatPmpError, Proto};
 /// Deliberately shaped as addresses in, addresses out: no identity material
 /// enters the engine, and the allocator cannot log or leak one.
 ///
-/// The callback runs while the allocator holds its own internal lock, so an
-/// implementation must not call back into the [`Allocator`] and must not block
-/// on a lock that a caller of `allocate*` may already hold. Either deadlocks
-/// the exit's whole port-forward path.
+/// The callback runs with the allocator's lock released, at most once per
+/// request, so an implementation may read the [`Allocator`] back and may take
+/// its own locks. It still runs on the request path: a slow answer delays
+/// that request, never the others.
 pub trait QuotaPeers: Send + Sync {
     /// Every address that shares `client_ip`'s port budget, `client_ip`
     /// included. An unknown address answers with just itself.
@@ -58,9 +57,8 @@ pub trait QuotaPeers: Send + Sync {
 /// material. Unwired, the allocator cannot tell a departed holder from a live
 /// one and refuses both.
 ///
-/// Like [`QuotaPeers`], the callback runs under the allocator's internal lock:
-/// never call back into the [`Allocator`], never block on a lock a caller of
-/// `allocate*` may hold.
+/// Like [`QuotaPeers`], the callback runs with the allocator's lock released,
+/// at most once per request.
 pub trait LiveSessions: Send + Sync {
     /// True when `client_ip` currently holds a live tunnel session.
     ///
@@ -84,6 +82,9 @@ pub trait LiveSessions: Send + Sync {
 /// applies its configured default, which is what lets a deployer degrade
 /// gracefully when it cannot verify what the client presented instead of
 /// refusing the request.
+///
+/// Like [`QuotaPeers`], the callback runs with the allocator's lock released,
+/// at most once per request.
 pub trait PortBudget: Send + Sync {
     /// Ports `client_ip` may hold at once, or `None` for the default.
     fn budget_for(&self, client_ip: Ipv4Addr) -> Option<usize>;
@@ -262,9 +263,137 @@ pub struct AllocatorMetrics {
 
 struct Inner {
     active: HashMap<(u16, Proto), Allocation>,
+    /// Never later than the earliest `expires_at` in `active` (`None` when it
+    /// is empty), so a request walks `active` for expired mappings only when
+    /// one can have expired. Kept by [`Inner::insert_active`]; a removal leaves
+    /// it earlier than needed, which costs one idle walk at most.
+    next_expiry: Option<Instant>,
     cooldown_until: HashMap<u16, Instant>,
     last_user_per_port: HashMap<u16, (Ipv4Addr, Instant)>,
     rate_limit_log: HashMap<Ipv4Addr, VecDeque<Instant>>,
+}
+
+impl Inner {
+    /// Adds `alloc` to `active`. Every insertion goes through here, which is
+    /// what keeps `next_expiry` a valid lower bound.
+    fn insert_active(&mut self, alloc: Allocation) {
+        self.next_expiry = Some(
+            self.next_expiry
+                .map_or(alloc.expires_at, |t| t.min(alloc.expires_at)),
+        );
+        self.active
+            .insert((alloc.external_port, alloc.proto), alloc);
+    }
+
+    /// Moves every mapping expired at `now` from `active` to `evicted`, and
+    /// arms the anti-inheritance cooldown of its port.
+    fn sweep_expired(&mut self, now: Instant, cooldown: Duration, evicted: &mut Vec<Allocation>) {
+        if self.next_expiry.is_none_or(|t| t > now) {
+            return;
+        }
+        // Collect lazily-expired `(port, owner_ip, expires_at)` so their
+        // anti-inheritance cooldown can be armed after the retain (the other
+        // side maps cannot be touched while `active` is mutably borrowed here).
+        let mut expired_ports: Vec<(u16, Ipv4Addr, Instant)> = Vec::new();
+        let mut next_expiry: Option<Instant> = None;
+        self.active.retain(|&(ext, _), alloc| {
+            let keep = alloc.expires_at > now;
+            if keep {
+                next_expiry =
+                    Some(next_expiry.map_or(alloc.expires_at, |t| t.min(alloc.expires_at)));
+            } else {
+                expired_ports.push((ext, alloc.internal_ip, alloc.expires_at));
+                evicted.push(alloc.clone());
+            }
+            keep
+        });
+        self.next_expiry = next_expiry;
+        // A lazily-expired lease (client crashed without sending delete) must
+        // arm the SAME cooldown as an explicit release, or a DIFFERENT client
+        // could grab the exact port the instant it lapses and inherit residual
+        // inbound traffic. The cooldown is measured from the lease's EXPIRY,
+        // not from `now` (the sweep time) - otherwise a client that simply
+        // asks long after the lease lapsed would restart the cooldown clock and
+        // be wrongly blocked. A long-dead entry whose cooldown already elapsed
+        // adds nothing, so skip it. The owner can still reclaim its own port
+        // via an explicit suggestion (`port_eligible` with a reclaim group),
+        // which is exactly the case the cooldown is NOT meant to block. A
+        // dual-proto pair expiring together arms once per leg; keep the later
+        // deadline.
+        for (ext, ip, expires_at) in expired_ports {
+            let deadline = expires_at + cooldown;
+            if deadline > now {
+                let slot = self.cooldown_until.entry(ext).or_insert(deadline);
+                if deadline > *slot {
+                    *slot = deadline;
+                }
+                let last = self.last_user_per_port.entry(ext).or_insert((ip, deadline));
+                if deadline > last.1 {
+                    *last = (ip, deadline);
+                }
+            }
+        }
+    }
+
+    /// Drops the side-map entries that have run out, which keeps the three
+    /// maps bounded under client churn (the rate-limit log would otherwise
+    /// keep an empty entry for every client that ever asked). Every reader
+    /// checks expiry itself, so this changes no decision.
+    fn trim_side_maps(&mut self, now: Instant, rate_window: Duration) {
+        self.cooldown_until.retain(|_, expiry| *expiry > now);
+        self.last_user_per_port
+            .retain(|_, (_, expiry)| *expiry > now);
+        self.rate_limit_log.retain(|_, log| {
+            while log
+                .front()
+                .is_some_and(|t| now.duration_since(*t) > rate_window)
+            {
+                log.pop_front();
+            }
+            !log.is_empty()
+        });
+    }
+}
+
+/// One MAP request, as [`Allocator::try_allocate`] decides it.
+#[derive(Clone, Copy)]
+struct MapRequest {
+    client_ip: Ipv4Addr,
+    proto: Proto,
+    internal_port: u16,
+    suggested: u16,
+    lifetime: Duration,
+    now: Instant,
+}
+
+/// What the deployer's callbacks answered for one request, gathered with the
+/// allocator lock released. `None` is "not asked yet".
+struct DeployerAnswers {
+    /// Every address of the requester's tenant, the requester included.
+    tenant: Option<HashSet<Ipv4Addr>>,
+    /// Ports the requester's tenant may hold.
+    budget: Option<usize>,
+    /// The holder asked about, and whether it had a live session.
+    holder_live: Option<(Ipv4Addr, bool)>,
+}
+
+/// An answer [`Allocator::try_allocate`] cannot decide without.
+#[derive(Clone, Copy)]
+enum Question {
+    /// The requester's tenant ([`QuotaPeers`]).
+    Tenant,
+    /// The tenant and its budget ([`QuotaPeers`], [`PortBudget`]), which the
+    /// quota check needs together.
+    QuotaInputs,
+    /// Whether this holder of the suggested port has a live session
+    /// ([`LiveSessions`]).
+    HolderLive(Ipv4Addr),
+}
+
+/// Where one pass of [`Allocator::try_allocate`] ended.
+enum Step {
+    Done(Result<Allocation, NatPmpError>),
+    Ask(Question),
 }
 
 impl Allocator {
@@ -313,6 +442,7 @@ impl Allocator {
         Self {
             inner: Mutex::new(Inner {
                 active: HashMap::new(),
+                next_expiry: None,
                 cooldown_until: HashMap::new(),
                 last_user_per_port: HashMap::new(),
                 rate_limit_log: HashMap::new(),
@@ -487,6 +617,13 @@ impl Allocator {
     /// Variant of [`Self::allocate_collecting`] with an injectable
     /// `now`. The allocation outcome is in [`AllocateOutcome::result`];
     /// `evicted` must be torn down by the caller on every path.
+    ///
+    /// The deployer callbacks ([`QuotaPeers`], [`PortBudget`],
+    /// [`LiveSessions`]) run with the allocator lock released: the decision
+    /// runs under the lock until it needs an answer it does not have yet,
+    /// releases the lock, asks, and runs again from the top against whatever
+    /// the table holds by then. Each question is asked at most once per
+    /// request, so a request takes the lock at most four times.
     pub fn allocate_at_collecting(
         &self,
         client_ip: Ipv4Addr,
@@ -496,14 +633,107 @@ impl Allocator {
         lifetime_secs: u32,
         now: Instant,
     ) -> AllocateOutcome {
-        let lifetime = clamp_lifetime(lifetime_secs);
-        let mut g = self.inner.lock();
-
-        // Entries this call removes from `active` (expiry sweep +
-        // refresh-reclaim), collected up-front so EVERY return path -
-        // including the error returns below - hands them back for
-        // backend teardown.
+        let request = MapRequest {
+            client_ip,
+            proto,
+            internal_port,
+            suggested,
+            lifetime: clamp_lifetime(lifetime_secs),
+            now,
+        };
+        let mut answers = self.unasked(client_ip);
         let mut evicted: Vec<Allocation> = Vec::new();
+        let mut first_pass = true;
+        loop {
+            let step = {
+                let mut g = self.inner.lock();
+                if first_pass {
+                    g.trim_side_maps(now, self.rate_limit_window);
+                    first_pass = false;
+                }
+                self.try_allocate(&mut g, &request, &answers, &mut evicted)
+            };
+            match step {
+                Step::Done(result) => return AllocateOutcome { result, evicted },
+                Step::Ask(question) => self.ask(question, client_ip, &mut answers),
+            }
+        }
+    }
+
+    /// The answers a request starts with: the callbacks the deployer did not
+    /// wire are answered by their defaults, so they are never asked for.
+    fn unasked(&self, client_ip: Ipv4Addr) -> DeployerAnswers {
+        DeployerAnswers {
+            tenant: self
+                .quota_peers
+                .get()
+                .is_none()
+                .then(|| HashSet::from([client_ip])),
+            budget: self
+                .port_budget
+                .get()
+                .is_none()
+                .then_some(self.quota_per_client),
+            holder_live: None,
+        }
+    }
+
+    /// Asks the deployer `question`. Runs with the allocator lock released.
+    fn ask(&self, question: Question, client_ip: Ipv4Addr, answers: &mut DeployerAnswers) {
+        let tenant = || match self.quota_peers.get() {
+            Some(peers) => peers
+                .peer_addresses(client_ip)
+                .into_iter()
+                .chain(std::iter::once(client_ip))
+                .collect(),
+            None => HashSet::from([client_ip]),
+        };
+        match question {
+            Question::Tenant => answers.tenant = Some(tenant()),
+            Question::QuotaInputs => {
+                if answers.tenant.is_none() {
+                    answers.tenant = Some(tenant());
+                }
+                if answers.budget.is_none() {
+                    answers.budget = Some(
+                        self.port_budget
+                            .get()
+                            .and_then(|b| b.budget_for(client_ip))
+                            .unwrap_or(self.quota_per_client),
+                    );
+                }
+            }
+            Question::HolderLive(holder) => {
+                // Unwired liveness is never asked; answering "live" keeps the
+                // refusal every deployer had before it was wired.
+                let live = self
+                    .live_sessions
+                    .get()
+                    .is_none_or(|sessions| sessions.has_live_session(holder));
+                answers.holder_live = Some((holder, live));
+            }
+        }
+    }
+
+    /// One pass of the allocation decision under the lock. Everything it
+    /// changes before it returns [`Step::Ask`] is idempotent (the expiry
+    /// sweep, the rate-window trims), so the pass that follows the answer
+    /// decides as if it had run in one go.
+    fn try_allocate(
+        &self,
+        g: &mut Inner,
+        request: &MapRequest,
+        answers: &DeployerAnswers,
+        evicted: &mut Vec<Allocation>,
+    ) -> Step {
+        let MapRequest {
+            client_ip,
+            proto,
+            internal_port,
+            suggested,
+            lifetime,
+            now,
+        } = *request;
 
         // Lazy sweep of expired allocations FIRST, so every check below
         // (the strict suggested-port pre-check included) sees only live
@@ -513,86 +743,10 @@ impl Allocator {
         // either way and the caller tears down `evicted` on every path.
         // Without the sweep, ports stay RAM-occupied past their lifetime
         // and the pool ends in guaranteed exhaustion (clients that crash
-        // without sending a delete-mapping).
-        // Collect lazily-expired `(port, owner_ip, expires_at)` so their
-        // anti-inheritance cooldown can be armed after the retain (the other
-        // side maps cannot be touched while `active` is mutably borrowed here).
-        let mut expired_ports: Vec<(u16, Ipv4Addr, Instant)> = Vec::new();
-        g.active.retain(|&(ext, _), alloc| {
-            let keep = alloc.expires_at > now;
-            if !keep {
-                expired_ports.push((ext, alloc.internal_ip, alloc.expires_at));
-                evicted.push(alloc.clone());
-            }
-            keep
-        });
-        // A lazily-expired lease (client crashed without sending delete) must
-        // arm the SAME cooldown as an explicit release, or a DIFFERENT client
-        // could grab the exact port the instant it lapses and inherit residual
-        // inbound traffic. The cooldown is measured from the lease's EXPIRY,
-        // not from `now` (the sweep time) - otherwise a client that simply
-        // asks long after the lease lapsed would restart the cooldown clock and
-        // be wrongly blocked. A long-dead entry whose cooldown already elapsed
-        // adds nothing, so skip it. The owner can still reclaim its own port
-        // via an explicit suggestion (`port_eligible` with a reclaim group),
-        // which is exactly the case the cooldown is NOT meant to block. A
-        // dual-proto pair expiring together arms once per leg; keep the later
-        // deadline.
-        for (ext, ip, expires_at) in expired_ports {
-            let deadline = expires_at + self.cooldown;
-            if deadline > now {
-                let slot = g.cooldown_until.entry(ext).or_insert(deadline);
-                if deadline > *slot {
-                    *slot = deadline;
-                }
-                let last = g.last_user_per_port.entry(ext).or_insert((ip, deadline));
-                if deadline > last.1 {
-                    *last = (ip, deadline);
-                }
-            }
-        }
-
-        // The three side maps used to grow without bound
-        // (cooldown_until, last_user_per_port, rate_limit_log). In
-        // particular `rate_limit_log` kept empty entries forever for
-        // any client that made a request then disappeared - unbounded
-        // leak under ephemeral-client churn. The two port maps are
-        // bounded by `range_size` but their entries used to remain
-        // permanent past expiry.
-        g.cooldown_until.retain(|_, expiry| *expiry > now);
-        g.last_user_per_port.retain(|_, (_, expiry)| *expiry > now);
-        let rate_window = self.rate_limit_window;
-        g.rate_limit_log.retain(|_, log| {
-            while log
-                .front()
-                .is_some_and(|t| now.duration_since(*t) > rate_window)
-            {
-                log.pop_front();
-            }
-            !log.is_empty()
-        });
-
-        // The addresses that answer for one tenant: what is budgeted per
-        // address only bounds a payer through this grouping, and so does a
-        // port one of its own sessions left behind. The deployer holds the
-        // mapping; only addresses come back.
-        //
-        // Resolved at most once per call, and only on the branches that need
-        // it: the answer costs the deployer a scan of its live sessions, and
-        // the requests that reach this function most often are the ones that
-        // need no grouping at all (a plain allocation, and the rejected
-        // suggestion that is a probe of another client's port).
-        let tenant_cell: OnceCell<HashSet<Ipv4Addr>> = OnceCell::new();
-        let tenant_addresses = || {
-            tenant_cell.get_or_init(|| match self.quota_peers.get() {
-                Some(peers) => peers
-                    .peer_addresses(client_ip)
-                    .into_iter()
-                    .chain(std::iter::once(client_ip))
-                    .collect(),
-                None => std::iter::once(client_ip).collect(),
-            })
-        };
+        // without sending a delete-mapping). Entries this call removes
+        // from `active` go to `evicted`, which EVERY return path - the
+        // error returns included - hands back for backend teardown.
+        g.sweep_expired(now, self.cooldown, evicted);
 
         // Strict honouring of an explicit suggestion. RFC 6886 §3.3
         // permits the server to grant a different port, but Warren's UX
@@ -615,7 +769,7 @@ impl Allocator {
         if suggested != 0 {
             // Everything decidable from the allocator's own maps, so the
             // ordinary request never pays for a deployer callback.
-            let owner_allows = port_owner(&g, suggested).is_none_or(|owner| owner == client_ip);
+            let owner_allows = port_owner(g, suggested).is_none_or(|owner| owner == client_ip);
             let cheap_grantable = port_in_range(suggested, self.range)
                 && owner_allows
                 && match g.active.get(&(suggested, proto)) {
@@ -631,13 +785,20 @@ impl Allocator {
                     // this port actually carries a live previous-user entry,
                     // since that is the only clause it can change.
                     None => {
-                        port_owner(&g, suggested).is_some() || {
-                            let group = g
+                        port_owner(g, suggested).is_some() || {
+                            let group = if g
                                 .last_user_per_port
                                 .get(&suggested)
                                 .is_some_and(|(_, expiry)| *expiry > now)
-                                .then(tenant_addresses);
-                            port_eligible(&g, suggested, client_ip, now, group)
+                            {
+                                let Some(tenant) = &answers.tenant else {
+                                    return Step::Ask(Question::Tenant);
+                                };
+                                Some(tenant)
+                            } else {
+                                None
+                            };
+                            port_eligible(g, suggested, client_ip, now, group)
                         }
                     }
                 };
@@ -660,19 +821,30 @@ impl Allocator {
             // that work instead of behind it.
             if !cheap_grantable
                 && port_in_range(suggested, self.range)
-                && let Some(holder) = port_owner(&g, suggested)
+                && let Some(holder) = port_owner(g, suggested)
                 && holder != client_ip
-                && let Some(sessions) = self.live_sessions.get()
+                && self.live_sessions.get().is_some()
                 && within_rate_budget(
-                    &mut g,
+                    g,
                     client_ip,
                     now,
                     self.rate_limit_window,
                     self.rate_limit_max,
                 )
             {
-                reclaim_from_departed_peer =
-                    !sessions.has_live_session(holder) && tenant_addresses().contains(&holder);
+                // The holder the answer names may have changed hands while the
+                // lock was released; an answer about another address says
+                // nothing about this one, so the reclaim is refused.
+                let holder_departed = match answers.holder_live {
+                    Some((asked, live)) => asked == holder && !live,
+                    None => return Step::Ask(Question::HolderLive(holder)),
+                };
+                reclaim_from_departed_peer = holder_departed && {
+                    let Some(tenant) = &answers.tenant else {
+                        return Step::Ask(Question::Tenant);
+                    };
+                    tenant.contains(&holder)
+                };
             }
 
             // A reclaimed port is actively allocated, hence in range, and its
@@ -699,22 +871,16 @@ impl Allocator {
                         .front()
                         .map(|t| window_reset_secs(self.rate_limit_window, now.duration_since(*t)))
                         .unwrap_or(0);
-                    return AllocateOutcome {
-                        result: Err(NatPmpError::RateLimited {
-                            client: client_ip,
-                            retry_after_secs,
-                        }),
-                        evicted,
-                    };
+                    return Step::Done(Err(NatPmpError::RateLimited {
+                        client: client_ip,
+                        retry_after_secs,
+                    }));
                 }
                 log.push_back(now);
                 self.counters
                     .suggested_in_use
                     .fetch_add(1, Ordering::Relaxed);
-                return AllocateOutcome {
-                    result: Err(NatPmpError::SuggestedPortInUse(suggested)),
-                    evicted,
-                };
+                return Step::Done(Err(NatPmpError::SuggestedPortInUse(suggested)));
             }
         }
 
@@ -727,16 +893,22 @@ impl Allocator {
         // rate-limit budget just keeping them alive - the limit is meant
         // to throttle NEW allocations / port changes, not steady-state
         // renewals.
-        let is_refresh = g.active.iter().any(|(key, a)| {
-            key.1 == proto && a.internal_ip == client_ip && a.internal_port == internal_port
-        });
+        let same_tuple: Vec<(u16, Proto)> = g
+            .active
+            .iter()
+            .filter(|(key, a)| {
+                key.1 == proto && a.internal_ip == client_ip && a.internal_port == internal_port
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        let is_refresh = !same_tuple.is_empty();
         // The rate limit throttles NEW port acquisition. An explicit
         // suggestion for a port this client already live-owns (the
         // dual-proto companion, or a re-add after a single-leg release)
         // acquires no new port number, so it is exempt like a refresh -
         // otherwise mapping TCP+UDP pairs would cost double budget.
         let owns_suggested_port =
-            suggested != 0 && port_owner(&g, suggested).is_some_and(|owner| owner == client_ip);
+            suggested != 0 && port_owner(g, suggested).is_some_and(|owner| owner == client_ip);
         let acquires_new_port = !is_refresh && !owns_suggested_port;
 
         // Rate limit (NEW port acquisitions only): trim the window then
@@ -761,15 +933,19 @@ impl Allocator {
                     .front()
                     .map(|t| window_reset_secs(self.rate_limit_window, now.duration_since(*t)))
                     .unwrap_or(0);
-                return AllocateOutcome {
-                    result: Err(NatPmpError::RateLimited {
-                        client: client_ip,
-                        retry_after_secs,
-                    }),
-                    evicted,
-                };
+                return Step::Done(Err(NatPmpError::RateLimited {
+                    client: client_ip,
+                    retry_after_secs,
+                }));
             }
         }
+
+        // Everything below may mutate `active`, so every answer it needs is
+        // gathered first. The budget belongs to whoever pays for it, which
+        // is the tenant behind the address, not the address.
+        let (Some(tenant), Some(budget)) = (&answers.tenant, answers.budget) else {
+            return Step::Ask(Question::QuotaInputs);
+        };
 
         // RFC 6886 §3.3 refresh semantics + orphan self-heal: a MAP
         // request for a `(client_ip, internal_port, proto)` tuple that
@@ -794,19 +970,11 @@ impl Allocator {
         // entry for the reclaimed port: the same client is the one
         // re-requesting, so penalising it would defeat the refresh.
         //
-        let stale_same_tuple: Vec<(u16, Proto)> = g
-            .active
-            .iter()
-            .filter(|(key, a)| {
-                key.1 == proto && a.internal_ip == client_ip && a.internal_port == internal_port
-            })
-            .map(|(key, _)| *key)
-            .collect();
         // Remember the port this client most recently held for the
         // tuple, so a refresh that carries no explicit suggestion can
         // reuse it (port stability across renewals - see below).
         let mut previously_held: Option<u16> = None;
-        for key in stale_same_tuple {
+        for key in same_tuple {
             if let Some(removed) = g.active.remove(&key) {
                 previously_held = Some(key.0);
                 // Refresh that moves to a different external port: the
@@ -829,16 +997,12 @@ impl Allocator {
         // is quota-free; only a genuinely new port number is refused
         // once the client holds `NATPMP_QUOTA_PER_CLIENT_IP` (currently
         // 5) of them.
-        // The budget belongs to whoever pays for it, which is the tenant
-        // behind the address, not the address.
-        let held_ports: HashSet<u16> = {
-            let tenant = tenant_addresses();
-            g.active
-                .iter()
-                .filter(|(_, a)| tenant.contains(&a.internal_ip))
-                .map(|(key, _)| key.0)
-                .collect()
-        };
+        let held_ports: HashSet<u16> = g
+            .active
+            .iter()
+            .filter(|(_, a)| tenant.contains(&a.internal_ip))
+            .map(|(key, _)| key.0)
+            .collect();
         // A request landing on a port the tenant already held before this call
         // acquires none, so it is quota-free: the dual-proto companion
         // suggestion, and the renewal whose own mapping this call dropped a
@@ -853,17 +1017,9 @@ impl Allocator {
         } else {
             previously_held.is_some()
         };
-        let budget = self
-            .port_budget
-            .get()
-            .and_then(|b| b.budget_for(client_ip))
-            .unwrap_or(self.quota_per_client);
         if !reuses_held_port && held_ports.len() >= budget {
             self.counters.quota_exceeded.fetch_add(1, Ordering::Relaxed);
-            return AllocateOutcome {
-                result: Err(NatPmpError::QuotaExceeded(client_ip)),
-                evicted,
-            };
+            return Step::Done(Err(NatPmpError::QuotaExceeded(client_ip)));
         }
 
         // Taking a pinned port back from the tenant's own departed address
@@ -905,7 +1061,7 @@ impl Allocator {
             suggested
         } else {
             match pick_port(
-                &g,
+                g,
                 self.range,
                 proto,
                 previously_held.unwrap_or(0),
@@ -915,10 +1071,7 @@ impl Allocator {
                 Some(p) => p,
                 None => {
                     self.counters.exhausted.fetch_add(1, Ordering::Relaxed);
-                    return AllocateOutcome {
-                        result: Err(NatPmpError::Exhausted),
-                        evicted,
-                    };
+                    return Step::Done(Err(NatPmpError::Exhausted));
                 }
             }
         };
@@ -942,12 +1095,9 @@ impl Allocator {
             proto,
             expires_at: now + lifetime,
         };
-        g.active.insert((port, proto), alloc.clone());
+        g.insert_active(alloc.clone());
         self.counters.allocations.fetch_add(1, Ordering::Relaxed);
-        AllocateOutcome {
-            result: Ok(alloc),
-            evicted,
-        }
+        Step::Done(Ok(alloc))
     }
 
     /// Releases an allocation. Starts the port cooldown and records
@@ -1084,7 +1234,7 @@ impl Allocator {
             }
             g.last_user_per_port
                 .insert(entry.external_port, (entry.internal_ip, now));
-            g.active.insert(key, entry.clone());
+            g.insert_active(entry.clone());
             kept.push(entry);
         }
         kept

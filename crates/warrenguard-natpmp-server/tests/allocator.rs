@@ -8,7 +8,7 @@ use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
 use warrenguard_natpmp_server::allocator::Allocator;
-use warrenguard_natpmp_server::{NatPmpError, Proto};
+use warrenguard_natpmp_server::{Allocation, NatPmpError, Proto};
 
 const ALICE: Ipv4Addr = Ipv4Addr::new(10, 66, 0, 42);
 const BOB: Ipv4Addr = Ipv4Addr::new(10, 66, 0, 99);
@@ -2524,4 +2524,166 @@ fn a_renewal_is_quota_free_when_the_budget_is_smaller_than_what_is_held() {
         2,
         "the client must not lose the mapping it was renewing"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Deployer callbacks and the allocator lock
+// ---------------------------------------------------------------------------
+
+/// A deployer answers the allocator's questions from its own session state,
+/// and nothing stops that code from reading the allocator back (a metrics
+/// read, a lookup of what a session holds). Were the allocator lock held
+/// across the call, the request would deadlock on itself and every other
+/// port-forward request would queue behind it.
+#[test]
+fn deployer_callbacks_run_without_the_allocator_lock() {
+    use std::sync::{Arc, OnceLock, Weak, mpsc};
+    use warrenguard_natpmp_server::allocator::{LiveSessions, PortBudget, QuotaPeers};
+
+    /// ALICE's tenant, with ALICE's first session departed, answered after
+    /// reading the allocator back.
+    struct ReadsBack(OnceLock<Weak<Allocator>>);
+    impl ReadsBack {
+        fn read_back(&self) {
+            if let Some(alloc) = self.0.get().and_then(Weak::upgrade) {
+                let _ = alloc.active_count();
+            }
+        }
+    }
+    impl QuotaPeers for ReadsBack {
+        fn peer_addresses(&self, client_ip: Ipv4Addr) -> Vec<Ipv4Addr> {
+            self.read_back();
+            AliceTenant.peer_addresses(client_ip)
+        }
+    }
+    impl LiveSessions for ReadsBack {
+        fn has_live_session(&self, client_ip: Ipv4Addr) -> bool {
+            self.read_back();
+            client_ip == ALICE_SECOND_SESSION
+        }
+    }
+    impl PortBudget for ReadsBack {
+        fn budget_for(&self, _client_ip: Ipv4Addr) -> Option<usize> {
+            self.read_back();
+            None
+        }
+    }
+
+    let alloc = Arc::new(Allocator::new());
+    let callbacks = Arc::new(ReadsBack(OnceLock::new()));
+    callbacks.0.set(Arc::downgrade(&alloc)).expect("set once");
+    assert!(alloc.set_quota_peers(callbacks.clone()));
+    assert!(alloc.set_live_sessions(callbacks.clone()));
+    assert!(alloc.set_port_budget(callbacks));
+    let now = Instant::now();
+
+    // The pin asks for the tenant and the budget; the reclaim also asks
+    // whether the holder is still live.
+    let (tx, rx) = mpsc::channel();
+    let worker = Arc::clone(&alloc);
+    std::thread::spawn(move || {
+        let pinned = worker.allocate_at(ALICE, Proto::Tcp, 52419, 52419, 600, now);
+        let reclaimed =
+            worker.allocate_at(ALICE_SECOND_SESSION, Proto::Tcp, 52419, 52419, 600, now);
+        let _ = tx.send((pinned, reclaimed));
+    });
+    let (pinned, reclaimed) = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("a callback reading the allocator back deadlocked the request");
+
+    pinned.expect("the first session pins its port");
+    let reclaimed = reclaimed.expect("the tenant takes its own port back");
+    assert_eq!(reclaimed.internal_ip, ALICE_SECOND_SESSION);
+}
+
+/// With the lock released while the deployer answers, the port can change
+/// hands before the answer comes back. An answer about the departed holder
+/// says nothing about the new one, and trusting it would let one live device
+/// of a tenant take the port another live device of that tenant just took.
+#[test]
+fn a_liveness_answer_about_a_previous_holder_grants_no_reclaim() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, OnceLock, Weak};
+    use warrenguard_natpmp_server::allocator::{LiveSessions, QuotaPeers};
+
+    const ALICE_THIRD_SESSION: Ipv4Addr = Ipv4Addr::new(10, 66, 0, 44);
+
+    /// ALICE's three sessions, of which the first has departed. The first
+    /// liveness question is answered only after the third session has taken
+    /// the port, which is the race the lock release opens.
+    struct PortChangesHands {
+        alloc: OnceLock<Weak<Allocator>>,
+        raced: AtomicBool,
+        now: Instant,
+    }
+    impl QuotaPeers for PortChangesHands {
+        fn peer_addresses(&self, _client_ip: Ipv4Addr) -> Vec<Ipv4Addr> {
+            vec![ALICE, ALICE_SECOND_SESSION, ALICE_THIRD_SESSION]
+        }
+    }
+    impl LiveSessions for PortChangesHands {
+        fn has_live_session(&self, client_ip: Ipv4Addr) -> bool {
+            if !self.raced.swap(true, Ordering::SeqCst)
+                && let Some(alloc) = self.alloc.get().and_then(Weak::upgrade)
+            {
+                alloc.take_active_for_slot(52419, Proto::Tcp);
+                alloc
+                    .allocate_at(ALICE_THIRD_SESSION, Proto::Tcp, 52419, 52419, 600, self.now)
+                    .expect("the third session takes the freed port");
+            }
+            client_ip != ALICE
+        }
+    }
+
+    let now = Instant::now();
+    let alloc = Arc::new(Allocator::new());
+    let callbacks = Arc::new(PortChangesHands {
+        alloc: OnceLock::new(),
+        raced: AtomicBool::new(false),
+        now,
+    });
+    callbacks
+        .alloc
+        .set(Arc::downgrade(&alloc))
+        .expect("set once");
+    assert!(alloc.set_quota_peers(callbacks.clone()));
+    assert!(alloc.set_live_sessions(callbacks));
+    alloc
+        .allocate_at(ALICE, Proto::Tcp, 52419, 52419, 600, now)
+        .expect("the first session pins its port");
+
+    let res = alloc.allocate_at(ALICE_SECOND_SESSION, Proto::Tcp, 52419, 52419, 600, now);
+
+    assert!(
+        matches!(res, Err(NatPmpError::SuggestedPortInUse(52419))),
+        "the port's live holder keeps it, got {res:?}"
+    );
+    let holders: Vec<_> = alloc
+        .snapshot_active()
+        .into_iter()
+        .map(|a| a.internal_ip)
+        .collect();
+    assert_eq!(holders, vec![ALICE_THIRD_SESSION]);
+}
+
+/// A mapping put back by `restore` expires like any other: the sweep that
+/// finds expired mappings must know it is there.
+#[test]
+fn a_restored_mapping_is_swept_once_it_expires() {
+    let alloc = Allocator::new();
+    let now = Instant::now();
+    let restored = Allocation {
+        external_port: 52419,
+        internal_ip: ALICE,
+        internal_port: 52419,
+        proto: Proto::Tcp,
+        expires_at: now + Duration::from_secs(10),
+    };
+    assert_eq!(alloc.restore_at(vec![restored.clone()], now).len(), 1);
+
+    let outcome =
+        alloc.allocate_at_collecting(BOB, Proto::Tcp, 8080, 0, 600, now + Duration::from_secs(20));
+
+    outcome.result.expect("bob gets a port");
+    assert_eq!(outcome.evicted, vec![restored]);
 }
