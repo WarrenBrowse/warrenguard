@@ -1313,6 +1313,7 @@ impl MultiHopSupervisor {
         self.placement
             .send_replace(Some((primary.exit_id(), spec.assigned)));
         self.publish_setup_ip_assign(&spec);
+        prime_leg(primary);
         SetupOutcome::Assigned(spec)
     }
 
@@ -1742,6 +1743,7 @@ impl MultiHopSupervisor {
                     // No-log (INV-3): the sticky per-session address is not an
                     // event field; `index` identifies the connection.
                     tracing::debug!(index, "bonded secondary up");
+                    prime_leg(&client);
                     return Some(client);
                 }
                 Some(_) => {
@@ -1848,6 +1850,27 @@ impl MultiHopSupervisor {
 /// smuggle that identity material into a debug log just by replying with
 /// the "wrong" variant. Mirrors
 /// `supervised_pump::dispatch_control_message`'s identical policy.
+/// Puts one cover datagram on a leg the moment its setup completes.
+///
+/// An exit that refreshes a `/v2` leg's session only from the leg's own
+/// traffic forgets a leg that stays silent for five seconds after its setup,
+/// and drops every later frame of it until the client's next rekey, thirty
+/// minutes on. Such exits are deployed, a bonded secondary carries nothing
+/// until a flow hashes onto it, and a quiet host sends nothing at all, so
+/// every leg speaks first. The datagram is idle cover, dropped by the exit
+/// before its TUN and sized from the same distribution as every other cover
+/// datagram, so it adds no shape of its own to the wire.
+fn prime_leg(client: &MultiHopClient) {
+    let budget = client.max_inner_payload();
+    let now = Instant::now();
+    let size = warrenguard_pump::idle_cover::IdleCover::new(rand::random(), now, Some(budget))
+        .fire_size(now);
+    let padding_len = size.saturating_sub(1).min(budget.saturating_sub(1));
+    if let Err(e) = client.send_cover_traffic(padding_len) {
+        tracing::debug!(error = %e, "could not put a first frame on a fresh multi-hop leg");
+    }
+}
+
 fn control_message_variant_name(msg: &WarrenControlMessage) -> &'static str {
     match msg {
         WarrenControlMessage::IpRequest { .. } => "IpRequest",
@@ -3393,6 +3416,58 @@ mod run_tests {
             vec![dialled.exit_id; 2],
             "the secondary is dialled to the exit of its primary"
         );
+
+        drop(bundle);
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    /// Every leg of a bond carries a frame the moment its setup completes,
+    /// on a silent host, with one sibling slow to join. An exit keeps a
+    /// `/v2` leg's session alive only once the leg has sent something, and
+    /// every exit deployed before that was fixed drops a leg that stays
+    /// silent for five seconds after its setup, with all its flows, until
+    /// the client's next rekey.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_bonded_leg_carries_a_frame_within_a_second_of_its_setup() {
+        if bond_pinned_to_one_connection_by_env() {
+            eprintln!("skipped: WARREN_MULTIHOP_CONNS pins the bond to one connection");
+            return;
+        }
+        let operational_key = SigningKey::from_bytes(&[0x51; 32]);
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x68; 16]));
+        let want = resolve_bonded_want(4, warrenguard_config::knobs::multihop_conns_override());
+        *exit.hold_setup_reply.lock() = Some((want, Duration::from_secs(3)));
+        let mut config = config_with_fake_exit(&exit, &operational_key);
+        config.n_connections = 4;
+        let (supervisor, mut rx) = MultiHopSupervisor::new(config);
+        let task = tokio::spawn(supervisor.run());
+
+        tokio::time::timeout(Duration::from_secs(5), rx.changed())
+            .await
+            .expect("the cold dial publishes a session")
+            .expect("watch sender alive");
+        let bundle = rx
+            .borrow_and_update()
+            .clone()
+            .expect("a session was published");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while bundle.num_connections() < want {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("every secondary bonds onto the published session");
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+        let delays = exit.first_datagram_delays();
+        assert_eq!(delays.len(), want, "the exit answered every leg's setup");
+        for (leg, delay) in delays.iter().enumerate() {
+            assert!(
+                delay.is_some_and(|d| d <= Duration::from_secs(1)),
+                "leg {leg} carried its first frame {delay:?} after its setup"
+            );
+        }
 
         drop(bundle);
         drop(rx);

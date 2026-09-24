@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ed25519_dalek::{Signer, SigningKey};
 use quinn::{Connection, Endpoint};
@@ -438,8 +438,24 @@ pub(crate) struct FakeMultihopExit {
     /// `CONNECTION_REFUSED`: what a drained entry relay's listener answers
     /// every new connection.
     pub(crate) refuse_handshake: Arc<AtomicBool>,
+    /// `(n, delay)`: the `n`-th accepted connection (1-based) waits `delay`
+    /// before it answers its setup, so a test can make one bonded leg slow to
+    /// join and the bond late to seal.
+    pub(crate) hold_setup_reply: Arc<parking_lot::Mutex<Option<(usize, Duration)>>>,
+    /// Every connection whose setup this exit answered with an `IpAssign`, in
+    /// answer order.
+    pub(crate) legs: Arc<parking_lot::Mutex<Vec<FakeLeg>>>,
     on_next_dial: NextDialHook,
     _server_ep: Endpoint,
+}
+
+/// What the fake exit saw of one connection it admitted.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FakeLeg {
+    /// When the `IpAssign` reply left.
+    pub(crate) answered_at: Instant,
+    /// When the first datagram arrived after that reply, if one did.
+    pub(crate) first_datagram_at: Option<Instant>,
 }
 
 /// One-shot hook the fake exit runs when the next connection attempt reaches
@@ -452,6 +468,16 @@ impl FakeMultihopExit {
     /// a dial to this exit is in flight.
     pub(crate) fn on_next_dial(&self, hook: impl FnOnce() + Send + 'static) {
         *self.on_next_dial.lock() = Some(Box::new(hook));
+    }
+
+    /// For every admitted connection, in answer order, how long after its
+    /// `IpAssign` reply the first datagram arrived (`None`: none yet).
+    pub(crate) fn first_datagram_delays(&self) -> Vec<Option<Duration>> {
+        self.legs
+            .lock()
+            .iter()
+            .map(|leg| leg.first_datagram_at.map(|at| at - leg.answered_at))
+            .collect()
     }
 }
 
@@ -466,6 +492,8 @@ struct FakeExitBehaviour {
     refuse_setup: Arc<AtomicU32>,
     close_after_setup: Arc<AtomicBool>,
     garbage_reply: Arc<AtomicBool>,
+    hold_setup_reply: Arc<parking_lot::Mutex<Option<(usize, Duration)>>>,
+    legs: Arc<parking_lot::Mutex<Vec<FakeLeg>>>,
 }
 
 const FAKE_EXIT_IKM: [u8; 32] = [0x99; 32];
@@ -476,6 +504,7 @@ const FAKE_EXIT_IKM: [u8; 32] = [0x99; 32];
 async fn serve_one_fake_exit_connection(
     conn: Connection,
     exit_id: ExitId,
+    ordinal: usize,
     behaviour: FakeExitBehaviour,
 ) {
     let Ok((mut send, mut recv)) = conn.accept_bi().await else {
@@ -544,6 +573,12 @@ async fn serve_one_fake_exit_connection(
     let Ok(wire) = encode_frame(&reply_frame) else {
         return;
     };
+    let hold = *behaviour.hold_setup_reply.lock();
+    if let Some((held, delay)) = hold
+        && held == ordinal
+    {
+        tokio::time::sleep(delay).await;
+    }
     if send.write_all(&wire).await.is_err() {
         return;
     }
@@ -554,10 +589,23 @@ async fn serve_one_fake_exit_connection(
         conn.close(quinn::VarInt::from_u32(0), b"fake exit closed the session");
         return;
     }
+    let assigned = matches!(reply_msg, WarrenControlMessage::IpAssign { .. });
+    let leg = assigned.then(|| {
+        let mut legs = behaviour.legs.lock();
+        legs.push(FakeLeg {
+            answered_at: Instant::now(),
+            first_datagram_at: None,
+        });
+        legs.len() - 1
+    });
 
     loop {
         if conn.read_datagram().await.is_err() {
             return;
+        }
+        if let Some(leg) = leg {
+            let mut legs = behaviour.legs.lock();
+            legs[leg].first_datagram_at.get_or_insert_with(Instant::now);
         }
     }
 }
@@ -628,6 +676,8 @@ pub(crate) fn spawn_fake_multihop_exit_on(
         refuse_setup: Arc::new(AtomicU32::new(0)),
         close_after_setup: Arc::new(AtomicBool::new(false)),
         garbage_reply: Arc::new(AtomicBool::new(false)),
+        hold_setup_reply: Arc::new(parking_lot::Mutex::new(None)),
+        legs: Arc::new(parking_lot::Mutex::new(Vec::new())),
     };
 
     let refuse_handshake = Arc::new(AtomicBool::new(false));
@@ -656,13 +706,14 @@ pub(crate) fn spawn_fake_multihop_exit_on(
                 continue;
             };
             accept_loop_accepted_at.lock().push(Instant::now());
-            accept_loop_accepted.fetch_add(1, Ordering::Relaxed);
+            let ordinal = accept_loop_accepted.fetch_add(1, Ordering::Relaxed) + 1;
             // Served off the accept loop, so a connection the exit holds open
             // (a live session, a swallowed setup) never stalls the client's
             // next dial, a make-before-break one included.
             tokio::spawn(serve_one_fake_exit_connection(
                 conn,
                 exit_id,
+                ordinal,
                 accept_loop_behaviour.clone(),
             ));
         }
@@ -682,6 +733,8 @@ pub(crate) fn spawn_fake_multihop_exit_on(
         garbage_reply: behaviour.garbage_reply,
         accepted_at,
         refuse_handshake,
+        hold_setup_reply: behaviour.hold_setup_reply,
+        legs: behaviour.legs,
         on_next_dial,
         _server_ep: server_ep,
     })
