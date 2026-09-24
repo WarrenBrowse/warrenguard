@@ -553,17 +553,18 @@ async fn probe_round(
         } else {
             round.steady
         };
-        if round.first {
+        let swept_at_seal = if round.first {
             // A fresh bond is swept as soon as every leg is attached, so a
             // leg that does not deliver is named, and routed around, within
             // seconds of the connect.
             tokio::select! {
-                () = tokio::time::sleep(cadence) => {}
-                () = bundle.sealed() => {}
+                () = tokio::time::sleep(cadence) => false,
+                () = bundle.sealed() => true,
             }
         } else {
             tokio::time::sleep(cadence).await;
-        }
+            false
+        };
         let Some((src, gw)) = *shared.endpoints.lock() else {
             return;
         };
@@ -689,6 +690,14 @@ async fn probe_round(
                 size_blackholed,
             },
         );
+        if swept_at_seal {
+            // The bond-level verdict keeps its own cadence. Its episode
+            // memory outlives the bundle and its verdict asks for a
+            // migration, which restarts the dead-path watches: one more
+            // sample at every connect would bring a redial on a dead path to
+            // that request ahead of the watch that has to kill the session.
+            return;
+        }
 
         let (small_ok, large_ok) = sweep.aggregate();
         let (events, small_lost, large_lost) = {
