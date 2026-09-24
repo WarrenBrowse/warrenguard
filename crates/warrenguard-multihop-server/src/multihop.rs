@@ -436,6 +436,10 @@ struct ConnSetup {
 #[cfg(feature = "pq-hpke")]
 struct ConnSetupPq {
     session: Arc<PqExitSession>,
+    /// Cache key of `session`, from the setup frame. The frame authenticated
+    /// before the exit sealed its reply, so it may pick the entry the pump's
+    /// keepalive refreshes. Identity material: never logged.
+    encapsulated_key: EncapsulatedKeyBytes,
     epoch: u32,
     assigned_ip: Ipv4Addr,
     assigned_ip_v6: Option<Ipv6Addr>,
@@ -563,6 +567,7 @@ impl SetupTermination {
             #[cfg(feature = "pq-hpke")]
             Self::V2 { session, frame, .. } => SetupOutcome::V2(ConnSetupPq {
                 session,
+                encapsulated_key: frame.encapsulated_key,
                 epoch: frame.epoch,
                 assigned_ip,
                 assigned_ip_v6,
@@ -4748,8 +4753,12 @@ async fn serve_pq_datagram_pump<T>(
     let current: SharedPqCurrentSession = Arc::new(Mutex::new((setup.session, setup.epoch)));
     // Encapsulated key of the session currently in use on this connection, so
     // the keepalive task below can tell the cache which entry to refresh.
+    // Seeded from the setup rather than from the first DATA frame: a leg can
+    // carry nothing for longer than the cache TTL after its setup, and a DATA
+    // frame cannot rebuild the session it would then find evicted.
     // Identity material: never logged, not even a prefix.
-    let current_key: Arc<Mutex<Option<EncapsulatedKeyBytes>>> = Arc::new(Mutex::new(None));
+    let current_key: Arc<Mutex<EncapsulatedKeyBytes>> =
+        Arc::new(Mutex::new(setup.encapsulated_key));
 
     // Inbound-activity counter for the sticky-IP takeover re-check (see the
     // classical pump). Registration already happened in `run_setup`; here we
@@ -4863,7 +4872,7 @@ async fn serve_pq_datagram_pump<T>(
             // otherwise silently evict a still-connected session (see
             // `PqSessionCache::refresh`). Only once the frame authenticated: a
             // forged one could otherwise point the keepalive elsewhere.
-            *current_key_rx.lock() = Some(frame_key);
+            *current_key_rx.lock() = frame_key;
             *current_rx.lock() = (session, frame_epoch);
             // Authenticated: this datagram really is the client's uplink, so
             // from here on failing to reach the TUN is a black-hole and not
@@ -5004,9 +5013,7 @@ async fn serve_pq_datagram_pump<T>(
                 _ = conn_ka.closed() => break,
                 () = tokio::time::sleep(SESSION_CACHE_TTL / 2) => {
                     let key = *current_key.lock();
-                    if let Some(k) = key {
-                        cache_ka.refresh(&k);
-                    }
+                    cache_ka.refresh(&key);
                 }
             }
         }
@@ -9608,6 +9615,29 @@ mod tests {
         )
         .await;
         client.harness.accept_task.abort();
+    }
+
+    /// A `/v2` connection that sends nothing after its setup keeps its
+    /// session. A bonded client attaches legs it has no traffic for yet, so a
+    /// leg's first DATA frame can come many seconds after its setup, and the
+    /// frame carries no `pq_ct` the exit could rebuild an evicted session
+    /// from: every frame of that leg would be dropped until the client's next
+    /// rekey.
+    #[cfg(feature = "pq-hpke")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pq_a_connection_idle_from_its_setup_keeps_its_session() {
+        let tun = warrenguard_transport_core::FakeTun::new();
+        let client = pq_data_client(tun.clone(), |ctx| ctx).await;
+
+        tokio::time::sleep(SESSION_CACHE_TTL + Duration::from_secs(1)).await;
+        client.send_data(1, &client.packet(51_003));
+        let got = settled_tun_outbound(&tun, 1, Duration::from_secs(5)).await;
+        client.harness.accept_task.abort();
+        assert_eq!(
+            got.len(),
+            1,
+            "the first packet of a connection idle since its setup must reach the TUN"
+        );
     }
 
     /// Publish a drain on `drain_tx` and require what a client attached to the
