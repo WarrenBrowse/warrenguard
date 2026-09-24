@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use parking_lot::Mutex as PlMutex;
 use warrenguard_daita::DaitaState;
-use warrenguard_multihop::{ExitId, WarrenControlMessage};
+use warrenguard_multihop::WarrenControlMessage;
 use warrenguard_pump::{TunIoTolerance, is_daita_dummy, record_uplink_too_large_drop};
 use warrenguard_transport_core::{
     PacketDevice, clamp_downlink_syn, clamp_uplink_syn, is_tcp_syn, uplink_frag_needed,
@@ -93,14 +93,14 @@ impl ExitDrainingChannel {
 
 /// Route a decoded downlink control message to its consumer channel.
 /// `IpAssign` -> `ip_assign_channel`; `ExitDraining` -> `exit_draining_channel`,
-/// attributed to `sealed_by`, the exit of the session that decoded it;
+/// attributed to the exit of `session`, the session that decoded it;
 /// anything else (or a missing channel) is logged and dropped. Shared by
 /// both downlink pumps so the dispatch policy lives in one place. A `0xC0`
 /// control plaintext is never an IP packet nor a DAITA dummy, so the
 /// caller routes here before the IP-forward path.
 fn dispatch_control_message(
     msg: &WarrenControlMessage,
-    sealed_by: ExitId,
+    session: &MultiHopBundle,
     ip_assign_channel: Option<&IpAssignChannel>,
     exit_draining_channel: Option<&ExitDrainingChannel>,
 ) {
@@ -120,13 +120,21 @@ fn dispatch_control_message(
         }
     } else if let Some(adv) = ExitDrainAdvisory::from_control(msg) {
         if let Some(ch) = exit_draining_channel {
-            tracing::warn!(
-                deadline_unix_secs = adv.deadline_unix_secs,
-                reason_code = adv.reason_code,
-                "downlink received ExitDraining; publishing migrate advisory (make-before-break)"
-            );
+            // The exit repeats the advisory on every leg until the client
+            // leaves: every repeat is still published, since the consumer
+            // decides what a repeat means, but only the first one of the
+            // session is a warning.
+            if session.first_sighting_of_drain(adv) {
+                tracing::warn!(
+                    deadline_unix_secs = adv.deadline_unix_secs,
+                    reason_code = adv.reason_code,
+                    "downlink received ExitDraining; publishing migrate advisory (make-before-break)"
+                );
+            } else {
+                tracing::debug!("downlink received ExitDraining again; publishing the repeat");
+            }
             ch.publish(ExitDrainNotice {
-                exit_id: sealed_by,
+                exit_id: session.exit_id(),
                 advisory: adv,
             });
         } else {
@@ -670,7 +678,7 @@ pub async fn run_downlink<T: PacketDevice>(
                                 // successor on another exit.
                                 dispatch_control_message(
                                     &msg,
-                                    client.exit_id(),
+                                    &client,
                                     None,
                                     exit_draining_channel.as_ref(),
                                 );
@@ -801,7 +809,7 @@ pub async fn run_downlink_with_daita<T: PacketDevice>(
                                 // came from, as in `run_downlink`.
                                 dispatch_control_message(
                                     &msg,
-                                    client.exit_id(),
+                                    &client,
                                     ip_assign_channel.as_ref(),
                                     exit_draining_channel.as_ref(),
                                 );
@@ -1002,6 +1010,8 @@ pub async fn run_idle_cover_interval(
 
 #[cfg(test)]
 mod tests {
+    use warrenguard_multihop::ExitId;
+
     use super::*;
 
     #[test]
@@ -1789,6 +1799,123 @@ mod live_pump_tests {
             from_second.advisory, from_first.advisory,
             "both exits announced the same drain"
         );
+    }
+
+    /// Every drain-advisory line logged in this test process, with the thread
+    /// that logged it.
+    static DRAIN_LINES: PlMutex<Vec<(std::thread::ThreadId, tracing::Level)>> =
+        parking_lot::const_mutex(Vec::new());
+
+    /// Starts filling [`DRAIN_LINES`]. Process-wide on purpose: with a single
+    /// thread-local subscriber, tracing caches a callsite's interest from
+    /// whichever thread registers it first, so a test running in parallel
+    /// could disable the very line under test.
+    fn record_drain_lines() {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            use tracing_subscriber::layer::SubscriberExt;
+            // Nothing else in this test binary installs a global subscriber.
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::registry().with(DrainLineRecorder),
+            );
+        });
+    }
+
+    /// Reads an event's message field.
+    struct MessageOf(Option<String>);
+
+    impl tracing::field::Visit for MessageOf {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    struct DrainLineRecorder;
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for DrainLineRecorder {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut message = MessageOf(None);
+            event.record(&mut message);
+            if message.0.is_some_and(|m| m.contains("ExitDraining")) {
+                DRAIN_LINES
+                    .lock()
+                    .push((std::thread::current().id(), *event.metadata().level()));
+            }
+        }
+    }
+
+    /// An exit repeats its drain advisory on every leg every few seconds until
+    /// the client leaves. The session says it once at WARN: logged on every
+    /// repeat it put 312 identical warnings in two minutes on one client.
+    #[tokio::test]
+    async fn a_repeated_drain_advisory_warns_once_per_advisory_and_session() {
+        record_drain_lines();
+        let this_test = std::thread::current().id();
+        let exit = ExitId::from_bytes([0x27; 16]);
+        let legs = [
+            spawn_loopback_multihop(exit).await,
+            spawn_loopback_multihop(exit).await,
+        ];
+        let session = MultiHopBundle::new(legs.iter().map(|leg| leg.client.clone()).collect());
+        let (tx, rx) = tokio::sync::watch::channel(Some(session));
+        let draining = ExitDrainingChannel::new();
+        let mut notices = draining.subscribe();
+        let task = tokio::spawn(run_downlink(
+            rx,
+            warrenguard_transport_core::FakeTun::new(),
+            Some(draining),
+        ));
+        let advisory = |deadline_unix_secs| {
+            encode_control(&WarrenControlMessage::ExitDraining {
+                deadline_unix_secs,
+                reason_code: 0,
+            })
+            .expect("encode_control")
+        };
+
+        for seq in 0..3 {
+            for leg in &legs {
+                exit_send_datagram(leg, seq, advisory(1_800_000_000)).await;
+                next_notice(&mut notices).await;
+            }
+        }
+        exit_send_datagram(&legs[0], 3, advisory(1_800_000_060)).await;
+        next_notice(&mut notices).await;
+        let next_session = spawn_loopback_multihop(exit).await;
+        tx.send(Some(MultiHopBundle::new(vec![next_session.client.clone()])))
+            .expect("the pump holds the watch");
+        exit_send_datagram(&next_session, 0, advisory(1_800_000_000)).await;
+        next_notice(&mut notices).await;
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        let levels: Vec<tracing::Level> = DRAIN_LINES
+            .lock()
+            .iter()
+            .filter(|(thread, _)| *thread == this_test)
+            .map(|(_, level)| *level)
+            .collect();
+        assert_eq!(
+            levels.len(),
+            8,
+            "every advisory reached the dispatch: {levels:?}"
+        );
+        assert_eq!(
+            levels
+                .iter()
+                .filter(|level| **level == tracing::Level::WARN)
+                .count(),
+            3,
+            "one warning for the first advisory, one for the new deadline, one for the new \
+             session: {levels:?}"
+        );
+        assert_eq!(levels[0], tracing::Level::WARN, "the first sighting warns");
     }
 
     #[tokio::test]

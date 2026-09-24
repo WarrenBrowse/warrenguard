@@ -94,6 +94,8 @@ tokio = { workspace = true, features = ["test-util"] }
 ed25519-dalek = { workspace = true }
 # Self-signed cover certificate for the carrier end-to-end test.
 rcgen = { workspace = true }
+# Captures the level of what a pump logs, for the tests that bound log volume.
+tracing-subscriber = { workspace = true }
 
 # Resolve the loopback interface index (safe wrapper, no `unsafe`, which this
 # crate forbids) to drive the real IP_BOUND_IF carrier-bypass dial test on macOS.
