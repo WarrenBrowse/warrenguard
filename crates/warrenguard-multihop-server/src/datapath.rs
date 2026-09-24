@@ -671,6 +671,10 @@ pub(crate) struct RxCounters {
     pub(crate) decode_errs: u64,
     pub(crate) exit_id_mismatches: u64,
     pub(crate) session_errs: u64,
+    /// The share of `session_errs` whose frame named this connection's own
+    /// session, the one it was set up with or last authenticated under. Only
+    /// an eviction under the live connection produces it.
+    pub(crate) session_evicted: u64,
     pub(crate) open_errs: u64,
     pub(crate) replays: u64,
     pub(crate) control_frames: u64,
@@ -705,6 +709,8 @@ pub(crate) struct RxReport {
     pub(crate) decode_errs: u64,
     pub(crate) exit_id_mismatches: u64,
     pub(crate) session_errs: u64,
+    /// See [`RxCounters::session_evicted`].
+    pub(crate) session_evicted: u64,
     pub(crate) open_errs: u64,
     pub(crate) dummies: u64,
     pub(crate) control_frames: u64,
@@ -732,6 +738,7 @@ impl RxReport {
             decode_errs: 0,
             exit_id_mismatches: 0,
             session_errs: 0,
+            session_evicted: 0,
             open_errs: 0,
             dummies: 0,
             control_frames: 0,
@@ -755,6 +762,7 @@ impl RxReport {
             decode_errs: self.decode_errs,
             exit_id_mismatches: self.exit_id_mismatches,
             session_errs: self.session_errs,
+            session_evicted: self.session_evicted,
             open_errs: self.open_errs,
             replays: self.replays,
             control_frames: self.control_frames,
@@ -797,6 +805,7 @@ impl RxReport {
             decode_errs = self.decode_errs,
             exit_id_mismatches = self.exit_id_mismatches,
             session_errs = self.session_errs,
+            session_evicted = self.session_evicted,
             open_errs = self.open_errs,
             dummies = self.dummies,
             control_frames = self.control_frames,
@@ -825,8 +834,12 @@ impl RxReport {
     /// session whose ENTIRE uplink is discarded prints the same single line
     /// as one that dropped one stray in-flight packet. That ambiguity is
     /// what made a 2026-08-02 exit black-hole undiagnosable from the logs.
+    ///
+    /// A frame that missed the connection's own evicted session never opens,
+    /// yet it was this client's uplink all the same, so it counts too.
     pub(crate) const fn is_uplink_blackhole(&self) -> bool {
-        self.to_tun == 0 && self.opened > self.dummies + self.control_frames
+        self.to_tun == 0
+            && (self.opened > self.dummies + self.control_frames || self.session_evicted > 0)
     }
 }
 
@@ -853,6 +866,7 @@ impl Drop for RxReport {
                 decode_errs = self.decode_errs,
                 exit_id_mismatches = self.exit_id_mismatches,
                 session_errs = self.session_errs,
+                session_evicted = self.session_evicted,
                 open_errs = self.open_errs,
                 replays = self.replays,
                 pool_drops = self.pool_drops,
@@ -1444,6 +1458,21 @@ pub(crate) mod tests {
         assert!(
             !report.is_uplink_blackhole(),
             "a connection that never authenticated a datagram black-holed nothing"
+        );
+    }
+
+    #[test]
+    fn a_pump_whose_own_session_was_evicted_under_it_is_a_blackhole() {
+        // No frame authenticates once the session is gone, so `opened` stays
+        // at zero, yet every one of them was this client's real uplink: the
+        // frames named the session the connection itself was set up with.
+        let mut report = RxReport::new("test");
+        report.datagrams = 12;
+        report.session_errs = 12;
+        report.session_evicted = 12;
+        assert!(
+            report.is_uplink_blackhole(),
+            "a connection whose every frame missed its own evicted session black-holed its uplink"
         );
     }
 

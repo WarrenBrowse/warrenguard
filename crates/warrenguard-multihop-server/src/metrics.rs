@@ -45,6 +45,9 @@ pub struct UplinkMetrics {
     dropped_decode: AtomicU64,
     dropped_exit_id: AtomicU64,
     dropped_session: AtomicU64,
+    /// Refinement of `dropped_session`, kept a separate series for the same
+    /// reason as `spoofed_by_class`.
+    dropped_session_evicted: AtomicU64,
     dropped_aead_open: AtomicU64,
     dropped_replay: AtomicU64,
     dropped_control_frame: AtomicU64,
@@ -97,6 +100,7 @@ impl UplinkMetrics {
             dropped_decode: AtomicU64::new(0),
             dropped_exit_id: AtomicU64::new(0),
             dropped_session: AtomicU64::new(0),
+            dropped_session_evicted: AtomicU64::new(0),
             dropped_aead_open: AtomicU64::new(0),
             dropped_replay: AtomicU64::new(0),
             dropped_control_frame: AtomicU64::new(0),
@@ -140,6 +144,11 @@ impl UplinkMetrics {
             &self.dropped_session,
             now.session_errs,
             published.session_errs,
+        );
+        add(
+            &self.dropped_session_evicted,
+            now.session_evicted,
+            published.session_evicted,
         );
         add(&self.dropped_aead_open, now.open_errs, published.open_errs);
         add(&self.dropped_replay, now.replays, published.replays);
@@ -189,6 +198,7 @@ impl UplinkMetrics {
             dropped_decode: self.dropped_decode.load(Ordering::Relaxed),
             dropped_exit_id: self.dropped_exit_id.load(Ordering::Relaxed),
             dropped_session: self.dropped_session.load(Ordering::Relaxed),
+            dropped_session_evicted: self.dropped_session_evicted.load(Ordering::Relaxed),
             dropped_aead_open: self.dropped_aead_open.load(Ordering::Relaxed),
             dropped_replay: self.dropped_replay.load(Ordering::Relaxed),
             dropped_control_frame: self.dropped_control_frame.load(Ordering::Relaxed),
@@ -468,6 +478,14 @@ pub struct UplinkSnapshot {
     /// established from it (a `/v2` DATA frame after a cache eviction, a
     /// stale key after an epoch rotation, a session-creation refusal).
     pub dropped_session: u64,
+    /// The share of `dropped_session` whose frame named the session its own
+    /// live connection was set up with or last authenticated under. Only an
+    /// eviction under a connection that is still up produces it, so any
+    /// growth means a client is sending into a session the exit forgot, and
+    /// every frame of that connection is lost until the client sends key
+    /// material again. A refinement rather than a reason, so the reasons
+    /// still sum to [`Self::dropped`].
+    pub dropped_session_evicted: u64,
     /// The AEAD open failed: wrong key, corrupted frame, forged tag.
     pub dropped_aead_open: u64,
     /// Anti-replay rejected an already-accepted `(epoch, seq)`.
@@ -561,6 +579,7 @@ mod tests {
             decode_errs: 1,
             exit_id_mismatches: 2,
             session_errs: 3,
+            session_evicted: 2,
             open_errs: 4,
             replays: 5,
             control_frames: 6,
@@ -646,6 +665,22 @@ mod tests {
         assert_eq!(
             named, s.dropped_spoofed_source,
             "the classes must account for every refusal the gate counted"
+        );
+    }
+
+    #[test]
+    fn a_live_session_eviction_folds_into_its_own_series_inside_the_session_reason() {
+        let m = UplinkMetrics::new();
+        m.fold(&distinct(), &RxCounters::default());
+        let s = m.snapshot();
+
+        assert_eq!(
+            s.dropped_session_evicted, 2,
+            "a frame that named its live connection's evicted session has its own series"
+        );
+        assert_eq!(
+            s.dropped_session, 3,
+            "the refinement is part of the session reason, never added to it"
         );
     }
 

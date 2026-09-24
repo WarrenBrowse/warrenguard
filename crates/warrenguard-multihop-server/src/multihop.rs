@@ -4801,6 +4801,7 @@ async fn serve_pq_datagram_pump<T>(
     let rx_task = tokio::spawn(async move {
         let mut report = RxReport::new(LABEL);
         let mut flows = FlowNoter::new();
+        let mut evicted_log = RateLimited::new(1_000);
         loop {
             let Ok(datagram) = conn_rx.read_datagram().await else {
                 return;
@@ -4831,6 +4832,22 @@ async fn serve_pq_datagram_pump<T>(
                     Some(h) => h,
                     None => {
                         report.session_errs += 1;
+                        // The frame names the session this connection is
+                        // using: the cache dropped it under a live
+                        // connection, and nothing the client sends will
+                        // rebuild it before its next rekey.
+                        if frame.encapsulated_key == *current_key_rx.lock() {
+                            report.session_evicted += 1;
+                            if evicted_log.hit() {
+                                tracing::warn!(
+                                    frames = report.session_evicted,
+                                    pump = LABEL,
+                                    "rx_task: this live connection's session is gone from the \
+                                     exit's cache; its frames are dropped until the client \
+                                     sends key material again"
+                                );
+                            }
+                        }
                         continue;
                     }
                 }
@@ -9637,6 +9654,56 @@ mod tests {
             got.len(),
             1,
             "the first packet of a connection idle since its setup must reach the TUN"
+        );
+    }
+
+    /// Frames that name the session their own live connection was set up
+    /// with, after that session left the cache, are counted apart from every
+    /// other session miss: only an eviction under a connection that is still
+    /// up produces them, and the client loses every frame of that connection
+    /// until it sends key material again. A frame under a key the exit never
+    /// established stays an ordinary session miss.
+    #[cfg(feature = "pq-hpke")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pq_frames_into_a_live_connection_s_evicted_session_are_counted_apart() {
+        let tun = warrenguard_transport_core::FakeTun::new();
+        let mut cache = None;
+        let client = pq_data_client(tun.clone(), |ctx| {
+            cache = Some(ctx.pq_cache.clone());
+            ctx
+        })
+        .await;
+        let cache = cache.expect("the exit context carries its PQ session cache");
+        let before = crate::metrics::uplink_snapshot();
+
+        let mut foreign = client
+            .session
+            .seal(&client.packet(51_004), 0, 1)
+            .expect("seal");
+        foreign.encapsulated_key = [0x66; 32];
+        client.send(&foreign);
+        cache.inner.lock().map.clear();
+        client.send_data(2, &client.packet(51_005));
+        client.send_data(3, &client.packet(51_006));
+        let delivered = settled_tun_outbound(&tun, 0, Duration::from_secs(1)).await;
+
+        // The pump publishes its tail when it ends.
+        client.conn.close(0u32.into(), b"done");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        client.harness.accept_task.abort();
+        let after = crate::metrics::uplink_snapshot();
+
+        assert!(delivered.is_empty(), "no frame had a session to open it");
+        assert!(
+            after.dropped_session - before.dropped_session >= 3,
+            "all three frames are session misses: {} to {}",
+            before.dropped_session,
+            after.dropped_session
+        );
+        assert_eq!(
+            after.dropped_session_evicted - before.dropped_session_evicted,
+            2,
+            "only the two frames under the connection's own session count as an eviction"
         );
     }
 
