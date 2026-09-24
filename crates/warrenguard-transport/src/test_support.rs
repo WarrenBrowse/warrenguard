@@ -449,9 +449,18 @@ pub(crate) struct FakeMultihopExit {
     /// answers, the way an exit that lost the leg's session discards them.
     /// Every other leg answers a path-health probe the way the gateway does.
     pub(crate) mute_leg: Arc<parking_lot::Mutex<Option<usize>>>,
+    /// Consulted for every path-health echo reply with the answer-order index
+    /// of the leg its request came on and the reply's length: `true` loses the
+    /// reply on its way back, the way an exit drops one it dispatched to a
+    /// dead downlink sender or one too large for the sender it picked.
+    pub(crate) lose_reply: ReplyLoss,
     on_next_dial: NextDialHook,
     _server_ep: Endpoint,
 }
+
+/// See [`FakeMultihopExit::lose_reply`].
+pub(crate) type ReplyLoss =
+    Arc<parking_lot::Mutex<Option<Box<dyn FnMut(usize, usize) -> bool + Send>>>>;
 
 /// What the fake exit saw of one connection it admitted.
 #[derive(Debug, Clone, Copy)]
@@ -525,6 +534,7 @@ struct FakeExitBehaviour {
     hold_setup_reply: Arc<parking_lot::Mutex<Option<(usize, Duration)>>>,
     legs: Arc<parking_lot::Mutex<Vec<FakeLeg>>>,
     mute_leg: Arc<parking_lot::Mutex<Option<usize>>>,
+    lose_reply: ReplyLoss,
 }
 
 const FAKE_EXIT_IKM: [u8; 32] = [0x99; 32];
@@ -659,6 +669,14 @@ async fn serve_one_fake_exit_connection(
         let Some(reply) = echo else {
             continue;
         };
+        if behaviour
+            .lose_reply
+            .lock()
+            .as_mut()
+            .is_some_and(|lose| lose(leg, reply.len()))
+        {
+            continue;
+        }
         let Ok(frame) = exit_session.seal_response(&reply, 0, reverse_seq) else {
             continue;
         };
@@ -738,6 +756,7 @@ pub(crate) fn spawn_fake_multihop_exit_on(
         hold_setup_reply: Arc::new(parking_lot::Mutex::new(None)),
         legs: Arc::new(parking_lot::Mutex::new(Vec::new())),
         mute_leg: Arc::new(parking_lot::Mutex::new(None)),
+        lose_reply: Arc::new(parking_lot::Mutex::new(None)),
     };
 
     let refuse_handshake = Arc::new(AtomicBool::new(false));
@@ -796,6 +815,7 @@ pub(crate) fn spawn_fake_multihop_exit_on(
         hold_setup_reply: behaviour.hold_setup_reply,
         legs: behaviour.legs,
         mute_leg: behaviour.mute_leg,
+        lose_reply: behaviour.lose_reply,
         on_next_dial,
         _server_ep: server_ep,
     })
