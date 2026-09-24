@@ -3628,6 +3628,189 @@ mod run_tests {
         );
     }
 
+    /// Runs a four-leg bond against `exit` for `window` and returns its width
+    /// with every leg-health report the prober published for the full bond.
+    async fn leg_health_of_a_fresh_bond(
+        exit: &FakeMultihopExit,
+        operational_key: &SigningKey,
+        window: Duration,
+    ) -> (usize, Vec<crate::path_health::LegHealth>) {
+        let want = resolve_bonded_want(4, warrenguard_config::knobs::multihop_conns_override());
+        let mut config = config_with_fake_exit(exit, operational_key);
+        config.n_connections = 4;
+        let (supervisor, mut rx) = MultiHopSupervisor::new(config);
+        let mut leg_health = supervisor.leg_health_rx();
+        let task = tokio::spawn(supervisor.run());
+        tokio::time::timeout(Duration::from_secs(5), rx.changed())
+            .await
+            .expect("the cold dial publishes a session")
+            .expect("watch sender alive");
+        let bundle = rx
+            .borrow_and_update()
+            .clone()
+            .expect("a session was published");
+        let reader = tokio::spawn({
+            let bundle = bundle.clone();
+            async move { while bundle.recv().await.is_ok() {} }
+        });
+        let mut reports = Vec::new();
+        let _ = tokio::time::timeout(window, async {
+            loop {
+                leg_health
+                    .changed()
+                    .await
+                    .expect("the prober's watch outlives the test");
+                let report = leg_health.borrow_and_update().clone();
+                if report.legs == want {
+                    reports.push(report);
+                }
+            }
+        })
+        .await;
+
+        reader.abort();
+        drop(bundle);
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        (want, reports)
+    }
+
+    /// Total IP length of the prober's small probe: anything longer is its
+    /// large one.
+    const SMALL_PROBE_LEN: usize = 84;
+
+    /// When a bond is sealed, the exit's side of its fresh legs is still
+    /// searching the path MTU, and a large echo reply it sends back on one of
+    /// them does not fit and is dropped. That loss is the exit's, on the leg it
+    /// chose for the reply, and it is over a round later: no leg is named a
+    /// size-selective blackhole for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_large_reply_the_exit_loses_once_at_the_seal_names_no_leg() {
+        if bond_pinned_to_one_connection_by_env() || path_health_cadence_too_short_by_env() {
+            eprintln!("skipped: the environment pins the bond width or the prober cadence");
+            return;
+        }
+        let operational_key = SigningKey::from_bytes(&[0x59; 32]);
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x6B; 16]));
+        let lost = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        *exit.lose_reply.lock() = Some(Box::new({
+            let lost = lost.clone();
+            move |_leg, len| {
+                len > SMALL_PROBE_LEN
+                    && lost
+                        .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+            }
+        }));
+
+        let (_, reports) =
+            leg_health_of_a_fresh_bond(&exit, &operational_key, Duration::from_secs(10)).await;
+
+        assert_eq!(
+            lost.load(Ordering::Relaxed),
+            1,
+            "the exit lost one large reply"
+        );
+        assert!(
+            reports
+                .iter()
+                .all(|report| report.size_blackholed.is_empty()),
+            "a reply lost once is no size-selective blackhole: {reports:?}"
+        );
+        assert!(
+            reports.len() >= 2,
+            "a second round ran within seconds of the seal: {reports:?}"
+        );
+    }
+
+    /// A leg whose large frames never get through is still named, once a
+    /// second round has seen it too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_leg_that_keeps_losing_its_large_probes_is_named_a_size_blackhole() {
+        if bond_pinned_to_one_connection_by_env() || path_health_cadence_too_short_by_env() {
+            eprintln!("skipped: the environment pins the bond width or the prober cadence");
+            return;
+        }
+        let operational_key = SigningKey::from_bytes(&[0x5A; 32]);
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x6C; 16]));
+        // The primary: the first leg the exit answers and the bond's leg 0.
+        *exit.lose_reply.lock() = Some(Box::new(|leg, len| leg == 0 && len > SMALL_PROBE_LEN));
+
+        let (_, reports) =
+            leg_health_of_a_fresh_bond(&exit, &operational_key, Duration::from_secs(10)).await;
+
+        assert!(
+            reports
+                .iter()
+                .any(|report| report.size_blackholed == vec![0]),
+            "the leg that never returns a large probe is named: {reports:?}"
+        );
+        assert!(
+            reports.iter().all(|report| report.unresponsive.is_empty()),
+            "a leg that returns its small probe delivers: {reports:?}"
+        );
+    }
+
+    /// Replies the exit loses for a few seconds, the way it loses those it
+    /// sends to a dead sender of the client's previous bond until it evicts
+    /// it, take no leg out of the routing plan: the leg delivered, the reply
+    /// was lost on its way back, and the next round hears the leg.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn replies_lost_for_one_round_take_no_leg_out_of_the_routing_plan() {
+        if bond_pinned_to_one_connection_by_env() || path_health_cadence_too_short_by_env() {
+            eprintln!("skipped: the environment pins the bond width or the prober cadence");
+            return;
+        }
+        let operational_key = SigningKey::from_bytes(&[0x5B; 32]);
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x6D; 16]));
+        let lost = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        *exit.lose_reply.lock() = Some(Box::new({
+            let lost = lost.clone();
+            move |leg, _len| leg == 0 && lost.fetch_add(1, Ordering::Relaxed) < 2
+        }));
+
+        let (_, reports) =
+            leg_health_of_a_fresh_bond(&exit, &operational_key, Duration::from_secs(10)).await;
+
+        assert!(
+            reports.iter().all(|report| report.unresponsive.is_empty()),
+            "a leg silent for one round only is never taken out: {reports:?}"
+        );
+        assert!(
+            reports.len() >= 2,
+            "a second round ran within seconds of the seal: {reports:?}"
+        );
+    }
+
+    /// A leg whose large probe comes back while its small one does not has
+    /// delivered both: the small one was lost on its way back. While the exit
+    /// is seen losing replies like that, a leg that returned nothing proves
+    /// nothing about its own path either, and is not taken out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn no_leg_is_taken_out_while_the_exit_is_seen_losing_replies() {
+        if bond_pinned_to_one_connection_by_env() || path_health_cadence_too_short_by_env() {
+            eprintln!("skipped: the environment pins the bond width or the prober cadence");
+            return;
+        }
+        let operational_key = SigningKey::from_bytes(&[0x5C; 32]);
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x6E; 16]));
+        *exit.lose_reply.lock() = Some(Box::new(|leg, len| {
+            leg == 0 || (leg == 1 && len <= SMALL_PROBE_LEN)
+        }));
+
+        let (_, reports) =
+            leg_health_of_a_fresh_bond(&exit, &operational_key, Duration::from_secs(10)).await;
+
+        assert!(
+            !reports.is_empty(),
+            "the bond was swept within seconds of the seal"
+        );
+        assert!(
+            reports.iter().all(|report| report.unresponsive.is_empty()),
+            "no leg is convicted on replies the exit is seen losing: {reports:?}"
+        );
+    }
+
     /// A leg whose frames the exit takes and never answers, while its QUIC
     /// layer acknowledges every one of them, is named in the leg health and
     /// carries no user flow: its flows go to the legs that deliver.
@@ -3660,9 +3843,20 @@ mod run_tests {
             async move { while bundle.recv().await.is_ok() {} }
         });
 
-        let report = leg_health_covering(&mut leg_health, want, Duration::from_secs(10))
-            .await
-            .expect("the bond's first sweep reports every leg");
+        let report = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let report = leg_health.borrow_and_update().clone();
+                if report.legs == want && !report.unresponsive.is_empty() {
+                    return report;
+                }
+                leg_health
+                    .changed()
+                    .await
+                    .expect("the prober's watch outlives the test");
+            }
+        })
+        .await
+        .expect("a leg that never answers is named within seconds of the seal");
         for port in 0..64u16 {
             bundle
                 .send(&udp_packet(40_000 + port))

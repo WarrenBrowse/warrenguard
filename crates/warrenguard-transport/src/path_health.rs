@@ -38,6 +38,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rand::seq::SliceRandom;
 use tokio::sync::{Notify, mpsc, watch};
 use warrenguard_transport_core::icmp_probe::{build_echo_request, parse_echo_reply};
 
@@ -96,15 +97,22 @@ pub enum HealthEvent {
 /// echo back on whichever leg of the bond it picks, so a leg whose own
 /// downlink failed shows here only through the replies it loses for others.
 /// This is what a consumer reads to say whether a leg carries traffic.
+///
+/// A lost reply is charged to the leg its request left on, while the exit
+/// alone decides how the reply comes back, and can lose it there for reasons
+/// of its own. So a leg is named only once two rounds in a row found it
+/// failing the same way, and never on a round in which the exit was seen
+/// losing replies.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct LegHealth {
     /// Legs the sweep probed. `0` until the live bond's first sweep lands.
     pub legs: usize,
-    /// Legs that returned neither probe. The bond keeps user flows off
-    /// them until a later sweep hears them again.
+    /// Legs that returned neither probe on two rounds in a row. The bond
+    /// keeps user flows off them until a later sweep hears them again.
     pub unresponsive: Vec<usize>,
-    /// Legs that returned the small probe and lost the large one.
+    /// Legs that returned the small probe and lost the large one on two
+    /// rounds in a row, until one returns its large probe again.
     pub size_blackholed: Vec<usize>,
 }
 
@@ -473,6 +481,17 @@ impl Sweep {
             .collect()
     }
 
+    /// Whether a leg got its large probe back and lost its small one. The
+    /// large reply proves the leg delivered both requests, so the small reply
+    /// was lost on its way back: the exit is losing replies, and in this round
+    /// a missing reply says nothing about the leg it was meant for.
+    fn return_path_lost_a_reply(&self) -> bool {
+        self.small_ok
+            .iter()
+            .zip(&self.large_ok)
+            .any(|(&small, &large)| large && !small)
+    }
+
     /// Legs that returned their small probe and lost their large one: the
     /// size-selective signature, named leg by leg.
     fn size_blackholed_legs(&self) -> Vec<usize> {
@@ -483,6 +502,114 @@ impl Sweep {
             .filter(|&(_, (&small, &large))| small && !large)
             .map(|(leg, _)| leg)
             .collect()
+    }
+}
+
+/// The per-leg verdicts of one bundle's prober, carried from round to round.
+///
+/// A round charges a lost reply to the leg its request left on, but the exit
+/// picks how every reply comes back (round robin across the bond, for an echo)
+/// and can lose it there: a fresh leg whose exit side has not yet raised its
+/// path MTU to the probe's size, a sender of the client's previous bond that
+/// the exit still serves until it evicts it. Those losses move from round to
+/// round, while a leg that really stopped delivering fails every round. So a
+/// leg is convicted only when two rounds in a row fail it the same way, and a
+/// round in which the exit was seen losing replies convicts no leg at all. A
+/// reply from a leg always counts: it proves the leg delivered, whatever else
+/// the exit lost.
+#[derive(Debug, Default)]
+struct LegVerdicts {
+    /// Legs convicted of returning neither probe.
+    silent: Vec<usize>,
+    /// Legs convicted of losing their large probe only.
+    size: Vec<usize>,
+    /// Legs the last round found silent.
+    silent_suspects: Vec<usize>,
+    /// Legs the last round found losing their large probe only.
+    size_suspects: Vec<usize>,
+}
+
+impl LegVerdicts {
+    /// Takes one round's evidence.
+    fn judge(&mut self, sweep: &Sweep) {
+        let silent = sweep.unresponsive_legs();
+        let size = sweep.size_blackholed_legs();
+        self.silent.retain(|leg| silent.contains(leg));
+        self.size
+            .retain(|&leg| !sweep.large_ok.get(leg).copied().unwrap_or(false));
+        if sweep.return_path_lost_a_reply() {
+            self.silent_suspects.clear();
+            self.size_suspects.clear();
+            return;
+        }
+        Self::convict(&mut self.silent, &self.silent_suspects, &silent);
+        Self::convict(&mut self.size, &self.size_suspects, &size);
+        self.silent_suspects = silent;
+        self.size_suspects = size;
+    }
+
+    /// Adds to `convicted` every leg found failing `now` that was already a
+    /// suspect.
+    fn convict(convicted: &mut Vec<usize>, suspects: &[usize], now: &[usize]) {
+        for &leg in now {
+            if suspects.contains(&leg) && !convicted.contains(&leg) {
+                convicted.push(leg);
+            }
+        }
+        convicted.sort_unstable();
+    }
+
+    /// Whether a leg failed the last round without being convicted yet, so
+    /// the next round should come soon to settle it.
+    fn awaiting_confirmation(&self) -> bool {
+        self.silent_suspects
+            .iter()
+            .any(|leg| !self.silent.contains(leg))
+            || self
+                .size_suspects
+                .iter()
+                .any(|leg| !self.size.contains(leg))
+    }
+}
+
+/// What a probe round is for, which decides when it runs and whether the
+/// bond-level verdict hears it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoundKind {
+    /// A bundle's first round, run as soon as the bond is sealed.
+    Seal,
+    /// Settles the legs the previous round suspected, [`FAST_CADENCE`] later.
+    Confirm,
+    /// The bond-level verdict's own cadence.
+    Cadence,
+}
+
+impl RoundKind {
+    /// The next round of a bundle's prober. A tracker that already probes at
+    /// [`FAST_CADENCE`] settles the suspects in its own next round.
+    fn next(first: bool, awaiting_confirmation: bool, tracker_wants_fast: bool) -> Self {
+        if first {
+            Self::Seal
+        } else if awaiting_confirmation && !tracker_wants_fast {
+            Self::Confirm
+        } else {
+            Self::Cadence
+        }
+    }
+
+    /// Whether the round's aggregate reaches the bond-level verdict. Only its
+    /// own cadence does, and a first round that ran on it because the bond
+    /// was not sealed in time. The verdict's episode memory outlives the
+    /// bundle and its verdict asks for a migration, which restarts the
+    /// dead-path watches: one more sample at every connect would bring a
+    /// redial on a dead path to that request ahead of the watch that has to
+    /// kill the session.
+    fn feeds_tracker(self, swept_at_seal: bool) -> bool {
+        match self {
+            Self::Seal => !swept_at_seal,
+            Self::Confirm => false,
+            Self::Cadence => true,
+        }
     }
 }
 
@@ -515,18 +642,24 @@ pub fn spawn_path_health(
             return;
         };
         let mut first = true;
+        let mut verdicts = LegVerdicts::default();
         loop {
             let Some(strong) = bundle.upgrade() else {
                 return;
             };
-            let round = Round {
+            let kind = RoundKind::next(
                 first,
+                verdicts.awaiting_confirmation(),
+                shared.tracker.lock().wants_fast(),
+            );
+            let round = Round {
+                kind,
                 generation,
                 steady,
             };
             let done = tokio::select! {
                 _ = strong.closed() => true,
-                () = probe_round(&strong, &shared, &overlap, round) => false,
+                () = probe_round(&strong, &shared, &overlap, round, &mut verdicts) => false,
             };
             drop(strong);
             if done {
@@ -540,8 +673,7 @@ pub fn spawn_path_health(
 /// What one probe round needs to know about its place in the prober's life.
 #[derive(Clone, Copy)]
 struct Round {
-    /// The bundle's first round.
-    first: bool,
+    kind: RoundKind,
     /// The bundle's [`ProberShared::generation`].
     generation: u64,
     /// Healthy cadence between rounds.
@@ -555,6 +687,7 @@ async fn probe_round(
     shared: &Arc<ProberShared>,
     overlap: &Arc<Notify>,
     round: Round,
+    verdicts: &mut LegVerdicts,
 ) {
     {
         // Single round; the caller's loop re-upgrades the bundle
@@ -564,17 +697,22 @@ async fn probe_round(
         } else {
             round.steady
         };
-        let swept_at_seal = if round.first {
+        let swept_at_seal = match round.kind {
             // A fresh bond is swept as soon as every leg is attached, so a
             // leg that does not deliver is named, and routed around, within
             // seconds of the connect.
-            tokio::select! {
+            RoundKind::Seal => tokio::select! {
                 () = tokio::time::sleep(cadence) => false,
                 () = bundle.sealed() => true,
+            },
+            RoundKind::Confirm => {
+                tokio::time::sleep(FAST_CADENCE).await;
+                false
             }
-        } else {
-            tokio::time::sleep(cadence).await;
-            false
+            RoundKind::Cadence => {
+                tokio::time::sleep(cadence).await;
+                false
+            }
         };
         let Some((src, gw)) = *shared.endpoints.lock() else {
             return;
@@ -597,7 +735,14 @@ async fn probe_round(
             let mut replies = shared.replies.lock().await;
             // Stale replies of older rounds must not credit this one.
             while replies.try_recv().is_ok() {}
-            for (leg, budget) in budgets.iter().enumerate() {
+            // A fresh order every round: an exit that returns echoes round
+            // robin and loses those it hands to one sender loses the replies
+            // at the same positions every round, and in a fixed order those
+            // would be the same legs' replies again.
+            let mut order: Vec<usize> = (0..legs).collect();
+            order.shuffle(&mut rand::rng());
+            for leg in order {
+                let budget = &budgets[leg];
                 let large_len = (*budget).max(SMALL_PROBE_LEN);
                 let (Some(small), Some(large)) = (
                     build_echo_request(
@@ -676,37 +821,19 @@ async fn probe_round(
             }
         }
 
-        // The sentence that names a collapsed leg. Logged before the
-        // aggregate verdict because a single leg failing is deliberately
-        // invisible to the bond-level tracker.
-        let size_blackholed = sweep.size_blackholed_legs();
-        for &leg in &size_blackholed {
-            tracing::warn!(
-                leg,
-                leg_inner_mtu = budgets[leg],
-                legs,
-                "path health: leg passes small probes and loses large ones (size-selective \
-                 blackhole on this leg alone); it is quarantined out of the routing plan while \
-                 it stays under the inner-QUIC floor"
-            );
-        }
-        let unresponsive = sweep.unresponsive_legs();
-        bundle.set_unresponsive_legs(unresponsive.clone());
+        verdicts.judge(&sweep);
+        bundle.set_unresponsive_legs(verdicts.silent.clone());
         publish_leg_health(
             shared,
             round.generation,
             LegHealth {
                 legs,
-                unresponsive,
-                size_blackholed,
+                unresponsive: verdicts.silent.clone(),
+                size_blackholed: verdicts.size.clone(),
             },
+            &budgets,
         );
-        if swept_at_seal {
-            // The bond-level verdict keeps its own cadence. Its episode
-            // memory outlives the bundle and its verdict asks for a
-            // migration, which restarts the dead-path watches: one more
-            // sample at every connect would bring a redial on a dead path to
-            // that request ahead of the watch that has to kill the session.
+        if !round.kind.feeds_tracker(swept_at_seal) {
             return;
         }
 
@@ -745,10 +872,17 @@ async fn probe_round(
     }
 }
 
-/// Publishes `report` and names each leg that went silent or came back
-/// since the previous one. The prober of a bundle that is no longer the
-/// published one stays quiet (see [`ProberShared::generation`]).
-fn publish_leg_health(shared: &ProberShared, generation: u64, report: LegHealth) {
+/// Publishes `report` and names each leg that went silent, came back, or
+/// started losing its large probes since the previous one. `budgets` are the
+/// legs' inner budgets the round sized its probes to. The prober of a bundle
+/// that is no longer the published one stays quiet (see
+/// [`ProberShared::generation`]).
+fn publish_leg_health(
+    shared: &ProberShared,
+    generation: u64,
+    report: LegHealth,
+    budgets: &[usize],
+) {
     shared.leg_health_tx.send_if_modified(|reading| {
         if shared.generation.load(std::sync::atomic::Ordering::Relaxed) != generation {
             return false;
@@ -761,9 +895,24 @@ fn publish_leg_health(shared: &ProberShared, generation: u64, report: LegHealth)
             tracing::warn!(
                 leg,
                 legs = report.legs,
-                "path health: leg returned neither probe, so its tunnel frames are not getting \
-                 through whatever its QUIC counters say; it carries no flow while another leg \
-                 delivers"
+                "path health: leg returned neither probe on two rounds in a row, so its tunnel \
+                 frames are not getting through whatever its QUIC counters say; it carries no \
+                 flow while another leg delivers"
+            );
+        }
+        // Routing is unchanged by this verdict: the routing plan quarantines a
+        // leg on its budget, when that falls under the inner-QUIC floor.
+        for &leg in report
+            .size_blackholed
+            .iter()
+            .filter(|leg| !reading.size_blackholed.contains(leg))
+        {
+            tracing::warn!(
+                leg,
+                leg_inner_mtu = budgets.get(leg).copied().unwrap_or_default(),
+                legs = report.legs,
+                "path health: leg passes small probes and loses large ones on two rounds in a \
+                 row (size-selective blackhole on this leg alone)"
             );
         }
         for &leg in reading
@@ -890,6 +1039,132 @@ mod tests {
         );
     }
 
+    /// A sweep of `legs` legs in which `small` and `large` name the legs that
+    /// returned that probe.
+    fn sweep_hearing(legs: usize, small: &[usize], large: &[usize]) -> Sweep {
+        let mut sweep = Sweep::new(legs);
+        for &leg in small {
+            sweep.record(leg, false);
+        }
+        for &leg in large {
+            sweep.record(leg, true);
+        }
+        sweep
+    }
+
+    #[test]
+    fn a_leg_silent_on_two_rounds_in_a_row_is_convicted_and_released_by_one_reply() {
+        let mut verdicts = LegVerdicts::default();
+
+        verdicts.judge(&sweep_hearing(4, &[1, 2, 3], &[1, 2, 3]));
+        assert!(
+            verdicts.silent.is_empty(),
+            "one silent round is a suspicion"
+        );
+        assert!(verdicts.awaiting_confirmation());
+
+        verdicts.judge(&sweep_hearing(4, &[1, 2, 3], &[1, 2, 3]));
+        assert_eq!(verdicts.silent, vec![0]);
+        assert!(!verdicts.awaiting_confirmation());
+
+        verdicts.judge(&sweep_hearing(4, &[1, 2, 3], &[0, 1, 2, 3]));
+        assert!(
+            verdicts.silent.is_empty(),
+            "any reply proves the leg delivers again"
+        );
+    }
+
+    #[test]
+    fn a_leg_silent_on_one_round_only_is_never_convicted() {
+        let mut verdicts = LegVerdicts::default();
+
+        verdicts.judge(&sweep_hearing(4, &[1, 2, 3], &[1, 2, 3]));
+        verdicts.judge(&sweep_hearing(4, &[0, 1, 2, 3], &[0, 1, 2, 3]));
+        verdicts.judge(&sweep_hearing(4, &[1, 2, 3], &[1, 2, 3]));
+
+        assert!(verdicts.silent.is_empty());
+        assert!(
+            verdicts.awaiting_confirmation(),
+            "the new silence is a suspicion"
+        );
+    }
+
+    #[test]
+    fn a_leg_losing_its_large_probe_on_two_rounds_in_a_row_is_named_until_it_returns_one() {
+        let mut verdicts = LegVerdicts::default();
+
+        verdicts.judge(&sweep_hearing(3, &[0, 1, 2], &[1, 2]));
+        assert!(
+            verdicts.size.is_empty(),
+            "one lost large reply is a suspicion"
+        );
+        verdicts.judge(&sweep_hearing(3, &[0, 1, 2], &[1, 2]));
+        assert_eq!(verdicts.size, vec![0]);
+
+        verdicts.judge(&sweep_hearing(3, &[0, 1, 2], &[0, 1, 2]));
+        assert!(verdicts.size.is_empty());
+    }
+
+    #[test]
+    fn a_round_in_which_the_exit_lost_a_reply_convicts_no_leg() {
+        let mut verdicts = LegVerdicts::default();
+        // Leg 2's large reply came back and its small one did not: the exit
+        // lost a reply on its way back, twice.
+        let lossy = sweep_hearing(3, &[1], &[1, 2]);
+
+        verdicts.judge(&lossy);
+        verdicts.judge(&lossy);
+
+        assert!(verdicts.silent.is_empty(), "leg 0 returned nothing, twice");
+        assert!(!verdicts.awaiting_confirmation());
+    }
+
+    #[test]
+    fn a_round_in_which_the_exit_lost_a_reply_still_releases_a_leg_it_heard() {
+        let mut verdicts = LegVerdicts::default();
+        let dead_leg_0 = sweep_hearing(3, &[1, 2], &[1, 2]);
+        verdicts.judge(&dead_leg_0);
+        verdicts.judge(&dead_leg_0);
+        assert_eq!(verdicts.silent, vec![0]);
+
+        verdicts.judge(&sweep_hearing(3, &[0, 1], &[0, 1, 2]));
+
+        assert!(verdicts.silent.is_empty());
+    }
+
+    #[test]
+    fn only_a_large_reply_without_its_small_one_shows_the_exit_losing_replies() {
+        assert!(sweep_hearing(2, &[0], &[0, 1]).return_path_lost_a_reply());
+        assert!(
+            !sweep_hearing(2, &[0, 1], &[0]).return_path_lost_a_reply(),
+            "a lost large reply is also what a size-selective leg shows"
+        );
+        assert!(
+            !sweep_hearing(2, &[0], &[0]).return_path_lost_a_reply(),
+            "a leg that returned nothing is also what a dead leg shows"
+        );
+    }
+
+    #[test]
+    fn only_the_bond_level_cadence_feeds_the_bond_level_verdict() {
+        assert!(!RoundKind::Seal.feeds_tracker(true));
+        assert!(
+            RoundKind::Seal.feeds_tracker(false),
+            "a first round the seal did not beat runs on the cadence"
+        );
+        assert!(!RoundKind::Confirm.feeds_tracker(false));
+        assert!(RoundKind::Cadence.feeds_tracker(false));
+    }
+
+    #[test]
+    fn a_suspicion_is_settled_by_a_prompt_round_unless_the_tracker_already_probes_fast() {
+        assert_eq!(RoundKind::next(true, false, false), RoundKind::Seal);
+        assert_eq!(RoundKind::next(true, true, true), RoundKind::Seal);
+        assert_eq!(RoundKind::next(false, true, false), RoundKind::Confirm);
+        assert_eq!(RoundKind::next(false, true, true), RoundKind::Cadence);
+        assert_eq!(RoundKind::next(false, false, false), RoundKind::Cadence);
+    }
+
     fn one_silent_leg_of(legs: usize) -> LegHealth {
         LegHealth {
             legs,
@@ -907,7 +1182,7 @@ mod tests {
             .generation
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
-        publish_leg_health(&shared, generation, one_silent_leg_of(4));
+        publish_leg_health(&shared, generation, one_silent_leg_of(4), &[]);
         let mut watch = shared.leg_health_watch();
         assert_eq!(watch.borrow_and_update().legs, 4);
 
@@ -926,13 +1201,13 @@ mod tests {
         shared
             .generation
             .store(2, std::sync::atomic::Ordering::Relaxed);
-        publish_leg_health(&shared, 1, one_silent_leg_of(8));
+        publish_leg_health(&shared, 1, one_silent_leg_of(8), &[]);
         assert_eq!(
             *shared.leg_health_watch().borrow(),
             LegHealth::default(),
             "legs of the session an overlap replaced must not reach the reading"
         );
-        publish_leg_health(&shared, 2, one_silent_leg_of(4));
+        publish_leg_health(&shared, 2, one_silent_leg_of(4), &[]);
         assert_eq!(shared.leg_health_watch().borrow().legs, 4);
     }
 
