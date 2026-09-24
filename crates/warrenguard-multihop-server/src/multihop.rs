@@ -1967,20 +1967,27 @@ const MAX_SENDERS_PER_IP: usize = 16;
 const TAKEOVER_STALE_RECHECK: Duration = Duration::from_millis(2000);
 
 /// How many looks the re-check takes before it is allowed to convict a
-/// predecessor on silence alone. The product must exceed the client
-/// keep-alive cadence (`CLIENT_KEEP_ALIVE_INTERVAL_SECS`, 5 s), because a
-/// live peer that has no application traffic to send only proves it is
-/// there when its next keep-alive PING arrives. A predecessor whose
-/// connection is already closed is evicted on the first look regardless,
-/// which is the common shape of a reconnect, so the window is only ever
-/// paid by a client that abandoned a connection without closing it: the
-/// 2026-07-16 shape, and still an order of magnitude faster than the
-/// ~80 s QUIC idle timeout that black-holed it back then.
-const TAKEOVER_STALE_ROUNDS: u32 = 4;
+/// predecessor on silence alone. The window must outlast the longest silence
+/// a live client connection can hold, which is the client's idle timeout:
+/// under idle cover, the client default, a connection runs no keep-alive,
+/// and an idle bonded leg's next packet is a cover dummy or a path-health
+/// probe that can come 15 to 20 s later. Every connect makes the legs of one
+/// bond each other's predecessors, so a shorter window convicts live legs at
+/// every connect. A predecessor whose connection is already closed is
+/// evicted on the first look regardless, which is the common shape of a
+/// reconnect, and one abandoned without a close is closed by its own idle
+/// timer within the window (the 2026-07-16 shape).
+const TAKEOVER_STALE_ROUNDS: u32 = 13;
+
+const _: () = assert!(
+    TAKEOVER_STALE_RECHECK.as_secs() * TAKEOVER_STALE_ROUNDS as u64
+        > warrenguard_transport_core::CLIENT_MAX_IDLE_TIMEOUT_SECS,
+    "the takeover silence window must outlast a live client's longest silence"
+);
 
 /// Interval between two rounds of the permanent downlink patrol. Matched to
 /// the client keep-alive cadence (`CLIENT_KEEP_ALIVE_INTERVAL_SECS`, 5 s) so
-/// every round of a live owner contains a keep-alive, and deliberately
+/// every round of a live owner that runs one contains a keep-alive, and deliberately
 /// slower than the takeover re-check: the patrol sweeps every shared slot on
 /// the node instead of one address, and nothing about it is latency
 /// critical (a reconnect is served by the takeover path, which keeps its
@@ -1988,11 +1995,11 @@ const TAKEOVER_STALE_ROUNDS: u32 = 4;
 const PATROL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Consecutive patrol rounds a sender must stay silent at BOTH levels
-/// before the patrol convicts it. The product with the interval (25 s)
-/// comfortably exceeds the takeover window (8 s) this backs up and covers
-/// five keep-alive cadences, so a live owner has to lose every one of them
-/// to be convicted, and it still bounds a dead sender's life two orders of
-/// magnitude below the tens of minutes one survived in production.
+/// before the patrol convicts it. The product with the interval (25 s) is
+/// the client's idle timeout, the longest silence a live client connection
+/// can hold whether it runs a keep-alive or idle cover, and it still bounds
+/// a dead sender's life two orders of magnitude below the tens of minutes
+/// one survived in production.
 const PATROL_SILENT_ROUNDS: u32 = 5;
 
 /// Consecutive patrol rounds of APPLICATION silence past which a sender
@@ -2824,7 +2831,7 @@ async fn pump_multihop_tun_router<T: PacketDevice>(tun: T, router: Arc<MultihopT
 /// Every other janitor on this table is one-shot. A serve task unregisters
 /// its own channel when it ends, [`RouteTable::dispatch`] prunes a channel
 /// whose receiver is gone, and the sticky-IP takeover re-check watches its
-/// predecessors for 8 s and stops. A sender whose serve-task teardown raced
+/// predecessors for one client idle timeout and stops. A sender whose serve-task teardown raced
 /// or died, and a closed channel in a slot no downlink traffic reaches, are
 /// looked at by none of them ever again. In production one exit slot carried
 /// seven dead senders out of fifteen for tens of minutes: each kept its
@@ -2842,11 +2849,11 @@ async fn pump_multihop_tun_router<T: PacketDevice>(tun: T, router: Arc<MultihopT
 /// answering.
 ///
 /// Why running the takeover re-check's verdict continuously is not a wider
-/// risk than running it for 8 s after a collision: it is applied to the same
+/// risk than running it once after a collision: it is applied to the same
 /// population (only slots with more than one sender, the only ones where a
 /// dead sender takes a share of the 5-tuple hash away from a live one) and
-/// it demands three times the evidence, five missed keep-alive cadences
-/// instead of one and a half.
+/// it demands the same evidence, a silence as long as a live client's idle
+/// timeout.
 ///
 /// Cost: one short map lock per address family per round, and nothing at all
 /// on the per-packet path.
@@ -6863,6 +6870,62 @@ mod tests {
         assert!(
             rx_new.try_recv().is_err(),
             "the newcomer must not steal an app-idle live owner's reply"
+        );
+    }
+
+    /// A bonded client under idle cover, the default, runs no QUIC
+    /// keep-alive: an idle leg's next packet is a cover dummy or a
+    /// path-health probe, many seconds after the takeover that a sibling's
+    /// setup triggers. Every connect registers such siblings, so a re-check
+    /// that convicts before the leg's own idle timeout could close it takes
+    /// live legs out of the bond's downlink at every connect.
+    #[tokio::test(start_paused = true)]
+    async fn a_predecessor_that_speaks_before_its_idle_timeout_keeps_its_route() {
+        let router = Arc::new(MultihopTunRouter::default());
+        let ip = Ipv4Addr::new(10, 66, 0, 167);
+        let (tx_idle, _rx_idle) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx_new, _rx_new) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let act_idle = Arc::new(AtomicU64::new(3));
+        let quic_idle = FakePeer::new();
+        router.register(ip, tx_idle.clone());
+        router.attach_liveness(ip, &tx_idle, act_idle.clone(), Some(quic_idle.clone()));
+        router.register(ip, tx_new.clone());
+        arm_takeover_recheck(
+            &router,
+            &tx_new,
+            ip,
+            None,
+            &Arc::new(AtomicU64::new(0)),
+            None,
+        );
+        tokio::task::yield_now().await;
+
+        let speaks_at =
+            Duration::from_secs(warrenguard_transport_core::CLIENT_MAX_IDLE_TIMEOUT_SECS - 1);
+        let settle = 2 * TAKEOVER_STALE_RECHECK * TAKEOVER_STALE_ROUNDS;
+        let mut elapsed = Duration::ZERO;
+        while elapsed < speaks_at + settle {
+            if elapsed == speaks_at {
+                // One cover dummy: an application datagram, and a QUIC packet.
+                act_idle.fetch_add(1, Ordering::Relaxed);
+                quic_idle.packets.fetch_add(1, Ordering::Relaxed);
+            }
+            tokio::time::advance(Duration::from_secs(1)).await;
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            elapsed += Duration::from_secs(1);
+        }
+
+        assert_eq!(
+            router
+                .routes
+                .0
+                .lock()
+                .get(&ip)
+                .map(|slot| slot.senders.len()),
+            Some(2),
+            "a leg that shows life before its idle timeout must keep its downlink route"
         );
     }
 

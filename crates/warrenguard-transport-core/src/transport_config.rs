@@ -336,7 +336,11 @@ const CLIENT_KEEP_ALIVE_INTERVAL_SECS: u64 = 5;
 /// for fast dead-exit detection instead. Changing the
 /// value requires a real-network bench, which is why this constant is
 /// documented rather than retuned.
-const CLIENT_MAX_IDLE_TIMEOUT_SECS: u64 = 25;
+///
+/// Public because it is also the longest a live client connection can stay
+/// silent: an exit that judges a peer dead on silence must wait at least
+/// this long.
+pub const CLIENT_MAX_IDLE_TIMEOUT_SECS: u64 = 25;
 
 /// Applies the aggressive client-side dead-peer detection knobs
 /// (see [`CLIENT_KEEP_ALIVE_INTERVAL_SECS`] /

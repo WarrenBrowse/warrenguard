@@ -32,8 +32,8 @@ pub use ip_parse::{
 pub use packet_device::{FakeTun, PacketDevice};
 pub use path_probe::{PATH_PROBE_INTERVAL, PathProbeDelta, spawn_path_probe};
 pub use transport_config::{
-    warren_transport_config_client, warren_transport_config_client_full,
-    warren_transport_config_client_multihop_with_gso,
+    CLIENT_MAX_IDLE_TIMEOUT_SECS, warren_transport_config_client,
+    warren_transport_config_client_full, warren_transport_config_client_multihop_with_gso,
     warren_transport_config_client_multihop_with_idle_cover,
     warren_transport_config_client_with_gso, warren_transport_config_client_with_idle_cover,
     warren_transport_config_exit, warren_transport_config_exit_full,
