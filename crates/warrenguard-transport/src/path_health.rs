@@ -84,15 +84,20 @@ pub enum HealthEvent {
 }
 
 /// Per-leg reading of the live bond's latest path-health sweep, indexed like
-/// [`crate::bundle::MultiHopBundle::clients`].
+/// [`crate::bundle::MultiHopBundle::clients`]: attach order, the primary
+/// first, which is not the dial index the bonding logs name a secondary by.
 ///
 /// A leg's QUIC counters cannot tell whether its tunnel frames get through:
 /// the exit acknowledges every datagram at the QUIC layer and may then
 /// discard it, which is what an exit does with the frames of a leg whose
-/// session it no longer holds. A probe crosses the whole datapath and comes
-/// back, so it is the per-leg proof of delivery, and this is what a
-/// consumer reads to say whether a leg carries traffic.
+/// session it no longer holds. A probe leaves on the leg it tests and must
+/// get past the exit's session, its gates and the gateway to be answered, so
+/// an answer is the proof that the leg's uplink delivers. The exit sends the
+/// echo back on whichever leg of the bond it picks, so a leg whose own
+/// downlink failed shows here only through the replies it loses for others.
+/// This is what a consumer reads to say whether a leg carries traffic.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LegHealth {
     /// Legs the sweep probed. `0` until the live bond's first sweep lands.
     pub legs: usize,
@@ -494,11 +499,17 @@ pub fn spawn_path_health(
     shared: Arc<ProberShared>,
     overlap: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
-    let generation = shared
-        .generation
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        + 1;
-    shared.leg_health_tx.send_replace(LegHealth::default());
+    let mut generation = 0;
+    // Bumped and reset under the watch's lock, the lock `publish_leg_health`
+    // checks the generation under, so a stale prober cannot slip its
+    // reading in after the reset.
+    shared.leg_health_tx.send_modify(|reading| {
+        generation = shared
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        *reading = LegHealth::default();
+    });
     tokio::spawn(async move {
         let Some(steady) = steady_cadence() else {
             return;
@@ -738,32 +749,36 @@ async fn probe_round(
 /// since the previous one. The prober of a bundle that is no longer the
 /// published one stays quiet (see [`ProberShared::generation`]).
 fn publish_leg_health(shared: &ProberShared, generation: u64, report: LegHealth) {
-    if shared.generation.load(std::sync::atomic::Ordering::Relaxed) != generation {
-        return;
-    }
-    let previous = shared.leg_health_tx.borrow().unresponsive.clone();
-    for &leg in report
-        .unresponsive
-        .iter()
-        .filter(|leg| !previous.contains(leg))
-    {
-        tracing::warn!(
-            leg,
-            legs = report.legs,
-            "path health: leg returned neither probe, so its tunnel frames are not getting \
-             through whatever its QUIC counters say; it carries no flow while another leg delivers"
-        );
-    }
-    for &leg in previous
-        .iter()
-        .filter(|leg| !report.unresponsive.contains(leg))
-    {
-        tracing::info!(
-            leg,
-            "path health: leg delivers probes again and carries flows again"
-        );
-    }
-    shared.leg_health_tx.send_replace(report);
+    shared.leg_health_tx.send_if_modified(|reading| {
+        if shared.generation.load(std::sync::atomic::Ordering::Relaxed) != generation {
+            return false;
+        }
+        for &leg in report
+            .unresponsive
+            .iter()
+            .filter(|leg| !reading.unresponsive.contains(leg))
+        {
+            tracing::warn!(
+                leg,
+                legs = report.legs,
+                "path health: leg returned neither probe, so its tunnel frames are not getting \
+                 through whatever its QUIC counters say; it carries no flow while another leg \
+                 delivers"
+            );
+        }
+        for &leg in reading
+            .unresponsive
+            .iter()
+            .filter(|leg| !report.unresponsive.contains(leg))
+        {
+            tracing::info!(
+                leg,
+                "path health: leg delivers probes again and carries flows again"
+            );
+        }
+        *reading = report;
+        true
+    });
 }
 
 #[cfg(test)]

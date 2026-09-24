@@ -1853,13 +1853,6 @@ impl MultiHopSupervisor {
     }
 }
 
-/// No-log helper: the discriminant name only, never the message body. A
-/// `WarrenControlMessage::IpRequest`/`IpRequestV7` carries a client pubkey
-/// (and, for the v7 path, anonymous session tokens); logging the full
-/// `Debug` of an unexpected control message would let a hostile relay/exit
-/// smuggle that identity material into a debug log just by replying with
-/// the "wrong" variant. Mirrors
-/// `supervised_pump::dispatch_control_message`'s identical policy.
 /// Puts one cover datagram on a leg the moment its setup completes.
 ///
 /// An exit that refreshes a `/v2` leg's session only from the leg's own
@@ -1881,6 +1874,13 @@ fn prime_leg(client: &MultiHopClient) {
     }
 }
 
+/// No-log helper: the discriminant name only, never the message body. A
+/// `WarrenControlMessage::IpRequest`/`IpRequestV7` carries a client pubkey
+/// (and, for the v7 path, anonymous session tokens); logging the full
+/// `Debug` of an unexpected control message would let a hostile relay/exit
+/// smuggle that identity material into a debug log just by replying with
+/// the "wrong" variant. Mirrors
+/// `supervised_pump::dispatch_control_message`'s identical policy.
 fn control_message_variant_name(msg: &WarrenControlMessage) -> &'static str {
     match msg {
         WarrenControlMessage::IpRequest { .. } => "IpRequest",
@@ -3562,7 +3562,9 @@ mod run_tests {
             .await
             .expect("the bond seals");
 
-        let report = leg_health_covering(&mut leg_health, want, Duration::from_secs(3)).await;
+        // Well under the 15 s steady cadence, and room for a sweep that
+        // waits out its whole reply timeout.
+        let report = leg_health_covering(&mut leg_health, want, Duration::from_secs(8)).await;
 
         reader.abort();
         drop(bundle);
@@ -3616,8 +3618,17 @@ mod run_tests {
                 .await
                 .expect("the bond takes the packet");
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let carried = exit.user_packets();
+        let carried = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let carried = exit.user_packets();
+                if carried.iter().sum::<usize>() >= 64 {
+                    return carried;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| exit.user_packets());
 
         reader.abort();
         drop(bundle);

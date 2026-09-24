@@ -87,7 +87,7 @@ struct RoutingPlan {
     /// Legs allowed to carry user traffic, ascending.
     usable: Vec<usize>,
     /// Budget published to the MSS clamp and the PTB reflection: the
-    /// smallest among the usable legs.
+    /// smallest among the legs the MTU rules keep, whatever the probes say.
     published: usize,
 }
 
@@ -111,6 +111,12 @@ impl RoutingPlan {
             })
             .map(|(i, _)| i)
             .collect();
+        // The published budget ignores the probe verdict: a verdict can flip
+        // with every sweep, and the MSS clamp and the PTB reflection must not
+        // flip with it.
+        let published = usable.iter().map(|&i| budgets[i]).min().unwrap_or(
+            usize::from(warrenguard_config::TUNNEL_MIN_MTU) - MULTIHOP_FRAME_MAX_OVERHEAD,
+        );
         let answering: Vec<usize> = usable
             .iter()
             .copied()
@@ -121,9 +127,6 @@ impl RoutingPlan {
         } else {
             answering
         };
-        let published = usable.iter().map(|&i| budgets[i]).min().unwrap_or(
-            usize::from(warrenguard_config::TUNNEL_MIN_MTU) - MULTIHOP_FRAME_MAX_OVERHEAD,
-        );
         Self {
             budgets,
             usable,
@@ -976,6 +979,15 @@ mod tests {
                 "flow {hash} was pinned to the leg that answers nothing"
             );
         }
+    }
+
+    #[test]
+    fn a_leg_that_answers_no_probe_leaves_the_published_budget_alone() {
+        // The verdict flips with one sweep; the budget the MSS clamp and the
+        // PTB reflection read must not flip with it.
+        let plan = RoutingPlan::from_budgets(vec![1400, 1300, 1400], &[1]);
+        assert_eq!(plan.usable, vec![0, 2]);
+        assert_eq!(plan.published, 1300);
     }
 
     #[test]
