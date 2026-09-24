@@ -20,8 +20,9 @@
 //! With `n = 1` the bundle is a transparent wrapper: same dial, same
 //! errors, no extra copies on the uplink path.
 
-use std::sync::Arc;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::{Mutex as PlMutex, RwLock};
 
@@ -196,6 +197,11 @@ pub struct MultiHopBundle {
     /// [`Self::real_traffic_totals`].
     real_tx: AtomicU64,
     real_rx: AtomicU64,
+    /// The part of `real_tx` the exit can answer. See
+    /// [`Self::answerable_uplink_total`].
+    answerable_tx: AtomicU64,
+    /// The inner addresses the exit assigned this session, once named.
+    source_addresses: OnceLock<(Ipv4Addr, Option<Ipv6Addr>)>,
     /// Path-health reply intercept, installed by the supervisor on every
     /// bundle it publishes. `recv()` consumes matching echo replies so
     /// probe traffic never reaches the TUN nor the real-traffic
@@ -272,6 +278,8 @@ impl MultiHopBundle {
             reader_tasks: PlMutex::new(reader_tasks),
             real_tx: AtomicU64::new(0),
             real_rx: AtomicU64::new(0),
+            answerable_tx: AtomicU64::new(0),
+            source_addresses: OnceLock::new(),
             probe_tap: RwLock::new(None),
             routing: RwLock::new(plan),
             routing_tick: AtomicU64::new(0),
@@ -496,8 +504,20 @@ impl MultiHopBundle {
         // `real_traffic_totals`).
         if sent.is_ok() {
             self.note_real_uplink();
+            if self.exit_admits(payload) {
+                self.answerable_tx.fetch_add(1, Ordering::Relaxed);
+            }
         }
         sent
+    }
+
+    /// Whether the exit's anti-spoof gate lets `packet` through, judged by
+    /// the same function the exit runs. Until the session's addresses are
+    /// named there is nothing to judge against, and every packet counts.
+    fn exit_admits(&self, packet: &[u8]) -> bool {
+        self.source_addresses.get().is_none_or(|&(v4, v6)| {
+            warrenguard_transport_core::ip_parse::classify_source(packet, v4, v6).is_none()
+        })
     }
 
     /// Seals and sends one path-health probe on the leg at `leg`, WITHOUT
@@ -697,13 +717,34 @@ impl MultiHopBundle {
         self.real_rx.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Names the inner addresses the exit assigned this session, which is
+    /// what its anti-spoof gate admits as a source. A session keeps the
+    /// addresses its setup assigned, so only the first call takes effect.
+    pub fn set_source_addresses(&self, v4: Ipv4Addr, v6: Option<Ipv6Addr>) {
+        let _ = self.source_addresses.set((v4, v6));
+    }
+
+    /// Real uplink packets sent so far that the exit can answer: those whose
+    /// source its anti-spoof gate admits (see [`Self::set_source_addresses`]).
+    ///
+    /// The one-way dead-path watch reads this rather than the real uplink
+    /// total. A quiet host keeps sending what the exit refuses by design (its
+    /// stack's link-local chatter, the tail of connections opened outside the
+    /// tunnel), and nothing ever answers those, on a healthy path as on a
+    /// dead one.
+    #[must_use]
+    pub fn answerable_uplink_total(&self) -> u64 {
+        self.answerable_tx.load(Ordering::Relaxed)
+    }
+
     /// Cumulative (real uplink, real downlink) packet counts recorded by
     /// the supervised pumps. Liveness watches MUST sample this instead of
     /// Quinn's datagram frame counters: an armed exit pads its downlink
     /// with dummies and a DAITA client pads its uplink, so frame counters
     /// keep advancing on a tunnel that carries no user traffic at all
     /// (a dead uplink can sit "Connected" behind a rain of exit
-    /// dummies).
+    /// dummies). A watch that expects an answer to what went up samples
+    /// [`Self::answerable_uplink_total`] for its uplink half.
     #[must_use]
     pub fn real_traffic_totals(&self) -> (u64, u64) {
         (
@@ -1035,6 +1076,80 @@ mod live_tests {
         spawn_loopback_multihop, spawn_loopback_multihop_migratable,
         spawn_loopback_multihop_with_transport,
     };
+
+    /// An IPv4/UDP packet from `src`.
+    fn udp_from(src: [u8; 4]) -> Vec<u8> {
+        let mut pkt = vec![0u8; 28];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&28u16.to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 17;
+        pkt[12..16].copy_from_slice(&src);
+        pkt[16..20].copy_from_slice(&[1, 1, 1, 1]);
+        pkt[20..22].copy_from_slice(&40_000u16.to_be_bytes());
+        pkt[22..24].copy_from_slice(&53u16.to_be_bytes());
+        pkt[24..26].copy_from_slice(&8u16.to_be_bytes());
+        pkt
+    }
+
+    /// An ICMPv6 packet from `src` to the all-routers group: from a
+    /// link-local source, the router solicitation a quiet host sends.
+    fn icmpv6_from(src: Ipv6Addr) -> Vec<u8> {
+        let mut pkt = vec![0u8; 48];
+        pkt[0] = 0x60;
+        pkt[4..6].copy_from_slice(&8u16.to_be_bytes());
+        pkt[6] = 58;
+        pkt[7] = 255;
+        pkt[8..24].copy_from_slice(&src.octets());
+        pkt[24..40].copy_from_slice(&"ff02::2".parse::<Ipv6Addr>().expect("literal").octets());
+        pkt[40] = 133;
+        pkt
+    }
+
+    /// The one-way dead-path watch reads this count. A packet the exit refuses
+    /// by design (a link-local IPv6 source, an IPv4 source other than the
+    /// session's, IPv6 on a session granted none) can never be answered
+    /// through the tunnel, so it is no evidence that the return path is dead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_packets_the_exit_admits_count_as_answerable_uplink() {
+        let pair = spawn_loopback_multihop(ExitId::from_bytes([0x89; 16])).await;
+        let session = MultiHopBundle::new(vec![pair.client.clone()]);
+        session.set_source_addresses(Ipv4Addr::new(10, 66, 0, 7), None);
+
+        for pkt in [
+            udp_from([10, 66, 0, 7]),
+            udp_from([172, 17, 0, 2]),
+            icmpv6_from("fe80::1".parse().expect("literal")),
+            icmpv6_from("2001:db8::7".parse().expect("literal")),
+        ] {
+            session
+                .send(&pkt)
+                .await
+                .expect("the session takes the packet");
+        }
+
+        assert_eq!(session.real_traffic_totals().0, 4, "every packet went out");
+        assert_eq!(
+            session.answerable_uplink_total(),
+            1,
+            "only the packet from the session's own address can be answered"
+        );
+    }
+
+    /// A session nobody named its addresses to cannot tell what the exit
+    /// admits, so it counts every packet, as the watch always did.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_session_without_known_addresses_counts_every_packet_as_answerable() {
+        let pair = spawn_loopback_multihop(ExitId::from_bytes([0x8A; 16])).await;
+        let session = MultiHopBundle::new(vec![pair.client.clone()]);
+
+        session
+            .send(&icmpv6_from("fe80::1".parse().expect("literal")))
+            .await
+            .expect("the session takes the packet");
+
+        assert_eq!(session.answerable_uplink_total(), 1);
+    }
 
     #[tokio::test]
     async fn closed_resolves_once_the_peer_closes_the_connection() {

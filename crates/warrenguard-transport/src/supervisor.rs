@@ -888,6 +888,7 @@ impl MultiHopSupervisor {
                 }
             };
             let mut bundle = MultiHopBundle::new_unsealed(vec![primary.clone()]);
+            bundle.set_source_addresses(assign.assigned, assign.assigned_v6);
             bundle.set_probe_tap(self.prober.tap());
 
             // Publish the live session. If the receiver side dropped,
@@ -967,8 +968,14 @@ impl MultiHopSupervisor {
                         // and a DAITA client pads its uplink, so frame
                         // counters keep a dead tunnel looking alive (and an
                         // idle DAITA session would look one-way and be
-                        // spuriously redialed).
-                        move || sample.real_traffic_totals()
+                        // spuriously redialed). The uplink half counts only
+                        // what the exit can answer.
+                        move || {
+                            (
+                                sample.answerable_uplink_total(),
+                                sample.real_traffic_totals().1,
+                            )
+                        }
                     }) => {
                         tracing::warn!(
                             window_secs = app_downlink_dead_secs(),
@@ -1536,10 +1543,9 @@ impl MultiHopSupervisor {
                 "multi-hop bonded session assembled"
             );
         }
-        Established::Session {
-            bundle: MultiHopBundle::new(clients),
-            primary,
-        }
+        let bundle = MultiHopBundle::new(clients);
+        bundle.set_source_addresses(primary_spec.assigned, primary_spec.assigned_v6);
+        Established::Session { bundle, primary }
     }
 
     /// Make-before-break warm dial: a best-effort SINGLE connect +
@@ -2017,8 +2023,9 @@ const APP_DOWNLINK_MIN_TX: u64 = 8;
 /// pubkey-sticky allocator preserves the inner IP); 15 s of genuinely one-way
 /// app traffic (no DNS reply, no TCP ACK, nothing) is a dead tunnel.
 ///
-/// `sample` returns cumulative (app datagram frames sent, received) across
-/// the bundle. Uses `tokio::time::Instant` for `start_paused` testability.
+/// `sample` returns cumulative (app datagrams sent that the exit can answer,
+/// app datagrams received) across the bundle. Uses `tokio::time::Instant` for
+/// `start_paused` testability.
 async fn app_downlink_dead_watch(mut sample: impl FnMut() -> (u64, u64)) {
     let dead_after = match app_downlink_dead_secs() {
         0 => return std::future::pending().await,
@@ -3471,6 +3478,69 @@ mod run_tests {
         warrenguard_config::knobs::path_health_secs() < 10
     }
 
+    /// A quiet host still sends: router solicitations from its link-local
+    /// address, and the last packets of connections it opened before the
+    /// tunnel, from its own LAN address. The exit refuses both by design, so
+    /// nothing ever answers them, and they must not read as a return path
+    /// that died: a redial about 18 s into every quiet connect was the cost.
+    #[tokio::test(start_paused = true)]
+    async fn uplink_the_exit_refuses_by_design_never_trips_the_one_way_watch() {
+        let operational_key = SigningKey::from_bytes(&[0x46; 32]);
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x55; 16]));
+        let config = config_with_fake_exit(&exit, &operational_key);
+        let (supervisor, mut rx) = MultiHopSupervisor::new(config);
+        let metrics = supervisor.metrics();
+        let task = tokio::spawn(supervisor.run());
+        let session = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                rx.changed().await.expect("watch sender alive");
+                if let Some(session) = rx.borrow_and_update().clone() {
+                    return session;
+                }
+            }
+        })
+        .await
+        .expect("the cold dial publishes a session");
+        // Stands in for the downlink pump, which hands the prober its
+        // replies: without it the bond-level verdict would ask for a
+        // migration of its own.
+        let reader = tokio::spawn({
+            let session = session.clone();
+            async move { while session.recv().await.is_ok() {} }
+        });
+        let mut router_solicitation = vec![0u8; 48];
+        router_solicitation[0] = 0x60;
+        router_solicitation[4..6].copy_from_slice(&8u16.to_be_bytes());
+        router_solicitation[6] = 58;
+        router_solicitation[7] = 255;
+        router_solicitation[8..10].copy_from_slice(&[0xfe, 0x80]);
+        router_solicitation[23] = 1;
+        router_solicitation[24..26].copy_from_slice(&[0xff, 0x02]);
+        router_solicitation[39] = 2;
+        router_solicitation[40] = 133;
+        let mut from_the_lan = udp_packet(40_000);
+        from_the_lan[12..16].copy_from_slice(&[172, 17, 0, 2]);
+
+        for _ in 0..20 {
+            for pkt in [&router_solicitation, &from_the_lan] {
+                // A redial closes this session under the sender, which is
+                // what the assertion below reports.
+                let _ = session.send(pkt).await;
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+
+        let redials = metrics.snapshot().reconnect_count;
+        reader.abort();
+        drop(session);
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        assert_eq!(
+            redials, 0,
+            "a minute of uplink the exit refuses by design must not redial the session"
+        );
+    }
+
     /// A minimal IPv4/UDP packet from the fake exit's assigned address, one
     /// flow per source port.
     fn udp_packet(src_port: u16) -> Vec<u8> {
@@ -3733,6 +3803,56 @@ mod run_tests {
         drop(rx);
         drop(handle);
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    /// A session an overlap swaps in is judged by the one-way watch like a
+    /// cold-dialled one: only what the exit can answer counts as uplink.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_session_an_overlap_swaps_in_counts_only_what_the_exit_admits() {
+        let operational_key = SigningKey::from_bytes(&[0x47; 32]);
+        let serving = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x56; 16]));
+        let next = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x57; 16]));
+        let config = config_with_fake_exit(&serving, &operational_key);
+        let (supervisor, mut rx) = MultiHopSupervisor::new(config);
+        let handle = supervisor.handle();
+        let task = tokio::spawn(supervisor.run());
+        tokio::time::timeout(Duration::from_secs(5), rx.changed())
+            .await
+            .expect("the cold dial publishes a session")
+            .expect("watch sender alive");
+
+        handle.migrate_to(circuit_to(&next, next.relay.relay_id, &operational_key));
+        let swapped_in = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                rx.changed().await.expect("watch sender alive");
+                let published = rx.borrow_and_update().clone();
+                if let Some(session) = published
+                    && session.exit_id() == next.exit_id
+                {
+                    return session;
+                }
+            }
+        })
+        .await
+        .expect("the overlap swaps the session");
+        let mut from_the_lan = udp_packet(40_000);
+        from_the_lan[12..16].copy_from_slice(&[172, 17, 0, 2]);
+        for pkt in [udp_packet(40_001), from_the_lan] {
+            swapped_in
+                .send(&pkt)
+                .await
+                .expect("the session takes the packet");
+        }
+        let answerable = swapped_in.answerable_uplink_total();
+
+        drop(swapped_in);
+        drop(rx);
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        assert_eq!(
+            answerable, 1,
+            "the packet from another source can never be answered"
+        );
     }
 
     /// A session that dies right after it was established is a flap: the
@@ -4032,8 +4152,8 @@ mod run_tests {
                 let Some(bundle) = burst_rx.borrow().clone() else {
                     continue;
                 };
-                for _ in 0..16 {
-                    let _ = bundle.send(&[0x45, 0, 0, 20, 1, 2, 3, 4]).await;
+                for port in 0..16 {
+                    let _ = bundle.send(&udp_packet(40_000 + port)).await;
                 }
             }
         });
