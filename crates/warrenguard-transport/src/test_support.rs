@@ -445,6 +445,10 @@ pub(crate) struct FakeMultihopExit {
     /// Every connection whose setup this exit answered with an `IpAssign`, in
     /// answer order.
     pub(crate) legs: Arc<parking_lot::Mutex<Vec<FakeLeg>>>,
+    /// Answer-order index of a leg whose datagrams this exit reads and never
+    /// answers, the way an exit that lost the leg's session discards them.
+    /// Every other leg answers a path-health probe the way the gateway does.
+    pub(crate) mute_leg: Arc<parking_lot::Mutex<Option<usize>>>,
     on_next_dial: NextDialHook,
     _server_ep: Endpoint,
 }
@@ -456,6 +460,8 @@ pub(crate) struct FakeLeg {
     pub(crate) answered_at: Instant,
     /// When the first datagram arrived after that reply, if one did.
     pub(crate) first_datagram_at: Option<Instant>,
+    /// Inner packets that were neither a probe nor cover: user traffic.
+    pub(crate) user_packets: usize,
 }
 
 /// One-shot hook the fake exit runs when the next connection attempt reaches
@@ -479,6 +485,30 @@ impl FakeMultihopExit {
             .map(|leg| leg.first_datagram_at.map(|at| at - leg.answered_at))
             .collect()
     }
+
+    /// User packets each admitted connection carried, in answer order.
+    pub(crate) fn user_packets(&self) -> Vec<usize> {
+        self.legs
+            .lock()
+            .iter()
+            .map(|leg| leg.user_packets)
+            .collect()
+    }
+}
+
+/// What the gateway's kernel sends back for a path-health probe: the echo
+/// request with its addresses swapped and its type turned into a reply.
+/// `None` for anything that is not an IPv4 ICMP echo request.
+fn echo_reply_for(pkt: &[u8]) -> Option<Vec<u8>> {
+    let ihl = usize::from(*pkt.first()? & 0x0f) * 4;
+    if pkt[0] >> 4 != 4 || ihl < 20 || pkt.len() < ihl + 8 || pkt[9] != 1 || pkt[ihl] != 8 {
+        return None;
+    }
+    let mut reply = pkt.to_vec();
+    reply[12..16].copy_from_slice(&pkt[16..20]);
+    reply[16..20].copy_from_slice(&pkt[12..16]);
+    reply[ihl] = 0;
+    Some(reply)
 }
 
 /// How the fake exit answers the connections it accepts, read afresh for each
@@ -494,6 +524,7 @@ struct FakeExitBehaviour {
     garbage_reply: Arc<AtomicBool>,
     hold_setup_reply: Arc<parking_lot::Mutex<Option<(usize, Duration)>>>,
     legs: Arc<parking_lot::Mutex<Vec<FakeLeg>>>,
+    mute_leg: Arc<parking_lot::Mutex<Option<usize>>>,
 }
 
 const FAKE_EXIT_IKM: [u8; 32] = [0x99; 32];
@@ -595,17 +626,45 @@ async fn serve_one_fake_exit_connection(
         legs.push(FakeLeg {
             answered_at: Instant::now(),
             first_datagram_at: None,
+            user_packets: 0,
         });
         legs.len() - 1
     });
 
+    // The setup reply was sealed at seq 0.
+    let mut reverse_seq = 1u64;
     loop {
-        if conn.read_datagram().await.is_err() {
+        let Ok(datagram) = conn.read_datagram().await else {
             return;
-        }
-        if let Some(leg) = leg {
+        };
+        let Some(leg) = leg else {
+            continue;
+        };
+        let plaintext = decode_frame(&datagram)
+            .ok()
+            .and_then(|frame| exit_session.open(&frame).ok());
+        let echo = plaintext.as_deref().and_then(echo_reply_for);
+        {
             let mut legs = behaviour.legs.lock();
             legs[leg].first_datagram_at.get_or_insert_with(Instant::now);
+            let cover = plaintext.as_deref().and_then(<[u8]>::first)
+                == Some(&warrenguard_pump::DAITA_DUMMY_FIRST_BYTE);
+            if plaintext.is_some() && echo.is_none() && !cover {
+                legs[leg].user_packets += 1;
+            }
+        }
+        if *behaviour.mute_leg.lock() == Some(leg) {
+            continue;
+        }
+        let Some(reply) = echo else {
+            continue;
+        };
+        let Ok(frame) = exit_session.seal_response(&reply, 0, reverse_seq) else {
+            continue;
+        };
+        reverse_seq += 1;
+        if let Ok(wire) = encode_frame(&frame) {
+            let _ = conn.send_datagram(wire.into());
         }
     }
 }
@@ -678,6 +737,7 @@ pub(crate) fn spawn_fake_multihop_exit_on(
         garbage_reply: Arc::new(AtomicBool::new(false)),
         hold_setup_reply: Arc::new(parking_lot::Mutex::new(None)),
         legs: Arc::new(parking_lot::Mutex::new(Vec::new())),
+        mute_leg: Arc::new(parking_lot::Mutex::new(None)),
     };
 
     let refuse_handshake = Arc::new(AtomicBool::new(false));
@@ -735,6 +795,7 @@ pub(crate) fn spawn_fake_multihop_exit_on(
         refuse_handshake,
         hold_setup_reply: behaviour.hold_setup_reply,
         legs: behaviour.legs,
+        mute_leg: behaviour.mute_leg,
         on_next_dial,
         _server_ep: server_ep,
     })

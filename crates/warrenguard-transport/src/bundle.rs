@@ -72,6 +72,14 @@ const ROUTING_PLAN_REFRESH_PACKETS: u64 = 256;
 /// - **Size-aware routing.** A packet too large for its flow-pinned leg moves
 ///   to a leg that can carry it instead of being dropped while healthy legs
 ///   sit idle.
+///
+/// And one bought by the legs an exit silently stopped serving: a leg whose
+/// path-health probes both came back empty carries no user traffic until a
+/// later sweep hears it again. Its QUIC layer acknowledges every datagram
+/// while the exit may discard each one, so without this every flow hashed
+/// onto it black-holes. When every usable leg is silent the rule steps
+/// aside: there is nowhere better to send, and the bond-level verdict owns
+/// that case.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RoutingPlan {
     /// Inner budget per leg, indexed by leg, quarantined legs included.
@@ -84,7 +92,7 @@ struct RoutingPlan {
 }
 
 impl RoutingPlan {
-    fn from_budgets(budgets: Vec<usize>) -> Self {
+    fn from_budgets(budgets: Vec<usize>, unresponsive: &[usize]) -> Self {
         let Some(best) = budgets.iter().copied().max() else {
             return Self {
                 budgets,
@@ -103,6 +111,16 @@ impl RoutingPlan {
             })
             .map(|(i, _)| i)
             .collect();
+        let answering: Vec<usize> = usable
+            .iter()
+            .copied()
+            .filter(|leg| !unresponsive.contains(leg))
+            .collect();
+        let usable = if answering.is_empty() {
+            usable
+        } else {
+            answering
+        };
         let published = usable.iter().map(|&i| budgets[i]).min().unwrap_or(
             usize::from(warrenguard_config::TUNNEL_MIN_MTU) - MULTIHOP_FRAME_MAX_OVERHEAD,
         );
@@ -185,6 +203,12 @@ pub struct MultiHopBundle {
     routing: RwLock<RoutingPlan>,
     /// Uplink packets since the last [`Self::refresh_routing_plan`].
     routing_tick: AtomicU64,
+    /// Legs the path-health prober last heard nothing back from, which the
+    /// routing plan keeps user traffic off. Indexed like `clients`, which
+    /// only ever grows, so an index keeps naming the same leg.
+    unresponsive: PlMutex<Vec<usize>>,
+    /// Flips to `true` once, when [`Self::seal`] runs.
+    sealed_tx: watch::Sender<bool>,
 }
 
 impl MultiHopBundle {
@@ -231,7 +255,7 @@ impl MultiHopBundle {
             .map(|client| Self::spawn_reader(client.clone(), merged_tx.clone(), closed_tx.clone()))
             .collect();
         let plan =
-            RoutingPlan::from_budgets(clients.iter().map(|c| c.max_inner_payload()).collect());
+            RoutingPlan::from_budgets(clients.iter().map(|c| c.max_inner_payload()).collect(), &[]);
         Arc::new(Self {
             clients: RwLock::new(clients),
             rr: AtomicUsize::new(0),
@@ -244,6 +268,8 @@ impl MultiHopBundle {
             probe_tap: RwLock::new(None),
             routing: RwLock::new(plan),
             routing_tick: AtomicU64::new(0),
+            unresponsive: PlMutex::new(Vec::new()),
+            sealed_tx: watch::channel(false).0,
         })
     }
 
@@ -282,7 +308,8 @@ impl MultiHopBundle {
         // the instant the secondary lands: refresh it here rather than let
         // the packet tick route against indices that no longer mean the
         // same thing.
-        *self.routing.write() = RoutingPlan::from_budgets(budgets);
+        let unresponsive = self.unresponsive.lock().clone();
+        *self.routing.write() = RoutingPlan::from_budgets(budgets, &unresponsive);
         true
     }
 
@@ -292,6 +319,29 @@ impl MultiHopBundle {
     /// path the supervisor's redial relies on).
     pub fn seal(&self) {
         self.merged_tx.lock().take();
+        self.sealed_tx.send_replace(true);
+    }
+
+    /// Resolves once the bundle is sealed: every leg it will ever have is
+    /// attached.
+    pub async fn sealed(&self) {
+        let mut sealed = self.sealed_tx.subscribe();
+        // The sender lives as long as `self`, so the wait cannot fail.
+        let _ = sealed.wait_for(|sealed| *sealed).await;
+    }
+
+    /// Keeps user traffic off `legs`, the ones the path-health prober last
+    /// heard nothing back from, and puts every other leg back in the
+    /// routing plan. See [`RoutingPlan`].
+    pub(crate) fn set_unresponsive_legs(&self, legs: Vec<usize>) {
+        {
+            let mut current = self.unresponsive.lock();
+            if *current == legs {
+                return;
+            }
+            *current = legs;
+        }
+        self.refresh_routing_plan();
     }
 
     fn spawn_reader(
@@ -378,7 +428,8 @@ impl MultiHopBundle {
             .iter()
             .map(|c| c.max_inner_payload())
             .collect();
-        *self.routing.write() = RoutingPlan::from_budgets(budgets);
+        let unresponsive = self.unresponsive.lock().clone();
+        *self.routing.write() = RoutingPlan::from_budgets(budgets, &unresponsive);
     }
 
     /// Session that must carry `pkt`: the flow-pinned leg when it is usable
@@ -821,7 +872,7 @@ mod tests {
     fn a_leg_under_the_quic_floor_with_a_healthier_peer_is_quarantined() {
         // The 2026-08-10 shape: seven legs at 1242, one collapsed to the
         // QUIC base MTU. The collapsed leg must stop dictating the bond.
-        let plan = RoutingPlan::from_budgets(vec![1242, 1242, 1242, 1076]);
+        let plan = RoutingPlan::from_budgets(vec![1242, 1242, 1242, 1076], &[]);
         assert_eq!(plan.usable, vec![0, 1, 2]);
         assert_eq!(
             plan.published, 1242,
@@ -834,15 +885,15 @@ mod tests {
         // A session on the TLS-over-TCP carrier is legitimately under the
         // floor on EVERY leg (CARRIER_MAX_INNER_MTU is 1100 on purpose).
         // Quarantining them all would leave nothing to send on.
-        let uniform = RoutingPlan::from_budgets(vec![1100, 1100, 1100]);
+        let uniform = RoutingPlan::from_budgets(vec![1100, 1100, 1100], &[]);
         assert_eq!(uniform.usable, vec![0, 1, 2]);
         assert_eq!(uniform.published, 1100);
 
-        let ragged = RoutingPlan::from_budgets(vec![1076, 1100]);
+        let ragged = RoutingPlan::from_budgets(vec![1076, 1100], &[]);
         assert_eq!(ragged.usable, vec![1], "the worse sub-floor leg is dropped");
         assert_eq!(ragged.published, 1100);
 
-        let single = RoutingPlan::from_budgets(vec![900]);
+        let single = RoutingPlan::from_budgets(vec![900], &[]);
         assert_eq!(single.usable, vec![0], "a lone leg is always usable");
         assert_eq!(single.published, 900);
     }
@@ -851,14 +902,14 @@ mod tests {
     fn a_leg_at_or_above_the_quic_floor_is_kept_even_when_it_is_the_worst() {
         // Above the floor a smaller leg is merely slower, and dropping it
         // would throw away capacity for nothing.
-        let plan = RoutingPlan::from_budgets(vec![1400, 1228]);
+        let plan = RoutingPlan::from_budgets(vec![1400, 1228], &[]);
         assert_eq!(plan.usable, vec![0, 1]);
         assert_eq!(plan.published, 1228);
     }
 
     #[test]
     fn route_never_hands_a_packet_to_a_quarantined_leg() {
-        let plan = RoutingPlan::from_budgets(vec![1242, 1242, 1076]);
+        let plan = RoutingPlan::from_budgets(vec![1242, 1242, 1076], &[]);
         for hash in 0..24u64 {
             let leg = plan.route(Some(hash), 0, 800);
             assert_ne!(leg, 2, "hash {hash} must not land on the quarantined leg");
@@ -878,7 +929,7 @@ mod tests {
         // takes the nearest capable leg from the pin, which spreads
         // oversized flows instead of piling them all on one leg, and it is
         // what tells this branch apart from the undeliverable fallback.
-        let plan = RoutingPlan::from_budgets(vec![1240, 1300, 1400]);
+        let plan = RoutingPlan::from_budgets(vec![1240, 1300, 1400], &[]);
         assert_eq!(plan.usable, vec![0, 1, 2]);
         assert_eq!(
             plan.route(Some(0), 0, 800),
@@ -897,13 +948,13 @@ mod tests {
         // No leg can take it: the drop is unavoidable, but it must be
         // charged to the widest leg so the counter and the reflected PTB
         // carry the largest MTU actually achievable.
-        let plan = RoutingPlan::from_budgets(vec![1240, 1400, 1300]);
+        let plan = RoutingPlan::from_budgets(vec![1240, 1400, 1300], &[]);
         assert_eq!(plan.route(Some(0), 0, 1500), 1);
     }
 
     #[test]
     fn route_is_stable_for_a_given_flow() {
-        let plan = RoutingPlan::from_budgets(vec![1242, 1242, 1242, 1076]);
+        let plan = RoutingPlan::from_budgets(vec![1242, 1242, 1242, 1076], &[]);
         let first = plan.route(Some(0xdead_beef), 0, 900);
         for _ in 0..8 {
             assert_eq!(
@@ -915,8 +966,29 @@ mod tests {
     }
 
     #[test]
+    fn a_leg_that_answers_no_probe_carries_no_flow() {
+        let plan = RoutingPlan::from_budgets(vec![1400; 4], &[2]);
+        assert_eq!(plan.usable, vec![0, 1, 3]);
+        for hash in 0..1_000u64 {
+            assert_ne!(
+                plan.route(Some(hash), 0, 900),
+                2,
+                "flow {hash} was pinned to the leg that answers nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bond_whose_every_leg_answers_no_probe_keeps_routing_on_all_of_them() {
+        // Taking every leg out would leave the packet nowhere to go; the
+        // bond-level verdict owns that case.
+        let plan = RoutingPlan::from_budgets(vec![1400; 3], &[0, 1, 2]);
+        assert_eq!(plan.usable, vec![0, 1, 2]);
+    }
+
+    #[test]
     fn an_empty_bundle_plan_is_inert_rather_than_panicking() {
-        let plan = RoutingPlan::from_budgets(Vec::new());
+        let plan = RoutingPlan::from_budgets(Vec::new(), &[]);
         assert!(plan.usable.is_empty());
         assert_eq!(plan.route(Some(7), 3, 900), 0);
     }

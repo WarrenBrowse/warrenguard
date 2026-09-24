@@ -743,6 +743,16 @@ impl MultiHopSupervisor {
         self.prober.health_watch()
     }
 
+    /// Subscribe to the per-leg reading of the live bond's latest
+    /// path-health sweep ([`crate::path_health::LegHealth`]): which legs
+    /// deliver a probe end to end and which do not. It is the only per-leg
+    /// delivery signal a leg's QUIC counters cannot fake. Call BEFORE
+    /// [`Self::run`] consumes `self`.
+    #[must_use]
+    pub fn leg_health_rx(&self) -> watch::Receiver<crate::path_health::LegHealth> {
+        self.prober.leg_health_watch()
+    }
+
     /// Build a [`SupervisorHandle`] for external reconnect control.
     /// Call BEFORE [`Self::run`] consumes `self`. The handle holds a
     /// watch receiver: it does NOT keep the supervisor alive, and a
@@ -3472,6 +3482,161 @@ mod run_tests {
         drop(bundle);
         drop(rx);
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    /// Whether `WARREN_PATH_HEALTH_SECS` leaves no steady cadence long enough
+    /// for a test to tell a sweep at the seal from a scheduled one.
+    fn path_health_cadence_too_short_by_env() -> bool {
+        warrenguard_config::knobs::path_health_secs() < 10
+    }
+
+    /// A minimal IPv4/UDP packet from the fake exit's assigned address, one
+    /// flow per source port.
+    fn udp_packet(src_port: u16) -> Vec<u8> {
+        let mut pkt = vec![0u8; 28];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&28u16.to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 17;
+        pkt[12..16].copy_from_slice(&[10, 77, 0, 2]);
+        pkt[16..20].copy_from_slice(&[1, 1, 1, 1]);
+        pkt[20..22].copy_from_slice(&src_port.to_be_bytes());
+        pkt[22..24].copy_from_slice(&53u16.to_be_bytes());
+        pkt[24..26].copy_from_slice(&8u16.to_be_bytes());
+        pkt
+    }
+
+    /// Waits for the first leg-health report that covers `legs` legs.
+    async fn leg_health_covering(
+        rx: &mut watch::Receiver<crate::path_health::LegHealth>,
+        legs: usize,
+        within: Duration,
+    ) -> Option<crate::path_health::LegHealth> {
+        tokio::time::timeout(within, async {
+            loop {
+                let report = rx.borrow_and_update().clone();
+                if report.legs == legs {
+                    return report;
+                }
+                rx.changed()
+                    .await
+                    .expect("the prober's watch outlives the test");
+            }
+        })
+        .await
+        .ok()
+    }
+
+    /// A fresh bond is swept the moment it is sealed rather than a steady
+    /// cadence later, so a leg that does not deliver is found, and routed
+    /// around, while the connect is still in progress.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_fresh_bond_is_swept_as_soon_as_it_is_sealed() {
+        if bond_pinned_to_one_connection_by_env() || path_health_cadence_too_short_by_env() {
+            eprintln!("skipped: the environment pins the bond width or the prober cadence");
+            return;
+        }
+        let operational_key = SigningKey::from_bytes(&[0x52; 32]);
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x69; 16]));
+        let want = resolve_bonded_want(4, warrenguard_config::knobs::multihop_conns_override());
+        let mut config = config_with_fake_exit(&exit, &operational_key);
+        config.n_connections = 4;
+        let (supervisor, mut rx) = MultiHopSupervisor::new(config);
+        let mut leg_health = supervisor.leg_health_rx();
+        let task = tokio::spawn(supervisor.run());
+        tokio::time::timeout(Duration::from_secs(5), rx.changed())
+            .await
+            .expect("the cold dial publishes a session")
+            .expect("watch sender alive");
+        let bundle = rx
+            .borrow_and_update()
+            .clone()
+            .expect("a session was published");
+        // Stands in for the downlink pump, which is where probe replies are
+        // taken off the receive path.
+        let reader = tokio::spawn({
+            let bundle = bundle.clone();
+            async move { while bundle.recv().await.is_ok() {} }
+        });
+        tokio::time::timeout(Duration::from_secs(10), bundle.sealed())
+            .await
+            .expect("the bond seals");
+
+        let report = leg_health_covering(&mut leg_health, want, Duration::from_secs(3)).await;
+
+        reader.abort();
+        drop(bundle);
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        let report = report.expect("the sealed bond is swept within seconds, not a cadence later");
+        assert!(
+            report.unresponsive.is_empty(),
+            "every leg of this bond answers its probes: {report:?}"
+        );
+    }
+
+    /// A leg whose frames the exit takes and never answers, while its QUIC
+    /// layer acknowledges every one of them, is named in the leg health and
+    /// carries no user flow: its flows go to the legs that deliver.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_leg_whose_probes_never_come_back_is_named_and_carries_no_flow() {
+        if bond_pinned_to_one_connection_by_env() || path_health_cadence_too_short_by_env() {
+            eprintln!("skipped: the environment pins the bond width or the prober cadence");
+            return;
+        }
+        let operational_key = SigningKey::from_bytes(&[0x53; 32]);
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x6A; 16]));
+        // The primary: the first leg the exit answers and the bond's leg 0.
+        *exit.mute_leg.lock() = Some(0);
+        let want = resolve_bonded_want(4, warrenguard_config::knobs::multihop_conns_override());
+        let mut config = config_with_fake_exit(&exit, &operational_key);
+        config.n_connections = 4;
+        let (supervisor, mut rx) = MultiHopSupervisor::new(config);
+        let mut leg_health = supervisor.leg_health_rx();
+        let task = tokio::spawn(supervisor.run());
+        tokio::time::timeout(Duration::from_secs(5), rx.changed())
+            .await
+            .expect("the cold dial publishes a session")
+            .expect("watch sender alive");
+        let bundle = rx
+            .borrow_and_update()
+            .clone()
+            .expect("a session was published");
+        let reader = tokio::spawn({
+            let bundle = bundle.clone();
+            async move { while bundle.recv().await.is_ok() {} }
+        });
+
+        let report = leg_health_covering(&mut leg_health, want, Duration::from_secs(10))
+            .await
+            .expect("the bond's first sweep reports every leg");
+        for port in 0..64u16 {
+            bundle
+                .send(&udp_packet(40_000 + port))
+                .await
+                .expect("the bond takes the packet");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let carried = exit.user_packets();
+
+        reader.abort();
+        drop(bundle);
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        assert_eq!(
+            report.unresponsive,
+            vec![0],
+            "only the leg the exit never answers is named"
+        );
+        assert_eq!(
+            carried[0], 0,
+            "no flow may be pinned to a leg whose frames do not get through"
+        );
+        assert_eq!(
+            carried.iter().sum::<usize>(),
+            64,
+            "every flow leaves on a leg that delivers: {carried:?}"
+        );
     }
 
     /// The overlap dial assembles its full bond before the swap: every

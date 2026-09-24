@@ -83,6 +83,26 @@ pub enum HealthEvent {
     RequestMigration,
 }
 
+/// Per-leg reading of the live bond's latest path-health sweep, indexed like
+/// [`crate::bundle::MultiHopBundle::clients`].
+///
+/// A leg's QUIC counters cannot tell whether its tunnel frames get through:
+/// the exit acknowledges every datagram at the QUIC layer and may then
+/// discard it, which is what an exit does with the frames of a leg whose
+/// session it no longer holds. A probe crosses the whole datapath and comes
+/// back, so it is the per-leg proof of delivery, and this is what a
+/// consumer reads to say whether a leg carries traffic.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LegHealth {
+    /// Legs the sweep probed. `0` until the live bond's first sweep lands.
+    pub legs: usize,
+    /// Legs that returned neither probe. The bond keeps user flows off
+    /// them until a later sweep hears them again.
+    pub unresponsive: Vec<usize>,
+    /// Legs that returned the small probe and lost the large one.
+    pub size_blackholed: Vec<usize>,
+}
+
 /// Probe outcomes evaluated per paired round.
 const WINDOW: usize = 5;
 /// Losses within [`WINDOW`] at which a size class counts as dead.
@@ -296,6 +316,12 @@ pub struct ProberShared {
     /// [`warrenguard_transport_core::QUIC_SAFE_INNER_MTU`]. Kept so the
     /// condition is logged on its transitions instead of on every round.
     under_quic_floor: std::sync::atomic::AtomicBool,
+    leg_health_tx: watch::Sender<LegHealth>,
+    /// Bumped for every bundle a prober is spawned on. Only the prober of the
+    /// latest one publishes [`LegHealth`]: the prober of a bundle an overlap
+    /// swapped out keeps running until that bundle closes, and its leg
+    /// indices name legs of a session no longer carrying traffic.
+    generation: std::sync::atomic::AtomicU64,
 }
 
 impl ProberShared {
@@ -312,6 +338,8 @@ impl ProberShared {
             health_tx,
             seq: std::sync::atomic::AtomicU16::new(0),
             under_quic_floor: std::sync::atomic::AtomicBool::new(false),
+            leg_health_tx: watch::channel(LegHealth::default()).0,
+            generation: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -331,6 +359,12 @@ impl ProberShared {
     #[must_use]
     pub fn health_watch(&self) -> watch::Receiver<PathHealth> {
         self.health_tx.subscribe()
+    }
+
+    /// Per-leg watch for embedders: see [`LegHealth`].
+    #[must_use]
+    pub fn leg_health_watch(&self) -> watch::Receiver<LegHealth> {
+        self.leg_health_tx.subscribe()
     }
 }
 
@@ -422,6 +456,18 @@ impl Sweep {
         )
     }
 
+    /// Legs that returned neither probe: whatever their QUIC layer
+    /// acknowledges, their tunnel frames are not getting through.
+    fn unresponsive_legs(&self) -> Vec<usize> {
+        self.small_ok
+            .iter()
+            .zip(&self.large_ok)
+            .enumerate()
+            .filter(|&(_, (&small, &large))| !small && !large)
+            .map(|(leg, _)| leg)
+            .collect()
+    }
+
     /// Legs that returned their small probe and lost their large one: the
     /// size-selective signature, named leg by leg.
     fn size_blackholed_legs(&self) -> Vec<usize> {
@@ -440,29 +486,55 @@ impl Sweep {
 /// alive past the supervisor's teardown) and exits when the bundle dies
 /// or is dropped; the supervisor spawns a fresh prober on the next
 /// publish. A no-op task when `WARREN_PATH_HEALTH_SECS=0`.
+///
+/// The published [`LegHealth`] is reset here: the legs of the new bundle
+/// have not been measured yet.
 pub fn spawn_path_health(
     bundle: std::sync::Weak<crate::bundle::MultiHopBundle>,
     shared: Arc<ProberShared>,
     overlap: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
+    let generation = shared
+        .generation
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
+    shared.leg_health_tx.send_replace(LegHealth::default());
     tokio::spawn(async move {
         let Some(steady) = steady_cadence() else {
             return;
         };
+        let mut first = true;
         loop {
             let Some(strong) = bundle.upgrade() else {
                 return;
             };
+            let round = Round {
+                first,
+                generation,
+                steady,
+            };
             let done = tokio::select! {
                 _ = strong.closed() => true,
-                () = probe_round(&strong, &shared, &overlap, steady) => false,
+                () = probe_round(&strong, &shared, &overlap, round) => false,
             };
             drop(strong);
             if done {
                 return;
             }
+            first = false;
         }
     })
+}
+
+/// What one probe round needs to know about its place in the prober's life.
+#[derive(Clone, Copy)]
+struct Round {
+    /// The bundle's first round.
+    first: bool,
+    /// The bundle's [`ProberShared::generation`].
+    generation: u64,
+    /// Healthy cadence between rounds.
+    steady: Duration,
 }
 
 /// One paced probe round against a live bundle: sleep the cadence, send
@@ -471,7 +543,7 @@ async fn probe_round(
     bundle: &Arc<crate::bundle::MultiHopBundle>,
     shared: &Arc<ProberShared>,
     overlap: &Arc<Notify>,
-    steady: Duration,
+    round: Round,
 ) {
     {
         // Single round; the caller's loop re-upgrades the bundle
@@ -479,9 +551,19 @@ async fn probe_round(
         let cadence = if shared.tracker.lock().wants_fast() {
             FAST_CADENCE
         } else {
-            steady
+            round.steady
         };
-        tokio::time::sleep(cadence).await;
+        if round.first {
+            // A fresh bond is swept as soon as every leg is attached, so a
+            // leg that does not deliver is named, and routed around, within
+            // seconds of the connect.
+            tokio::select! {
+                () = tokio::time::sleep(cadence) => {}
+                () = bundle.sealed() => {}
+            }
+        } else {
+            tokio::time::sleep(cadence).await;
+        }
         let Some((src, gw)) = *shared.endpoints.lock() else {
             return;
         };
@@ -585,7 +667,8 @@ async fn probe_round(
         // The sentence that names a collapsed leg. Logged before the
         // aggregate verdict because a single leg failing is deliberately
         // invisible to the bond-level tracker.
-        for leg in sweep.size_blackholed_legs() {
+        let size_blackholed = sweep.size_blackholed_legs();
+        for &leg in &size_blackholed {
             tracing::warn!(
                 leg,
                 leg_inner_mtu = budgets[leg],
@@ -595,6 +678,17 @@ async fn probe_round(
                  it stays under the inner-QUIC floor"
             );
         }
+        let unresponsive = sweep.unresponsive_legs();
+        bundle.set_unresponsive_legs(unresponsive.clone());
+        publish_leg_health(
+            shared,
+            round.generation,
+            LegHealth {
+                legs,
+                unresponsive,
+                size_blackholed,
+            },
+        );
 
         let (small_ok, large_ok) = sweep.aggregate();
         let (events, small_lost, large_lost) = {
@@ -629,6 +723,38 @@ async fn probe_round(
             }
         }
     }
+}
+
+/// Publishes `report` and names each leg that went silent or came back
+/// since the previous one. The prober of a bundle that is no longer the
+/// published one stays quiet (see [`ProberShared::generation`]).
+fn publish_leg_health(shared: &ProberShared, generation: u64, report: LegHealth) {
+    if shared.generation.load(std::sync::atomic::Ordering::Relaxed) != generation {
+        return;
+    }
+    let previous = shared.leg_health_tx.borrow().unresponsive.clone();
+    for &leg in report
+        .unresponsive
+        .iter()
+        .filter(|leg| !previous.contains(leg))
+    {
+        tracing::warn!(
+            leg,
+            legs = report.legs,
+            "path health: leg returned neither probe, so its tunnel frames are not getting \
+             through whatever its QUIC counters say; it carries no flow while another leg delivers"
+        );
+    }
+    for &leg in previous
+        .iter()
+        .filter(|leg| !report.unresponsive.contains(leg))
+    {
+        tracing::info!(
+            leg,
+            "path health: leg delivers probes again and carries flows again"
+        );
+    }
+    shared.leg_health_tx.send_replace(report);
 }
 
 #[cfg(test)]
@@ -724,6 +850,66 @@ mod tests {
             both_dead.size_blackholed_legs().is_empty(),
             "a leg that lost BOTH sizes is congestion or a dead leg, not a size blackhole"
         );
+    }
+
+    #[test]
+    fn only_a_leg_that_returned_neither_probe_is_unresponsive() {
+        let mut sweep = Sweep::new(4);
+        sweep.record(0, false);
+        sweep.record(0, true);
+        sweep.record(1, false);
+        sweep.record(3, true);
+        assert_eq!(
+            sweep.unresponsive_legs(),
+            vec![2],
+            "one probe back of either size proves the leg delivers"
+        );
+    }
+
+    fn one_silent_leg_of(legs: usize) -> LegHealth {
+        LegHealth {
+            legs,
+            unresponsive: vec![0],
+            size_blackholed: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_new_bundle_starts_with_no_leg_measured() {
+        // The previous bundle's reading names legs of a session that no
+        // longer carries traffic.
+        let shared = ProberShared::new(0xC0DE);
+        let generation = shared
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        publish_leg_health(&shared, generation, one_silent_leg_of(4));
+        let mut watch = shared.leg_health_watch();
+        assert_eq!(watch.borrow_and_update().legs, 4);
+
+        drop(spawn_path_health(
+            std::sync::Weak::new(),
+            shared.clone(),
+            Arc::new(Notify::new()),
+        ));
+
+        assert_eq!(*watch.borrow_and_update(), LegHealth::default());
+    }
+
+    #[test]
+    fn the_prober_of_a_swapped_out_bundle_publishes_nothing() {
+        let shared = ProberShared::new(0xC0DE);
+        shared
+            .generation
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+        publish_leg_health(&shared, 1, one_silent_leg_of(8));
+        assert_eq!(
+            *shared.leg_health_watch().borrow(),
+            LegHealth::default(),
+            "legs of the session an overlap replaced must not reach the reading"
+        );
+        publish_leg_health(&shared, 2, one_silent_leg_of(4));
+        assert_eq!(shared.leg_health_watch().borrow().legs, 4);
     }
 
     fn reply_packet(id: u16, seq: u16, len: usize) -> Vec<u8> {
