@@ -2002,6 +2002,12 @@ const PATROL_INTERVAL: Duration = Duration::from_secs(5);
 /// one survived in production.
 const PATROL_SILENT_ROUNDS: u32 = 5;
 
+const _: () = assert!(
+    PATROL_INTERVAL.as_secs() * PATROL_SILENT_ROUNDS as u64
+        >= warrenguard_transport_core::CLIENT_MAX_IDLE_TIMEOUT_SECS,
+    "the patrol's silence window must cover a live client's longest silence"
+);
+
 /// Consecutive patrol rounds of APPLICATION silence past which a sender
 /// sharing its address is COUNTED as stale (2 minutes). Nothing is ever
 /// evicted on this reading: it is the only signal for the senders the
@@ -4808,7 +4814,7 @@ async fn serve_pq_datagram_pump<T>(
     let rx_task = tokio::spawn(async move {
         let mut report = RxReport::new(LABEL);
         let mut flows = FlowNoter::new();
-        let mut evicted_log = RateLimited::new(1_000);
+        let mut evicted_log = RateLimited::new(10_000);
         loop {
             let Ok(datagram) = conn_rx.read_datagram().await else {
                 return;
@@ -9763,6 +9769,9 @@ mod tests {
             before.dropped_session,
             after.dropped_session
         );
+        // Exact, unlike the other node-wide deltas: no other test in this
+        // binary evicts a live connection's session, and the foreign-key
+        // miss must not show up here.
         assert_eq!(
             after.dropped_session_evicted - before.dropped_session_evicted,
             2,
