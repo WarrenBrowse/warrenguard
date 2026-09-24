@@ -3789,6 +3789,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "tun-rs",
  "warren-quinn",
  "warren-quinn-udp",

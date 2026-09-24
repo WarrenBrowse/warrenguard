@@ -29,6 +29,7 @@ use quinn::Connection;
 use tokio::sync::{mpsc, watch};
 use warrenguard_multihop::{ExitId, MULTIHOP_FRAME_MAX_OVERHEAD, RejectionReason};
 
+use crate::drain_policy::ExitDrainAdvisory;
 use crate::multihop::{MultiHopClient, MultiHopError, RebindError, RebindPolicy};
 
 /// Hard cap on bonded connections per session, matching the `n_connections`
@@ -212,6 +213,9 @@ pub struct MultiHopBundle {
     unresponsive: PlMutex<Vec<usize>>,
     /// Flips to `true` once, when [`Self::seal`] runs.
     sealed_tx: watch::Sender<bool>,
+    /// The drain advisory this session last announced. See
+    /// [`Self::first_sighting_of_drain`].
+    drain_announced: PlMutex<Option<ExitDrainAdvisory>>,
 }
 
 impl MultiHopBundle {
@@ -273,6 +277,7 @@ impl MultiHopBundle {
             routing_tick: AtomicU64::new(0),
             unresponsive: PlMutex::new(Vec::new()),
             sealed_tx: watch::channel(false).0,
+            drain_announced: PlMutex::new(None),
         })
     }
 
@@ -323,6 +328,14 @@ impl MultiHopBundle {
     pub fn seal(&self) {
         self.merged_tx.lock().take();
         self.sealed_tx.send_replace(true);
+    }
+
+    /// Whether `advisory` is news for this session, recording it as
+    /// announced. An exit repeats its drain advisory on every leg every few
+    /// seconds until the client leaves, so only a change of advisory, or a
+    /// new session, is worth saying out loud again.
+    pub fn first_sighting_of_drain(&self, advisory: ExitDrainAdvisory) -> bool {
+        self.drain_announced.lock().replace(advisory) != Some(advisory)
     }
 
     /// Resolves once the bundle is sealed: every leg it will ever have is
@@ -1248,6 +1261,27 @@ mod live_tests {
         let bundle = MultiHopBundle::new(vec![primary.client.clone(), secondary.client.clone()]);
 
         assert_eq!(bundle.exit_id(), exit);
+    }
+
+    /// A session knows a repeat of the drain advisory it last announced, and
+    /// takes a changed one as news.
+    #[tokio::test]
+    async fn a_session_tells_a_repeated_drain_advisory_from_a_new_one() {
+        let pair = spawn_loopback_multihop(ExitId::from_bytes([0x88; 16])).await;
+        let session = MultiHopBundle::new(vec![pair.client.clone()]);
+        let first = ExitDrainAdvisory {
+            deadline_unix_secs: 1_800_000_000,
+            reason_code: 0,
+        };
+        let later = ExitDrainAdvisory {
+            deadline_unix_secs: 1_800_000_060,
+            reason_code: 0,
+        };
+
+        assert!(session.first_sighting_of_drain(first));
+        assert!(!session.first_sighting_of_drain(first));
+        assert!(session.first_sighting_of_drain(later));
+        assert!(!session.first_sighting_of_drain(later));
     }
 
     /// A late secondary to another exit is refused (its caller closes it):
