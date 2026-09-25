@@ -305,6 +305,12 @@ impl MultiHopError {
         if let MultiHopError::Rejected(reason) = self {
             return reason.retryability();
         }
+        // Not an account verdict: a refilled token store or a released serial
+        // can admit a later attempt, and a fatal cause would read as a
+        // subscription failure.
+        if let MultiHopError::NoSessionToken(_) = self {
+            return warrenguard_wire::Retryability::RetrySameTarget;
+        }
         if self.dial_refusal().is_some() {
             return warrenguard_wire::Retryability::RetryReselect;
         }
@@ -3436,6 +3442,20 @@ mod tests {
             }),
         );
         assert_eq!(other_transport_close.dial_refusal(), None);
+    }
+
+    #[test]
+    fn a_missing_session_token_is_retried_later_and_never_reported_as_an_account_failure() {
+        // No token, or every token held elsewhere, says nothing about the
+        // account: a later retry (a refilled store, a released serial) can
+        // succeed, and a fatal verdict would show a subscription error.
+        for cause in [NoSessionTokenCause::Empty, NoSessionTokenCause::AllRefused] {
+            assert_eq!(
+                MultiHopError::NoSessionToken(cause).retryability(),
+                warrenguard_wire::Retryability::RetrySameTarget,
+                "{cause}"
+            );
+        }
     }
 
     #[test]
