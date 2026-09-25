@@ -46,7 +46,7 @@ use warrenguard_transport_core::{
     warren_transport_config_client_with_idle_cover,
 };
 
-use crate::multihop::{self, MultiHopClient, MultiHopError};
+use crate::multihop::{self, MultiHopClient, MultiHopError, NoSessionTokenCause};
 
 /// Observer invoked whenever the supervisor successfully publishes a
 /// fresh session that follows a previous disconnect (i.e. the initial
@@ -100,13 +100,109 @@ pub type PathRttObserver = Arc<dyn Fn([u8; 32], u32) + Send + Sync>;
 /// per session establishment to obtain the token stack the primary and all its
 /// bonded secondaries present; because they share one stack they resolve to the
 /// same anonymous serial and thus the same sticky tunnel IP. Returning an empty
-/// vec (or configuring no provider) keeps the v6 wallet-signed `IpRequest` path.
+/// vec (or configuring no provider) keeps the v6 wallet-signed `IpRequest` path,
+/// unless the supervisor runs under [`SessionAdmission::TokensOnly`].
+///
+/// The exit spends the first token of the stack that verifies and stops there.
+/// When it refuses the session, the supervisor redials leading with the next
+/// token (see [`SessionAdmission`]), so a stack of several current-epoch tokens
+/// lets a session get past a serial another device already holds.
 ///
 /// The app wires this to a closure that pops a token from its `TokenStore` for
 /// the current epoch (plus an optional next-epoch lookahead for clock skew) and
 /// converts it to the wire [`SessionToken`]. The supervisor is deliberately
 /// ignorant of epochs and the store: it only asks for a per-session stack.
 pub type SessionTokenProvider = Arc<dyn Fn() -> Vec<SessionToken> + Send + Sync>;
+
+/// How the supervisor's sessions are admitted at the exit. Set with
+/// [`MultiHopSupervisor::with_session_admission`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum SessionAdmission {
+    /// Present v7 anonymous tokens when the [`SessionTokenProvider`] yields
+    /// any, and the v6 wallet-signed `IpRequest` otherwise.
+    #[default]
+    TokensOrWallet,
+    /// Present v7 anonymous tokens only. A session with no token, or whose
+    /// every token the exit refuses, is never set up:
+    /// [`MultiHopSupervisor::run`] returns
+    /// [`MultiHopError::NoSessionToken`], and no request naming the wallet is
+    /// ever built, for the primary or any bonded secondary. For a session that
+    /// must not be linkable to the account at the exit it lands on.
+    TokensOnly,
+}
+
+impl SessionAdmission {
+    /// The wallet key a setup request may prove possession of: none at all
+    /// under [`Self::TokensOnly`], so even a request built without tokens
+    /// could not carry the account pubkey.
+    fn wallet_identity(self, key: &SigningKey) -> Option<&SigningKey> {
+        match self {
+            Self::TokensOrWallet => Some(key),
+            Self::TokensOnly => None,
+        }
+    }
+}
+
+/// Whether a setup rejection can be the exit refusing the presented token. The
+/// exit answers every v7 refusal (no token verified, or the token's serial is
+/// already leased to a live session elsewhere, `SerialInUse`) with the same
+/// sealed `Rejected` detail, or with the bare opaque close when the detail is
+/// lost, so the client cannot tell an in-use serial from an invalid token.
+fn is_token_refusal(reason: RejectionReason) -> bool {
+    matches!(
+        reason,
+        RejectionReason::NotAllowlisted | RejectionReason::PolicyRefused
+    )
+}
+
+/// One session's v7 token stack, as the provider handed it out, plus how many
+/// of its tokens the exit has refused so far.
+///
+/// The exit spends the FIRST token of a stack that verifies and stops there, a
+/// refusal included, so the next token is only ever tried by a fresh setup
+/// that leads with it. A refused token is moved to the back rather than
+/// dropped: a refusal spends nothing, and the session holding its serial may
+/// release it. Retries are bounded by the stack: each token leads at most one
+/// attempt.
+#[derive(Clone)]
+struct TokenStack {
+    tokens: Vec<SessionToken>,
+    refused: usize,
+}
+
+impl TokenStack {
+    /// `None` for an empty stack (no token to present).
+    fn new(tokens: Vec<SessionToken>) -> Option<Self> {
+        (!tokens.is_empty()).then_some(Self { tokens, refused: 0 })
+    }
+
+    fn as_slice(&self) -> &[SessionToken] {
+        &self.tokens
+    }
+
+    /// Record that the exit refused the lead token and move it to the back.
+    /// `false` once every token has led an attempt: nothing untried remains.
+    fn rotate(&mut self) -> bool {
+        self.refused += 1;
+        if self.refused >= self.tokens.len() {
+            return false;
+        }
+        self.tokens.rotate_left(1);
+        true
+    }
+
+    /// Whether this stack is part-way through its refusal retries, so an
+    /// attempt that fails for another reason must re-present it rather than
+    /// pop a fresh one.
+    fn is_retrying(&self) -> bool {
+        self.refused > 0
+    }
+
+    fn into_tokens(self) -> Vec<SessionToken> {
+        self.tokens
+    }
+}
 
 /// Upper bound on a pre-swap check. Past it the swap is ABORTED (fail
 /// closed), because during the check the serve loop polls nothing else:
@@ -534,6 +630,8 @@ pub struct MultiHopSupervisor {
     /// installed on every published bundle; one prober task runs per
     /// published bundle and exits with it.
     prober: Arc<crate::path_health::ProberShared>,
+    /// How sessions are admitted; see [`SessionAdmission`].
+    admission: SessionAdmission,
 }
 
 /// Consecutive watchdog-forced redials, each of a session whose ENTIRE life
@@ -641,8 +739,18 @@ impl MultiHopSupervisor {
             target,
             placement: watch::channel(None).0,
             prober: crate::path_health::ProberShared::new(rand::random()),
+            admission: SessionAdmission::default(),
         };
         (supervisor, rx)
+    }
+
+    /// Admit this supervisor's sessions under `admission` instead of the
+    /// default [`SessionAdmission::TokensOrWallet`]. Call before
+    /// [`Self::run`].
+    #[must_use]
+    pub fn with_session_admission(mut self, admission: SessionAdmission) -> Self {
+        self.admission = admission;
+        self
     }
 
     /// Subscribe to the supervisor's terminal-rejection signal. The
@@ -803,6 +911,9 @@ impl MultiHopSupervisor {
         let mut first_session = true;
         let mut dead_path_escalation = DeadPathEscalation::default();
         let mut redial = self.config.backoff.forever();
+        // A token stack part-way through its refusal retries, re-presented by
+        // the next dial instead of a fresh stack from the provider.
+        let mut retrying_tokens: Option<TokenStack> = None;
         loop {
             // Non-racy shutdown check: if every pump receiver is already
             // gone (the tunnel monitor tore down and aborted the pumps),
@@ -855,18 +966,54 @@ impl MultiHopSupervisor {
             let mut primary = primary;
             // One token stack per session: the primary and every bonded
             // secondary present it, so they share one anonymous serial + IP.
-            let session_tokens = self.select_session_tokens();
+            let session_tokens = match retrying_tokens.take() {
+                Some(stack) => Some(stack),
+                None => match self.select_session_tokens() {
+                    Ok(stack) => stack,
+                    Err(error) => {
+                        tracing::warn!(%error, "tokens-only session has no token; not setting it up");
+                        drop(primary);
+                        return Err(error);
+                    }
+                },
+            };
             let assign = match self
-                .setup_primary(&primary, session_tokens.as_deref())
+                .setup_primary(&primary, session_tokens.as_ref().map(TokenStack::as_slice))
                 .await
             {
                 SetupOutcome::Assigned(assign) => assign,
                 SetupOutcome::Rejected(reason) => {
+                    if is_token_refusal(reason)
+                        && let Some(mut stack) = session_tokens
+                    {
+                        if stack.rotate() {
+                            // No-log: counts only, never a token or its serial.
+                            tracing::info!(
+                                refused = stack.refused,
+                                stack = stack.tokens.len(),
+                                "exit refused the session token; redialling with the next token"
+                            );
+                            drop(primary);
+                            retrying_tokens = Some(stack);
+                            continue;
+                        }
+                        if self.admission == SessionAdmission::TokensOnly {
+                            tracing::warn!(
+                                stack = stack.tokens.len(),
+                                "exit refused every token of a tokens-only session"
+                            );
+                            drop(primary);
+                            return Err(MultiHopError::NoSessionToken(
+                                NoSessionTokenCause::AllRefused,
+                            ));
+                        }
+                    }
                     let _ = self.fatal_tx.send(Some(reason));
                     tracing::warn!(%reason, "multi-hop session rejected by exit at setup; surfacing fatal");
                     return Err(MultiHopError::Rejected(reason));
                 }
                 SetupOutcome::TimedOut => {
+                    retrying_tokens = session_tokens.filter(TokenStack::is_retrying);
                     // The censor shape: the handshake passed, the request went
                     // out, nothing came back. No session is born, so the
                     // session-death path below never runs and this is the only
@@ -882,6 +1029,7 @@ impl MultiHopSupervisor {
                 SetupOutcome::Failed(error) => {
                     // Never published: the redial draws the next backoff
                     // delay, since nothing reset the schedule.
+                    retrying_tokens = session_tokens.filter(TokenStack::is_retrying);
                     self.report_setup_failure(&primary, &session_target, error.as_ref());
                     drop(primary);
                     continue;
@@ -913,7 +1061,12 @@ impl MultiHopSupervisor {
                 self.prober.clone(),
                 self.overlap.clone(),
             ));
-            self.spawn_background_bond(&bundle, &session_target, assign, session_tokens);
+            self.spawn_background_bond(
+                &bundle,
+                &session_target,
+                assign,
+                session_tokens.map(TokenStack::into_tokens),
+            );
             self.notify_on_reconnect(first_session);
             self.notify_path_rtt(
                 session_target.relay.relay_ed25519_pubkey,
@@ -1240,15 +1393,25 @@ impl MultiHopSupervisor {
         .await
     }
 
-    /// The anonymous v7 token stack for ONE session, or `None` when no
-    /// provider is wired (v6) or the provider yielded an empty stack (no token
-    /// available this epoch, so fall back to v6 rather than fail closed). Called
-    /// once per session establishment; the same stack feeds the primary and
-    /// every bonded secondary so they share one serial and one sticky IP.
-    fn select_session_tokens(&self) -> Option<Vec<SessionToken>> {
-        let provider = self.config.session_token_provider.as_ref()?;
-        let tokens = provider();
-        (!tokens.is_empty()).then_some(tokens)
+    /// The anonymous v7 token stack for ONE session. With no provider wired,
+    /// or an empty stack from it (no token available this epoch), the default
+    /// admission falls back to v6 (`Ok(None)`) rather than fail closed, and
+    /// [`SessionAdmission::TokensOnly`] fails with
+    /// [`NoSessionTokenCause::Empty`]. Called once per session establishment;
+    /// the same stack feeds the primary and every bonded secondary so they
+    /// share one serial and one sticky IP.
+    fn select_session_tokens(&self) -> Result<Option<TokenStack>, MultiHopError> {
+        let stack = self
+            .config
+            .session_token_provider
+            .as_ref()
+            .and_then(|provider| TokenStack::new(provider()));
+        match (stack, self.admission) {
+            (None, SessionAdmission::TokensOnly) => {
+                Err(MultiHopError::NoSessionToken(NoSessionTokenCause::Empty))
+            }
+            (stack, _) => Ok(stack),
+        }
     }
 
     /// Run the primary's reliable setup-stream round-trip, bounded by
@@ -1292,7 +1455,7 @@ impl MultiHopSupervisor {
         let placement = self.session_placement_hint(primary.exit_id());
         let setup_result = primary
             .setup_over_stream_with_options(
-                Some(&self.config.client_signing),
+                self.admission.wallet_identity(&self.config.client_signing),
                 self.config.wants_ipv6,
                 self.config.enable_daita,
                 session_tokens,
@@ -1382,6 +1545,7 @@ impl MultiHopSupervisor {
     /// check and leave one bond spanning two exits.
     async fn bond_secondaries(
         config: &SupervisorConfig,
+        admission: SessionAdmission,
         target: &CircuitTarget,
         primary_spec: IpAssignSpec,
         want: usize,
@@ -1396,9 +1560,15 @@ impl MultiHopSupervisor {
             // hands it the same sticky IP.
             let tokens = session_tokens.clone();
             dials.spawn(async move {
-                let secondary =
-                    Self::dial_secondary(&config, &target, index, primary_spec, tokens.as_deref())
-                        .await;
+                let secondary = Self::dial_secondary(
+                    &config,
+                    admission,
+                    &target,
+                    index,
+                    primary_spec,
+                    tokens.as_deref(),
+                )
+                .await;
                 (index, secondary)
             });
         }
@@ -1450,6 +1620,7 @@ impl MultiHopSupervisor {
         }
         let weak = Arc::downgrade(bundle);
         let config = self.config.clone();
+        let admission = self.admission;
         let target = dialled.clone();
         tokio::spawn(async move {
             let mut dials = tokio::task::JoinSet::new();
@@ -1459,8 +1630,15 @@ impl MultiHopSupervisor {
                 // Same token stack as the primary (shared serial -> same IP).
                 let tokens = session_tokens.clone();
                 dials.spawn(async move {
-                    Self::dial_secondary(&config, &target, index, primary_spec, tokens.as_deref())
-                        .await
+                    Self::dial_secondary(
+                        &config,
+                        admission,
+                        &target,
+                        index,
+                        primary_spec,
+                        tokens.as_deref(),
+                    )
+                    .await
                 });
             }
             let mut bonded = 1usize;
@@ -1502,11 +1680,10 @@ impl MultiHopSupervisor {
         &self,
         primary: Arc<MultiHopClient>,
         dialled: &CircuitTarget,
+        session_tokens: Option<&TokenStack>,
     ) -> Established {
-        // One token stack for this whole session (primary + secondaries).
-        let session_tokens = self.select_session_tokens();
         let primary_spec = match self
-            .setup_primary(&primary, session_tokens.as_deref())
+            .setup_primary(&primary, session_tokens.map(TokenStack::as_slice))
             .await
         {
             SetupOutcome::Assigned(spec) => spec,
@@ -1530,10 +1707,11 @@ impl MultiHopSupervisor {
             clients.extend(
                 Self::bond_secondaries(
                     &self.config,
+                    self.admission,
                     dialled,
                     primary_spec,
                     want,
-                    session_tokens.clone(),
+                    session_tokens.map(|stack| stack.as_slice().to_vec()),
                 )
                 .await,
             );
@@ -1557,32 +1735,65 @@ impl MultiHopSupervisor {
         &self,
     ) -> Option<(Arc<MultiHopBundle>, Arc<MultiHopClient>, CircuitTarget)> {
         let target = self.current_target();
-        let primary = match self.connect_once(&target).await {
-            Ok(c) => Arc::new(c),
-            Err(e) => {
-                // A refusal is reported like one met on a cold dial, so the
-                // deployer reselects while the current session still serves.
-                self.notify_dial_refused(&e, &target);
-                tracing::warn!(error = %e, "overlap dial failed; keeping the current session");
-                return None;
+        // Set once the exit refused a token: the next dial leads with the
+        // stack's next token instead of popping a fresh stack.
+        let mut retrying_tokens: Option<TokenStack> = None;
+        loop {
+            let primary = match self.connect_once(&target).await {
+                Ok(c) => Arc::new(c),
+                Err(e) => {
+                    // A refusal is reported like one met on a cold dial, so the
+                    // deployer reselects while the current session still serves.
+                    self.notify_dial_refused(&e, &target);
+                    tracing::warn!(error = %e, "overlap dial failed; keeping the current session");
+                    return None;
+                }
+            };
+            // One token stack for this whole session (primary + secondaries).
+            let session_tokens = match retrying_tokens.take() {
+                Some(stack) => Some(stack),
+                None => match self.select_session_tokens() {
+                    Ok(stack) => stack,
+                    Err(error) => {
+                        tracing::warn!(%error, "overlap dial has no session token; keeping the current session");
+                        return None;
+                    }
+                },
+            };
+            match self
+                .establish_session(primary, &target, session_tokens.as_ref())
+                .await
+            {
+                Established::Session { bundle, primary } => return Some((bundle, primary, target)),
+                Established::Rejected(reason) => {
+                    if is_token_refusal(reason)
+                        && let Some(mut stack) = session_tokens
+                        && stack.rotate()
+                    {
+                        tracing::info!(
+                            refused = stack.refused,
+                            stack = stack.tokens.len(),
+                            "overlap dial's session token refused; redialling with the next token"
+                        );
+                        retrying_tokens = Some(stack);
+                        continue;
+                    }
+                    tracing::warn!(%reason, "overlap dial rejected by exit; keeping the current session");
+                    return None;
+                }
+                // Deliberately NOT recorded as a censor signature: an overlap runs
+                // while a session is serving fine, so the network is demonstrably
+                // carrying traffic and a stalled warm dial says much less than the
+                // same stall on a cold one.
+                Established::SetupTimedOut => {
+                    tracing::warn!(
+                        "overlap dial setup answered nothing; keeping the current session"
+                    );
+                    return None;
+                }
+                // Already logged and reported by `establish_session`.
+                Established::SetupFailed => return None,
             }
-        };
-        match self.establish_session(primary, &target).await {
-            Established::Session { bundle, primary } => Some((bundle, primary, target)),
-            Established::Rejected(reason) => {
-                tracing::warn!(%reason, "overlap dial rejected by exit; keeping the current session");
-                None
-            }
-            // Deliberately NOT recorded as a censor signature: an overlap runs
-            // while a session is serving fine, so the network is demonstrably
-            // carrying traffic and a stalled warm dial says much less than the
-            // same stall on a cold one.
-            Established::SetupTimedOut => {
-                tracing::warn!("overlap dial setup answered nothing; keeping the current session");
-                None
-            }
-            // Already logged and reported by `establish_session`.
-            Established::SetupFailed => None,
         }
     }
 
@@ -1700,11 +1911,17 @@ impl MultiHopSupervisor {
     /// this connection, so it is closed and skipped.
     async fn dial_secondary(
         config: &SupervisorConfig,
+        admission: SessionAdmission,
         target: &CircuitTarget,
         index: usize,
         primary_spec: IpAssignSpec,
         session_tokens: Option<&[SessionToken]>,
     ) -> Option<Arc<MultiHopClient>> {
+        // A tokens-only primary never sets up without tokens, so this only
+        // guards a future caller against building a wallet request here.
+        if admission == SessionAdmission::TokensOnly && session_tokens.is_none_or(<[_]>::is_empty) {
+            return None;
+        }
         let bind_addr = secondary_bind_addr(config.bind_addr);
         for attempt in 0..2u8 {
             let result = Self::dial_target(config, target, bind_addr).await;
@@ -1728,7 +1945,7 @@ impl MultiHopSupervisor {
             // binding.
             let setup = client
                 .setup_over_stream_with_options(
-                    Some(&config.client_signing),
+                    admission.wallet_identity(&config.client_signing),
                     config.wants_ipv6,
                     config.enable_daita,
                     session_tokens,
@@ -2471,6 +2688,64 @@ mod tests {
         );
     }
 
+    fn token(fill: u8) -> SessionToken {
+        SessionToken([fill; warrenguard_wire::SESSION_TOKEN_LEN])
+    }
+
+    fn leads(stack: &TokenStack) -> Vec<u8> {
+        stack.as_slice().iter().map(|t| t.0[0]).collect()
+    }
+
+    #[test]
+    fn a_refused_lead_token_moves_to_the_back_of_the_stack_until_each_was_presented() {
+        // The refused token stays in the stack (another session may release its
+        // serial), and the redials stop once every token led one attempt.
+        let mut stack = TokenStack::new(vec![token(1), token(2), token(3)]).expect("non-empty");
+        assert!(stack.rotate());
+        assert_eq!(leads(&stack), [2, 3, 1]);
+        assert!(stack.rotate());
+        assert_eq!(leads(&stack), [3, 1, 2]);
+        assert!(!stack.rotate(), "a third refusal has no untried token left");
+        assert_eq!(
+            leads(&stack),
+            [3, 1, 2],
+            "an exhausted stack keeps its tokens"
+        );
+    }
+
+    #[test]
+    fn a_single_token_stack_has_no_next_token() {
+        let mut stack = TokenStack::new(vec![token(1)]).expect("non-empty");
+        assert!(!stack.rotate());
+    }
+
+    #[test]
+    fn an_empty_provider_stack_is_no_stack() {
+        assert!(TokenStack::new(Vec::new()).is_none());
+    }
+
+    #[test]
+    fn only_the_refusals_a_token_can_cause_move_to_the_next_token() {
+        // A v7 refusal of any cause reaches the client as the sealed `Rejected`
+        // detail (or, detail lost, the opaque close). Pool exhaustion and a ban
+        // are not about the token: another token cannot change them.
+        assert!(is_token_refusal(RejectionReason::NotAllowlisted));
+        assert!(is_token_refusal(RejectionReason::PolicyRefused));
+        assert!(!is_token_refusal(RejectionReason::IpExhausted));
+        assert!(!is_token_refusal(RejectionReason::Banned(0)));
+    }
+
+    #[test]
+    fn tokens_only_admission_never_hands_the_wallet_key_to_a_setup() {
+        let key = SigningKey::from_bytes(&[0x07; 32]);
+        assert!(SessionAdmission::TokensOnly.wallet_identity(&key).is_none());
+        assert!(
+            SessionAdmission::TokensOrWallet
+                .wallet_identity(&key)
+                .is_some()
+        );
+    }
+
     #[test]
     fn a_supervisor_names_an_address_only_to_the_exit_that_assigned_it() {
         // An address is one exit's allocation. Naming it to another exit
@@ -2701,7 +2976,7 @@ mod run_tests {
     use ed25519_dalek::SigningKey;
 
     use super::*;
-    use crate::test_support::{FakeMultihopExit, spawn_fake_multihop_exit};
+    use crate::test_support::{FakeMultihopExit, SeenSetupRequest, spawn_fake_multihop_exit};
 
     fn config_with_fake_exit(
         exit: &FakeMultihopExit,
@@ -4412,5 +4687,308 @@ mod run_tests {
 
         drop(rx);
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    /// A provider that hands out `stacks` in order (then empty stacks) and
+    /// counts its calls, so a test can see that no token was popped twice.
+    fn provider_of(
+        stacks: Vec<Vec<SessionToken>>,
+    ) -> (SessionTokenProvider, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let queue = Arc::new(Mutex::new(std::collections::VecDeque::from(stacks)));
+        let provider: SessionTokenProvider = Arc::new({
+            let calls = calls.clone();
+            move || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                queue
+                    .lock()
+                    .expect("provider lock")
+                    .pop_front()
+                    .unwrap_or_default()
+            }
+        });
+        (provider, calls)
+    }
+
+    fn v7_token(fill: u8) -> SessionToken {
+        SessionToken([fill; warrenguard_wire::SESSION_TOKEN_LEN])
+    }
+
+    fn presented(fills: &[u8]) -> SeenSetupRequest {
+        SeenSetupRequest::Tokens(
+            fills
+                .iter()
+                .map(|f| [*f; warrenguard_wire::SESSION_TOKEN_LEN])
+                .collect(),
+        )
+    }
+
+    async fn first_session(rx: &mut ClientWatch) -> Arc<MultiHopBundle> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(b) = rx.borrow_and_update().clone() {
+                    return b;
+                }
+                rx.changed().await.expect("watch sender alive");
+            }
+        })
+        .await
+        .expect("a session is published")
+    }
+
+    #[tokio::test]
+    async fn tokens_only_with_no_token_fails_typed_and_never_sends_a_setup_request() {
+        let operational_key = SigningKey::from_bytes(&[0x61; 32]);
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x71; 16]));
+        let mut config = config_with_fake_exit(&exit, &operational_key);
+        let (provider, calls) = provider_of(Vec::new());
+        config.session_token_provider = Some(provider);
+        let (supervisor, _rx) = MultiHopSupervisor::new(config);
+        let supervisor = supervisor.with_session_admission(SessionAdmission::TokensOnly);
+        let mut fatal_rx = supervisor.fatal_rx();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), supervisor.run())
+            .await
+            .expect("run() must stop, not redial, when no token is available");
+
+        assert!(
+            matches!(
+                result,
+                Err(MultiHopError::NoSessionToken(NoSessionTokenCause::Empty))
+            ),
+            "got {result:?}"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(
+            exit.setup_requests.lock().is_empty(),
+            "no setup request of any kind may leave: {:?}",
+            exit.setup_requests.lock()
+        );
+        assert_eq!(
+            *fatal_rx.borrow_and_update(),
+            None,
+            "a missing token is not an exit rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_the_policy_an_empty_token_stack_keeps_the_wallet_signed_request() {
+        let operational_key = SigningKey::from_bytes(&[0x62; 32]);
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x72; 16]));
+        let mut config = config_with_fake_exit(&exit, &operational_key);
+        config.session_token_provider = Some(provider_of(Vec::new()).0);
+        let (supervisor, mut rx) = MultiHopSupervisor::new(config);
+        let task = tokio::spawn(supervisor.run());
+
+        let bundle = first_session(&mut rx).await;
+
+        assert_eq!(
+            *exit.setup_requests.lock(),
+            vec![SeenSetupRequest::Wallet { names_pubkey: true }]
+        );
+        drop(bundle);
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    #[tokio::test]
+    async fn a_token_refused_as_in_use_is_followed_by_the_next_token_of_the_stack() {
+        let operational_key = SigningKey::from_bytes(&[0x63; 32]);
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x73; 16]));
+        exit.tokens_in_use
+            .lock()
+            .push([1; warrenguard_wire::SESSION_TOKEN_LEN]);
+        let mut config = config_with_fake_exit(&exit, &operational_key);
+        let (provider, calls) = provider_of(vec![vec![v7_token(1), v7_token(2), v7_token(3)]]);
+        config.session_token_provider = Some(provider);
+        let (supervisor, mut rx) = MultiHopSupervisor::new(config);
+        let supervisor = supervisor.with_session_admission(SessionAdmission::TokensOnly);
+        let task = tokio::spawn(supervisor.run());
+
+        let bundle = first_session(&mut rx).await;
+
+        assert_eq!(
+            *exit.setup_requests.lock(),
+            vec![presented(&[1, 2, 3]), presented(&[2, 3, 1])],
+            "the redial leads with the next token and keeps the refused one"
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "the retry reuses the stack instead of popping new tokens"
+        );
+        drop(bundle);
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    #[tokio::test]
+    async fn every_token_refused_ends_after_one_attempt_per_token_and_stays_fatal_by_default() {
+        let operational_key = SigningKey::from_bytes(&[0x64; 32]);
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x74; 16]));
+        exit.tokens_in_use.lock().extend([
+            [1; warrenguard_wire::SESSION_TOKEN_LEN],
+            [2; warrenguard_wire::SESSION_TOKEN_LEN],
+        ]);
+        let mut config = config_with_fake_exit(&exit, &operational_key);
+        config.session_token_provider = Some(provider_of(vec![vec![v7_token(1), v7_token(2)]]).0);
+        let (supervisor, _rx) = MultiHopSupervisor::new(config);
+        let mut fatal_rx = supervisor.fatal_rx();
+
+        let result = tokio::time::timeout(Duration::from_secs(10), supervisor.run())
+            .await
+            .expect("the retries are bounded by the stack");
+
+        assert!(
+            matches!(
+                result,
+                Err(MultiHopError::Rejected(RejectionReason::NotAllowlisted))
+            ),
+            "got {result:?}"
+        );
+        assert_eq!(
+            *fatal_rx.borrow_and_update(),
+            Some(RejectionReason::NotAllowlisted)
+        );
+        assert_eq!(
+            *exit.setup_requests.lock(),
+            vec![presented(&[1, 2]), presented(&[2, 1])]
+        );
+    }
+
+    #[tokio::test]
+    async fn tokens_only_with_every_token_refused_fails_typed_without_a_wallet_request() {
+        let operational_key = SigningKey::from_bytes(&[0x65; 32]);
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x75; 16]));
+        exit.tokens_in_use.lock().extend([
+            [1; warrenguard_wire::SESSION_TOKEN_LEN],
+            [2; warrenguard_wire::SESSION_TOKEN_LEN],
+        ]);
+        let mut config = config_with_fake_exit(&exit, &operational_key);
+        config.session_token_provider = Some(provider_of(vec![vec![v7_token(1), v7_token(2)]]).0);
+        let (supervisor, _rx) = MultiHopSupervisor::new(config);
+        let supervisor = supervisor.with_session_admission(SessionAdmission::TokensOnly);
+        let mut fatal_rx = supervisor.fatal_rx();
+
+        let result = tokio::time::timeout(Duration::from_secs(10), supervisor.run())
+            .await
+            .expect("the retries are bounded by the stack");
+
+        assert!(
+            matches!(
+                result,
+                Err(MultiHopError::NoSessionToken(
+                    NoSessionTokenCause::AllRefused
+                ))
+            ),
+            "got {result:?}"
+        );
+        assert_eq!(
+            *exit.setup_requests.lock(),
+            vec![presented(&[1, 2]), presented(&[2, 1])],
+            "only token requests, one per token"
+        );
+        assert_eq!(*fatal_rx.borrow_and_update(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_overlap_whose_token_is_in_use_swaps_in_on_the_next_token() {
+        let operational_key = SigningKey::from_bytes(&[0x66; 32]);
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x76; 16]));
+        let mut config = config_with_fake_exit(&exit, &operational_key);
+        config.session_token_provider =
+            Some(provider_of(vec![vec![v7_token(1)], vec![v7_token(2), v7_token(3)]]).0);
+        let swaps = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        config.on_overlap_swapped = Some(Arc::new({
+            let swaps = swaps.clone();
+            move |_: &CircuitTarget| {
+                swaps.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+        let (supervisor, mut rx) = MultiHopSupervisor::new(config);
+        let supervisor = supervisor.with_session_admission(SessionAdmission::TokensOnly);
+        let handle = supervisor.handle();
+        let task = tokio::spawn(supervisor.run());
+        drop(first_session(&mut rx).await);
+        exit.tokens_in_use
+            .lock()
+            .push([2; warrenguard_wire::SESSION_TOKEN_LEN]);
+
+        handle.overlap_reconnect();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while swaps.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the overlap swaps in on the next token");
+
+        assert_eq!(
+            *exit.setup_requests.lock(),
+            vec![presented(&[1]), presented(&[2, 3]), presented(&[3, 2])]
+        );
+        drop(rx);
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    #[tokio::test]
+    async fn a_retrying_stack_survives_a_failed_setup_and_is_presented_again() {
+        // The first token is refused, then the setup leading with the second
+        // fails for an unrelated reason: the redial re-presents the rotated
+        // stack rather than popping a fresh one and losing the refused token.
+        let operational_key = SigningKey::from_bytes(&[0x67; 32]);
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x77; 16]));
+        exit.tokens_in_use
+            .lock()
+            .push([1; warrenguard_wire::SESSION_TOKEN_LEN]);
+        *exit.garbage_reply_on.lock() = Some(2);
+        let mut config = config_with_fake_exit(&exit, &operational_key);
+        let (provider, calls) = provider_of(vec![vec![v7_token(1), v7_token(2)]]);
+        config.session_token_provider = Some(provider);
+        let (supervisor, mut rx) = MultiHopSupervisor::new(config);
+        let task = tokio::spawn(supervisor.run());
+
+        let bundle = first_session(&mut rx).await;
+
+        assert_eq!(
+            *exit.setup_requests.lock(),
+            vec![presented(&[1, 2]), presented(&[2, 1])],
+            "the garbage-answered attempt is not recorded; the admitted one re-presents the stack"
+        );
+        assert_eq!(exit.accepted.load(Ordering::Relaxed), 3);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        drop(bundle);
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    #[tokio::test]
+    async fn a_tokens_only_secondary_without_tokens_is_never_dialled() {
+        let operational_key = SigningKey::from_bytes(&[0x68; 32]);
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x78; 16]));
+        let config = config_with_fake_exit(&exit, &operational_key);
+        let spec = IpAssignSpec {
+            assigned: std::net::Ipv4Addr::new(10, 77, 0, 2),
+            prefix_len: 24,
+            gateway: std::net::Ipv4Addr::new(10, 77, 0, 1),
+            assigned_v6: None,
+            prefix_len_v6: 0,
+            gateway_v6: None,
+        };
+
+        let secondary = MultiHopSupervisor::dial_secondary(
+            &config,
+            SessionAdmission::TokensOnly,
+            &CircuitTarget::from_config(&config),
+            1,
+            spec,
+            None,
+        )
+        .await;
+
+        assert!(secondary.is_none());
+        assert_eq!(exit.accepted.load(Ordering::Relaxed), 0);
+        assert!(exit.setup_requests.lock().is_empty());
     }
 }

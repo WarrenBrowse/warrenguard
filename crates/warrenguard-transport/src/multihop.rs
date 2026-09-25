@@ -192,6 +192,35 @@ pub enum MultiHopError {
     /// Never path evidence: the leg is gone, not broken.
     #[error("no bonded session at that leg index")]
     NoSession,
+    /// A tokens-only session had no v7 token the exit would admit, so it was
+    /// never set up (see
+    /// [`crate::supervisor::SessionAdmission::TokensOnly`]). No wallet-signed
+    /// request was sent. Carries no token material.
+    #[error("no usable session token: {0}")]
+    NoSessionToken(NoSessionTokenCause),
+}
+
+/// Why a tokens-only session had no usable v7 token
+/// ([`MultiHopError::NoSessionToken`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NoSessionTokenCause {
+    /// The token provider had no token to hand out (none configured, or its
+    /// store is empty for the current epoch).
+    Empty,
+    /// The exit refused every token of the stack, one attempt each. The wire
+    /// does not say why; with a wallet's tokens shared across its devices the
+    /// usual cause is that each serial already holds a live session elsewhere.
+    AllRefused,
+}
+
+impl core::fmt::Display for NoSessionTokenCause {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Empty => "no token available",
+            Self::AllRefused => "every token was refused",
+        })
+    }
 }
 
 impl MultiHopError {

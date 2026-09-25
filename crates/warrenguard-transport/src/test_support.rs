@@ -21,12 +21,13 @@ use quinn::{Connection, Endpoint};
 use warrenguard_multihop::{
     ExitId, ExitSession, RelayDescriptorSigned, WarrenControlMessage, decode_frame, encode_control,
     encode_frame, relay_descriptor_signing_payload, test_support::derive_exit_keypair,
+    try_decode_control,
 };
 #[cfg(feature = "pq-hpke")]
 use warrenguard_multihop::{
     PqExitSession, XWingRecipientSecretKey, decode_frame_v2, encode_frame_v2,
 };
-use warrenguard_wire::WarrenPubkey;
+use warrenguard_wire::{SESSION_TOKEN_LEN, WarrenPubkey};
 
 #[cfg(feature = "pq-hpke")]
 use crate::multihop::client_pq_setup_material_for_test;
@@ -431,6 +432,9 @@ pub(crate) struct FakeMultihopExit {
     /// frame, and the connection is held open: a setup that fails while the
     /// connection itself stays up.
     pub(crate) garbage_reply: Arc<AtomicBool>,
+    /// `Some(n)`: the `n`-th accepted connection (1-based) gets the
+    /// `garbage_reply` answer, every other one the normal answer.
+    pub(crate) garbage_reply_on: Arc<parking_lot::Mutex<Option<usize>>>,
     /// When each connection was accepted, in order, so a test can measure the
     /// spacing of the client's redials.
     pub(crate) accepted_at: Arc<parking_lot::Mutex<Vec<Instant>>>,
@@ -454,8 +458,28 @@ pub(crate) struct FakeMultihopExit {
     /// reply on its way back, the way an exit drops one it dispatched to a
     /// dead downlink sender or one too large for the sender it picked.
     pub(crate) lose_reply: ReplyLoss,
+    /// Every setup request this exit opened, in arrival order.
+    pub(crate) setup_requests: Arc<parking_lot::Mutex<Vec<SeenSetupRequest>>>,
+    /// Tokens whose serial is leased elsewhere. A v7 request whose FIRST token
+    /// is listed is refused with the sealed `Rejected` detail, the way a real
+    /// exit spends the first token that verifies and stops at the refusal.
+    pub(crate) tokens_in_use: Arc<parking_lot::Mutex<Vec<[u8; SESSION_TOKEN_LEN]>>>,
     on_next_dial: NextDialHook,
     _server_ep: Endpoint,
+}
+
+/// What the fake exit read from one setup request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SeenSetupRequest {
+    /// A v6 wallet-path `IpRequest`, and whether it named an account pubkey.
+    Wallet {
+        /// `client_pubkey` was present.
+        names_pubkey: bool,
+    },
+    /// A v7 `IpRequestV7` with its tokens in presentation order.
+    Tokens(Vec<[u8; SESSION_TOKEN_LEN]>),
+    /// Anything else, or a plaintext that is no control message.
+    Other,
 }
 
 /// See [`FakeMultihopExit::lose_reply`].
@@ -531,10 +555,13 @@ struct FakeExitBehaviour {
     refuse_setup: Arc<AtomicU32>,
     close_after_setup: Arc<AtomicBool>,
     garbage_reply: Arc<AtomicBool>,
+    garbage_reply_on: Arc<parking_lot::Mutex<Option<usize>>>,
     hold_setup_reply: Arc<parking_lot::Mutex<Option<(usize, Duration)>>>,
     legs: Arc<parking_lot::Mutex<Vec<FakeLeg>>>,
     mute_leg: Arc<parking_lot::Mutex<Option<usize>>>,
     lose_reply: ReplyLoss,
+    setup_requests: Arc<parking_lot::Mutex<Vec<SeenSetupRequest>>>,
+    tokens_in_use: Arc<parking_lot::Mutex<Vec<[u8; SESSION_TOKEN_LEN]>>>,
 }
 
 const FAKE_EXIT_IKM: [u8; 32] = [0x99; 32];
@@ -567,7 +594,9 @@ async fn serve_one_fake_exit_connection(
         conn.close(quinn::VarInt::from_u32(refuse_code), &[]);
         return;
     }
-    if behaviour.garbage_reply.load(Ordering::Relaxed) {
+    if behaviour.garbage_reply.load(Ordering::Relaxed)
+        || *behaviour.garbage_reply_on.lock() == Some(ordinal)
+    {
         if send.write_all(&[0xEE; 64]).await.is_ok() {
             let _ = send.finish();
         }
@@ -585,14 +614,32 @@ async fn serve_one_fake_exit_connection(
     let Ok(exit_session) = ExitSession::new(&exit_priv, &frame.encapsulated_key, exit_id) else {
         return;
     };
-    if exit_session.open(&frame).is_err() {
+    let Ok(request) = exit_session.open(&frame) else {
         return;
-    }
+    };
+    let seen = match try_decode_control(&request) {
+        Ok(Some(WarrenControlMessage::IpRequest { client_pubkey, .. })) => {
+            SeenSetupRequest::Wallet {
+                names_pubkey: client_pubkey.is_some(),
+            }
+        }
+        Ok(Some(WarrenControlMessage::IpRequestV7 { session_tokens, .. })) => {
+            SeenSetupRequest::Tokens(session_tokens.iter().map(|t| t.0).collect())
+        }
+        _ => SeenSetupRequest::Other,
+    };
+    let lead_token_in_use = match &seen {
+        SeenSetupRequest::Tokens(tokens) => tokens
+            .first()
+            .is_some_and(|lead| behaviour.tokens_in_use.lock().contains(lead)),
+        _ => false,
+    };
+    behaviour.setup_requests.lock().push(seen);
     let reply_msg = if behaviour.reject_banned.load(Ordering::Relaxed) {
         WarrenControlMessage::RejectedBanned {
             reason_code: behaviour.ban_reason_code.load(Ordering::Relaxed),
         }
-    } else if behaviour.reject.load(Ordering::Relaxed) {
+    } else if behaviour.reject.load(Ordering::Relaxed) || lead_token_in_use {
         WarrenControlMessage::Rejected
     } else {
         WarrenControlMessage::IpAssign {
@@ -753,10 +800,13 @@ pub(crate) fn spawn_fake_multihop_exit_on(
         refuse_setup: Arc::new(AtomicU32::new(0)),
         close_after_setup: Arc::new(AtomicBool::new(false)),
         garbage_reply: Arc::new(AtomicBool::new(false)),
+        garbage_reply_on: Arc::new(parking_lot::Mutex::new(None)),
         hold_setup_reply: Arc::new(parking_lot::Mutex::new(None)),
         legs: Arc::new(parking_lot::Mutex::new(Vec::new())),
         mute_leg: Arc::new(parking_lot::Mutex::new(None)),
         lose_reply: Arc::new(parking_lot::Mutex::new(None)),
+        setup_requests: Arc::new(parking_lot::Mutex::new(Vec::new())),
+        tokens_in_use: Arc::new(parking_lot::Mutex::new(Vec::new())),
     };
 
     let refuse_handshake = Arc::new(AtomicBool::new(false));
@@ -810,12 +860,15 @@ pub(crate) fn spawn_fake_multihop_exit_on(
         refuse_setup: behaviour.refuse_setup,
         close_after_setup: behaviour.close_after_setup,
         garbage_reply: behaviour.garbage_reply,
+        garbage_reply_on: behaviour.garbage_reply_on,
         accepted_at,
         refuse_handshake,
         hold_setup_reply: behaviour.hold_setup_reply,
         legs: behaviour.legs,
         mute_leg: behaviour.mute_leg,
         lose_reply: behaviour.lose_reply,
+        setup_requests: behaviour.setup_requests,
+        tokens_in_use: behaviour.tokens_in_use,
         on_next_dial,
         _server_ep: server_ep,
     })
