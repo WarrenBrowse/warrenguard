@@ -2370,6 +2370,11 @@ impl MultiHopClient {
     /// as a fallback is ignored. `None` or an empty slice keeps the v6 path
     /// verbatim.
     ///
+    /// Every token of the slice goes on the wire in the one request, so an
+    /// exit sees all their serials together and can link the holder's other
+    /// sessions presenting one of them. Pass a single token, as the
+    /// supervisor does, unless that linkage is acceptable.
+    ///
     /// # Errors
     ///
     /// Same as [`Self::setup_over_stream`].
