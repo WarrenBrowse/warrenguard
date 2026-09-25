@@ -91,6 +91,30 @@ pub trait PortBudget: Send + Sync {
     fn budget_for(&self, client_ip: Ipv4Addr) -> Option<usize>;
 }
 
+/// Hears about every mapping that leaves the table on the engine's own
+/// decision, so a deployer that keeps something per mapping can drop it with
+/// the mapping.
+///
+/// Reported: a client's release, a release through the backend (including the
+/// rollback of an allocation whose rule could not be installed), a lease the
+/// expiry sweep drops, and the old port of a refresh that moved or of a port
+/// reclaimed from a departed address. A renewal that keeps its port is not a
+/// removal and is not reported: the mapping never stops existing.
+///
+/// NOT reported: what the deployer removes itself
+/// ([`Allocator::take_active_for_ip`], [`Allocator::take_active_for_port`],
+/// [`Allocator::take_active_for_slot`], [`Allocator::revoke_for_abuse`]).
+/// Those calls return what they removed, and the caller may need to read what
+/// it bound to a mapping before dropping it, which a report sent from inside
+/// the call would already have destroyed.
+///
+/// Like [`QuotaPeers`], the callback runs with the allocator's lock released,
+/// on the thread that made the call.
+pub trait ReleaseObserver: Send + Sync {
+    /// `allocations` have left the table. Never called with an empty slice.
+    fn released(&self, allocations: &[Allocation]);
+}
+
 /// Tunable configuration for the [`Allocator`]. Use [`Allocator::new`]
 /// for the Warren defaults; reach for `with_config` when a test needs
 /// to shrink limits or a future subscription tier needs to widen the
@@ -182,6 +206,9 @@ pub struct AllocateOutcome {
 ///   consecutive sessions (anti-predictable-rotation mitigation).
 /// - `rate_limit_log`: `client_ip → sliding window of request
 ///   instants`. Rejects if > 5 allocations in the last 60 seconds.
+/// - `abuse_quarantine_until`: ports closed after an abuse report
+///   ([`Allocator::revoke_for_abuse`]), out of every client's reach until
+///   the deadline, the previous tenant included.
 pub struct Allocator {
     inner: Mutex<Inner>,
     range: (u16, u16),
@@ -201,6 +228,9 @@ pub struct Allocator {
     /// pinned port from its own dead session. Unset refuses both (see
     /// [`LiveSessions`]).
     live_sessions: OnceLock<Arc<dyn LiveSessions>>,
+    /// Told about every mapping the engine removes on its own decision (see
+    /// [`ReleaseObserver`]). Unset reports nothing.
+    release_observer: OnceLock<Arc<dyn ReleaseObserver>>,
     counters: AllocatorCounters,
 }
 
@@ -219,6 +249,7 @@ struct AllocatorCounters {
     exhausted: AtomicU64,
     suggested_in_use: AtomicU64,
     reclaimed_from_departed_peer: AtomicU64,
+    abuse_revocations: AtomicU64,
 }
 
 /// Snapshot of [`Allocator`] counters. Cheap to copy and stable
@@ -260,6 +291,10 @@ pub struct AllocatorMetrics {
     /// and an operator needs it to tell whether reconnects still lose their
     /// forward.
     pub reclaimed_from_departed_peer_total: u64,
+    /// Ports taken off a tenant by [`Allocator::revoke_for_abuse`], one per
+    /// port whatever the number of legs. A revoke that found the port free
+    /// adds nothing.
+    pub abuse_revocations_total: u64,
 }
 
 struct Inner {
@@ -270,6 +305,10 @@ struct Inner {
     /// it earlier than needed, which costs one idle walk at most.
     next_expiry: Option<Instant>,
     cooldown_until: HashMap<u16, Instant>,
+    /// Ports an operator closed after an abuse report, until when. Unlike
+    /// `cooldown_until`, no tenant bypass lifts it (see
+    /// [`Allocator::revoke_for_abuse`]).
+    abuse_quarantine_until: HashMap<u16, Instant>,
     last_user_per_port: HashMap<u16, (Ipv4Addr, Instant)>,
     rate_limit_log: HashMap<Ipv4Addr, VecDeque<Instant>>,
 }
@@ -342,6 +381,8 @@ impl Inner {
     /// checks expiry itself, so this changes no decision.
     fn trim_side_maps(&mut self, now: Instant, rate_window: Duration) {
         self.cooldown_until.retain(|_, expiry| *expiry > now);
+        self.abuse_quarantine_until
+            .retain(|_, expiry| *expiry > now);
         self.last_user_per_port
             .retain(|_, (_, expiry)| *expiry > now);
         self.rate_limit_log.retain(|_, log| {
@@ -445,6 +486,7 @@ impl Allocator {
                 active: HashMap::new(),
                 next_expiry: None,
                 cooldown_until: HashMap::new(),
+                abuse_quarantine_until: HashMap::new(),
                 last_user_per_port: HashMap::new(),
                 rate_limit_log: HashMap::new(),
             }),
@@ -456,6 +498,7 @@ impl Allocator {
             quota_peers: OnceLock::new(),
             port_budget: OnceLock::new(),
             live_sessions: OnceLock::new(),
+            release_observer: OnceLock::new(),
             counters: AllocatorCounters::default(),
         }
     }
@@ -497,6 +540,27 @@ impl Allocator {
         self.live_sessions.set(sessions).is_ok()
     }
 
+    /// Report to `observer` every mapping the engine removes on its own
+    /// decision. See [`ReleaseObserver`] for what is and is not reported.
+    ///
+    /// Wired once, at startup, like [`Self::set_quota_peers`]: a later call is
+    /// ignored and returns `false`, so a second wiring can never orphan what
+    /// the first observer holds.
+    pub fn set_release_observer(&self, observer: Arc<dyn ReleaseObserver>) -> bool {
+        self.release_observer.set(observer).is_ok()
+    }
+
+    /// Hands `removed` to the release observer, if any. Called with the lock
+    /// released.
+    fn report_released(&self, removed: &[Allocation]) {
+        if removed.is_empty() {
+            return;
+        }
+        if let Some(observer) = self.release_observer.get() {
+            observer.released(removed);
+        }
+    }
+
     /// Snapshot of the monotonic event counters. Useful for ops
     /// dashboards (Prometheus exporter, admin JSON view) and tests
     /// that assert on behavior end-to-end without prying into the
@@ -515,6 +579,7 @@ impl Allocator {
                 .counters
                 .reclaimed_from_departed_peer
                 .load(Ordering::Relaxed),
+            abuse_revocations_total: self.counters.abuse_revocations.load(Ordering::Relaxed),
         }
     }
 
@@ -655,10 +720,33 @@ impl Allocator {
                 self.try_allocate(&mut g, &request, &answers, &mut evicted)
             };
             match step {
-                Step::Done(result) => return AllocateOutcome { result, evicted },
+                Step::Done(result) => {
+                    self.report_evicted(&evicted, result.as_ref().ok());
+                    return AllocateOutcome { result, evicted };
+                }
                 Step::Ask(question) => self.ask(question, client_ip, &mut answers),
             }
         }
+    }
+
+    /// Reports what an allocation removed, except the mapping it re-granted in
+    /// place: a renewal that keeps its port, same address and same slot, never
+    /// stopped existing.
+    fn report_evicted(&self, evicted: &[Allocation], granted: Option<&Allocation>) {
+        if self.release_observer.get().is_none() {
+            return;
+        }
+        let removed: Vec<Allocation> = evicted
+            .iter()
+            .filter(|e| {
+                granted.is_none_or(|g| {
+                    (e.external_port, e.proto, e.internal_ip)
+                        != (g.external_port, g.proto, g.internal_ip)
+                })
+            })
+            .cloned()
+            .collect();
+        self.report_released(&removed);
     }
 
     /// The answers a request starts with: the callbacks the deployer did not
@@ -748,6 +836,23 @@ impl Allocator {
         // from `active` go to `evicted`, which EVERY return path - the
         // error returns included - hands back for backend teardown.
         g.sweep_expired(now, self.cooldown, evicted);
+
+        // A port under abuse quarantine is nobody's to pin, its former tenant
+        // least of all. The suggestion is dropped and the request is served
+        // like one without a preference: a refresh keeps the port the client
+        // already holds, a new request gets a fresh one. This is the one
+        // exception to the strict honouring below, because refusing would
+        // leave a pinned forward failing at every renewal for the whole
+        // quarantine.
+        let suggested = if g
+            .abuse_quarantine_until
+            .get(&suggested)
+            .is_some_and(|until| *until > now)
+        {
+            0
+        } else {
+            suggested
+        };
 
         // Strict honouring of an explicit suggestion. RFC 6886 §3.3
         // permits the server to grant a different port, but Warren's UX
@@ -1125,21 +1230,22 @@ impl Allocator {
     /// Variant with an injectable `now`.
     pub fn release_at(&self, alloc: &Allocation, now: Instant) {
         let mut g = self.inner.lock();
-        if g.active
-            .remove(&(alloc.external_port, alloc.proto))
-            .is_some()
-        {
-            g.cooldown_until
-                .insert(alloc.external_port, now + self.cooldown);
-            // Anti-rotation expires with the cooldown: past that, the
-            // same client may re-request the same port (no permanent
-            // penalty).
-            g.last_user_per_port.insert(
-                alloc.external_port,
-                (alloc.internal_ip, now + self.cooldown),
-            );
-            self.counters.releases.fetch_add(1, Ordering::Relaxed);
-        }
+        let Some(removed) = g.active.remove(&(alloc.external_port, alloc.proto)) else {
+            return;
+        };
+        g.cooldown_until
+            .insert(alloc.external_port, now + self.cooldown);
+        // Anti-rotation expires with the cooldown: past that, the
+        // same client may re-request the same port (no permanent
+        // penalty).
+        g.last_user_per_port.insert(
+            alloc.external_port,
+            (alloc.internal_ip, now + self.cooldown),
+        );
+        drop(g);
+        self.counters.releases.fetch_add(1, Ordering::Relaxed);
+        // What was actually in the slot, which is what a deployer bound to.
+        self.report_released(std::slice::from_ref(&removed));
     }
 
     /// Releases a mapping identified by `(client_ip, internal_port,
@@ -1190,7 +1296,9 @@ impl Allocator {
         g.cooldown_until.insert(key.0, now + self.cooldown);
         g.last_user_per_port
             .insert(key.0, (alloc.internal_ip, now + self.cooldown));
+        drop(g);
         self.counters.releases.fetch_add(1, Ordering::Relaxed);
+        self.report_released(std::slice::from_ref(&alloc));
         Some(alloc)
     }
 
@@ -1305,22 +1413,75 @@ impl Allocator {
     /// Variant of [`Self::take_active_for_port`] with an injectable
     /// `now` for tests.
     pub fn take_active_for_port_at(&self, port: u16, now: Instant) -> Vec<Allocation> {
-        let mut g = self.inner.lock();
-        let mut removed = Vec::new();
-        for proto in [Proto::Tcp, Proto::Udp] {
-            if let Some(alloc) = g.active.remove(&(port, proto)) {
-                g.cooldown_until.insert(port, now + self.cooldown);
-                g.last_user_per_port
-                    .insert(port, (alloc.internal_ip, now + self.cooldown));
-                removed.push(alloc);
-            }
-        }
+        let removed = take_port(&mut self.inner.lock(), port, now + self.cooldown);
         if !removed.is_empty() {
             let n = removed.len() as u64;
             self.counters.releases.fetch_add(n, Ordering::Relaxed);
             self.counters.evictions.fetch_add(n, Ordering::Relaxed);
         }
         removed
+    }
+
+    /// Close `port` after an abuse report: remove both legs of whatever holds
+    /// it, return them for teardown, and keep the port out of every client's
+    /// reach for `quarantine`.
+    ///
+    /// Differs from [`Self::take_active_for_port`] in what follows the take.
+    /// The ordinary cooldown is lifted for the tenant that held the port, so a
+    /// payer that reconnects keeps its pinned forward; a pinned client would
+    /// therefore get a reported port back at its next renewal. The quarantine
+    /// has no such bypass: while it runs, a suggestion of the port reads as
+    /// "no preference" (the client is served another port) and the random pick
+    /// never lands on it.
+    ///
+    /// The quarantine is armed even when nothing holds the port, since a report
+    /// can arrive after the mapping lapsed and the tenant that let it lapse
+    /// must not walk back onto it. A second report never shortens a running
+    /// quarantine. `quarantine` is capped at [`MAX_ABUSE_QUARANTINE`].
+    ///
+    /// The removed mappings are returned rather than reported to the
+    /// [`ReleaseObserver`], so the caller can read what it bound to them first.
+    ///
+    /// # Warning
+    ///
+    /// Like [`Self::take_active_for_port`], no owner check: never reachable
+    /// with a client-supplied port.
+    pub fn revoke_for_abuse(&self, port: u16, quarantine: Duration) -> Vec<Allocation> {
+        self.revoke_for_abuse_at(port, quarantine, Instant::now())
+    }
+
+    /// [`Self::revoke_for_abuse`] with an injectable `now`.
+    pub fn revoke_for_abuse_at(
+        &self,
+        port: u16,
+        quarantine: Duration,
+        now: Instant,
+    ) -> Vec<Allocation> {
+        let until = now + quarantine.min(MAX_ABUSE_QUARANTINE);
+        let mut g = self.inner.lock();
+        let slot = g.abuse_quarantine_until.entry(port).or_insert(until);
+        if until > *slot {
+            *slot = until;
+        }
+        let removed = take_port(&mut g, port, now + self.cooldown);
+        drop(g);
+        if !removed.is_empty() {
+            let n = removed.len() as u64;
+            self.counters.releases.fetch_add(n, Ordering::Relaxed);
+            self.counters.evictions.fetch_add(n, Ordering::Relaxed);
+            self.counters
+                .abuse_revocations
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        removed
+    }
+
+    /// Number of ports under an abuse quarantine, expired ones included until
+    /// the next allocation trims them (useful for metrics and memory-purge
+    /// invariant tests).
+    #[must_use]
+    pub fn abuse_quarantine_count(&self) -> usize {
+        self.inner.lock().abuse_quarantine_until.len()
     }
 
     /// Remove exactly one `(external_port, proto)` slot WITHOUT arming a
@@ -1433,6 +1594,26 @@ impl Default for Allocator {
     }
 }
 
+/// Longest abuse quarantine [`Allocator::revoke_for_abuse`] arms. A bound
+/// only so a caller's `Duration::MAX` cannot overflow the clock; a real
+/// quarantine is hours.
+pub const MAX_ABUSE_QUARANTINE: Duration = Duration::from_secs(365 * 24 * 3600);
+
+/// Removes both legs of `port`, arming the ordinary release cooldown until
+/// `cooldown_until` for each one taken.
+fn take_port(g: &mut Inner, port: u16, cooldown_until: Instant) -> Vec<Allocation> {
+    let mut removed = Vec::new();
+    for proto in [Proto::Tcp, Proto::Udp] {
+        if let Some(alloc) = g.active.remove(&(port, proto)) {
+            g.cooldown_until.insert(port, cooldown_until);
+            g.last_user_per_port
+                .insert(port, (alloc.internal_ip, cooldown_until));
+            removed.push(alloc);
+        }
+    }
+    removed
+}
+
 /// Whether `client_ip` still has a slot in its sliding rate-limit window,
 /// trimming the window on the way. Reads the budget WITHOUT consuming it: the
 /// caller uses it to decide whether a refusal may pay for a deployer callback,
@@ -1515,6 +1696,14 @@ fn port_eligible(
     reclaim: Option<&HashSet<Ipv4Addr>>,
 ) -> bool {
     if g.active.contains_key(&(p, Proto::Tcp)) || g.active.contains_key(&(p, Proto::Udp)) {
+        return false;
+    }
+    // An abuse quarantine comes before the tenant bypass below, which is the
+    // whole difference between it and the cooldown.
+    if g.abuse_quarantine_until
+        .get(&p)
+        .is_some_and(|until| *until > now)
+    {
         return false;
     }
     // The tenant reclaiming a port it just released (explicit suggestion

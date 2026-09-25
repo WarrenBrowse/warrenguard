@@ -6,7 +6,8 @@
 //!   I/O).
 //! - [`allocator`] - in-RAM port pool with abuse mitigations: 5 min
 //!   cooldown, per-port-per-user anti-rotation, 5/min rate-limit,
-//!   lifetime clamp `[60..3600]`.
+//!   lifetime clamp `[60..3600]`, and the abuse quarantine a deployer
+//!   arms when it closes a reported port.
 //! - [`server`] - tokio UDP loop on port 5351, dispatching the
 //!   protocol.
 //! - [`stub_backend`] - pure RAM `PortForwardingBackend` (dev on
