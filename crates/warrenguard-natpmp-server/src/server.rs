@@ -12,7 +12,11 @@
 //!      - `ExternalAddress` → returns the configured `external_ip`.
 //!      - `Map { lifetime=0 }` → `release_by_client` on the
 //!        backend's underlying allocator (RFC §3.3.2).
-//!      - `Map { lifetime>0 }` → `backend.allocate(...)`.
+//!      - `Map { lifetime>0 }` → the deployer's [`CredentialAuthority`], when
+//!        one is wired, decides on the presented credential (or on its
+//!        absence) whether the request is served; a refusal answers
+//!        `NotAuthorized`. Then `backend.allocate(...)`, and a granted
+//!        credential is told the mapping it now holds.
 //! - Datagrams are handled in separate tasks, concurrent with each other
 //!   and bounded by [`MAX_IN_FLIGHT_REQUESTS`], so one slow request does
 //!   not immobilize the service for the others.
@@ -88,21 +92,66 @@ fn proto_to_wire(p: Proto) -> MapProto {
 /// allowed to talk to the server.
 pub type SourceFilter = Arc<dyn Fn(Ipv4Addr) -> bool + Send + Sync>;
 
+/// What a [`CredentialAuthority`] decided about a presented credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialVerdict {
+    /// Serve the request, within whatever budget the deployer answers through
+    /// [`crate::allocator::PortBudget`] (the configured quota when it answers
+    /// nothing). This is also the verdict for a credential the deployer could
+    /// not check for a reason of its own, such as an outage, when it prefers
+    /// the constant quota to a refusal.
+    Grant,
+    /// Refuse the request with RFC 6886 result code 2 (`NotAuthorized`). No
+    /// allocation is attempted.
+    Refuse,
+}
+
 /// Receives the credential a client presented with its Map request, before
-/// the request is served.
+/// the request is served, and decides whether it is served.
 ///
 /// The engine carries the bytes and forms no opinion about them: a deployer
-/// verifies them, spends them if that is what they are, and decides what
-/// budget they buy (see [`crate::allocator::PortBudget`]). Presentation is
-/// awaited, so an authority that has to reach the network holds the request
-/// while it does; keep it quick, and answer rather than hang.
+/// verifies them, spends them if that is what they are, decides whether they
+/// admit the request and what budget they buy (see
+/// [`crate::allocator::PortBudget`]). Presentation is awaited, so an authority
+/// that has to reach the network holds the request while it does; keep it
+/// quick, and answer rather than hang.
+///
+/// Only a Map request that creates or renews a mapping is gated. A delete
+/// (lifetime 0) buys nothing and is always served, so a client can take down
+/// a forward it no longer wants whatever it holds.
 pub trait CredentialAuthority: Send + Sync {
-    /// Hand `credential`, as presented by `client_ip`, to the deployer.
+    /// Hand `credential`, as presented by `client_ip`, to the deployer, and
+    /// return whether the request it came with is served.
     fn present<'a>(
         &'a self,
         client_ip: Ipv4Addr,
         credential: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = CredentialVerdict> + Send + 'a>>;
+
+    /// Whether a Map request that presents no credential at all is refused
+    /// (`NotAuthorized`) rather than served on the configured quota. Such a
+    /// request never reaches [`Self::present`], so a deployer can still tell
+    /// "claimed nothing" from "claimed something I could not verify". Defaults
+    /// to `false`, the behaviour of every deployer that predates it.
+    fn requires_credential(&self) -> bool {
+        false
+    }
+
+    /// `credential` was granted and now holds `allocation`: one call per
+    /// successful Map request that presented one, renewals included, so both
+    /// legs of a TCP+UDP pair each report their own slot of the same port.
+    ///
+    /// This is how a deployer binds what it knows about a credential to a
+    /// port. Dropping that binding with the mapping is the job of
+    /// [`crate::allocator::ReleaseObserver`] and of the allocations the
+    /// deployer's own takes return. Called once the allocation is live, while
+    /// the server still holds its backend slot, so no release of that mapping
+    /// can run before it; a request that times out afterwards is rolled back
+    /// through the backend's release, which the observer hears. It runs on the
+    /// request path, so it must not block.
+    fn on_granted(&self, credential: &[u8], allocation: &Allocation) {
+        let _ = (credential, allocation);
+    }
 }
 
 /// RFC 6886 NAT-PMP server - UDP listening loop.
@@ -371,30 +420,56 @@ impl<B: PortForwardingBackend + 'static> Server<B> {
                 lifetime_secs,
             } => {
                 // Before serving: hand the deployer whatever the client
-                // presented, so the budget this allocation is measured
-                // against is the one the credential bought. A client that
-                // presented nothing reaches the authority not at all, which is
-                // how a deployer tells "claimed nothing" from "claimed
-                // something I could not verify".
-                if let (Some(authority), Some(credential)) = (
-                    self.credential_authority.as_ref(),
-                    credential_trailer(frame),
-                ) {
-                    // Bounded, and fail closed: an authority that does not
-                    // answer has not verified the credential, so the
-                    // allocation is refused rather than served unverified.
-                    if tokio::time::timeout(
-                        self.request_timeout,
-                        authority.present(src_v4, credential),
-                    )
-                    .await
-                    .is_err()
-                    {
-                        // No-log: never log the client's tunnel-inner address.
-                        tracing::warn!(
-                            "natpmp credential authority timed out; refusing the map request"
-                        );
-                        return error_response(frame, ResultCode::NetworkFailure, epoch_secs);
+                // presented, so it decides whether the request is served and
+                // the budget this allocation is measured against is the one
+                // the credential bought. A client that presented nothing
+                // reaches `present` not at all, which is how a deployer tells
+                // "claimed nothing" from "claimed something I could not
+                // verify"; whether claiming nothing is enough is its
+                // `requires_credential` answer.
+                let authority = self.credential_authority.as_ref();
+                let mut granted_credential = None;
+                if let Some(authority) = authority {
+                    let refused = || {
+                        map_failure_response(
+                            proto,
+                            internal_port,
+                            &crate::NatPmpError::NotAuthorized(src_v4),
+                            epoch_secs,
+                        )
+                    };
+                    match credential_trailer(frame) {
+                        Some(credential) => {
+                            // Bounded, and fail closed: an authority that does
+                            // not answer has not verified the credential, so
+                            // the allocation is refused rather than served
+                            // unverified.
+                            match tokio::time::timeout(
+                                self.request_timeout,
+                                authority.present(src_v4, credential),
+                            )
+                            .await
+                            {
+                                Ok(CredentialVerdict::Grant) => {
+                                    granted_credential = Some(credential);
+                                }
+                                Ok(CredentialVerdict::Refuse) => return refused(),
+                                Err(_) => {
+                                    // No-log: never log the client's
+                                    // tunnel-inner address.
+                                    tracing::warn!(
+                                        "natpmp credential authority timed out; refusing the map request"
+                                    );
+                                    return error_response(
+                                        frame,
+                                        ResultCode::NetworkFailure,
+                                        epoch_secs,
+                                    );
+                                }
+                            }
+                        }
+                        None if authority.requires_credential() => return refused(),
+                        None => {}
                     }
                 }
                 // Defense in depth: clamp
@@ -425,6 +500,9 @@ impl<B: PortForwardingBackend + 'static> Server<B> {
                     return error_response(frame, ResultCode::NetworkFailure, epoch_secs);
                 };
                 let backend = Arc::clone(&self.backend);
+                let binding = granted_credential
+                    .zip(authority)
+                    .map(|(credential, authority)| (credential.to_vec(), Arc::clone(authority)));
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 tokio::spawn(async move {
                     let _permit = permit;
@@ -437,6 +515,15 @@ impl<B: PortForwardingBackend + 'static> Server<B> {
                             lifetime,
                         )
                         .await;
+                    // Bound while the backend slot is still held, so no other
+                    // release can run between the grant and the binding: a
+                    // client delete racing its own request would otherwise be
+                    // reported first and leave the binding behind it. A
+                    // rollback below goes through the backend's release, which
+                    // the release observer hears like any other.
+                    if let (Ok(alloc), Some((credential, authority))) = (&result, &binding) {
+                        authority.on_granted(credential, alloc);
+                    }
                     if let Err(Ok(alloc)) = tx.send(result) {
                         // The requester timed out while the backend was in flight.
                         // Keep the slot until the unacknowledged mapping is gone.

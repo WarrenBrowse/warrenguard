@@ -14,7 +14,9 @@ use tokio::net::UdpSocket;
 use warrenguard_natpmp_protocol::{
     MapProto, Request, append_credential_trailer, serialize_request,
 };
-use warrenguard_natpmp_server::server::{CredentialAuthority, Server, SourceFilter};
+use warrenguard_natpmp_server::server::{
+    CredentialAuthority, CredentialVerdict, Server, SourceFilter,
+};
 use warrenguard_natpmp_server::stub_backend::StubBackend;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -35,10 +37,11 @@ impl CredentialAuthority for RecordingAuthority {
         &'a self,
         client_ip: Ipv4Addr,
         credential: &'a [u8],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CredentialVerdict> + Send + 'a>> {
         let entry = (client_ip, credential.to_vec());
         Box::pin(async move {
             self.0.lock().expect("recorder lock").push(entry);
+            CredentialVerdict::Grant
         })
     }
 }

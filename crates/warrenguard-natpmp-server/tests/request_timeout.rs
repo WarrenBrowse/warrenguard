@@ -19,7 +19,9 @@ use tokio::net::UdpSocket;
 use warrenguard_natpmp_protocol::{
     MapProto, Request, append_credential_trailer, serialize_request,
 };
-use warrenguard_natpmp_server::server::{CredentialAuthority, Server, SourceFilter};
+use warrenguard_natpmp_server::server::{
+    CredentialAuthority, CredentialVerdict, Server, SourceFilter,
+};
 use warrenguard_natpmp_server::stub_backend::StubBackend;
 use warrenguard_natpmp_server::{Allocation, NatPmpError, PortForwardingBackend, Proto};
 
@@ -37,8 +39,8 @@ impl CredentialAuthority for AlwaysPending {
         &'a self,
         _client_ip: Ipv4Addr,
         _credential: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(std::future::pending::<()>())
+    ) -> Pin<Box<dyn Future<Output = CredentialVerdict> + Send + 'a>> {
+        Box::pin(std::future::pending::<CredentialVerdict>())
     }
 }
 
@@ -54,7 +56,7 @@ impl CredentialAuthority for SlowMarkerAuthority {
         &'a self,
         _client_ip: Ipv4Addr,
         credential: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = CredentialVerdict> + Send + 'a>> {
         let entered = self.entered.clone();
         let slow = credential == b"SLOW";
         Box::pin(async move {
@@ -62,6 +64,7 @@ impl CredentialAuthority for SlowMarkerAuthority {
                 let _ = entered.send(());
                 std::future::pending::<()>().await;
             }
+            CredentialVerdict::Grant
         })
     }
 }
