@@ -281,6 +281,7 @@ async fn an_abuse_quarantine_keeps_the_former_tenant_off_its_port_until_it_lifts
     // What the deployer's abuse path does: find the binding, then revoke.
     let revoked = allocator.revoke_for_abuse(50000, Duration::from_millis(300));
     assert_eq!(revoked.len(), 1);
+    assert!(revoked[0].held_since <= std::time::Instant::now());
     assert!(
         authority
             .bound()

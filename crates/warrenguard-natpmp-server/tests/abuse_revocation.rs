@@ -12,7 +12,7 @@ use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use warrenguard_natpmp_server::allocator::{Allocator, QuotaPeers, ReleaseObserver};
+use warrenguard_natpmp_server::allocator::{Allocator, LiveSessions, QuotaPeers, ReleaseObserver};
 use warrenguard_natpmp_server::{Allocation, NatPmpError, Proto};
 
 const ALICE: Ipv4Addr = Ipv4Addr::new(10, 66, 0, 42);
@@ -66,13 +66,13 @@ fn abuse_revoke_takes_both_legs_of_the_port_and_returns_them() {
 
     let revoked = alloc.revoke_for_abuse_at(PINNED, QUARANTINE, t0);
 
-    let mut protos: Vec<Proto> = revoked.iter().map(|a| a.proto).collect();
+    let mut protos: Vec<Proto> = revoked.iter().map(|r| r.allocation.proto).collect();
     protos.sort_by_key(|p| matches!(p, Proto::Udp));
     assert_eq!(protos, vec![Proto::Tcp, Proto::Udp], "{revoked:?}");
     assert!(
         revoked
             .iter()
-            .all(|a| a.external_port == PINNED && a.internal_ip == ALICE),
+            .all(|r| r.allocation.external_port == PINNED && r.allocation.internal_ip == ALICE),
         "the caller tears down exactly what held the port: {revoked:?}"
     );
     assert_eq!(alloc.active_count(), 0);
@@ -425,4 +425,179 @@ fn an_unbounded_quarantine_is_capped_rather_than_overflowing_the_clock() {
         .expect("served elsewhere");
 
     assert_ne!(got.external_port, PINNED);
+}
+
+// ---------------------------------------------------------------------------
+// Held since: a report names an incident time, and a tenant that took the
+// port after it must not be struck for it. The revocation says since when the
+// tenant it removed has held the port without anybody else holding it.
+// ---------------------------------------------------------------------------
+
+fn held_since(alloc: &Allocator, port: u16, now: Instant) -> Vec<Instant> {
+    let revoked = alloc.revoke_for_abuse_at(port, QUARANTINE, now);
+    assert!(!revoked.is_empty(), "the port must be held when revoked");
+    revoked.iter().map(|r| r.held_since).collect()
+}
+
+#[test]
+fn renewals_and_the_companion_leg_keep_the_first_grant_time() {
+    let alloc = allocator();
+    let t0 = Instant::now();
+    alloc
+        .allocate_at(ALICE, Proto::Tcp, 4242, PINNED, 3600, t0)
+        .expect("tcp");
+    let t1 = t0 + Duration::from_secs(10);
+    alloc
+        .allocate_at(ALICE, Proto::Udp, 4242, PINNED, 3600, t1)
+        .expect("udp companion");
+    let t2 = t0 + Duration::from_secs(1800);
+    alloc
+        .allocate_at(ALICE, Proto::Tcp, 4242, PINNED, 3600, t2)
+        .expect("pinned renewal");
+    alloc
+        .allocate_at(ALICE, Proto::Udp, 4242, 0, 3600, t2)
+        .expect("unpinned renewal");
+
+    assert_eq!(
+        held_since(&alloc, PINNED, t0 + Duration::from_secs(2000)),
+        vec![t0, t0]
+    );
+}
+
+#[test]
+fn a_port_that_changed_tenant_reports_the_later_holder() {
+    let alloc = Allocator::with_config(
+        (PINNED, PINNED),
+        Duration::from_secs(1),
+        1000,
+        Duration::from_secs(60),
+    );
+    let t0 = Instant::now();
+    let alice = alloc
+        .allocate_at(ALICE, Proto::Tcp, 4242, PINNED, 3600, t0)
+        .expect("alice");
+    alloc.release_at(&alice, t0 + Duration::from_secs(5));
+    let t_bob = t0 + Duration::from_secs(60);
+    alloc
+        .allocate_at(BOB, Proto::Tcp, 80, 0, 3600, t_bob)
+        .expect("bob takes the only port");
+
+    assert_eq!(
+        held_since(&alloc, PINNED, t0 + Duration::from_secs(120)),
+        vec![t_bob],
+        "an incident before bob took the port is not bob's"
+    );
+}
+
+#[test]
+fn moving_to_another_port_starts_a_new_holding() {
+    let alloc = allocator();
+    let t0 = Instant::now();
+    alloc
+        .allocate_at(ALICE, Proto::Tcp, 4242, PINNED, 3600, t0)
+        .expect("first port");
+    let t1 = t0 + Duration::from_secs(30);
+    alloc
+        .allocate_at(ALICE, Proto::Tcp, 4242, PINNED + 1, 3600, t1)
+        .expect("moved");
+
+    assert_eq!(
+        held_since(&alloc, PINNED + 1, t1 + Duration::from_secs(100)),
+        vec![t1]
+    );
+}
+
+/// ALICE's first session is gone, which is what lets her second one take the
+/// port over without a release in between.
+struct AliceDeparted;
+
+impl LiveSessions for AliceDeparted {
+    fn has_live_session(&self, client_ip: Ipv4Addr) -> bool {
+        client_ip != ALICE
+    }
+}
+
+#[test]
+fn a_takeover_from_the_tenant_departed_session_keeps_the_holding() {
+    // The port never left the tenant: the reconnecting session takes it
+    // straight from the dead one.
+    let alloc = allocator();
+    assert!(alloc.set_live_sessions(std::sync::Arc::new(AliceDeparted)));
+    let t0 = Instant::now();
+    alloc
+        .allocate_at(ALICE, Proto::Tcp, 4242, PINNED, 3600, t0)
+        .expect("first session");
+    let t1 = t0 + Duration::from_secs(90);
+    let moved = alloc
+        .allocate_at(ALICE_SECOND_SESSION, Proto::Tcp, 4242, PINNED, 3600, t1)
+        .expect("takeover");
+    assert_eq!(moved.internal_ip, ALICE_SECOND_SESSION);
+
+    assert_eq!(
+        held_since(&alloc, PINNED, t1 + Duration::from_secs(100)),
+        vec![t0]
+    );
+}
+
+#[test]
+fn a_reclaim_after_a_release_starts_a_new_holding() {
+    // Between the release and the reclaim nothing forwarded the port, so the
+    // holding the report can blame starts again at the reclaim.
+    let alloc = allocator();
+    let t0 = Instant::now();
+    let first = alloc
+        .allocate_at(ALICE, Proto::Tcp, 4242, PINNED, 3600, t0)
+        .expect("first session");
+    alloc.release_at(&first, t0 + Duration::from_secs(60));
+    let t1 = t0 + Duration::from_secs(90);
+    alloc
+        .allocate_at(ALICE_SECOND_SESSION, Proto::Tcp, 4242, PINNED, 3600, t1)
+        .expect("reclaim within the cooldown");
+
+    assert_eq!(
+        held_since(&alloc, PINNED, t1 + Duration::from_secs(100)),
+        vec![t1]
+    );
+}
+
+#[test]
+fn a_restored_mapping_is_held_since_its_restore() {
+    // The holding a previous process saw is not carried across a restart, so
+    // the restore is the earliest instant this process can vouch for.
+    let before = Allocator::new();
+    let t0 = Instant::now();
+    let saved = before
+        .allocate_at(ALICE, Proto::Tcp, 4242, PINNED, 3600, t0)
+        .expect("saved");
+    let alloc = allocator();
+    let t_restore = t0 + Duration::from_secs(300);
+    assert_eq!(alloc.restore_at(vec![saved], t_restore).len(), 1);
+
+    assert_eq!(
+        held_since(&alloc, PINNED, t_restore + Duration::from_secs(100)),
+        vec![t_restore]
+    );
+}
+
+#[test]
+fn a_single_leg_renewal_keeps_the_first_grant_time() {
+    // No companion leg to vouch for the port: the renewal itself must.
+    let alloc = allocator();
+    let t0 = Instant::now();
+    alloc
+        .allocate_at(ALICE, Proto::Udp, 4242, PINNED, 3600, t0)
+        .expect("udp");
+    for at in [
+        t0 + Duration::from_secs(1800),
+        t0 + Duration::from_secs(3600),
+    ] {
+        alloc
+            .allocate_at(ALICE, Proto::Udp, 4242, 0, 3600, at)
+            .expect("renewal");
+    }
+
+    assert_eq!(
+        held_since(&alloc, PINNED, t0 + Duration::from_secs(4000)),
+        vec![t0]
+    );
 }

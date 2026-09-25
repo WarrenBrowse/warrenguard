@@ -115,6 +115,26 @@ pub trait ReleaseObserver: Send + Sync {
     fn released(&self, allocations: &[Allocation]);
 }
 
+/// A mapping [`Allocator::revoke_for_abuse`] took off its tenant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevokedAllocation {
+    /// The mapping removed, for backend teardown and for whatever the
+    /// deployer bound to it.
+    pub allocation: Allocation,
+    /// Since when the tenant it was taken from has held this port with no
+    /// other client holding it in between, so a report naming an earlier
+    /// incident is not blamed on a tenant that took the port afterwards.
+    ///
+    /// Renewals and the second leg of a pair keep it, and so does a takeover
+    /// of the port from a departed address of the same tenant (the port never
+    /// left that tenant). Anything that leaves the port unforwarded in between
+    /// starts a new holding: a release then a reclaim, a lapsed lease renewed
+    /// late, a move to another port. A mapping restored after a restart is
+    /// held since its restore, the earliest instant this process can vouch
+    /// for. RAM only; it is never logged.
+    pub held_since: Instant,
+}
+
 /// Tunable configuration for the [`Allocator`]. Use [`Allocator::new`]
 /// for the Warren defaults; reach for `with_config` when a test needs
 /// to shrink limits or a future subscription tier needs to widen the
@@ -309,6 +329,11 @@ struct Inner {
     /// `cooldown_until`, no tenant bypass lifts it (see
     /// [`Allocator::revoke_for_abuse`]).
     abuse_quarantine_until: HashMap<u16, Instant>,
+    /// `external_port -> since when its current tenant has held it` (see
+    /// [`RevokedAllocation::held_since`]). An entry outlives its port by at
+    /// most one request: [`Inner::trim_side_maps`] drops the ports no longer
+    /// held.
+    held_since: HashMap<u16, Instant>,
     last_user_per_port: HashMap<u16, (Ipv4Addr, Instant)>,
     rate_limit_log: HashMap<Ipv4Addr, VecDeque<Instant>>,
 }
@@ -383,6 +408,10 @@ impl Inner {
         self.cooldown_until.retain(|_, expiry| *expiry > now);
         self.abuse_quarantine_until
             .retain(|_, expiry| *expiry > now);
+        let active = &self.active;
+        self.held_since.retain(|port, _| {
+            active.contains_key(&(*port, Proto::Tcp)) || active.contains_key(&(*port, Proto::Udp))
+        });
         self.last_user_per_port
             .retain(|_, (_, expiry)| *expiry > now);
         self.rate_limit_log.retain(|_, log| {
@@ -487,6 +516,7 @@ impl Allocator {
                 next_expiry: None,
                 cooldown_until: HashMap::new(),
                 abuse_quarantine_until: HashMap::new(),
+                held_since: HashMap::new(),
                 last_user_per_port: HashMap::new(),
                 rate_limit_log: HashMap::new(),
             }),
@@ -1194,6 +1224,19 @@ impl Allocator {
                 .push_back(now);
         }
 
+        // The holding goes on when the port never left this tenant: the
+        // request renews the mapping this call dropped, adds a leg next to one
+        // the client still holds, or takes the port over from a departed
+        // address of its own. Anything else starts one now.
+        let holding_goes_on = previously_held == Some(port)
+            || reclaim_from_departed_peer
+            || port_owner(g, port) == Some(client_ip);
+        let since = match g.held_since.get(&port) {
+            Some(since) if holding_goes_on => *since,
+            _ => now,
+        };
+        g.held_since.insert(port, since);
+
         let alloc = Allocation {
             external_port: port,
             internal_ip: client_ip,
@@ -1343,6 +1386,7 @@ impl Allocator {
             }
             g.last_user_per_port
                 .insert(entry.external_port, (entry.internal_ip, now));
+            g.held_since.entry(entry.external_port).or_insert(now);
             g.insert_active(entry.clone());
             kept.push(entry);
         }
@@ -1440,13 +1484,16 @@ impl Allocator {
     /// quarantine. `quarantine` is capped at [`MAX_ABUSE_QUARANTINE`].
     ///
     /// The removed mappings are returned rather than reported to the
-    /// [`ReleaseObserver`], so the caller can read what it bound to them first.
+    /// [`ReleaseObserver`], so the caller can read what it bound to them first,
+    /// each with the instant its tenant's holding of the port began
+    /// ([`RevokedAllocation::held_since`]), which is what lets the caller tell
+    /// whether that tenant held the port at the time a report names.
     ///
     /// # Warning
     ///
     /// Like [`Self::take_active_for_port`], no owner check: never reachable
     /// with a client-supplied port.
-    pub fn revoke_for_abuse(&self, port: u16, quarantine: Duration) -> Vec<Allocation> {
+    pub fn revoke_for_abuse(&self, port: u16, quarantine: Duration) -> Vec<RevokedAllocation> {
         self.revoke_for_abuse_at(port, quarantine, Instant::now())
     }
 
@@ -1456,7 +1503,7 @@ impl Allocator {
         port: u16,
         quarantine: Duration,
         now: Instant,
-    ) -> Vec<Allocation> {
+    ) -> Vec<RevokedAllocation> {
         let until = now + quarantine.min(MAX_ABUSE_QUARANTINE);
         let mut g = self.inner.lock();
         let slot = g.abuse_quarantine_until.entry(port).or_insert(until);
@@ -1464,6 +1511,9 @@ impl Allocator {
             *slot = until;
         }
         let removed = take_port(&mut g, port, now + self.cooldown);
+        // Every live port has an entry; `now` only answers for one that would
+        // not, and it is the answer that blames nobody for anything earlier.
+        let held_since = g.held_since.remove(&port).unwrap_or(now);
         drop(g);
         if !removed.is_empty() {
             let n = removed.len() as u64;
@@ -1474,6 +1524,12 @@ impl Allocator {
                 .fetch_add(1, Ordering::Relaxed);
         }
         removed
+            .into_iter()
+            .map(|allocation| RevokedAllocation {
+                allocation,
+                held_since,
+            })
+            .collect()
     }
 
     /// Number of ports under an abuse quarantine, expired ones included until
