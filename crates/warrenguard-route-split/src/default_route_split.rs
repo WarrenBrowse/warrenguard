@@ -141,6 +141,10 @@ pub enum IncludeFwmarkError {
     /// The mark is the split-tunnel exclusion mark installed alongside it.
     #[error("the include fwmark must differ from the split-tunnel exclusion fwmark")]
     ExclusionMark,
+    /// The split-tunnel exclusion mark installed alongside it is not a plain
+    /// number (a masked form, or text), so the two cannot be proven distinct.
+    #[error("the split-tunnel exclusion fwmark is not a plain number")]
+    ExclusionMarkUnreadable,
 }
 
 /// Which traffic the tunnel-table lookup (pref [`RULE_PREF_TUN`]) captures.
@@ -152,18 +156,29 @@ pub enum TunLookupScope {
     AllTraffic,
     /// Only packets carrying the include mark ("VPN only for these apps"):
     /// `fwmark <mark> lookup 100`, so unmarked traffic falls through to the
-    /// main table and keeps the physical default route. Routing alone is not
-    /// fail-closed here: when the tunnel routes disappear the lookup misses and
-    /// marked traffic falls through too, so the consumer's firewall must drop
-    /// marked traffic that would leave through anything but the tunnel.
+    /// main table and keeps the physical default route.
+    ///
+    /// The rule alone does not make include-only correct or leak-free. The
+    /// consumer must also:
+    /// - drop marked traffic that would leave through anything but the
+    ///   tunnel: when the tunnel routes disappear the lookup misses and marked
+    ///   traffic falls through to `main` like everything else;
+    /// - give included sockets the tunnel source address. A mark set by the
+    ///   firewall after `connect()` reroutes the packet into the tunnel but
+    ///   keeps the source address `main` chose, the physical one, which the
+    ///   exit then sees in the inner header. Mark the socket itself before it
+    ///   connects, or SNAT marked traffic leaving through the tunnel;
+    /// - let the reverse-path filter accept replies arriving on the tunnel
+    ///   (`net.ipv4.conf.all.src_valid_mark=1` under strict `rp_filter`);
+    /// - drop traffic to the tunnel resolver that would not leave through the
+    ///   tunnel, marked or not, since system DNS is unmarked.
     Marked(IncludeFwmark),
 }
 
 /// The pref-[`RULE_PREF_TUN`] tunnel lookup rule for `scope`. `verb` is
 /// `add`/`del`; the `del` form carries the same full selector so teardown
 /// removes this rule and only this one.
-#[must_use]
-pub fn build_tun_lookup_rule(verb: &str, scope: TunLookupScope) -> Vec<String> {
+fn build_tun_lookup_rule(verb: &str, scope: TunLookupScope) -> Vec<String> {
     let mut rule = vec!["rule".to_string(), verb.to_string()];
     if let TunLookupScope::Marked(mark) = scope {
         rule.push("fwmark".into());
@@ -180,8 +195,7 @@ pub fn build_tun_lookup_rule(verb: &str, scope: TunLookupScope) -> Vec<String> {
 
 /// IPv6 counterpart of [`build_tun_lookup_rule`], for the separate v6 rule
 /// database.
-#[must_use]
-pub fn build_tun_lookup_rule_v6(verb: &str, scope: TunLookupScope) -> Vec<String> {
+fn build_tun_lookup_rule_v6(verb: &str, scope: TunLookupScope) -> Vec<String> {
     let mut rule = vec!["-6".to_string()];
     rule.extend(build_tun_lookup_rule(verb, scope));
     rule
@@ -190,8 +204,9 @@ pub fn build_tun_lookup_rule_v6(verb: &str, scope: TunLookupScope) -> Vec<String
 /// Refuses an include mark equal to the split-tunnel exclusion mark: the
 /// exclusion rule routes its mark to `main` at pref [`RULE_PREF_BYPASS_CIDR`],
 /// ahead of the conditional lookup, so sharing the value would send every
-/// included app off-tunnel. An exclusion mark that does not parse is left to
-/// `ip` to refuse.
+/// included app off-tunnel. An exclusion mark that is not a plain number (a
+/// `mark/mask` form can match values other than its own) is refused too,
+/// because the two marks cannot then be proven distinct.
 fn check_scope_against_exclusion_mark(
     scope: TunLookupScope,
     split_tunnel_fwmark: Option<&str>,
@@ -199,14 +214,25 @@ fn check_scope_against_exclusion_mark(
     let (TunLookupScope::Marked(include), Some(exclusion)) = (scope, split_tunnel_fwmark) else {
         return Ok(());
     };
-    let exclusion = match exclusion.strip_prefix("0x") {
-        Some(hex) => u32::from_str_radix(hex, 16).ok(),
-        None => exclusion.parse::<u32>().ok(),
-    };
-    if exclusion == Some(include.get()) {
-        return Err(IncludeFwmarkError::ExclusionMark);
+    match parse_mark_like_ip(exclusion) {
+        None => Err(IncludeFwmarkError::ExclusionMarkUnreadable),
+        Some(exclusion) if exclusion == include.get() => Err(IncludeFwmarkError::ExclusionMark),
+        Some(_) => Ok(()),
     }
-    Ok(())
+}
+
+/// Reads a mark the way `ip` does (`strtoul` in base 0): `0x`/`0X` is
+/// hexadecimal, another leading `0` is octal, anything else decimal.
+fn parse_mark_like_ip(mark: &str) -> Option<u32> {
+    if let Some(hex) = mark.strip_prefix("0x").or_else(|| mark.strip_prefix("0X")) {
+        return u32::from_str_radix(hex, 16).ok();
+    }
+    if mark.len() > 1
+        && let Some(octal) = mark.strip_prefix('0')
+    {
+        return u32::from_str_radix(octal, 8).ok();
+    }
+    mark.parse::<u32>().ok()
 }
 
 /// Builds the list of `ip` commands to run to install the split-default
@@ -1261,6 +1287,16 @@ mod tests {
             "the decimal spelling of the same mark is the same mark"
         );
         assert_eq!(
+            check_scope_against_exclusion_mark(scope, Some("0X6D6F6C65")),
+            Err(IncludeFwmarkError::ExclusionMark),
+            "`ip` reads numbers in base 0, upper-case prefix included"
+        );
+        assert_eq!(
+            check_scope_against_exclusion_mark(scope, Some("015533666145")),
+            Err(IncludeFwmarkError::ExclusionMark),
+            "a leading zero is octal to `ip`"
+        );
+        assert_eq!(
             check_scope_against_exclusion_mark(scope, Some("0x1")),
             Ok(())
         );
@@ -1269,6 +1305,20 @@ mod tests {
             check_scope_against_exclusion_mark(TunLookupScope::AllTraffic, Some("0x6d6f6c65")),
             Ok(())
         );
+    }
+
+    #[test]
+    fn a_marked_scope_refuses_an_exclusion_mark_it_cannot_compare() {
+        // A masked or otherwise unreadable exclusion mark may still match the
+        // include mark at pref 49, so the check fails closed instead of passing.
+        let scope = include(0x1234);
+        for unreadable in ["0x1234/0xff00", " 0x1", "mark", ""] {
+            assert_eq!(
+                check_scope_against_exclusion_mark(scope, Some(unreadable)),
+                Err(IncludeFwmarkError::ExclusionMarkUnreadable),
+                "{unreadable:?}"
+            );
+        }
     }
 
     #[test]
