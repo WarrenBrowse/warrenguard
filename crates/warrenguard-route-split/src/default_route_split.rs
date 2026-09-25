@@ -38,6 +38,10 @@
 //! (unmarked) socket:
 //! - pref 50 does not match -> pref 51 matches -> table 100 -> tun -> tunnelled, never leaked
 //!
+//! Include-only routing ("VPN only for these apps", [`TunLookupScope::Marked`])
+//! changes only pref 51 into `fwmark <include mark> lookup 100`: marked traffic
+//! is tunnelled, everything else falls through to `main`.
+//!
 //! ## Platforms
 //!
 //! This module is the **Linux** recipe (`ip rule` + dedicated table 100),
@@ -93,6 +97,118 @@ const RULE_PREF_EXIT_BYPASS: u32 = 50;
 /// bypasses win for packets matching their `to <cidr>` filter.
 const RULE_PREF_TUN: u32 = 51;
 
+/// Firewall mark that selects the traffic an include-only tunnel captures
+/// (see [`TunLookupScope::Marked`]). Validated at construction: non-zero, and
+/// distinct from the carrier's own [`WARREN_TUNNEL_FWMARK`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IncludeFwmark(u32);
+
+impl IncludeFwmark {
+    /// Validates `mark` as an include mark.
+    ///
+    /// # Errors
+    ///
+    /// - [`IncludeFwmarkError::Zero`]: an unmarked packet carries mark 0, so a
+    ///   zero include mark would select the whole host.
+    /// - [`IncludeFwmarkError::CarrierMark`]: the carrier's mark is routed to
+    ///   `main` at a higher priority than the tunnel lookup, so included
+    ///   traffic carrying it would leave off-tunnel.
+    pub fn new(mark: u32) -> Result<Self, IncludeFwmarkError> {
+        match mark {
+            0 => Err(IncludeFwmarkError::Zero),
+            WARREN_TUNNEL_FWMARK => Err(IncludeFwmarkError::CarrierMark),
+            _ => Ok(Self(mark)),
+        }
+    }
+
+    /// The raw mark value.
+    #[must_use]
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// Why a mark cannot serve as an [`IncludeFwmark`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum IncludeFwmarkError {
+    /// The mark is zero.
+    #[error("the include fwmark must be non-zero")]
+    Zero,
+    /// The mark is the tunnel carrier's own mark.
+    #[error("the include fwmark must differ from the tunnel carrier's mark")]
+    CarrierMark,
+    /// The mark is the split-tunnel exclusion mark installed alongside it.
+    #[error("the include fwmark must differ from the split-tunnel exclusion fwmark")]
+    ExclusionMark,
+}
+
+/// Which traffic the tunnel-table lookup (pref [`RULE_PREF_TUN`]) captures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TunLookupScope {
+    /// Every packet no higher-priority bypass claims: the full tunnel. The
+    /// recipe is the historical unconditional `lookup 100`.
+    #[default]
+    AllTraffic,
+    /// Only packets carrying the include mark ("VPN only for these apps"):
+    /// `fwmark <mark> lookup 100`, so unmarked traffic falls through to the
+    /// main table and keeps the physical default route. Routing alone is not
+    /// fail-closed here: when the tunnel routes disappear the lookup misses and
+    /// marked traffic falls through too, so the consumer's firewall must drop
+    /// marked traffic that would leave through anything but the tunnel.
+    Marked(IncludeFwmark),
+}
+
+/// The pref-[`RULE_PREF_TUN`] tunnel lookup rule for `scope`. `verb` is
+/// `add`/`del`; the `del` form carries the same full selector so teardown
+/// removes this rule and only this one.
+#[must_use]
+pub fn build_tun_lookup_rule(verb: &str, scope: TunLookupScope) -> Vec<String> {
+    let mut rule = vec!["rule".to_string(), verb.to_string()];
+    if let TunLookupScope::Marked(mark) = scope {
+        rule.push("fwmark".into());
+        rule.push(format!("{:#x}", mark.get()));
+    }
+    rule.extend([
+        "lookup".to_string(),
+        ROUTE_TABLE.to_string(),
+        "pref".to_string(),
+        RULE_PREF_TUN.to_string(),
+    ]);
+    rule
+}
+
+/// IPv6 counterpart of [`build_tun_lookup_rule`], for the separate v6 rule
+/// database.
+#[must_use]
+pub fn build_tun_lookup_rule_v6(verb: &str, scope: TunLookupScope) -> Vec<String> {
+    let mut rule = vec!["-6".to_string()];
+    rule.extend(build_tun_lookup_rule(verb, scope));
+    rule
+}
+
+/// Refuses an include mark equal to the split-tunnel exclusion mark: the
+/// exclusion rule routes its mark to `main` at pref [`RULE_PREF_BYPASS_CIDR`],
+/// ahead of the conditional lookup, so sharing the value would send every
+/// included app off-tunnel. An exclusion mark that does not parse is left to
+/// `ip` to refuse.
+fn check_scope_against_exclusion_mark(
+    scope: TunLookupScope,
+    split_tunnel_fwmark: Option<&str>,
+) -> Result<(), IncludeFwmarkError> {
+    let (TunLookupScope::Marked(include), Some(exclusion)) = (scope, split_tunnel_fwmark) else {
+        return Ok(());
+    };
+    let exclusion = match exclusion.strip_prefix("0x") {
+        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+        None => exclusion.parse::<u32>().ok(),
+    };
+    if exclusion == Some(include.get()) {
+        return Err(IncludeFwmarkError::ExclusionMark);
+    }
+    Ok(())
+}
+
 /// Builds the list of `ip` commands to run to install the split-default
 /// policy routing. Pure function, testable without shell-out.
 ///
@@ -137,6 +253,19 @@ pub fn build_tunnel_socket_fwmark_rule(verb: &str) -> Vec<String> {
 /// captured by the tunnel like anything else and cannot leak.
 #[must_use]
 pub fn build_install_commands(tun_name: &str, bypass_cidrs: &[BypassCidr]) -> Vec<Vec<String>> {
+    build_install_commands_scoped(tun_name, bypass_cidrs, TunLookupScope::AllTraffic)
+}
+
+/// [`build_install_commands`] with the tunnel lookup restricted to `scope`.
+/// [`TunLookupScope::AllTraffic`] yields the unscoped recipe byte for byte;
+/// [`TunLookupScope::Marked`] changes only the final pref-51 rule, so the
+/// carrier's pref-50 escape and the pref-49 bypasses keep precedence over it.
+#[must_use]
+pub fn build_install_commands_scoped(
+    tun_name: &str,
+    bypass_cidrs: &[BypassCidr],
+    scope: TunLookupScope,
+) -> Vec<Vec<String>> {
     let mut cmds = vec![
         // Split-default routes in the dedicated table 100.
         vec![
@@ -179,15 +308,9 @@ pub fn build_install_commands(tun_name: &str, bypass_cidrs: &[BypassCidr]) -> Ve
         ]);
     }
 
-    // ip rule: all other traffic -> table 100 -> tun
-    cmds.push(vec![
-        "rule".into(),
-        "add".into(),
-        "lookup".into(),
-        ROUTE_TABLE.to_string(),
-        "pref".into(),
-        RULE_PREF_TUN.to_string(),
-    ]);
+    // ip rule: all other traffic (or, include-only, the marked traffic) ->
+    // table 100 -> tun
+    cmds.push(build_tun_lookup_rule("add", scope));
 
     cmds
 }
@@ -197,16 +320,20 @@ pub fn build_install_commands(tun_name: &str, bypass_cidrs: &[BypassCidr]) -> Ve
 /// Caller-side idempotent (tolerates "No such file or directory").
 #[must_use]
 pub fn build_uninstall_commands(bypass_cidrs: &[BypassCidr]) -> Vec<Vec<String>> {
+    build_uninstall_commands_scoped(bypass_cidrs, TunLookupScope::AllTraffic)
+}
+
+/// Reverse of [`build_install_commands_scoped`]: `scope` must match the value
+/// the recipe was installed with, so the lookup rule is deleted by its full
+/// selector.
+#[must_use]
+pub fn build_uninstall_commands_scoped(
+    bypass_cidrs: &[BypassCidr],
+    scope: TunLookupScope,
+) -> Vec<Vec<String>> {
     let mut cmds = vec![
         // ip rule del (inverse order: highest pref first)
-        vec![
-            "rule".into(),
-            "del".into(),
-            "lookup".into(),
-            ROUTE_TABLE.to_string(),
-            "pref".into(),
-            RULE_PREF_TUN.to_string(),
-        ],
+        build_tun_lookup_rule("del", scope),
         build_tunnel_socket_fwmark_rule("del"),
     ];
 
@@ -379,9 +506,18 @@ fn rule_pref_targeting_table(line: &str, table: &str) -> Option<u32> {
 /// Returned format mirrors [`build_install_commands`]: `Vec<Vec<String>>`,
 /// each inner vec the args to pass to `ip` (starting with `-6`).
 #[must_use]
-pub fn build_install_commands_v6(
+pub fn build_install_commands_v6(exit_ip_v6: Option<Ipv6Addr>, tun_name: &str) -> Vec<Vec<String>> {
+    build_install_commands_v6_scoped(exit_ip_v6, tun_name, TunLookupScope::AllTraffic)
+}
+
+/// [`build_install_commands_v6`] with the tunnel lookup restricted to `scope`,
+/// mirroring [`build_install_commands_scoped`] on the v6 rule database. The
+/// firewall mark is family-agnostic, so one include mark selects both families.
+#[must_use]
+pub fn build_install_commands_v6_scoped(
     _exit_ip_v6: Option<Ipv6Addr>,
     tun_name: &str,
+    scope: TunLookupScope,
 ) -> Vec<Vec<String>> {
     let mut cmds = vec![
         vec![
@@ -414,15 +550,7 @@ pub fn build_install_commands_v6(
     // for API symmetry with the v6 guard; it no longer shapes any route.
     cmds.push(build_tunnel_socket_fwmark_rule_v6("add"));
 
-    cmds.push(vec![
-        "-6".into(),
-        "rule".into(),
-        "add".into(),
-        "lookup".into(),
-        ROUTE_TABLE.to_string(),
-        "pref".into(),
-        RULE_PREF_TUN.to_string(),
-    ]);
+    cmds.push(build_tun_lookup_rule_v6("add", scope));
 
     cmds
 }
@@ -444,17 +572,19 @@ pub fn build_tunnel_socket_fwmark_rule_v6(verb: &str) -> Vec<String> {
 /// [`build_install_commands_v6`] so the matching bypass rule is
 /// removed (when it was installed).
 #[must_use]
-pub fn build_uninstall_commands_v6(_exit_ip_v6: Option<Ipv6Addr>) -> Vec<Vec<String>> {
+pub fn build_uninstall_commands_v6(exit_ip_v6: Option<Ipv6Addr>) -> Vec<Vec<String>> {
+    build_uninstall_commands_v6_scoped(exit_ip_v6, TunLookupScope::AllTraffic)
+}
+
+/// Reverse of [`build_install_commands_v6_scoped`]; `scope` must match the
+/// installed value.
+#[must_use]
+pub fn build_uninstall_commands_v6_scoped(
+    _exit_ip_v6: Option<Ipv6Addr>,
+    scope: TunLookupScope,
+) -> Vec<Vec<String>> {
     let mut cmds = vec![
-        vec![
-            "-6".into(),
-            "rule".into(),
-            "del".into(),
-            "lookup".into(),
-            ROUTE_TABLE.to_string(),
-            "pref".into(),
-            RULE_PREF_TUN.to_string(),
-        ],
+        build_tun_lookup_rule_v6("del", scope),
         build_tunnel_socket_fwmark_rule_v6("del"),
     ];
 
@@ -485,6 +615,9 @@ pub struct DefaultRouteSplitV6Guard {
     /// variant), mirroring the v4 guard. When set, install/uninstall also
     /// manage the `-6 rule fwmark <mark> lookup main pref 49` rule.
     split_tunnel_fwmark: Option<String>,
+    /// Which traffic the v6 tunnel lookup captures; teardown deletes the
+    /// lookup rule by this same selector.
+    scope: TunLookupScope,
     installed: bool,
 }
 
@@ -506,9 +639,33 @@ impl DefaultRouteSplitV6Guard {
         tun_name: &str,
         split_tunnel_fwmark: Option<&str>,
     ) -> Result<Self> {
-        ks_validate_tun_name(tun_name).context("invalid tun_name")?;
+        Self::install_scoped(
+            exit_ip_v6,
+            tun_name,
+            split_tunnel_fwmark,
+            TunLookupScope::AllTraffic,
+        )
+        .await
+    }
 
-        let mut cmds = build_install_commands_v6(exit_ip_v6, tun_name);
+    /// [`Self::install`] with the v6 tunnel lookup restricted to `scope`
+    /// (include-only routing, see [`TunLookupScope::Marked`]).
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Self::install`], plus an include mark equal to
+    /// `split_tunnel_fwmark` ([`IncludeFwmarkError::ExclusionMark`]), refused
+    /// before any command runs.
+    pub async fn install_scoped(
+        exit_ip_v6: Option<Ipv6Addr>,
+        tun_name: &str,
+        split_tunnel_fwmark: Option<&str>,
+        scope: TunLookupScope,
+    ) -> Result<Self> {
+        ks_validate_tun_name(tun_name).context("invalid tun_name")?;
+        check_scope_against_exclusion_mark(scope, split_tunnel_fwmark)?;
+
+        let mut cmds = build_install_commands_v6_scoped(exit_ip_v6, tun_name, scope);
         if let Some(fwmark) = split_tunnel_fwmark {
             cmds.push(build_split_tunnel_fwmark_install_rule_v6(fwmark));
         }
@@ -523,12 +680,14 @@ impl DefaultRouteSplitV6Guard {
             table = ROUTE_TABLE,
             exit_bypass_v6 = exit_ip_v6.is_some(),
             split_tunnel_fwmark = split_tunnel_fwmark.unwrap_or("none"),
+            include_only = matches!(scope, TunLookupScope::Marked(_)),
             "Warren IPv6 split-default routing installed"
         );
 
         Ok(Self {
             exit_ip_v6,
             split_tunnel_fwmark: split_tunnel_fwmark.map(str::to_owned),
+            scope,
             installed: true,
         })
     }
@@ -536,7 +695,7 @@ impl DefaultRouteSplitV6Guard {
     /// All `ip -6` teardown commands for this guard: the shared recipe plus the
     /// optional split-tunnel fwmark rule. Shared by `uninstall` and `Drop`.
     fn teardown_commands(&self) -> Vec<Vec<String>> {
-        let mut cmds = build_uninstall_commands_v6(self.exit_ip_v6);
+        let mut cmds = build_uninstall_commands_v6_scoped(self.exit_ip_v6, self.scope);
         if let Some(fwmark) = &self.split_tunnel_fwmark {
             cmds.push(build_split_tunnel_fwmark_uninstall_rule_v6(fwmark));
         }
@@ -589,6 +748,9 @@ pub struct DefaultRouteSplitGuard {
     /// rule so excluded-app traffic egresses the physical NIC. The standalone
     /// CLI leaves this `None` and uses `bypass_cidrs` instead.
     split_tunnel_fwmark: Option<String>,
+    /// Which traffic the tunnel lookup captures; teardown deletes the lookup
+    /// rule by this same selector.
+    scope: TunLookupScope,
     installed: bool,
 }
 
@@ -613,9 +775,38 @@ impl DefaultRouteSplitGuard {
         bypass_cidrs: &[BypassCidr],
         split_tunnel_fwmark: Option<&str>,
     ) -> Result<Self> {
-        ks_validate_tun_name(tun_name).context("invalid tun_name")?;
+        Self::install_scoped(
+            exit_ip,
+            tun_name,
+            bypass_cidrs,
+            split_tunnel_fwmark,
+            TunLookupScope::AllTraffic,
+        )
+        .await
+    }
 
-        let mut cmds = build_install_commands(tun_name, bypass_cidrs);
+    /// [`Self::install`] with the tunnel lookup restricted to `scope`. With
+    /// [`TunLookupScope::Marked`] only traffic carrying the include mark enters
+    /// the tunnel ("VPN only for these apps"); the rest of the host keeps the
+    /// main table. The consumer marks the included traffic and drops marked
+    /// traffic that would leave through anything but the tunnel.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Self::install`], plus an include mark equal to
+    /// `split_tunnel_fwmark` ([`IncludeFwmarkError::ExclusionMark`]), refused
+    /// before any command runs.
+    pub async fn install_scoped(
+        exit_ip: Ipv4Addr,
+        tun_name: &str,
+        bypass_cidrs: &[BypassCidr],
+        split_tunnel_fwmark: Option<&str>,
+        scope: TunLookupScope,
+    ) -> Result<Self> {
+        ks_validate_tun_name(tun_name).context("invalid tun_name")?;
+        check_scope_against_exclusion_mark(scope, split_tunnel_fwmark)?;
+
+        let mut cmds = build_install_commands_scoped(tun_name, bypass_cidrs, scope);
         if let Some(fwmark) = split_tunnel_fwmark {
             cmds.push(build_split_tunnel_fwmark_install_rule(fwmark));
         }
@@ -631,12 +822,14 @@ impl DefaultRouteSplitGuard {
             table = ROUTE_TABLE,
             bypass_cidr_count = bypass_cidrs.len(),
             split_tunnel_fwmark = split_tunnel_fwmark.unwrap_or("none"),
+            include_only = matches!(scope, TunLookupScope::Marked(_)),
             "Warren default-route split-tunnel installed"
         );
 
         Ok(Self {
             bypass_cidrs: bypass_cidrs.to_vec(),
             split_tunnel_fwmark: split_tunnel_fwmark.map(str::to_owned),
+            scope,
             installed: true,
         })
     }
@@ -644,7 +837,7 @@ impl DefaultRouteSplitGuard {
     /// All `ip` teardown commands for this guard: the shared recipe plus the
     /// optional split-tunnel fwmark rule. Shared by `uninstall` and `Drop`.
     fn teardown_commands(&self) -> Vec<Vec<String>> {
-        let mut cmds = build_uninstall_commands(&self.bypass_cidrs);
+        let mut cmds = build_uninstall_commands_scoped(&self.bypass_cidrs, self.scope);
         if let Some(fwmark) = &self.split_tunnel_fwmark {
             cmds.push(build_split_tunnel_fwmark_uninstall_rule(fwmark));
         }
@@ -936,6 +1129,170 @@ mod tests {
         assert_eq!(uninstall[1], "del");
         // Everything after the verb is identical (the selector).
         assert_eq!(install[2..], uninstall[2..]);
+    }
+
+    // --- include-only scope (conditional tunnel lookup) ---
+
+    fn include(mark: u32) -> TunLookupScope {
+        TunLookupScope::Marked(IncludeFwmark::new(mark).expect("valid include mark"))
+    }
+
+    #[test]
+    fn include_fwmark_refuses_zero() {
+        // `fwmark 0` would not select the included cgroup: an unmarked packet
+        // carries mark 0, so the whole host would be steered into the tunnel.
+        assert_eq!(IncludeFwmark::new(0), Err(IncludeFwmarkError::Zero));
+    }
+
+    #[test]
+    fn include_fwmark_refuses_the_carrier_mark() {
+        // The carrier's own mark is routed to `main` at pref 50, ahead of the
+        // conditional lookup: included traffic carrying it would leave off-tunnel.
+        assert_eq!(
+            IncludeFwmark::new(WARREN_TUNNEL_FWMARK),
+            Err(IncludeFwmarkError::CarrierMark)
+        );
+    }
+
+    #[test]
+    fn include_fwmark_keeps_a_valid_mark() {
+        assert_eq!(
+            IncludeFwmark::new(0x1234).map(IncludeFwmark::get),
+            Ok(0x1234)
+        );
+    }
+
+    #[test]
+    fn marked_scope_makes_only_the_tun_lookup_conditional_on_the_include_mark() {
+        // Include-only: the pref-51 lookup matches the include mark and nothing
+        // else, so unmarked traffic falls through to the main table. Every other
+        // command, the carrier's pref-50 escape included, is the full-tunnel one.
+        let full = build_install_commands("warren-cli", &[]);
+        let scoped = build_install_commands_scoped("warren-cli", &[], include(0x1234));
+        assert_eq!(scoped.len(), full.len(), "got: {scoped:#?}");
+        assert_eq!(scoped[..scoped.len() - 1], full[..full.len() - 1]);
+        assert_eq!(
+            scoped.last().expect("non-empty"),
+            &vec![
+                "rule", "add", "fwmark", "0x1234", "lookup", "100", "pref", "51"
+            ]
+        );
+    }
+
+    #[test]
+    fn marked_scope_uninstall_deletes_the_conditional_lookup_by_its_full_selector() {
+        let scoped = build_uninstall_commands_scoped(&[], include(0x1234));
+        assert_eq!(
+            scoped[0],
+            vec![
+                "rule", "del", "fwmark", "0x1234", "lookup", "100", "pref", "51"
+            ]
+        );
+        let full = build_uninstall_commands(&[]);
+        assert_eq!(scoped[1..], full[1..], "only the lookup rule may differ");
+    }
+
+    #[test]
+    fn v6_marked_scope_makes_only_the_tun_lookup_conditional() {
+        let full = build_install_commands_v6(None, "warren-cli");
+        let scoped = build_install_commands_v6_scoped(None, "warren-cli", include(0x1234));
+        assert_eq!(scoped[..scoped.len() - 1], full[..full.len() - 1]);
+        assert_eq!(
+            scoped.last().expect("non-empty"),
+            &vec![
+                "-6", "rule", "add", "fwmark", "0x1234", "lookup", "100", "pref", "51"
+            ]
+        );
+    }
+
+    #[test]
+    fn v6_marked_scope_uninstall_deletes_the_conditional_lookup() {
+        let scoped = build_uninstall_commands_v6_scoped(None, include(0x1234));
+        assert_eq!(
+            scoped[0],
+            vec![
+                "-6", "rule", "del", "fwmark", "0x1234", "lookup", "100", "pref", "51"
+            ]
+        );
+        assert_eq!(scoped[1..], build_uninstall_commands_v6(None)[1..]);
+    }
+
+    #[test]
+    fn a_marked_guard_tears_down_its_conditional_lookup_on_both_families() {
+        // `installed: false` keeps Drop from shelling out to `ip`.
+        let v4 = DefaultRouteSplitGuard {
+            bypass_cidrs: Vec::new(),
+            split_tunnel_fwmark: None,
+            scope: include(0x1234),
+            installed: false,
+        };
+        assert!(
+            v4.teardown_commands()
+                .contains(&build_tun_lookup_rule("del", include(0x1234))),
+            "got: {:#?}",
+            v4.teardown_commands()
+        );
+        let v6 = DefaultRouteSplitV6Guard {
+            exit_ip_v6: None,
+            split_tunnel_fwmark: None,
+            scope: include(0x1234),
+            installed: false,
+        };
+        assert_eq!(
+            v6.teardown_commands()[0],
+            vec![
+                "-6", "rule", "del", "fwmark", "0x1234", "lookup", "100", "pref", "51"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_marked_scope_refuses_an_include_mark_equal_to_the_exclusion_mark() {
+        // The exclusion rule sends its mark to `main` at pref 49, ahead of the
+        // conditional lookup, so a shared value would leak every included app.
+        let scope = include(0x6d6f_6c65);
+        assert_eq!(
+            check_scope_against_exclusion_mark(scope, Some("0x6d6f6c65")),
+            Err(IncludeFwmarkError::ExclusionMark)
+        );
+        assert_eq!(
+            check_scope_against_exclusion_mark(scope, Some("1836018789")),
+            Err(IncludeFwmarkError::ExclusionMark),
+            "the decimal spelling of the same mark is the same mark"
+        );
+        assert_eq!(
+            check_scope_against_exclusion_mark(scope, Some("0x1")),
+            Ok(())
+        );
+        assert_eq!(check_scope_against_exclusion_mark(scope, None), Ok(()));
+        assert_eq!(
+            check_scope_against_exclusion_mark(TunLookupScope::AllTraffic, Some("0x6d6f6c65")),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn force_cleanup_reclaims_a_conditional_lookup_100_rule() {
+        // A crashed include-only daemon leaves `fwmark <mark> lookup 100`: the
+        // reclaim keys on the table, so the conditional rule goes too.
+        let leaked = "\
+0:\tfrom all lookup local
+50:\tfrom all fwmark 0x77617272 lookup main
+51:\tfrom all fwmark 0x1234 lookup 100
+32766:\tfrom all lookup main
+";
+        let plan = plan_force_cleanup(leaked);
+        assert!(
+            plan.contains(&vec![
+                "rule".to_string(),
+                "del".to_string(),
+                "pref".to_string(),
+                "51".to_string(),
+                "lookup".to_string(),
+                "100".to_string(),
+            ]),
+            "got: {plan:#?}"
+        );
     }
 
     // --- force-cleanup ownership-scoped reclaim (plan_force_cleanup) ---
