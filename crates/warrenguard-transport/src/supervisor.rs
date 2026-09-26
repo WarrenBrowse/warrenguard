@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use tokio::sync::{Notify, watch};
 use warrenguard_backoff::{Backoff, JitterBackoff};
-use warrenguard_multihop::{ExitId, RejectionReason, RelayDescriptorSigned, WarrenControlMessage};
+use warrenguard_multihop::{ExitId, RejectionReason, RelayDescriptorSigned};
 use warrenguard_socket_bypass::SocketBypass;
 use warrenguard_wire::SessionToken;
 
@@ -1889,7 +1889,7 @@ impl MultiHopSupervisor {
                     // `supervised_pump::dispatch_control_message`'s no-log
                     // policy for exactly the same reason.
                     tracing::debug!(
-                        variant = control_message_variant_name(&msg),
+                        variant = msg.variant_name(),
                         "setup-stream reply is not an IpAssign; ignoring"
                     );
                 }
@@ -2134,25 +2134,6 @@ fn prime_leg(client: &MultiHopClient) {
     let padding_len = size.saturating_sub(1).min(budget.saturating_sub(1));
     if let Err(e) = client.send_cover_traffic(padding_len) {
         tracing::debug!(error = %e, "could not put a first frame on a fresh multi-hop leg");
-    }
-}
-
-/// No-log helper: the discriminant name only, never the message body. A
-/// `WarrenControlMessage::IpRequest`/`IpRequestV7` carries a client pubkey
-/// (and, for the v7 path, anonymous session tokens); logging the full
-/// `Debug` of an unexpected control message would let a hostile relay/exit
-/// smuggle that identity material into a debug log just by replying with
-/// the "wrong" variant. Mirrors
-/// `supervised_pump::dispatch_control_message`'s identical policy.
-fn control_message_variant_name(msg: &WarrenControlMessage) -> &'static str {
-    match msg {
-        WarrenControlMessage::IpRequest { .. } => "IpRequest",
-        WarrenControlMessage::IpRequestV7 { .. } => "IpRequestV7",
-        WarrenControlMessage::IpAssign { .. } => "IpAssign",
-        WarrenControlMessage::IpExhausted => "IpExhausted",
-        WarrenControlMessage::Rejected => "Rejected",
-        WarrenControlMessage::RejectedBanned { .. } => "RejectedBanned",
-        WarrenControlMessage::ExitDraining { .. } => "ExitDraining",
     }
 }
 

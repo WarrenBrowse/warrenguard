@@ -94,6 +94,10 @@ pub enum SetupError {
     /// The exit's address pool is exhausted.
     #[error("multihop exit ip pool exhausted")]
     IpExhausted,
+    /// The exit refused a route admission (`IpRequestRoute`). Carries the
+    /// wire code of [`crate::RouteRejectCode`].
+    #[error("multihop route admission refused")]
+    RouteRejected(u8),
     /// The reply was not a control message, or was a control message the client
     /// never expects to receive (e.g. an `IpRequest`).
     #[error("unexpected multihop setup reply")]
@@ -126,7 +130,9 @@ impl SetupError {
         match self {
             SetupError::Rejected => Retryability::Fatal(FatalCause::NotAuthorized),
             SetupError::Banned(_) => Retryability::Fatal(FatalCause::Banned),
-            SetupError::IpExhausted => Retryability::RetryReselect,
+            // The same request meets the same refusal; the route admission
+            // path falls back to another admission rather than redialling.
+            SetupError::IpExhausted | SetupError::RouteRejected(_) => Retryability::RetryReselect,
             SetupError::Session(_) | SetupError::Control(_) | SetupError::UnexpectedReply => {
                 Retryability::RetrySameTarget
             }
@@ -174,6 +180,9 @@ pub fn ip_assignment_from_setup_plaintext(plaintext: &[u8]) -> Result<IpAssignme
             Err(SetupError::Banned(reason_code))
         }
         Some(WarrenControlMessage::IpExhausted) => Err(SetupError::IpExhausted),
+        Some(WarrenControlMessage::RouteRejected { reason_code }) => {
+            Err(SetupError::RouteRejected(reason_code))
+        }
         // An IpRequest (client->exit direction), a mid-session ExitDraining
         // advisory (data-plane only, never a setup reply), or a non-control
         // plaintext on the reply path is a protocol violation by the peer. The
@@ -182,7 +191,11 @@ pub fn ip_assignment_from_setup_plaintext(plaintext: &[u8]) -> Result<IpAssignme
         Some(
             WarrenControlMessage::IpRequest { .. }
             | WarrenControlMessage::IpRequestV7 { .. }
-            | WarrenControlMessage::ExitDraining { .. },
+            | WarrenControlMessage::ExitDraining { .. }
+            | WarrenControlMessage::IpRequestRoute { .. }
+            | WarrenControlMessage::RouteAnchorRequest { .. }
+            | WarrenControlMessage::RouteAnchorAck { .. }
+            | WarrenControlMessage::RouteEnded { .. },
         )
         | None => Err(SetupError::UnexpectedReply),
     }
@@ -448,6 +461,26 @@ mod tests {
         assert!(matches!(
             client.open_setup_reply(&reply),
             Err(SetupError::IpExhausted)
+        ));
+    }
+
+    #[test]
+    fn route_rejected_reply_carries_its_code() {
+        let (client, exit, account) = pair();
+        let request = client
+            .seal_setup_request(Some(&account), None, false, false, 0, 0)
+            .unwrap();
+        let _ = exit.open(&request).unwrap();
+        let reply = exit
+            .seal_response(
+                &encode_control(&WarrenControlMessage::RouteRejected { reason_code: 2 }).unwrap(),
+                0,
+                0,
+            )
+            .unwrap();
+        assert!(matches!(
+            client.open_setup_reply(&reply),
+            Err(SetupError::RouteRejected(2))
         ));
     }
 

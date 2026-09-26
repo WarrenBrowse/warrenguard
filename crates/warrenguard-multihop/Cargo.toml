@@ -25,7 +25,7 @@ test-helpers = []
 # wire structs that merely carry a signed ML-KEM key (the `/v2` exit
 # descriptor field and its signing payload) are NOT gated here: a
 # classical-only build must still parse and correctly reject a PQ descriptor.
-pq-hpke = ["dep:ml-kem", "dep:kem", "dep:x25519-dalek", "dep:sha3", "dep:hkdf", "dep:sha2"]
+pq-hpke = ["dep:ml-kem", "dep:kem", "dep:x25519-dalek", "dep:sha3"]
 
 [dependencies]
 # HPKE RFC 9180 for client-to-exit end-to-end payload encryption (multi-message
@@ -64,10 +64,11 @@ kem = { version = "=0.3.0-pre.0", default-features = false, optional = true }
 x25519-dalek = { version = "2", default-features = false, features = ["zeroize"], optional = true }
 # SHA3-256 is the X-Wing combiner hash (draft-connolly-cfrg-xwing-kem).
 sha3 = { version = "0.10", default-features = false, optional = true }
-# HKDF-SHA256 exporter deriving the per-packet keys from the X-Wing shared
-# secret (the PQ analogue of the classical `AeadCtxS::export` key schedule).
-hkdf = { workspace = true, optional = true }
-sha2 = { workspace = true, optional = true }
+# HKDF-SHA256: the exporter deriving the per-packet keys from the X-Wing
+# shared secret, and the route admission KEM key derivation. SHA-256 also
+# derives the route anchor reference and route serial.
+hkdf = { workspace = true }
+sha2 = { workspace = true }
 
 # Wire format encoding consistent with `warren-protocol` and `warren-tls/name`.
 # `use-std` is required for `postcard::to_stdvec`; the workspace dep only
@@ -102,7 +103,6 @@ rand_core = { version = "0.9", default-features = false, features = ["os_rng"] }
 
 [dev-dependencies]
 proptest = "1"
-sha2 = { workspace = true }
 # Deterministic ChaCha20Rng for reproducible HPKE vector generation. Must be
 # the 0.9 line (uses rand_core 0.9 traits) to interop with hpke 0.13's
 # `setup_sender` rng parameter. See `tests/hpke_vectors_v1.rs`.

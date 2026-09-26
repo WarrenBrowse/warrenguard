@@ -6,8 +6,13 @@
 //! byte-for-byte. A failure means the wire layout moved.
 
 use serde::Deserialize;
+use warrenguard_multihop::route_admission::{
+    seal_route_anchor_with_ephemeral_ikm, seal_route_locator_with_ephemeral_ikm,
+};
 use warrenguard_multihop::{
-    PopSignature, WarrenControlMessage, WarrenMultihopFrame, WarrenMultihopFrameV2, encode_control,
+    PopSignature, RouteAnchorSecret, RouteKemSecretKey, RouteSealError, SealedToApi,
+    WarrenControlMessage, WarrenMultihopFrame, WarrenMultihopFrameV2, encode_control,
+    try_decode_control,
 };
 use warrenguard_wire::ExitId;
 
@@ -146,6 +151,16 @@ struct ControlVec {
     #[serde(default)]
     wants_daita: bool,
     daita_spec: Option<DaitaSpecVec>,
+    discriminant: Option<u8>,
+    route_locator_hex: Option<String>,
+    sealed_anchor_hex: Option<String>,
+    session_token_hex: Option<String>,
+    status: Option<u8>,
+    max_routes: Option<u16>,
+}
+
+fn sealed(hex_str: &str) -> SealedToApi {
+    SealedToApi::from_slice(&hex::decode(hex_str).expect("hex")).expect("81 bytes")
 }
 
 /// The granted maybenot machine, mirrored from the vector so the replay drives
@@ -198,6 +213,38 @@ fn message_for(v: &ControlVec) -> WarrenControlMessage {
             deadline_unix_secs: v.deadline_unix_secs.expect("deadline_unix_secs"),
             reason_code: v.reason_code.expect("reason_code"),
         },
+        "ip_request_route_minimal" | "ip_request_route_full" => {
+            WarrenControlMessage::IpRequestRoute {
+                prefer_ipv4: v.prefer_ipv4,
+                wants_ipv6: v.wants_ipv6,
+                route_locator: sealed(v.route_locator_hex.as_ref().expect("route_locator_hex")),
+                wants_daita: v.wants_daita,
+            }
+        }
+        "route_rejected_anchor_unknown" | "route_rejected_route_limit" => {
+            WarrenControlMessage::RouteRejected {
+                reason_code: v.reason_code.expect("reason_code"),
+            }
+        }
+        "route_anchor_request" | "route_anchor_request_with_token" => {
+            WarrenControlMessage::RouteAnchorRequest {
+                sealed_anchor: sealed(v.sealed_anchor_hex.as_ref().expect("sealed_anchor_hex")),
+                session_token: v.session_token_hex.as_ref().map(|h| {
+                    Box::new(warrenguard_wire::SessionToken(
+                        hex::decode(h).expect("hex").try_into().expect("354 bytes"),
+                    ))
+                }),
+            }
+        }
+        "route_anchor_ack_bound" | "route_anchor_ack_lost" => {
+            WarrenControlMessage::RouteAnchorAck {
+                status: v.status.expect("status"),
+                max_routes: v.max_routes.expect("max_routes"),
+            }
+        }
+        "route_ended_anchor_gone" => WarrenControlMessage::RouteEnded {
+            reason_code: v.reason_code.expect("reason_code"),
+        },
         other => panic!("unknown control vector name: {other}"),
     }
 }
@@ -217,5 +264,152 @@ fn control_vectors_match() {
             "control message `{}` encode bytes drifted from the frozen vector",
             v.name
         );
+        let bytes = hex::decode(&v.bytes_hex).expect("hex");
+        if let Some(discriminant) = v.discriminant {
+            assert_eq!(bytes[2], discriminant, "`{}` discriminant moved", v.name);
+        }
+        assert_eq!(
+            try_decode_control(&bytes).expect("decode").as_ref(),
+            Some(&msg),
+            "control message `{}` decode drifted from the frozen vector",
+            v.name
+        );
+    }
+}
+
+// ---- route admission v1 (doc 107 section 6) ----
+
+#[derive(Deserialize)]
+struct RouteFile {
+    version: u8,
+    sealed_len: usize,
+    kem_key: RouteKem,
+    anchor_secret_hex: String,
+    anchor_seal: RouteSeal,
+    locator_seal: RouteSeal,
+    derived: RouteDerived,
+    invalid_opens: Vec<RouteInvalid>,
+}
+
+#[derive(Deserialize)]
+struct RouteKem {
+    signing_seed_hex: String,
+    key_id: u8,
+    pk_hex: String,
+}
+
+#[derive(Deserialize)]
+struct RouteSeal {
+    serial_hex: Option<String>,
+    exit_id_hex: Option<String>,
+    eph_ikm_hex: String,
+    sealed_hex: String,
+}
+
+#[derive(Deserialize)]
+struct RouteDerived {
+    anchor_ref_hex: String,
+    exit_id_hex: String,
+    route_serial_hex: String,
+}
+
+#[derive(Deserialize)]
+struct RouteInvalid {
+    name: String,
+    sealed_hex: String,
+    open_as: String,
+    serial_hex: Option<String>,
+    exit_id_hex: Option<String>,
+}
+
+fn route_file() -> RouteFile {
+    serde_json::from_str(&read("vectors/route_admission_v1.json")).expect("parse")
+}
+
+#[test]
+fn route_admission_kem_key_and_seals_match() {
+    let f = route_file();
+    assert_eq!(
+        (f.version, f.sealed_len),
+        (1, warrenguard_multihop::SEALED_TO_API_LEN)
+    );
+    let key = RouteKemSecretKey::derive(&bytes32(&f.kem_key.signing_seed_hex), f.kem_key.key_id)
+        .expect("derive");
+    assert_eq!(
+        hex::encode(key.public_key().to_bytes()),
+        f.kem_key.pk_hex,
+        "route KEM key derivation drifted"
+    );
+    let secret = || RouteAnchorSecret::from_bytes(bytes32(&f.anchor_secret_hex));
+    let serial = bytes32(f.anchor_seal.serial_hex.as_ref().expect("serial_hex"));
+    let exit_id = warrenguard_wire::ExitId::from_bytes(bytes16(
+        f.locator_seal.exit_id_hex.as_ref().expect("exit_id_hex"),
+    ));
+
+    let anchor = seal_route_anchor_with_ephemeral_ikm(
+        key.public_key(),
+        &secret(),
+        &serial,
+        bytes32(&f.anchor_seal.eph_ikm_hex),
+    )
+    .expect("seal anchor");
+    assert_eq!(
+        hex::encode(anchor.to_bytes()),
+        f.anchor_seal.sealed_hex,
+        "anchor seal drifted"
+    );
+    let locator = seal_route_locator_with_ephemeral_ikm(
+        key.public_key(),
+        &secret(),
+        &exit_id,
+        bytes32(&f.locator_seal.eph_ikm_hex),
+    )
+    .expect("seal locator");
+    assert_eq!(
+        hex::encode(locator.to_bytes()),
+        f.locator_seal.sealed_hex,
+        "locator seal drifted"
+    );
+
+    let expected_ref = secret().anchor_ref();
+    let opened = key
+        .open_anchor(&sealed(&f.anchor_seal.sealed_hex), &serial)
+        .expect("the vector anchor opens");
+    assert_eq!(opened.anchor_ref(), expected_ref);
+    let opened = key
+        .open_locator(&sealed(&f.locator_seal.sealed_hex), &exit_id)
+        .expect("the vector locator opens");
+    assert_eq!(opened.anchor_ref(), expected_ref);
+
+    assert_eq!(
+        hex::encode(expected_ref.as_bytes()),
+        f.derived.anchor_ref_hex
+    );
+    let route_exit = warrenguard_wire::ExitId::from_bytes(bytes16(&f.derived.exit_id_hex));
+    assert_eq!(
+        hex::encode(expected_ref.route_serial(&route_exit).as_bytes()),
+        f.derived.route_serial_hex
+    );
+}
+
+#[test]
+fn route_admission_invalid_opens_are_refused() {
+    let f = route_file();
+    let key = RouteKemSecretKey::derive(&bytes32(&f.kem_key.signing_seed_hex), f.kem_key.key_id)
+        .expect("derive");
+    assert!(!f.invalid_opens.is_empty());
+    for case in &f.invalid_opens {
+        let blob = sealed(&case.sealed_hex);
+        let result: Result<RouteAnchorSecret, RouteSealError> = match case.open_as.as_str() {
+            "anchor" => key.open_anchor(&blob, &bytes32(case.serial_hex.as_ref().expect("serial"))),
+            "locator" => key.open_locator(
+                &blob,
+                &warrenguard_wire::ExitId::from_bytes(bytes16(
+                    case.exit_id_hex.as_ref().expect("exit id"),
+                )),
+            ),
+            other => panic!("unknown open_as {other}"),
+        };
+        assert!(result.is_err(), "`{}` must be refused", case.name);
     }
 }

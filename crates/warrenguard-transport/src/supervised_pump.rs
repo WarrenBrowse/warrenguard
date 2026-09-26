@@ -145,17 +145,8 @@ fn dispatch_control_message(
         // (an `IpRequest`/`IpRequestV7` carries a client pubkey + PoP or
         // anonymous session tokens; both are uplink-only and unreachable here,
         // but this dispatch is shared code).
-        let variant = match msg {
-            WarrenControlMessage::IpRequest { .. } => "IpRequest",
-            WarrenControlMessage::IpRequestV7 { .. } => "IpRequestV7",
-            WarrenControlMessage::IpAssign { .. } => "IpAssign",
-            WarrenControlMessage::IpExhausted => "IpExhausted",
-            WarrenControlMessage::Rejected => "Rejected",
-            WarrenControlMessage::RejectedBanned { .. } => "RejectedBanned",
-            WarrenControlMessage::ExitDraining { .. } => "ExitDraining",
-        };
         tracing::debug!(
-            variant,
+            variant = msg.variant_name(),
             "downlink observed a control message with no consumer; dropping"
         );
     }

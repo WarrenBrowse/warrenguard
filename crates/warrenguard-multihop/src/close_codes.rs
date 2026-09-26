@@ -128,7 +128,15 @@ impl RejectionReason {
             // must NOT map to a fatal RejectionReason (same contract as
             // WARREN_MH_FORCED_RECONNECT), or the supervisor would treat a
             // routine maintenance migration as a terminal tunnel error.
-            | crate::WarrenControlMessage::ExitDraining { .. } => None,
+            | crate::WarrenControlMessage::ExitDraining { .. }
+            // A route refusal is not fatal to anything but that route: the
+            // route admission path reads it itself and falls back to a token
+            // route, so it never becomes a session-wide rejection.
+            | crate::WarrenControlMessage::RouteRejected { .. }
+            | crate::WarrenControlMessage::IpRequestRoute { .. }
+            | crate::WarrenControlMessage::RouteAnchorRequest { .. }
+            | crate::WarrenControlMessage::RouteAnchorAck { .. }
+            | crate::WarrenControlMessage::RouteEnded { .. } => None,
         }
     }
 
@@ -324,6 +332,26 @@ mod tests {
             RejectionReason::from_sealed_detail(&assign),
             None,
             "a normal IpAssign must never read as a rejection"
+        );
+    }
+
+    #[test]
+    fn a_route_refusal_is_never_a_session_rejection() {
+        // The route path falls back to a token route on it; reading it as a
+        // RejectionReason would surface a fatal tunnel error instead.
+        for code in 0..=4 {
+            assert_eq!(
+                RejectionReason::from_sealed_detail(&WarrenControlMessage::RouteRejected {
+                    reason_code: code
+                }),
+                None
+            );
+        }
+        assert_eq!(
+            RejectionReason::from_sealed_detail(&WarrenControlMessage::RouteEnded {
+                reason_code: 1
+            }),
+            None
         );
     }
 }
