@@ -50,7 +50,7 @@ use warrenguard_multihop::{
 };
 use warrenguard_pump::DAITA_DUMMY_FIRST_BYTE;
 use warrenguard_ratelimit::{RateOverride, RatePolicyHandle, RateSpec};
-use warrenguard_server::{AllowlistHandle, SessionTokenAdmitter};
+use warrenguard_server::{AllowlistHandle, SessionTokenAdmitter, TOKEN_SERIAL_LEN};
 use warrenguard_transport_core::PacketDevice;
 use warrenguard_transport_core::ip_parse::TunnelPool;
 use warrenguard_wire::WarrenPubkey;
@@ -3170,7 +3170,16 @@ pub struct MultihopSessionRegistry<C: ClosableConn = Connection> {
     /// client's entry is tombstoned (not dropped) until its lease can no longer
     /// linger (see [`Ipv4Owner::departed_deadline`]).
     ipv4_to_pubkey: Mutex<HashMap<Ipv4Addr, Ipv4Owner>>,
+    /// Told the serial of a token session whose last connection just ended,
+    /// see [`Self::set_token_session_end_observer`].
+    token_end_observer: std::sync::OnceLock<TokenSessionEndObserver>,
 }
+
+/// Callback a deployer wires with
+/// [`MultihopSessionRegistry::set_token_session_end_observer`]. It runs on the
+/// connection teardown path, synchronously, so it must hand the serial off
+/// (a `try_send`, a spawn) and never block or await.
+pub type TokenSessionEndObserver = Box<dyn Fn([u8; TOKEN_SERIAL_LEN]) + Send + Sync>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum SessionKey {
@@ -3183,6 +3192,7 @@ impl<C: ClosableConn> Default for MultihopSessionRegistry<C> {
         Self {
             live: Mutex::new(HashMap::new()),
             ipv4_to_pubkey: Mutex::new(HashMap::new()),
+            token_end_observer: std::sync::OnceLock::new(),
         }
     }
 }
@@ -3232,6 +3242,11 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
                     SessionKey::Wallet(pubkey) | SessionKey::TokenSerial(pubkey) => pubkey,
                 };
                 self.tombstone_attribution(&pubkey, Instant::now());
+                if let (SessionKey::TokenSerial(serial), Some(observer)) =
+                    (key, self.token_end_observer.get())
+                {
+                    observer(*serial.as_bytes());
+                }
             }
         }
     }
@@ -3262,6 +3277,47 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
                 owner.departed_deadline = Some(deadline);
             }
         }
+    }
+
+    /// Serials of the anonymous token sessions that hold at least one live
+    /// connection right now.
+    ///
+    /// This is the set a deployer holding a per-serial lease must renew. The
+    /// attribution snapshot ([`Self::snapshot_ipv4_to_pubkey_hex`]) is not: it
+    /// keeps a departed session for [`DEPARTED_ATTRIBUTION_RETENTION`], so a
+    /// lease renewed off it outlives its session by minutes and refuses the
+    /// same serial everywhere else in the meantime.
+    #[must_use]
+    pub fn live_token_serials(&self) -> Vec<[u8; TOKEN_SERIAL_LEN]> {
+        self.live
+            .lock()
+            .keys()
+            .filter_map(|key| match key {
+                SessionKey::TokenSerial(serial) => Some(*serial.as_bytes()),
+                SessionKey::Wallet(_) => None,
+            })
+            .collect()
+    }
+
+    /// Whether a token session under `serial` holds a live connection. Lets a
+    /// deployer that heard a session end check, before releasing its lease,
+    /// that the same serial has not reconnected in the meantime.
+    #[must_use]
+    pub fn is_token_serial_live(&self, serial: &[u8; TOKEN_SERIAL_LEN]) -> bool {
+        self.live
+            .lock()
+            .contains_key(&SessionKey::TokenSerial(WarrenPubkey::from_bytes(*serial)))
+    }
+
+    /// Wire the callback told a token serial each time the last live
+    /// connection admitted under it ends: the moment a deployer can release
+    /// the serial's fleet-wide lease instead of letting it run to its TTL.
+    /// A bonded connection leaving while another of the same serial stays up
+    /// does not fire it, and wallet sessions never do.
+    ///
+    /// Set once. Returns `false`, keeping the first, when one is already wired.
+    pub fn set_token_session_end_observer(&self, observer: TokenSessionEndObserver) -> bool {
+        self.token_end_observer.set(observer).is_ok()
     }
 
     /// Snapshot of `tunnel IPv4 -> 64-char pubkey hex`, consumed by
@@ -5445,6 +5501,101 @@ mod tests {
 
     fn reg_pk(seed: u8) -> WarrenPubkey {
         WarrenPubkey::from_bytes([seed; 32])
+    }
+
+    /// Records every serial the registry reports as ended, in order.
+    fn recording_end_observer(
+        registry: &MultihopSessionRegistry<FakeConn>,
+    ) -> Arc<Mutex<Vec<[u8; TOKEN_SERIAL_LEN]>>> {
+        let ended = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&ended);
+        assert!(
+            registry.set_token_session_end_observer(Box::new(move |serial| {
+                sink.lock().push(serial);
+            })),
+            "the first observer must be wired"
+        );
+        ended
+    }
+
+    #[test]
+    fn live_token_serials_omit_a_departed_serial_the_attribution_snapshot_still_holds() {
+        // The attribution map keeps a departed session for the NAT-PMP reclaim
+        // window, minutes after it ended. A deployer that renewed a per-serial
+        // lease off that map kept every closed serial leased for those minutes,
+        // refusing the same serial on any other exit. Only live connections
+        // may name a live serial.
+        let registry: MultihopSessionRegistry<FakeConn> = MultihopSessionRegistry::default();
+        let departed = reg_pk(7);
+        let staying = reg_pk(8);
+        let departed_ip = Ipv4Addr::new(10, 66, 0, 7);
+        registry.register_token(departed, 100, FakeConn::new());
+        registry.record_assigned_ipv4(departed_ip, departed);
+        registry.register_token(staying, 101, FakeConn::new());
+        registry.register(reg_pk(9), 102, FakeConn::new());
+
+        registry.unregister_key(SessionKey::TokenSerial(departed), 100);
+
+        assert_eq!(
+            registry.snapshot_ipv4_to_pubkey_hex().get(&departed_ip),
+            Some(&departed.to_hex()),
+            "the NAT-PMP attribution tombstone must survive the session"
+        );
+        assert_eq!(
+            registry.live_token_serials(),
+            vec![*staying.as_bytes()],
+            "a departed serial and a wallet session are not live token serials"
+        );
+        assert!(!registry.is_token_serial_live(departed.as_bytes()));
+        assert!(registry.is_token_serial_live(staying.as_bytes()));
+    }
+
+    #[test]
+    fn the_end_observer_hears_a_serial_once_its_last_connection_ends() {
+        let registry: MultihopSessionRegistry<FakeConn> = MultihopSessionRegistry::default();
+        let ended = recording_end_observer(&registry);
+        let serial = reg_pk(11);
+        registry.register_token(serial, 100, FakeConn::new());
+        registry.register_token(serial, 101, FakeConn::new());
+
+        registry.unregister_key(SessionKey::TokenSerial(serial), 100);
+        assert!(
+            ended.lock().is_empty(),
+            "one bonded connection leaving does not end the session"
+        );
+
+        registry.unregister_key(SessionKey::TokenSerial(serial), 101);
+        registry.unregister_key(SessionKey::TokenSerial(serial), 101);
+        assert_eq!(
+            *ended.lock(),
+            vec![*serial.as_bytes()],
+            "the last connection ending reports the serial exactly once"
+        );
+    }
+
+    #[test]
+    fn the_end_observer_ignores_wallet_sessions() {
+        let registry: MultihopSessionRegistry<FakeConn> = MultihopSessionRegistry::default();
+        let ended = recording_end_observer(&registry);
+        let wallet = reg_pk(12);
+        registry.register(wallet, 100, FakeConn::new());
+        registry.unregister(&wallet, 100);
+        let _ = registry.terminate(&wallet);
+        assert!(
+            ended.lock().is_empty(),
+            "a wallet session holds no serial lease to release"
+        );
+    }
+
+    #[test]
+    fn a_second_end_observer_is_refused_and_the_first_kept() {
+        let registry: MultihopSessionRegistry<FakeConn> = MultihopSessionRegistry::default();
+        let ended = recording_end_observer(&registry);
+        assert!(!registry.set_token_session_end_observer(Box::new(|_| {})));
+        let serial = reg_pk(13);
+        registry.register_token(serial, 100, FakeConn::new());
+        registry.unregister_key(SessionKey::TokenSerial(serial), 100);
+        assert_eq!(*ended.lock(), vec![*serial.as_bytes()]);
     }
 
     #[test]
