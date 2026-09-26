@@ -4,6 +4,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
+mod route_admission;
 mod session;
 mod session_token;
 
@@ -14,6 +15,7 @@ mod session_token;
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 // Re-export public types so external consumers keep the same path.
+pub use route_admission::{AnchorVerdict, RouteAdmission, RouteAdmitter};
 pub use session::{ExitRevocationHandle, ExitSessionsHandle};
 pub use session_token::{
     SessionTokenAdmitter, TOKEN_SERIAL_LEN, TokenAdmission, attach_secret_for_serial,

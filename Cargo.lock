@@ -3552,6 +3552,7 @@ dependencies = [
  "warrenguard-token",
  "warrenguard-transport-core",
  "warrenguard-wire",
+ "zeroize",
 ]
 
 [[package]]
