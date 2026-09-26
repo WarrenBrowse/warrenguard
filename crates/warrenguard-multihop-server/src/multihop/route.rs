@@ -20,11 +20,12 @@ use quinn::{Connection, SendDatagramError, VarInt};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use warrenguard_multihop::{
-    RouteAnchorStatus, RouteEndReason, SEALED_TO_API_LEN, SealedToApi, WARREN_MH_REJECTED,
-    WarrenControlMessage, encode_control,
+    RouteAnchorStatus, RouteEndReason, RouteRejectCode, SEALED_TO_API_LEN, SealedToApi,
+    WARREN_MH_REJECTED, WarrenControlMessage, encode_control,
 };
 use warrenguard_server::{
-    AnchorVerdict, RouteAdmitter, SessionTokenAdmitter, TOKEN_SERIAL_LEN, TokenAdmission,
+    AnchorVerdict, RouteAdmission, RouteAdmitter, SessionTokenAdmitter, TOKEN_SERIAL_LEN,
+    TokenAdmission,
 };
 use warrenguard_wire::{SessionToken, WarrenPubkey};
 use zeroize::Zeroizing;
@@ -48,6 +49,75 @@ const ANCHOR_MIN_INTERVAL: Duration = Duration::from_secs(2);
 /// datagram still queued.
 const ROUTE_END_REPEATS: u32 = 3;
 const ROUTE_END_SPACING: Duration = Duration::from_millis(50);
+
+/// Ceiling on one anchor registration (token spend plus policy call). A
+/// policy that never answers must not leave the session's call in flight
+/// forever, which would stop it from ever anchoring again.
+const ANCHOR_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Ceiling on one route admission call. Under the client's own setup
+/// round-trip bound, so the sealed refusal still reaches it.
+pub(super) const ROUTE_CALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Route admissions this exit forwards to its policy per second, sustained
+/// and in a burst, and at most this many at once. A locator cannot be checked
+/// offline, so without this any peer able to complete a setup could make the
+/// exit spend its control-plane budget on forged locators; the budget left
+/// over keeps the anchor registrations of its admitted sessions going.
+const ROUTE_OPEN_RATE_PER_SEC: f64 = 200.0;
+const ROUTE_OPEN_BURST: f64 = 400.0;
+const ROUTE_OPEN_MAX_IN_FLIGHT: usize = 128;
+
+/// The route policy of an exit with its local admission limits.
+#[derive(Clone)]
+pub(crate) struct RouteGate {
+    pub(super) admitter: Arc<dyn RouteAdmitter>,
+    bucket: Arc<Mutex<super::TokenBucket>>,
+    in_flight: Arc<tokio::sync::Semaphore>,
+}
+
+impl RouteGate {
+    pub(super) fn new(admitter: Arc<dyn RouteAdmitter>) -> Self {
+        Self::with_limits(
+            admitter,
+            ROUTE_OPEN_RATE_PER_SEC,
+            ROUTE_OPEN_BURST,
+            ROUTE_OPEN_MAX_IN_FLIGHT,
+        )
+    }
+
+    fn with_limits(
+        admitter: Arc<dyn RouteAdmitter>,
+        rate_per_sec: f64,
+        burst: f64,
+        max_in_flight: usize,
+    ) -> Self {
+        Self {
+            admitter,
+            bucket: Arc::new(Mutex::new(super::TokenBucket::new(
+                rate_per_sec,
+                burst,
+                Instant::now(),
+            ))),
+            in_flight: Arc::new(tokio::sync::Semaphore::new(max_in_flight)),
+        }
+    }
+
+    /// Ask the policy about `locator`, within the local limits: past them, or
+    /// past [`ROUTE_CALL_TIMEOUT`], the route is refused as unavailable.
+    pub(super) async fn admit_route(&self, locator: &SealedToApi) -> RouteAdmission {
+        let unavailable = RouteAdmission::Refuse(RouteRejectCode::Unavailable);
+        if !self.bucket.lock().try_take(Instant::now()) {
+            return unavailable;
+        }
+        let Ok(_permit) = self.in_flight.try_acquire() else {
+            return unavailable;
+        };
+        tokio::time::timeout(ROUTE_CALL_TIMEOUT, self.admitter.admit_route(locator))
+            .await
+            .unwrap_or(unavailable)
+    }
+}
 
 /// What a connection's control emitter is asked to send.
 #[derive(Debug)]
@@ -185,6 +255,8 @@ impl RegistryRouteState {
     }
 
     /// Forget a route whose last connection ended, and count its teardown.
+    /// Called under the `live` lock, so a session registering the same key
+    /// cannot lose its fresh state to it.
     pub(super) fn forget_route(&self, route_serial: &[u8; 32]) {
         self.locators.lock().remove(route_serial);
         if !self.ended_by_policy.lock().remove(route_serial) {
@@ -197,7 +269,7 @@ impl RegistryRouteState {
     }
 
     /// Forget a token session's anchor state and return the lease serial it
-    /// held last.
+    /// held last. Called under the `live` lock, like [`Self::forget_route`].
     pub(super) fn forget_anchor(
         &self,
         key_serial: &[u8; TOKEN_SERIAL_LEN],
@@ -208,14 +280,30 @@ impl RegistryRouteState {
             .map(|slot| slot.lease_serial)
     }
 
-    pub(super) fn lease_serial_of(
+    /// The lease serial of each token session key, in order (the key itself
+    /// for a session never rebound).
+    pub(super) fn lease_serials_of(
         &self,
-        key_serial: &[u8; TOKEN_SERIAL_LEN],
-    ) -> Option<[u8; TOKEN_SERIAL_LEN]> {
-        self.anchors
-            .lock()
-            .get(key_serial)
-            .map(|slot| slot.lease_serial)
+        keys: &[[u8; TOKEN_SERIAL_LEN]],
+    ) -> Vec<[u8; TOKEN_SERIAL_LEN]> {
+        let anchors = self.anchors.lock();
+        keys.iter()
+            .map(|key| anchors.get(key).map_or(*key, |slot| slot.lease_serial))
+            .collect()
+    }
+
+    /// A key is registered afresh: no state of an earlier session under the
+    /// same key may carry over. Called under the `live` lock.
+    pub(super) fn reset_for_new_session(&self, key: SessionKey) {
+        match key {
+            SessionKey::TokenSerial(serial) => {
+                self.anchors.lock().remove(serial.as_bytes());
+            }
+            SessionKey::Route(serial) => {
+                self.ended_by_policy.lock().remove(serial.as_bytes());
+            }
+            SessionKey::Wallet(_) => {}
+        }
     }
 }
 
@@ -226,18 +314,16 @@ pub(crate) struct AnchorContext {
     pub(super) key: Option<SessionKey>,
     pub(super) reply: ControlTx,
     pub(super) token_admitter: Option<Arc<dyn SessionTokenAdmitter>>,
-    pub(super) route_admitter: Option<Arc<dyn RouteAdmitter>>,
+    pub(super) route: Option<RouteGate>,
 }
 
 impl AnchorContext {
     /// Handle one anchor request read off this connection's uplink.
     /// `plaintext` is the request as it arrived, for the repeat check.
     pub(crate) fn submit(&self, plaintext: &[u8], frame: AnchorRequestFrame) {
-        let (Some(registry), Some(SessionKey::TokenSerial(serial)), Some(route)) = (
-            self.registry.as_ref(),
-            self.key,
-            self.route_admitter.as_ref(),
-        ) else {
+        let (Some(registry), Some(SessionKey::TokenSerial(serial)), Some(route)) =
+            (self.registry.as_ref(), self.key, self.route.as_ref())
+        else {
             // A wallet session never anchors (it would join a pubkey to the
             // route exits on the control plane), nor does a route session, a
             // session with no identity, or any session of an exit with route
@@ -255,7 +341,7 @@ impl AnchorContext {
             frame,
             self.reply.clone(),
             self.token_admitter.clone(),
-            Arc::clone(route),
+            Arc::clone(&route.admitter),
         );
     }
 }
@@ -271,6 +357,17 @@ enum AnchorDecision {
     Repeat(AnchorVerdict),
     Throttled,
     Call([u8; TOKEN_SERIAL_LEN]),
+    Gone,
+}
+
+/// What rebinding a session to a freshly spent serial came to.
+enum Rebind {
+    /// The session holds the new lease now.
+    Done,
+    /// Another live session of this exit holds that serial: never rebind onto
+    /// it, or the other session's lease would be released while it serves.
+    HeldElsewhere,
+    /// The session ended meanwhile.
     Gone,
 }
 
@@ -291,8 +388,11 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
         route_admitter: Arc<dyn RouteAdmitter>,
     ) {
         let key = SessionKey::TokenSerial(WarrenPubkey::from_bytes(key_serial));
-        let live = self.live.lock().contains_key(&key);
-        let decision = if live {
+        // `live` then `anchors`, the one order every path takes: the slot is
+        // created only while the session is known live, and its removal at
+        // the session's end happens under `live` too.
+        let live = self.live.lock();
+        let decision = if live.contains_key(&key) {
             let mut anchors = self.route.anchors.lock();
             let slot = anchors
                 .entry(key_serial)
@@ -318,6 +418,7 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
         } else {
             AnchorDecision::Gone
         };
+        drop(live);
         match decision {
             AnchorDecision::Gone => {}
             AnchorDecision::Repeat(verdict) => {
@@ -330,15 +431,18 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
             AnchorDecision::Call(lease_serial) => {
                 let registry = Arc::clone(self);
                 tokio::spawn(async move {
-                    let verdict = registry
-                        .resolve_anchor(
+                    let verdict = tokio::time::timeout(
+                        ANCHOR_CALL_TIMEOUT,
+                        registry.resolve_anchor(
                             key_serial,
                             lease_serial,
                             frame,
                             token_admitter,
                             route_admitter,
-                        )
-                        .await;
+                        ),
+                    )
+                    .await
+                    .unwrap_or(AnchorVerdict::status(RouteAnchorStatus::Unavailable));
                     if let Some(slot) = registry.route.anchors.lock().get_mut(&key_serial) {
                         slot.in_flight = false;
                         slot.anchored = verdict.status == RouteAnchorStatus::Bound;
@@ -374,10 +478,12 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
                 };
                 let token: SessionToken = *token;
                 match admitter.admit(std::slice::from_ref(&token)).await {
-                    TokenAdmission::Admit { serial } => {
-                        self.rebind_lease_serial(key_serial, serial);
-                        serial
-                    }
+                    TokenAdmission::Admit { serial } => match self.rebind(key_serial, serial) {
+                        Rebind::Done => serial,
+                        Rebind::HeldElsewhere | Rebind::Gone => {
+                            return AnchorVerdict::status(RouteAnchorStatus::Refused);
+                        }
+                    },
                     _ => return AnchorVerdict::status(RouteAnchorStatus::Refused),
                 }
             }
@@ -385,22 +491,41 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
         route_admitter.anchor(&lease_serial, &sealed_anchor).await
     }
 
-    /// The session keyed by `key_serial` now holds the lease of `new`: report
-    /// the serial it leaves behind as ended, so the deployer releases it,
-    /// while the sticky allocation keeps its key.
-    fn rebind_lease_serial(&self, key_serial: [u8; TOKEN_SERIAL_LEN], new: [u8; TOKEN_SERIAL_LEN]) {
-        let old = {
+    /// Make the session keyed by `key_serial` hold the lease of `new`, the
+    /// serial of a token its anchor request just spent. The serial it leaves
+    /// behind is reported ended so the deployer releases it; the sticky
+    /// allocation keeps its key. Refused when another live session of this
+    /// exit holds `new` (the control plane re-admits a same-exit duplicate,
+    /// so only this registry can tell), and when the session ended
+    /// meanwhile, in which case `new` is released since nobody holds it.
+    fn rebind(&self, key_serial: [u8; TOKEN_SERIAL_LEN], new: [u8; TOKEN_SERIAL_LEN]) -> Rebind {
+        let key = SessionKey::TokenSerial(WarrenPubkey::from_bytes(key_serial));
+        let (outcome, release) = {
+            let live = self.live.lock();
             let mut anchors = self.route.anchors.lock();
-            let slot = anchors
-                .entry(key_serial)
-                .or_insert_with(|| AnchorSlot::new(key_serial));
-            std::mem::replace(&mut slot.lease_serial, new)
+            let held_elsewhere = live.keys().any(|other| match other {
+                SessionKey::TokenSerial(other) if *other.as_bytes() != key_serial => {
+                    let other = *other.as_bytes();
+                    anchors.get(&other).map_or(other, |slot| slot.lease_serial) == new
+                }
+                _ => false,
+            });
+            if held_elsewhere {
+                (Rebind::HeldElsewhere, None)
+            } else {
+                match (live.contains_key(&key), anchors.get_mut(&key_serial)) {
+                    (true, Some(slot)) => {
+                        let old = std::mem::replace(&mut slot.lease_serial, new);
+                        (Rebind::Done, (old != new).then_some(old))
+                    }
+                    _ => (Rebind::Gone, Some(new)),
+                }
+            }
         };
-        if old != new
-            && let Some(observer) = self.token_end_observer.get()
-        {
-            observer(old);
+        if let (Some(serial), Some(observer)) = (release, self.token_end_observer.get()) {
+            observer(serial);
         }
+        outcome
     }
 
     /// Lease serials of the live v7 main sessions whose anchor is bound: the
@@ -442,13 +567,12 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
             *key_serial
         };
         let key = SessionKey::TokenSerial(WarrenPubkey::from_bytes(key_serial));
-        let controls = self.route.controls_of(key);
-        for (_, tx) in &controls {
-            send_ack(tx, AnchorVerdict::status(RouteAnchorStatus::Lost));
-        }
-        if controls.is_empty() {
+        // One connection is enough: an ack carries no correlation, so one per
+        // bonded leg would read as several verdicts on the client.
+        let Some((_, tx)) = self.route.controls_of(key).into_iter().next() else {
             return false;
-        }
+        };
+        send_ack(&tx, AnchorVerdict::status(RouteAnchorStatus::Lost));
         route_admission_metrics().record_anchor(AnchorRequestResult::LostSent);
         true
     }
@@ -507,16 +631,20 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
         C: Clone,
     {
         let key = SessionKey::Route(WarrenPubkey::from_bytes(*route_serial));
-        let conns: Vec<(ConnId, C)> = match self.live.lock().get(&key) {
-            Some(conns) => conns.iter().map(|(id, c)| (*id, c.clone())).collect(),
-            None => return 0,
+        let conns: Vec<(ConnId, C)> = {
+            let live = self.live.lock();
+            let Some(conns) = live.get(&key) else {
+                return 0;
+            };
+            // Marked under `live`, so it cannot outlive the session it ends.
+            if self.route.ended_by_policy.lock().insert(*route_serial) {
+                route_admission_metrics().record_teardown(match reason {
+                    RouteEndReason::AnchorGone => RouteTeardown::AnchorGone,
+                    _ => RouteTeardown::Close,
+                });
+            }
+            conns.iter().map(|(id, c)| (*id, c.clone())).collect()
         };
-        if self.route.ended_by_policy.lock().insert(*route_serial) {
-            route_admission_metrics().record_teardown(match reason {
-                RouteEndReason::AnchorGone => RouteTeardown::AnchorGone,
-                _ => RouteTeardown::Close,
-            });
-        }
         let controls: HashMap<ConnId, ControlTx> =
             self.route.controls_of(key).into_iter().collect();
         for (id, conn) in &conns {
@@ -597,13 +725,19 @@ mod tests {
     }
 
     /// Admits every token on the serial of its first 32 bytes, or refuses.
+    /// With a gate, each admission waits for it (and says it started).
     struct FakeTokens {
         admit: bool,
+        gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     }
 
     impl SessionTokenAdmitter for FakeTokens {
         fn admit<'a>(&'a self, tokens: &'a [SessionToken]) -> BoxFuture<'a, TokenAdmission> {
             Box::pin(async move {
+                if let Some((started, release)) = &self.gate {
+                    started.notify_one();
+                    release.notified().await;
+                }
                 if !self.admit {
                     return TokenAdmission::Denied;
                 }
@@ -740,7 +874,10 @@ mod tests {
         let sink = Arc::clone(&ended);
         assert!(registry.set_token_session_end_observer(Box::new(move |s| sink.lock().push(s))));
         let policy = FakePolicy::answering(RouteAnchorStatus::Bound);
-        let tokens: Arc<dyn SessionTokenAdmitter> = Arc::new(FakeTokens { admit: true });
+        let tokens: Arc<dyn SessionTokenAdmitter> = Arc::new(FakeTokens {
+            admit: true,
+            gate: None,
+        });
         let (tx, mut rx) = mpsc::channel(8);
         request(
             &registry,
@@ -779,7 +916,10 @@ mod tests {
     async fn a_refused_token_is_acked_refused_without_asking_the_policy() {
         let registry = registry_with_main();
         let policy = FakePolicy::answering(RouteAnchorStatus::Bound);
-        let tokens: Arc<dyn SessionTokenAdmitter> = Arc::new(FakeTokens { admit: false });
+        let tokens: Arc<dyn SessionTokenAdmitter> = Arc::new(FakeTokens {
+            admit: false,
+            gate: None,
+        });
         let (tx, mut rx) = mpsc::channel(8);
         request(
             &registry,
@@ -840,7 +980,7 @@ mod tests {
                 key,
                 reply: tx,
                 token_admitter: None,
-                route_admitter,
+                route: route_admitter.map(RouteGate::new),
             };
             ctx.submit(b"request", frame(0xA1, None));
             assert_eq!(
@@ -907,5 +1047,198 @@ mod tests {
         );
         assert!(!registry.is_route_serial_live(&serial));
         assert_eq!(registry.end_route(&serial, RouteEndReason::AnchorGone), 0);
+    }
+    #[tokio::test]
+    async fn a_token_whose_serial_another_session_holds_is_never_rebound_onto() {
+        // Session B holds S2. A presents a token of S2 on its anchor request:
+        // rebinding A onto S2 would report S1 ended while A still serves on
+        // it, and the deployer would release a lease in use.
+        let registry = registry_with_main();
+        let other = [0x77; 32];
+        registry.register_key(
+            SessionKey::TokenSerial(WarrenPubkey::from_bytes(other)),
+            2,
+            FakeConn::default(),
+        );
+        let ended = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&ended);
+        registry.set_token_session_end_observer(Box::new(move |s| sink.lock().push(s)));
+        let policy = FakePolicy::answering(RouteAnchorStatus::Bound);
+        let tokens: Arc<dyn SessionTokenAdmitter> = Arc::new(FakeTokens {
+            admit: true,
+            gate: None,
+        });
+        let (tx, mut rx) = mpsc::channel(8);
+        request(
+            &registry,
+            1,
+            frame(0xA1, Some(0x77)),
+            &tx,
+            Some(tokens),
+            &policy,
+        );
+        assert_eq!(next_ack(&mut rx).await.0, RouteAnchorStatus::Refused.code());
+        assert!(ended.lock().is_empty(), "no lease is released");
+        let mut live = registry.live_token_serials();
+        live.sort_unstable();
+        assert_eq!(live, vec![MAIN, other], "each session keeps its own lease");
+        assert!(policy.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_session_that_ends_during_the_token_spend_leaves_no_state_behind() {
+        let registry = registry_with_main();
+        let ended = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&ended);
+        registry.set_token_session_end_observer(Box::new(move |s| sink.lock().push(s)));
+        let (started, release) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let tokens: Arc<dyn SessionTokenAdmitter> = Arc::new(FakeTokens {
+            admit: true,
+            gate: Some((Arc::clone(&started), Arc::clone(&release))),
+        });
+        let policy = FakePolicy::answering(RouteAnchorStatus::Bound);
+        let (tx, mut rx) = mpsc::channel(8);
+        request(
+            &registry,
+            1,
+            frame(0xA1, Some(0x77)),
+            &tx,
+            Some(tokens),
+            &policy,
+        );
+        started.notified().await;
+
+        registry.unregister_key(main_key(), 1);
+        release.notify_one();
+        assert_eq!(next_ack(&mut rx).await.0, RouteAnchorStatus::Refused.code());
+        assert_eq!(
+            *ended.lock(),
+            vec![MAIN, [0x77; 32]],
+            "the session's lease, then the one spent for nobody, are both released"
+        );
+        assert!(
+            registry.route.anchors.lock().is_empty(),
+            "no slot for a dead key"
+        );
+
+        // The same key registering again starts clean.
+        registry.register_key(main_key(), 4, FakeConn::default());
+        assert_eq!(registry.live_token_serials(), vec![MAIN]);
+        assert!(registry.live_anchor_serials().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_lost_anchor_is_reported_once_whatever_the_bond_width() {
+        let registry = registry_with_main();
+        registry.register_key(main_key(), 2, FakeConn::default());
+        let (tx1, mut rx1) = mpsc::channel(8);
+        let (tx2, mut rx2) = mpsc::channel(8);
+        registry.attach_control(main_key(), 1, tx1.clone());
+        registry.attach_control(main_key(), 2, tx2);
+        let policy = FakePolicy::answering(RouteAnchorStatus::Bound);
+        request(&registry, 1, frame(0xA1, None), &tx1, None, &policy);
+        next_ack(&mut rx1).await;
+        assert!(registry.notify_anchor_lost(&MAIN));
+        let lost = usize::from(rx1.try_recv().is_ok()) + usize::from(rx2.try_recv().is_ok());
+        assert_eq!(lost, 1, "one lost ack per session, not per leg");
+    }
+
+    /// Never answers.
+    struct SilentPolicy;
+
+    impl RouteAdmitter for SilentPolicy {
+        fn admit_route<'a>(&'a self, _: &'a SealedToApi) -> BoxFuture<'a, RouteAdmission> {
+            Box::pin(std::future::pending())
+        }
+
+        fn anchor<'a>(
+            &'a self,
+            _: &'a [u8; TOKEN_SERIAL_LEN],
+            _: &'a SealedToApi,
+        ) -> BoxFuture<'a, AnchorVerdict> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_policy_that_never_answers_cannot_wedge_the_anchor_or_the_setup() {
+        let registry = registry_with_main();
+        let (tx, mut rx) = mpsc::channel(8);
+        registry.handle_anchor_request(
+            MAIN,
+            [1; 32],
+            frame(0xA1, None),
+            tx.clone(),
+            None,
+            Arc::new(SilentPolicy),
+        );
+        // The paused clock jumps to the call's own deadline first.
+        match tokio::time::timeout(ANCHOR_CALL_TIMEOUT * 3, rx.recv()).await {
+            Ok(Some(Outbound::Control(WarrenControlMessage::RouteAnchorAck {
+                status, ..
+            }))) => {
+                assert_eq!(status, RouteAnchorStatus::Unavailable.code());
+            }
+            other => panic!("expected an unavailable ack, got {other:?}"),
+        }
+        assert!(
+            !registry
+                .route
+                .anchors
+                .lock()
+                .get(&MAIN)
+                .expect("slot")
+                .in_flight,
+            "the session may anchor again"
+        );
+
+        let gate = RouteGate::new(Arc::new(SilentPolicy));
+        let locator = SealedToApi::from_bytes(&[0x11; SEALED_TO_API_LEN]);
+        let verdict = tokio::spawn({
+            let gate = gate.clone();
+            async move { gate.admit_route(&locator).await }
+        });
+        assert_eq!(
+            verdict.await.expect("no panic"),
+            RouteAdmission::Refuse(RouteRejectCode::Unavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn route_admissions_past_the_local_limits_are_refused_unavailable() {
+        let policy: Arc<dyn RouteAdmitter> = Arc::new(SilentPolicy);
+        let locator = SealedToApi::from_bytes(&[0x11; SEALED_TO_API_LEN]);
+        // A bucket of two: the third admission in the same instant is refused
+        // without reaching the policy.
+        let gate = RouteGate::with_limits(Arc::clone(&policy), 0.0, 2.0, 16);
+        let pending: Vec<_> = (0..2)
+            .map(|_| {
+                let gate = gate.clone();
+                tokio::spawn(async move { gate.admit_route(&locator).await })
+            })
+            .collect();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            gate.admit_route(&locator).await,
+            RouteAdmission::Refuse(RouteRejectCode::Unavailable)
+        );
+        // One in flight at most: the second waits on nothing, it is refused.
+        let narrow = RouteGate::with_limits(policy, 100.0, 100.0, 1);
+        let first = tokio::spawn({
+            let narrow = narrow.clone();
+            async move { narrow.admit_route(&locator).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            narrow.admit_route(&locator).await,
+            RouteAdmission::Refuse(RouteRejectCode::Unavailable)
+        );
+        first.abort();
+        for task in pending {
+            task.abort();
+        }
     }
 }

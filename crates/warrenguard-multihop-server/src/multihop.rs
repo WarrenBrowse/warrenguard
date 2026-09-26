@@ -692,7 +692,7 @@ async fn accept_setup_stream(
     allowlist: Option<&AllowlistHandle>,
     session_registry: Option<&Arc<MultihopSessionRegistry>>,
     token_admitter: Option<&Arc<dyn SessionTokenAdmitter>>,
-    route_admitter: Option<&Arc<dyn RouteAdmitter>>,
+    route_admitter: Option<&route::RouteGate>,
     offered_daita: Option<&warrenguard_wire::DaitaConfig>,
     #[cfg(feature = "pq-hpke")] pq: Option<&PqSetup>,
 ) -> Option<SetupOutcome> {
@@ -765,7 +765,7 @@ async fn process_setup_frame(
     allowlist: Option<&AllowlistHandle>,
     session_registry: Option<&Arc<MultihopSessionRegistry>>,
     token_admitter: Option<&Arc<dyn SessionTokenAdmitter>>,
-    route_admitter: Option<&Arc<dyn RouteAdmitter>>,
+    route_admitter: Option<&route::RouteGate>,
     offered_daita: Option<&warrenguard_wire::DaitaConfig>,
     #[cfg(feature = "pq-hpke")] pq: Option<&PqSetup>,
 ) -> Option<SetupOutcome> {
@@ -855,9 +855,11 @@ async fn process_setup_frame(
             route_locator,
             wants_daita,
         }) => {
-            let verdict = match route_admitter {
-                Some(admitter) => admitter.admit_route(route_locator).await,
-                None => RouteAdmission::Refuse(warrenguard_multihop::RouteRejectCode::NotOffered),
+            // A route the deployer could never renew (no registry to list
+            // it) is not offered either.
+            let verdict = match (route_admitter, session_registry) {
+                (Some(gate), Some(_)) => gate.admit_route(route_locator).await,
+                _ => RouteAdmission::Refuse(warrenguard_multihop::RouteRejectCode::NotOffered),
             };
             match verdict {
                 RouteAdmission::Admit { route_serial } => {
@@ -888,6 +890,8 @@ async fn process_setup_frame(
                 // `RouteAdmission` is non-exhaustive: a verdict this build
                 // does not know refuses, since route admission fails closed.
                 _ => {
+                    crate::metrics::route_admission_metrics()
+                        .record_refused(warrenguard_multihop::RouteRejectCode::Unspecified);
                     reply_sealed_detail_then_close(
                         &mut send,
                         &term,
@@ -1162,7 +1166,7 @@ async fn run_setup(
     allowlist: Option<&AllowlistHandle>,
     session_registry: Option<&Arc<MultihopSessionRegistry>>,
     token_admitter: Option<&Arc<dyn SessionTokenAdmitter>>,
-    route_admitter: Option<&Arc<dyn RouteAdmitter>>,
+    route_admitter: Option<&route::RouteGate>,
     offered_daita: Option<&warrenguard_wire::DaitaConfig>,
     #[cfg(feature = "pq-hpke")] pq: Option<&PqSetup>,
 ) -> Option<SetupOutcome> {
@@ -3326,11 +3330,12 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
     }
 
     fn register_key(&self, key: SessionKey, conn_id: ConnId, conn: C) {
-        self.live
-            .lock()
-            .entry(key)
-            .or_default()
-            .insert(conn_id, conn);
+        let mut live = self.live.lock();
+        let conns = live.entry(key).or_default();
+        if conns.is_empty() {
+            self.route.reset_for_new_session(key);
+        }
+        conns.insert(conn_id, conn);
     }
 
     /// Remove one connection from the registry (called from the RAII
@@ -3347,27 +3352,36 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
             conns.remove(&conn_id);
             if conns.is_empty() {
                 guard.remove(&key);
+                // The route state goes under `live`: a session registering
+                // the same key right after must not lose its fresh state.
+                let ended = match key {
+                    // The lease the session held last: the rebound one when an
+                    // anchor request presented a fresh token.
+                    SessionKey::TokenSerial(serial) => Some(
+                        self.route
+                            .forget_anchor(serial.as_bytes())
+                            .unwrap_or(*serial.as_bytes()),
+                    ),
+                    SessionKey::Route(route_serial) => {
+                        self.route.forget_route(route_serial.as_bytes());
+                        None
+                    }
+                    SessionKey::Wallet(_) => None,
+                };
                 drop(guard);
                 self.tombstone_attribution(&key.value(), Instant::now());
-                match key {
-                    SessionKey::TokenSerial(serial) => {
-                        // The lease the session held last: the rebound one
-                        // when an anchor request presented a fresh token.
-                        let lease = self
-                            .route
-                            .forget_anchor(serial.as_bytes())
-                            .unwrap_or(*serial.as_bytes());
+                match (key, ended) {
+                    (SessionKey::TokenSerial(_), Some(lease)) => {
                         if let Some(observer) = self.token_end_observer.get() {
                             observer(lease);
                         }
                     }
-                    SessionKey::Route(route_serial) => {
-                        self.route.forget_route(route_serial.as_bytes());
+                    (SessionKey::Route(route_serial), _) => {
                         if let Some(observer) = self.route.end_observer() {
                             observer(*route_serial.as_bytes());
                         }
                     }
-                    SessionKey::Wallet(_) => {}
+                    _ => {}
                 }
             }
         }
@@ -3422,9 +3436,7 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
             .collect();
         // A session an anchor request rebound to a fresh token holds that
         // token's lease now, not the one it was admitted on.
-        keys.into_iter()
-            .map(|key| self.route.lease_serial_of(&key).unwrap_or(key))
-            .collect()
+        self.route.lease_serials_of(&keys)
     }
 
     /// Whether a token session under `serial` holds a live connection. Lets a
@@ -3951,7 +3963,7 @@ pub struct ExitTerminateCtx<T: PacketDevice + Clone> {
     /// [`ExitTerminateCtx::with_route_admitter`]; `None` answers every route
     /// request `RouteRejected{not offered}` and every anchor request
     /// `RouteAnchorAck{not eligible}`.
-    route_admitter: Option<Arc<dyn RouteAdmitter>>,
+    route_admitter: Option<route::RouteGate>,
     /// Per-session bandwidth policy (doc: [`SessionRatePolicy`]). `Some`
     /// only when the deployer wires it via
     /// [`ExitTerminateCtx::with_session_rate_policy`]; `None` (the default,
@@ -4151,7 +4163,7 @@ impl<T: PacketDevice + Clone> ExitTerminateCtx<T> {
     /// client; `None` keeps route admission off.
     #[must_use]
     pub fn with_route_admitter(mut self, admitter: Option<Arc<dyn RouteAdmitter>>) -> Self {
-        self.route_admitter = admitter;
+        self.route_admitter = admitter.map(route::RouteGate::new);
         self
     }
 
@@ -4509,7 +4521,7 @@ async fn serve_terminating_connection<T>(
     session_registry: Option<Arc<MultihopSessionRegistry>>,
     drain_rx: Option<watch::Receiver<Option<DrainAdvisory>>>,
     token_admitter: Option<Arc<dyn SessionTokenAdmitter>>,
-    route_admitter: Option<Arc<dyn RouteAdmitter>>,
+    route_admitter: Option<route::RouteGate>,
     session_rate: Option<SessionRatePolicy>,
     #[cfg(feature = "pq-hpke")] pq: Option<PqSetup>,
 ) where
@@ -5327,7 +5339,7 @@ struct PqRouteControl {
     registry: Option<Arc<MultihopSessionRegistry>>,
     conn_id: ConnId,
     token_admitter: Option<Arc<dyn SessionTokenAdmitter>>,
-    route_admitter: Option<Arc<dyn RouteAdmitter>>,
+    route_admitter: Option<route::RouteGate>,
 }
 
 /// Hook this connection's control emitter to its registry session, and build
@@ -5338,7 +5350,7 @@ fn attach_route_control(
     conn_id: ConnId,
     control_tx: route::ControlTx,
     token_admitter: Option<Arc<dyn SessionTokenAdmitter>>,
-    route_admitter: Option<Arc<dyn RouteAdmitter>>,
+    route_admitter: Option<route::RouteGate>,
 ) -> route::AnchorContext {
     if let (Some(registry), Some(key)) = (registry, key) {
         registry.attach_control(key, conn_id, control_tx.clone());
@@ -5348,7 +5360,7 @@ fn attach_route_control(
         key,
         reply: control_tx,
         token_admitter,
-        route_admitter,
+        route: route_admitter,
     }
 }
 
