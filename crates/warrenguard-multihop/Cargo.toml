@@ -25,7 +25,7 @@ test-helpers = []
 # wire structs that merely carry a signed ML-KEM key (the `/v2` exit
 # descriptor field and its signing payload) are NOT gated here: a
 # classical-only build must still parse and correctly reject a PQ descriptor.
-pq-hpke = ["dep:ml-kem", "dep:kem", "dep:x25519-dalek", "dep:sha3"]
+pq-hpke = ["dep:ml-kem", "dep:kem", "dep:sha3"]
 
 [dependencies]
 # HPKE RFC 9180 for client-to-exit end-to-end payload encryption (multi-message
@@ -61,7 +61,10 @@ kem = { version = "=0.3.0-pre.0", default-features = false, optional = true }
 # X25519 (RFC 7748) half of the X-Wing hybrid. The free `x25519()` function is
 # the raw scalar mult used for the ephemeral DH; no `StaticSecret` feature
 # needed. `zeroize` scrubs the derived scalar/shared-secret material.
-x25519-dalek = { version = "2", default-features = false, features = ["zeroize"], optional = true }
+# It is also the X25519 of the `hpke` crate: depending on it unconditionally
+# with `zeroize` makes every HPKE private key, the route KEM key included,
+# zeroized on drop in a classical-only build too.
+x25519-dalek = { version = "2", default-features = false, features = ["zeroize"] }
 # SHA3-256 is the X-Wing combiner hash (draft-connolly-cfrg-xwing-kem).
 sha3 = { version = "0.10", default-features = false, optional = true }
 # HKDF-SHA256: the exporter deriving the per-packet keys from the X-Wing

@@ -186,6 +186,11 @@ pub struct RouteAnchorSecret(Zeroizing<[u8; ROUTE_ANCHOR_SECRET_LEN]>);
 
 impl RouteAnchorSecret {
     /// Draw a fresh secret from the operating system's CSPRNG.
+    ///
+    /// # Panics
+    ///
+    /// When the operating system's CSPRNG fails, as every other key the
+    /// engine draws does: there is no safe secret to fall back on.
     #[must_use]
     pub fn generate() -> Self {
         let mut bytes = Zeroizing::new([0u8; ROUTE_ANCHOR_SECRET_LEN]);
@@ -422,11 +427,13 @@ impl RouteKemSecretKey {
             )
             .map_err(|_| RouteSealError::Open)?,
         );
-        let secret: [u8; ROUTE_ANCHOR_SECRET_LEN] = plaintext
-            .as_slice()
-            .try_into()
-            .map_err(|_| RouteSealError::Open)?;
-        Ok(RouteAnchorSecret::from_bytes(secret))
+        if plaintext.len() != ROUTE_ANCHOR_SECRET_LEN {
+            return Err(RouteSealError::Open);
+        }
+        // Straight into the zeroizing buffer: no plain copy on the stack.
+        let mut secret = Zeroizing::new([0u8; ROUTE_ANCHOR_SECRET_LEN]);
+        secret.copy_from_slice(&plaintext);
+        Ok(RouteAnchorSecret(secret))
     }
 }
 
