@@ -511,6 +511,20 @@ fn seal_with<R: CryptoRng + RngCore>(
     })
 }
 
+/// Length of the signed pre-image at the head of a session token
+/// (`token_type || nonce || challenge_digest || token_key_id`).
+const TOKEN_INPUT_LEN: usize = 98;
+
+/// The serial of a session token, `SHA-256(token_input)`: the serial the exit
+/// admits a v7 setup on, and so the one an anchor registration is sealed to.
+/// Computed here so a client can seal to it without the issuer's RSA stack.
+#[must_use]
+pub fn session_token_serial(
+    token: &warrenguard_wire::SessionToken,
+) -> [u8; ROUTE_TOKEN_SERIAL_LEN] {
+    Sha256::digest(&token.0[..TOKEN_INPUT_LEN]).into()
+}
+
 /// An RNG that yields one fixed HPKE ephemeral `ikm`, so a seal is
 /// reproducible for the golden vectors. HPKE draws exactly one private-key
 /// length from it per encapsulation.
@@ -922,6 +936,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_token_serial_is_the_issuer_crate_serial() {
+        use rand_v10::SeedableRng;
+        let mut rng = rand_v10::rngs::StdRng::seed_from_u64(0x005E_41A1);
+        let sk = warrenguard_token::IssuerSecretKey::generate(&mut rng).expect("issuer key");
+        let pk = sk.public_key();
+        let challenge =
+            warrenguard_token::TokenChallenge::for_epoch("issuer.test", "warren/token/epoch", 3)
+                .expect("challenge");
+        let (req, state) = pk.blind_token(&mut rng, &challenge).expect("blind");
+        let token = pk
+            .finalize_token(state, &sk.blind_sign(&req).expect("sign"))
+            .expect("finalize");
+        assert_eq!(
+            session_token_serial(&warrenguard_wire::SessionToken(token.serialize())),
+            *token.serial().as_bytes(),
+            "the client must seal to the serial the exit admits on"
+        );
     }
 
     #[test]

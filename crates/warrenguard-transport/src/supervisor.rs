@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use tokio::sync::{Notify, watch};
 use warrenguard_backoff::{Backoff, JitterBackoff};
-use warrenguard_multihop::{ExitId, RejectionReason, RelayDescriptorSigned};
+use warrenguard_multihop::{ExitId, RejectionReason, RelayDescriptorSigned, WarrenControlMessage};
 use warrenguard_socket_bypass::SocketBypass;
 use warrenguard_wire::SessionToken;
 
@@ -119,7 +119,7 @@ pub type SessionTokenProvider = Arc<dyn Fn() -> Vec<SessionToken> + Send + Sync>
 
 /// How the supervisor's sessions are admitted at the exit. Set with
 /// [`MultiHopSupervisor::with_session_admission`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum SessionAdmission {
     /// Present v7 anonymous tokens when the [`SessionTokenProvider`] yields
@@ -133,16 +133,30 @@ pub enum SessionAdmission {
     /// ever built, for the primary or any bonded secondary. For a session that
     /// must not be linkable to the account at the exit it lands on.
     TokensOnly,
+    /// A route session admitted against the main session's anchor: every
+    /// setup presents `IpRequestRoute` with a fresh locator for its exit, and
+    /// never a token or the wallet. A refusal ends the run with
+    /// [`MultiHopError::RouteRefused`] (never rotating a token) so the
+    /// consumer falls back to a token route; `RouteRejected{anchor unknown}`
+    /// first waits for the anchor to be bound again, then redials.
+    Route(crate::route_anchor::RouteSessionAdmission),
 }
 
 impl SessionAdmission {
     /// The wallet key a setup request may prove possession of: none at all
-    /// under [`Self::TokensOnly`], so even a request built without tokens
-    /// could not carry the account pubkey.
-    fn wallet_identity(self, key: &SigningKey) -> Option<&SigningKey> {
+    /// under [`Self::TokensOnly`] or [`Self::Route`], so even a request built
+    /// without tokens could not carry the account pubkey.
+    fn wallet_identity<'k>(&self, key: &'k SigningKey) -> Option<&'k SigningKey> {
         match self {
             Self::TokensOrWallet => Some(key),
-            Self::TokensOnly => None,
+            Self::TokensOnly | Self::Route(_) => None,
+        }
+    }
+
+    fn route(&self) -> Option<&crate::route_anchor::RouteSessionAdmission> {
+        match self {
+            Self::Route(route) => Some(route),
+            Self::TokensOrWallet | Self::TokensOnly => None,
         }
     }
 }
@@ -662,6 +676,12 @@ pub struct MultiHopSupervisor {
     prober: Arc<crate::path_health::ProberShared>,
     /// How sessions are admitted; see [`SessionAdmission`].
     admission: SessionAdmission,
+    /// The anchor this main supervisor registers after every v7 setup; see
+    /// [`Self::with_route_anchor`].
+    route_anchor: Option<crate::route_anchor::RouteAnchorHandle>,
+    /// Waits between two sends of an anchor request. The doc 107 schedule
+    /// in production; shortened by tests only.
+    anchor_retry_waits: [Duration; 5],
 }
 
 /// Consecutive watchdog-forced redials, each of a session whose ENTIRE life
@@ -718,6 +738,8 @@ enum Established {
     /// The setup round-trip ended without an `IpAssign` (see
     /// [`SetupOutcome::Failed`]), already reported.
     SetupFailed,
+    /// A route setup refused (see [`SetupOutcome::RouteRefused`]).
+    RouteRefused,
 }
 
 /// Ceiling on the setup round-trip, measured from a completed handshake.
@@ -745,6 +767,9 @@ enum SetupOutcome {
     /// exit answered something else (`None`). The session has no address
     /// the exit routes to, so it is never published.
     Failed(Option<MultiHopError>),
+    /// A route setup the exit refused (only under
+    /// [`SessionAdmission::Route`]).
+    RouteRefused(crate::route_anchor::RouteRefusal),
 }
 
 impl MultiHopSupervisor {
@@ -770,6 +795,8 @@ impl MultiHopSupervisor {
             placement: watch::channel(None).0,
             prober: crate::path_health::ProberShared::new(rand::random()),
             admission: SessionAdmission::default(),
+            route_anchor: None,
+            anchor_retry_waits: crate::route_anchor::ANCHOR_RETRY_WAITS,
         };
         (supervisor, rx)
     }
@@ -780,6 +807,26 @@ impl MultiHopSupervisor {
     #[must_use]
     pub fn with_session_admission(mut self, admission: SessionAdmission) -> Self {
         self.admission = admission;
+        self
+    }
+
+    /// Anchor this (main) supervisor's logical session with `anchor`: after
+    /// every v7 setup, the supervisor seals the anchor to the serial of the
+    /// token that setup was admitted on and registers it with the exit,
+    /// retried until acknowledged, re-registered after every reconnect or
+    /// migration. A wallet (v6) session never anchors: the anchor then reads
+    /// [`crate::route_anchor::AnchorState::Unavailable`]. Hand the same
+    /// handle to the tunnel's route supervisors
+    /// ([`SessionAdmission::Route`]). Call before [`Self::run`].
+    #[must_use]
+    pub fn with_route_anchor(mut self, anchor: crate::route_anchor::RouteAnchorHandle) -> Self {
+        self.route_anchor = Some(anchor);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_anchor_retry_waits(mut self, waits: [Duration; 5]) -> Self {
+        self.anchor_retry_waits = waits;
         self
     }
 
@@ -956,6 +1003,11 @@ impl MultiHopSupervisor {
                 tracing::info!("supervisor watch has no receivers, terminating before dial");
                 return Ok(());
             }
+            // A route session dials only an exit that offers route admission,
+            // and only once its main session is anchored.
+            if let Some(route) = self.admission.route() {
+                route_gate(route).await?;
+            }
 
             let reconnect_start = Instant::now();
             // Race the dial against the receivers disappearing: a teardown
@@ -1062,6 +1114,27 @@ impl MultiHopSupervisor {
                     drop(primary);
                     continue;
                 }
+                SetupOutcome::RouteRefused(refusal) => {
+                    primary.force_close_for_reconnect();
+                    drop(primary);
+                    if refusal
+                        == crate::route_anchor::RouteRefusal::Rejected(
+                            warrenguard_multihop::RouteRejectCode::AnchorUnknown,
+                        )
+                        && let Some(route) = self.admission.route()
+                    {
+                        // The control plane lost the anchor (a restart, a main
+                        // session between exits): wait for the main session to
+                        // bind it again, then redial.
+                        tracing::info!(
+                            "route refused: anchor unknown; waiting for the anchor to be bound again"
+                        );
+                        wait_for_rebound_anchor(route).await?;
+                        continue;
+                    }
+                    tracing::info!(%refusal, "route session refused; falling back is the consumer's call");
+                    return Err(MultiHopError::RouteRefused(refusal));
+                }
             };
             let mut bundle = MultiHopBundle::new_unsealed(vec![primary.clone()]);
             bundle.set_source_addresses(assign.assigned, assign.assigned_v6);
@@ -1093,6 +1166,11 @@ impl MultiHopSupervisor {
                 &bundle,
                 &session_target,
                 assign,
+                session_tokens.as_ref().map(TokenStack::lead),
+            );
+            let mut route_control = self.start_route_control(
+                &bundle,
+                &primary,
                 session_tokens.as_ref().map(TokenStack::lead),
             );
             self.notify_on_reconnect(first_session);
@@ -1186,6 +1264,16 @@ impl MultiHopSupervisor {
                         bundle.force_close_for_reconnect();
                         bundle.closed().await
                     }
+                    reason = route_control.ended() => {
+                        // The exit ended this route (its anchor is gone): end
+                        // the run so the consumer falls back to a token route.
+                        tracing::info!(reason = reason.as_str(), "route session ended by its exit");
+                        bundle.force_close_for_reconnect();
+                        let _ = self.tx.send(None);
+                        return Err(MultiHopError::RouteRefused(
+                            crate::route_anchor::RouteRefusal::Ended(reason),
+                        ));
+                    }
                     () = self.overlap.notified() => {
                         // Make-before-break: dial a FRESH session while
                         // the current one keeps serving, then atomically swap
@@ -1195,7 +1283,7 @@ impl MultiHopSupervisor {
                         // dial keeps the current session (the cold path still
                         // covers a real death).
                         match self.try_overlap().await {
-                            Some((new_bundle, new_primary, new_target)) => {
+                            Some((new_bundle, new_primary, new_target, new_lead)) => {
                                 if !pre_swap_allows(
                                     self.config.pre_swap_check.as_ref(),
                                     new_bundle.clone(),
@@ -1251,6 +1339,8 @@ impl MultiHopSupervisor {
                                 ) {
                                     redial.reset();
                                 }
+                                route_control =
+                                    self.start_route_control(&new_bundle, &new_primary, new_lead);
                                 bundle = new_bundle;
                                 primary = new_primary;
                                 session_target = new_target;
@@ -1279,6 +1369,20 @@ impl MultiHopSupervisor {
                 // rejection code) is not a transient loss: redialing hits the
                 // same refusal, so surface it as a clean error state instead of
                 // a reconnect storm.
+                if self.admission.route().is_some()
+                    && multihop::rejection_from_conn_error(&close_err).is_some()
+                {
+                    // A route the exit closed by policy: the `RouteEnded` that
+                    // preceded the close names why, when it arrived.
+                    let reason = route_control
+                        .try_ended()
+                        .unwrap_or(warrenguard_multihop::RouteEndReason::Unspecified);
+                    bundle.force_close_for_reconnect();
+                    let _ = self.tx.send(None);
+                    return Err(MultiHopError::RouteRefused(
+                        crate::route_anchor::RouteRefusal::Ended(reason),
+                    ));
+                }
                 if let Some(reason) = multihop::rejection_from_conn_error(&close_err) {
                     let _ = self.fatal_tx.send(Some(reason));
                     tracing::warn!(%reason, "multi-hop session rejected by exit; surfacing fatal");
@@ -1338,6 +1442,47 @@ impl MultiHopSupervisor {
                 }
                 break;
             }
+        }
+    }
+
+    /// Hook the route admission of a freshly published session: a route
+    /// session listens for its exit ending it; a main session with an anchor
+    /// registers it on the serial `lead` was admitted with (a wallet session,
+    /// with no `lead`, never anchors).
+    fn start_route_control(
+        &self,
+        bundle: &Arc<MultiHopBundle>,
+        primary: &Arc<MultiHopClient>,
+        lead: Option<SessionToken>,
+    ) -> SessionRouteControl {
+        if self.admission.route().is_some() {
+            let (tap, events) = tokio::sync::mpsc::unbounded_channel();
+            bundle.set_route_tap(tap);
+            return SessionRouteControl {
+                events: Some(events),
+                anchoring: None,
+            };
+        }
+        let Some(anchor) = self.route_anchor.clone() else {
+            return SessionRouteControl::default();
+        };
+        let Some(lead) = lead else {
+            anchor.set_state(crate::route_anchor::AnchorState::Unavailable);
+            return SessionRouteControl::default();
+        };
+        let (tap, acks) = tokio::sync::mpsc::unbounded_channel();
+        bundle.set_route_tap(tap);
+        let anchoring = tokio::spawn(crate::route_anchor::run_anchoring(
+            anchor,
+            Arc::clone(primary),
+            warrenguard_multihop::session_token_serial(&lead),
+            self.config.session_token_provider.clone(),
+            acks,
+            self.anchor_retry_waits,
+        ));
+        SessionRouteControl {
+            events: None,
+            anchoring: Some(anchoring),
         }
     }
 
@@ -1434,12 +1579,16 @@ impl MultiHopSupervisor {
     /// A tokens-only session with an empty provider therefore still completes
     /// one handshake before giving up, and sends no setup request.
     fn select_session_tokens(&self) -> Result<Option<TokenStack>, MultiHopError> {
+        // A route session presents no token: never pop one for it.
+        if self.admission.route().is_some() {
+            return Ok(None);
+        }
         let stack = self
             .config
             .session_token_provider
             .as_ref()
             .and_then(|provider| TokenStack::new(provider()));
-        match (stack, self.admission) {
+        match (stack, &self.admission) {
             (None, SessionAdmission::TokensOnly) => {
                 Err(MultiHopError::NoSessionToken(NoSessionTokenCause::Empty))
             }
@@ -1499,15 +1648,20 @@ impl MultiHopSupervisor {
         // sentinel so it can never be co-housed with another live session
         // of the same identity. Exits predating the hint ignore it.
         let placement = self.session_placement_hint(primary.exit_id());
-        let setup_result = primary
-            .setup_over_stream_with_options(
-                self.admission.wallet_identity(&self.config.client_signing),
-                self.config.wants_ipv6,
-                self.config.enable_daita,
-                session_token.as_ref().map(std::slice::from_ref),
-                placement,
-            )
-            .await;
+        let setup_result = Self::setup_request(
+            primary,
+            &self.config,
+            &self.admission,
+            session_token,
+            placement,
+        )
+        .await;
+
+        if self.admission.route().is_some()
+            && let Some(refusal) = Self::route_refusal(primary, &setup_result)
+        {
+            return SetupOutcome::RouteRefused(refusal);
+        }
 
         let sealed_detail = setup_result
             .as_ref()
@@ -1541,6 +1695,70 @@ impl MultiHopSupervisor {
         self.publish_setup_ip_assign(&spec);
         prime_leg(primary);
         SetupOutcome::Assigned(spec)
+    }
+
+    /// One setup round trip for `client` under `admission`: a route request
+    /// with a fresh locator for a route session, else the token or wallet
+    /// request.
+    async fn setup_request(
+        client: &MultiHopClient,
+        config: &SupervisorConfig,
+        admission: &SessionAdmission,
+        session_token: Option<SessionToken>,
+        prefer_ipv4: Option<std::net::Ipv4Addr>,
+    ) -> Result<Vec<u8>, MultiHopError> {
+        if let Some(route) = admission.route() {
+            let request = crate::route_anchor::route_request(
+                route,
+                &client.exit_id(),
+                prefer_ipv4,
+                config.wants_ipv6,
+                config.enable_daita,
+            )
+            .map_err(|_| {
+                MultiHopError::RouteRefused(crate::route_anchor::RouteRefusal::AnchorUnavailable)
+            })?;
+            return client.setup_over_stream_request(&request).await;
+        }
+        client
+            .setup_over_stream_with_options(
+                admission.wallet_identity(&config.client_signing),
+                config.wants_ipv6,
+                config.enable_daita,
+                session_token.as_ref().map(std::slice::from_ref),
+                prefer_ipv4,
+            )
+            .await
+    }
+
+    /// How a route setup was refused, if it was: the sealed `RouteRejected`
+    /// code, a capacity refusal, or a plain rejection from an exit that
+    /// predates route admission (sealed `Rejected` or the opaque close).
+    fn route_refusal(
+        primary: &MultiHopClient,
+        setup_result: &Result<Vec<u8>, MultiHopError>,
+    ) -> Option<crate::route_anchor::RouteRefusal> {
+        use crate::route_anchor::RouteRefusal;
+        use warrenguard_multihop::RouteRejectCode;
+        let reply = match setup_result {
+            Ok(reply) => warrenguard_multihop::try_decode_control(reply)
+                .ok()
+                .flatten(),
+            Err(MultiHopError::RouteRefused(refusal)) => return Some(*refusal),
+            Err(_) => None,
+        };
+        match reply {
+            Some(WarrenControlMessage::RouteRejected { reason_code }) => Some(
+                RouteRefusal::Rejected(RouteRejectCode::from_code(reason_code)),
+            ),
+            Some(WarrenControlMessage::IpExhausted) => {
+                Some(RouteRefusal::Rejected(RouteRejectCode::Unavailable))
+            }
+            Some(WarrenControlMessage::Rejected | WarrenControlMessage::RejectedBanned { .. }) => {
+                Some(RouteRefusal::Legacy)
+            }
+            _ => primary.rejection_reason().map(|_| RouteRefusal::Legacy),
+        }
     }
 
     /// Account for a setup round-trip that ended without an `IpAssign`: close
@@ -1601,6 +1819,7 @@ impl MultiHopSupervisor {
         for index in 1..want {
             let config = config.clone();
             let target = target.clone();
+            let admission = admission.clone();
             // Every bonded connection presents the token the primary was
             // admitted with, so it resolves to the same anonymous serial and
             // the exit hands it the same sticky IP.
@@ -1665,13 +1884,14 @@ impl MultiHopSupervisor {
         }
         let weak = Arc::downgrade(bundle);
         let config = self.config.clone();
-        let admission = self.admission;
+        let admission = self.admission.clone();
         let target = dialled.clone();
         tokio::spawn(async move {
             let mut dials = tokio::task::JoinSet::new();
             for index in 1..want {
                 let config = config.clone();
                 let target = target.clone();
+                let admission = admission.clone();
                 // The primary's admitted token (shared serial -> same IP).
                 dials.spawn(async move {
                     Self::dial_secondary(
@@ -1735,6 +1955,10 @@ impl MultiHopSupervisor {
                 self.report_setup_failure(&primary, dialled, error.as_ref());
                 return Established::SetupFailed;
             }
+            SetupOutcome::RouteRefused(_) => {
+                primary.force_close_for_reconnect();
+                return Established::RouteRefused;
+            }
         };
 
         // Bonded secondaries: best-effort extra connections under the same
@@ -1749,7 +1973,7 @@ impl MultiHopSupervisor {
             clients.extend(
                 Self::bond_secondaries(
                     &self.config,
-                    self.admission,
+                    self.admission.clone(),
                     dialled,
                     primary_spec,
                     want,
@@ -1775,7 +1999,12 @@ impl MultiHopSupervisor {
     /// healthy current session - the natural cold path covers a real death).
     async fn try_overlap(
         &self,
-    ) -> Option<(Arc<MultiHopBundle>, Arc<MultiHopClient>, CircuitTarget)> {
+    ) -> Option<(
+        Arc<MultiHopBundle>,
+        Arc<MultiHopClient>,
+        CircuitTarget,
+        Option<SessionToken>,
+    )> {
         let target = self.current_target();
         // Set once the exit refused a token: the next dial leads with the
         // stack's next token instead of popping a fresh stack.
@@ -1804,7 +2033,10 @@ impl MultiHopSupervisor {
                 .establish_session(primary, &target, session_tokens.as_ref())
                 .await
             {
-                Established::Session { bundle, primary } => return Some((bundle, primary, target)),
+                Established::Session { bundle, primary } => {
+                    let lead = session_tokens.as_ref().map(TokenStack::lead);
+                    return Some((bundle, primary, target, lead));
+                }
                 Established::Rejected(reason) => {
                     if is_token_refusal(reason)
                         && let Some(mut stack) = session_tokens
@@ -1833,6 +2065,10 @@ impl MultiHopSupervisor {
                 }
                 // Already logged and reported by `establish_session`.
                 Established::SetupFailed => return None,
+                Established::RouteRefused => {
+                    tracing::warn!("overlap route dial refused; keeping the current session");
+                    return None;
+                }
             }
         }
     }
@@ -1983,15 +2219,14 @@ impl MultiHopSupervisor {
             // a per-session exit lands it on the primary's IP even when
             // another live session of the same identity holds the sticky
             // binding.
-            let setup = client
-                .setup_over_stream_with_options(
-                    admission.wallet_identity(&config.client_signing),
-                    config.wants_ipv6,
-                    config.enable_daita,
-                    session_token.as_ref().map(std::slice::from_ref),
-                    Some(primary_spec.assigned),
-                )
-                .await;
+            let setup = Self::setup_request(
+                &client,
+                config,
+                &admission,
+                session_token,
+                Some(primary_spec.assigned),
+            )
+            .await;
             if let Some(reason) = client.rejection_reason() {
                 tracing::warn!(index, %reason, "bonded secondary rejected at setup; skipping");
                 return None;
@@ -2113,6 +2348,117 @@ impl MultiHopSupervisor {
                 Err(e) => return Err(e),
             }
         }
+    }
+}
+
+/// How long a route supervisor waits for its main session's anchor, before
+/// its first dial or after an `anchor unknown` refusal. Covers the main
+/// exit's renewal tick (30 s) plus a full anchor retry schedule (31 s) with
+/// margin; past it the route falls back.
+const ROUTE_ANCHOR_WAIT: Duration = Duration::from_secs(90);
+
+/// The route admission side of one published session: the route end events
+/// of a route session, or the anchoring task of a main session (aborted with
+/// the session).
+#[derive(Default)]
+struct SessionRouteControl {
+    events: Option<tokio::sync::mpsc::UnboundedReceiver<crate::route_anchor::RouteDownlink>>,
+    anchoring: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl SessionRouteControl {
+    /// Resolves when the exit ends this route session; never for a main
+    /// session.
+    async fn ended(&mut self) -> warrenguard_multihop::RouteEndReason {
+        let Some(events) = self.events.as_mut() else {
+            return std::future::pending().await;
+        };
+        loop {
+            match events.recv().await {
+                Some(crate::route_anchor::RouteDownlink::Ended(reason)) => return reason,
+                Some(crate::route_anchor::RouteDownlink::Ack { .. }) => {}
+                None => return std::future::pending().await,
+            }
+        }
+    }
+
+    /// A route end that already arrived, if any.
+    fn try_ended(&mut self) -> Option<warrenguard_multihop::RouteEndReason> {
+        let events = self.events.as_mut()?;
+        while let Ok(event) = events.try_recv() {
+            if let crate::route_anchor::RouteDownlink::Ended(reason) = event {
+                return Some(reason);
+            }
+        }
+        None
+    }
+}
+
+impl Drop for SessionRouteControl {
+    fn drop(&mut self) {
+        if let Some(task) = self.anchoring.take() {
+            task.abort();
+        }
+    }
+}
+
+/// Before a route dial: the exit must offer route admission and the main
+/// session's anchor must be bound (waited for while no verdict exists yet).
+async fn route_gate(
+    route: &crate::route_anchor::RouteSessionAdmission,
+) -> Result<(), MultiHopError> {
+    use crate::route_anchor::{AnchorState, RouteRefusal};
+    if !route.exit_offers_routes {
+        return Err(MultiHopError::RouteRefused(RouteRefusal::Rejected(
+            warrenguard_multihop::RouteRejectCode::NotOffered,
+        )));
+    }
+    let mut state = route.anchor.state();
+    let verdict = async {
+        loop {
+            match *state.borrow_and_update() {
+                AnchorState::Anchored { .. } => return Ok(()),
+                AnchorState::Unavailable => return Err(RouteRefusal::AnchorUnavailable),
+                AnchorState::Unanchored => {}
+            }
+            if state.changed().await.is_err() {
+                return Err(RouteRefusal::AnchorUnavailable);
+            }
+        }
+    };
+    tokio::time::timeout(ROUTE_ANCHOR_WAIT, verdict)
+        .await
+        .unwrap_or(Err(RouteRefusal::AnchorUnavailable))
+        .map_err(MultiHopError::RouteRefused)
+}
+
+/// After an `anchor unknown` refusal: wait for the anchor to be bound AGAIN
+/// (a fresh publication, since the state may still read bound from before
+/// the control plane lost it).
+async fn wait_for_rebound_anchor(
+    route: &crate::route_anchor::RouteSessionAdmission,
+) -> Result<(), MultiHopError> {
+    use crate::route_anchor::{AnchorState, RouteRefusal};
+    let unknown = MultiHopError::RouteRefused(RouteRefusal::Rejected(
+        warrenguard_multihop::RouteRejectCode::AnchorUnknown,
+    ));
+    let mut state = route.anchor.state();
+    state.borrow_and_update();
+    let rebound = async {
+        loop {
+            if state.changed().await.is_err() {
+                return false;
+            }
+            match *state.borrow_and_update() {
+                AnchorState::Anchored { .. } => return true,
+                AnchorState::Unavailable => return false,
+                AnchorState::Unanchored => {}
+            }
+        }
+    };
+    match tokio::time::timeout(ROUTE_ANCHOR_WAIT, rebound).await {
+        Ok(true) => Ok(()),
+        _ => Err(unknown),
     }
 }
 
@@ -4883,7 +5229,7 @@ mod run_tests {
             let (provider, calls) = provider_of(vec![vec![v7_token(1), v7_token(2), v7_token(3)]]);
             config.session_token_provider = Some(provider);
             let (supervisor, mut rx) = MultiHopSupervisor::new(config);
-            let supervisor = supervisor.with_session_admission(admission);
+            let supervisor = supervisor.with_session_admission(admission.clone());
             let task = tokio::spawn(supervisor.run());
 
             let bundle = first_session(&mut rx).await;
@@ -4994,7 +5340,7 @@ mod run_tests {
                 }
             }));
             let (supervisor, mut rx) = MultiHopSupervisor::new(config);
-            let supervisor = supervisor.with_session_admission(admission);
+            let supervisor = supervisor.with_session_admission(admission.clone());
             let handle = supervisor.handle();
             let task = tokio::spawn(supervisor.run());
             drop(first_session(&mut rx).await);
@@ -5103,7 +5449,7 @@ mod run_tests {
             config.session_token_provider =
                 Some(provider_of(vec![vec![v7_token(1), v7_token(2), v7_token(3)]]).0);
             let (supervisor, mut rx) = MultiHopSupervisor::new(config);
-            let supervisor = supervisor.with_session_admission(admission);
+            let supervisor = supervisor.with_session_admission(admission.clone());
             let task = tokio::spawn(supervisor.run());
             drop(first_session(&mut rx).await);
 
@@ -5159,5 +5505,530 @@ mod run_tests {
         drop(rx);
         drop(handle);
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+}
+
+/// Route admission by anchor through [`MultiHopSupervisor::run`] against the
+/// fake exit: the main session's anchoring (retries, `needs token`, `lost`,
+/// re-anchor after a reconnect) and route sessions (locator, refusal codes,
+/// the end of a route). The exit's control plane is played by a real route
+/// KEM key, so every sealed blob is opened for real.
+#[cfg(test)]
+mod route_run_tests {
+    use std::sync::atomic::Ordering as AtomicOrdering;
+
+    use ed25519_dalek::SigningKey;
+    use warrenguard_multihop::{
+        RouteEndReason, RouteKemSecretKey, RouteRejectCode, SealedToApi, WARREN_MH_REJECTED,
+        session_token_serial,
+    };
+
+    use super::*;
+    use crate::route_anchor::{
+        AnchorState, RouteAnchorConfig, RouteAnchorHandle, RouteRefusal, RouteSessionAdmission,
+    };
+    use crate::test_support::{FakeMultihopExit, SeenSetupRequest, spawn_fake_multihop_exit};
+
+    const FAST: [Duration; 5] = [Duration::from_millis(40); 5];
+
+    fn config(exit: &FakeMultihopExit, operational_key: &SigningKey) -> SupervisorConfig {
+        SupervisorConfig {
+            relay: exit.relay.clone(),
+            exit_id: exit.exit_id,
+            exit_x25519_multihop_pubkey: exit.exit_x25519_pubkey,
+            exit_mlkem768_pubkey: None,
+            operational_pubkey: operational_key.verifying_key(),
+            client_signing: SigningKey::from_bytes(&[0x24; 32]),
+            bind_addr: "127.0.0.1:0".parse().expect("static addr parses"),
+            enable_gso: false,
+            use_warren_obfuscation: false,
+            socket_bypass: None,
+            enable_daita: false,
+            idle_cover: false,
+            backoff: Backoff::HANDSHAKE,
+            on_reconnect: None,
+            ip_assign_channel: None,
+            wants_ipv6: false,
+            n_connections: 1,
+            pre_swap_check: None,
+            on_overlap_swapped: None,
+            on_dial_refused: None,
+            on_path_rtt: None,
+            session_token_provider: None,
+        }
+    }
+
+    fn kem() -> RouteKemSecretKey {
+        RouteKemSecretKey::derive(&[0x71; 32], 1).expect("kem")
+    }
+
+    fn anchor(kem: &RouteKemSecretKey) -> RouteAnchorHandle {
+        RouteAnchorHandle::new(RouteAnchorConfig {
+            kem: kem.public_key().clone(),
+        })
+    }
+
+    fn token(fill: u8) -> SessionToken {
+        SessionToken([fill; warrenguard_wire::SESSION_TOKEN_LEN])
+    }
+
+    /// A provider handing out `stacks` in order, then empty stacks.
+    fn provider(stacks: Vec<Vec<SessionToken>>) -> (SessionTokenProvider, Arc<AtomicU64>) {
+        let calls = Arc::new(AtomicU64::new(0));
+        let queue = Arc::new(Mutex::new(std::collections::VecDeque::from(stacks)));
+        let counter = Arc::clone(&calls);
+        let provider: SessionTokenProvider = Arc::new(move || {
+            counter.fetch_add(1, AtomicOrdering::Relaxed);
+            queue
+                .lock()
+                .expect("provider lock")
+                .pop_front()
+                .unwrap_or_default()
+        });
+        (provider, calls)
+    }
+
+    /// Reads every published bundle the way a pump does, so the route
+    /// messages reach the supervisor's intercept.
+    fn spawn_reader(mut rx: ClientWatch) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                let current = rx.borrow_and_update().clone();
+                if let Some(bundle) = current {
+                    tokio::select! {
+                        _ = async { while bundle.recv().await.is_ok() {} } => {}
+                        changed = rx.changed() => if changed.is_err() { return },
+                    }
+                } else if rx.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+    }
+
+    async fn wait_state(anchor: &RouteAnchorHandle, want: AnchorState) {
+        let mut state = anchor.state();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while *state.borrow_and_update() != want {
+                state.changed().await.expect("anchor alive");
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("anchor never reached {want:?}"));
+    }
+
+    async fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !ready() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+    }
+
+    fn opens_for_serial(kem: &RouteKemSecretKey, sealed: &[u8], serial: &[u8; 32]) -> bool {
+        SealedToApi::from_slice(sealed).is_some_and(|b| kem.open_anchor(&b, serial).is_ok())
+    }
+
+    fn main_supervisor(
+        exit: &FakeMultihopExit,
+        operational_key: &SigningKey,
+        tokens: Option<SessionTokenProvider>,
+        anchor: &RouteAnchorHandle,
+    ) -> (MultiHopSupervisor, ClientWatch) {
+        let mut config = config(exit, operational_key);
+        config.session_token_provider = tokens;
+        let (supervisor, rx) = MultiHopSupervisor::new(config);
+        (
+            supervisor
+                .with_route_anchor(anchor.clone())
+                .with_anchor_retry_waits(FAST),
+            rx,
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_v7_main_session_registers_its_anchor_on_its_token_serial() {
+        let (operational_key, kem) = (SigningKey::from_bytes(&[0x81; 32]), kem());
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x91; 16]));
+        exit.anchor_script.lock().push_back(Some(0));
+        let anchor = anchor(&kem);
+        let (tokens, _) = provider(vec![vec![token(1)]]);
+        let (supervisor, rx) = main_supervisor(&exit, &operational_key, Some(tokens), &anchor);
+        let reader = spawn_reader(rx);
+        let task = tokio::spawn(supervisor.run());
+
+        wait_state(&anchor, AnchorState::Anchored { max_routes: 32 }).await;
+        let seen = exit.anchor_requests.lock().clone();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].token.is_none());
+        assert!(
+            opens_for_serial(&kem, &seen[0].sealed, &session_token_serial(&token(1))),
+            "the anchor is sealed to the serial the setup was admitted on"
+        );
+        task.abort();
+        reader.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unanswered_request_is_resent_as_is_then_the_anchor_is_unavailable() {
+        let (operational_key, kem) = (SigningKey::from_bytes(&[0x82; 32]), kem());
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x92; 16]));
+        let anchor = anchor(&kem);
+        let (tokens, _) = provider(vec![vec![token(2)]]);
+        let (supervisor, rx) = main_supervisor(&exit, &operational_key, Some(tokens), &anchor);
+        let reader = spawn_reader(rx);
+        let task = tokio::spawn(supervisor.run());
+
+        wait_state(&anchor, AnchorState::Unavailable).await;
+        let seen = exit.anchor_requests.lock().clone();
+        assert_eq!(
+            seen.len(),
+            5,
+            "five tries, then the main exit is taken for an old binary"
+        );
+        assert!(
+            seen.windows(2).all(|w| w[0] == w[1]),
+            "a retry re-sends the same bytes, so a lost ack costs the exit nothing"
+        );
+        task.abort();
+        reader.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_late_ack_after_retries_binds_the_anchor() {
+        let (operational_key, kem) = (SigningKey::from_bytes(&[0x83; 32]), kem());
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x93; 16]));
+        exit.anchor_script.lock().extend([None, None, Some(0)]);
+        let anchor = anchor(&kem);
+        let (tokens, _) = provider(vec![vec![token(3)]]);
+        let (supervisor, rx) = main_supervisor(&exit, &operational_key, Some(tokens), &anchor);
+        let reader = spawn_reader(rx);
+        let task = tokio::spawn(supervisor.run());
+
+        wait_state(&anchor, AnchorState::Anchored { max_routes: 32 }).await;
+        assert_eq!(exit.anchor_requests.lock().len(), 3);
+        task.abort();
+        reader.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn needs_token_presents_the_providers_lead_sealed_to_its_serial() {
+        let (operational_key, kem) = (SigningKey::from_bytes(&[0x84; 32]), kem());
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x94; 16]));
+        exit.anchor_script.lock().extend([Some(1), Some(0)]);
+        let anchor = anchor(&kem);
+        let (tokens, calls) = provider(vec![vec![token(4)], vec![token(5), token(6)]]);
+        let (supervisor, rx) = main_supervisor(&exit, &operational_key, Some(tokens), &anchor);
+        let reader = spawn_reader(rx);
+        let task = tokio::spawn(supervisor.run());
+
+        wait_state(&anchor, AnchorState::Anchored { max_routes: 32 }).await;
+        let seen = exit.anchor_requests.lock().clone();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[1].token, Some(token(5).0), "the lead of a fresh stack");
+        assert!(opens_for_serial(
+            &kem,
+            &seen[1].sealed,
+            &session_token_serial(&token(5))
+        ));
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 2);
+        task.abort();
+        reader.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lost_anchor_is_registered_again() {
+        let (operational_key, kem) = (SigningKey::from_bytes(&[0x85; 32]), kem());
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x95; 16]));
+        exit.anchor_script.lock().extend([Some(0), Some(0)]);
+        let anchor = anchor(&kem);
+        let (tokens, _) = provider(vec![vec![token(7)]]);
+        let (supervisor, rx) = main_supervisor(&exit, &operational_key, Some(tokens), &anchor);
+        let reader = spawn_reader(rx);
+        let task = tokio::spawn(supervisor.run());
+        wait_state(&anchor, AnchorState::Anchored { max_routes: 32 }).await;
+
+        let _ = exit.downlink.send((
+            WarrenControlMessage::RouteAnchorAck {
+                status: 5,
+                max_routes: 0,
+            },
+            None,
+        ));
+        wait_for("a second anchor request", || {
+            exit.anchor_requests.lock().len() == 2
+        })
+        .await;
+        wait_state(&anchor, AnchorState::Anchored { max_routes: 32 }).await;
+        task.abort();
+        reader.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wallet_main_session_never_anchors() {
+        let (operational_key, kem) = (SigningKey::from_bytes(&[0x86; 32]), kem());
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x96; 16]));
+        let anchor = anchor(&kem);
+        let (supervisor, rx) = main_supervisor(&exit, &operational_key, None, &anchor);
+        let reader = spawn_reader(rx);
+        let task = tokio::spawn(supervisor.run());
+
+        wait_state(&anchor, AnchorState::Unavailable).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(exit.anchor_requests.lock().is_empty());
+        task.abort();
+        reader.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_anchor_is_registered_again_after_the_main_session_reconnects() {
+        let (operational_key, kem) = (SigningKey::from_bytes(&[0x87; 32]), kem());
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x97; 16]));
+        exit.anchor_script.lock().extend([Some(0), Some(0)]);
+        let anchor = anchor(&kem);
+        let (tokens, _) = provider(vec![vec![token(8)], vec![token(9)]]);
+        let (supervisor, rx) = main_supervisor(&exit, &operational_key, Some(tokens), &anchor);
+        let handle = supervisor.handle();
+        let reader = spawn_reader(rx);
+        let task = tokio::spawn(supervisor.run());
+        wait_state(&anchor, AnchorState::Anchored { max_routes: 32 }).await;
+
+        assert!(handle.force_reconnect());
+        wait_for("the re-anchor on the new setup", || {
+            exit.anchor_requests.lock().len() == 2
+        })
+        .await;
+        let seen = exit.anchor_requests.lock().clone();
+        assert!(
+            opens_for_serial(&kem, &seen[1].sealed, &session_token_serial(&token(9))),
+            "the new setup's serial, the same secret"
+        );
+        let first = kem
+            .open_anchor(
+                &SealedToApi::from_slice(&seen[0].sealed).expect("81"),
+                &session_token_serial(&token(8)),
+            )
+            .expect("open");
+        let second = kem
+            .open_anchor(
+                &SealedToApi::from_slice(&seen[1].sealed).expect("81"),
+                &session_token_serial(&token(9)),
+            )
+            .expect("open");
+        assert_eq!(
+            first.anchor_ref(),
+            second.anchor_ref(),
+            "the anchor survives the reconnect"
+        );
+        task.abort();
+        reader.abort();
+    }
+
+    fn route_supervisor(
+        exit: &FakeMultihopExit,
+        operational_key: &SigningKey,
+        anchor: &RouteAnchorHandle,
+        offered: bool,
+        tokens: Option<SessionTokenProvider>,
+    ) -> (MultiHopSupervisor, ClientWatch) {
+        let mut config = config(exit, operational_key);
+        config.session_token_provider = tokens;
+        let (supervisor, rx) = MultiHopSupervisor::new(config);
+        (
+            supervisor.with_session_admission(SessionAdmission::Route(RouteSessionAdmission {
+                anchor: anchor.clone(),
+                exit_offers_routes: offered,
+            })),
+            rx,
+        )
+    }
+
+    async fn run_result(task: tokio::task::JoinHandle<Result<(), MultiHopError>>) -> MultiHopError {
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the route run ends")
+            .expect("no panic")
+            .expect_err("a refused route ends the run with an error")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_route_session_presents_a_locator_for_its_exit_and_never_a_token() {
+        let (operational_key, kem) = (SigningKey::from_bytes(&[0x88; 32]), kem());
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x98; 16]));
+        let anchor = anchor(&kem);
+        anchor.set_state(AnchorState::Anchored { max_routes: 32 });
+        let (tokens, calls) = provider(vec![vec![token(1)]]);
+        let (supervisor, mut rx) =
+            route_supervisor(&exit, &operational_key, &anchor, true, Some(tokens));
+        let task = tokio::spawn(supervisor.run());
+
+        let bundle = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(b) = rx.borrow_and_update().clone() {
+                    return b;
+                }
+                rx.changed().await.expect("alive");
+            }
+        })
+        .await
+        .expect("the route session is published");
+        let seen = exit.setup_requests.lock().clone();
+        let [SeenSetupRequest::Route(locator)] = seen.as_slice() else {
+            panic!("expected one route request, got {seen:?}");
+        };
+        assert!(
+            kem.open_locator(&SealedToApi::from_bytes(locator), &exit.exit_id)
+                .is_ok(),
+            "the locator is sealed for the exit dialled"
+        );
+        assert_eq!(
+            calls.load(AtomicOrdering::Relaxed),
+            0,
+            "no token is ever popped"
+        );
+        drop(bundle);
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn each_route_refusal_ends_the_run_typed_and_is_never_a_fatal_tunnel_error() {
+        for (reply, want) in [
+            (
+                Some(WarrenControlMessage::RouteRejected { reason_code: 2 }),
+                RouteRefusal::Rejected(RouteRejectCode::RouteLimit),
+            ),
+            (
+                Some(WarrenControlMessage::RouteRejected { reason_code: 3 }),
+                RouteRefusal::Rejected(RouteRejectCode::NotOffered),
+            ),
+            (
+                Some(WarrenControlMessage::RouteRejected { reason_code: 4 }),
+                RouteRefusal::Rejected(RouteRejectCode::Unavailable),
+            ),
+            (Some(WarrenControlMessage::Rejected), RouteRefusal::Legacy),
+        ] {
+            let (operational_key, kem) = (SigningKey::from_bytes(&[0x89; 32]), kem());
+            let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x99; 16]));
+            *exit.route_reply.lock() = reply;
+            let anchor = anchor(&kem);
+            anchor.set_state(AnchorState::Anchored { max_routes: 32 });
+            let (tokens, calls) = provider(vec![vec![token(1)], vec![token(2)]]);
+            let (supervisor, _rx) =
+                route_supervisor(&exit, &operational_key, &anchor, true, Some(tokens));
+            let fatal = supervisor.fatal_rx();
+            let task = tokio::spawn(supervisor.run());
+            match run_result(task).await {
+                MultiHopError::RouteRefused(refusal) => assert_eq!(refusal, want),
+                other => panic!("expected a route refusal, got {other:?}"),
+            }
+            assert_eq!(
+                exit.accepted.load(AtomicOrdering::Relaxed),
+                1,
+                "{want:?}: one dial"
+            );
+            assert_eq!(
+                calls.load(AtomicOrdering::Relaxed),
+                0,
+                "{want:?}: no token rotated"
+            );
+            assert!(
+                fatal.borrow().is_none(),
+                "{want:?}: the consumer falls back, no fatal"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_route_to_an_exit_that_does_not_offer_routes_never_dials() {
+        let (operational_key, kem) = (SigningKey::from_bytes(&[0x8A; 32]), kem());
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x9A; 16]));
+        let anchor = anchor(&kem);
+        anchor.set_state(AnchorState::Anchored { max_routes: 32 });
+        let (supervisor, _rx) = route_supervisor(&exit, &operational_key, &anchor, false, None);
+        let error = run_result(tokio::spawn(supervisor.run())).await;
+        assert!(matches!(
+            error,
+            MultiHopError::RouteRefused(RouteRefusal::Rejected(RouteRejectCode::NotOffered))
+        ));
+        assert_eq!(exit.accepted.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_route_without_a_usable_anchor_never_dials() {
+        let (operational_key, kem) = (SigningKey::from_bytes(&[0x8B; 32]), kem());
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x9B; 16]));
+        let anchor = anchor(&kem);
+        anchor.set_state(AnchorState::Unavailable);
+        let (supervisor, _rx) = route_supervisor(&exit, &operational_key, &anchor, true, None);
+        let error = run_result(tokio::spawn(supervisor.run())).await;
+        assert!(matches!(
+            error,
+            MultiHopError::RouteRefused(RouteRefusal::AnchorUnavailable)
+        ));
+        assert_eq!(exit.accepted.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn anchor_unknown_waits_for_the_anchor_to_be_bound_again_then_redials() {
+        let (operational_key, kem) = (SigningKey::from_bytes(&[0x8C; 32]), kem());
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x9C; 16]));
+        *exit.route_reply.lock() = Some(WarrenControlMessage::RouteRejected { reason_code: 1 });
+        let anchor = anchor(&kem);
+        anchor.set_state(AnchorState::Anchored { max_routes: 32 });
+        let (supervisor, mut rx) = route_supervisor(&exit, &operational_key, &anchor, true, None);
+        let task = tokio::spawn(supervisor.run());
+
+        wait_for("the refused first dial", || {
+            exit.setup_requests.lock().len() == 1
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            exit.accepted.load(AtomicOrdering::Relaxed),
+            1,
+            "no redial while the anchor is not bound again"
+        );
+        *exit.route_reply.lock() = None;
+        anchor.set_state(AnchorState::Anchored { max_routes: 32 });
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while rx.borrow_and_update().is_none() {
+                rx.changed().await.expect("alive");
+            }
+        })
+        .await
+        .expect("the redial is admitted");
+        let seen = exit.setup_requests.lock().clone();
+        assert_eq!(seen.len(), 2);
+        assert_ne!(seen[0], seen[1], "every dial carries a fresh locator");
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_route_ended_by_its_exit_ends_the_run_with_the_reason() {
+        let (operational_key, kem) = (SigningKey::from_bytes(&[0x8D; 32]), kem());
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x9D; 16]));
+        let anchor = anchor(&kem);
+        anchor.set_state(AnchorState::Anchored { max_routes: 32 });
+        let (supervisor, rx) = route_supervisor(&exit, &operational_key, &anchor, true, None);
+        let reader = spawn_reader(rx);
+        let task = tokio::spawn(supervisor.run());
+        wait_for("the admitted route", || exit.legs.lock().len() == 1).await;
+
+        let _ = exit.downlink.send((
+            WarrenControlMessage::RouteEnded { reason_code: 1 },
+            Some(WARREN_MH_REJECTED),
+        ));
+        match run_result(task).await {
+            MultiHopError::RouteRefused(RouteRefusal::Ended(reason)) => {
+                assert_eq!(reason, RouteEndReason::AnchorGone);
+            }
+            other => panic!("expected the route end, got {other:?}"),
+        }
+        reader.abort();
     }
 }

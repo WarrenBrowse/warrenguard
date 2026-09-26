@@ -464,8 +464,27 @@ pub(crate) struct FakeMultihopExit {
     /// is listed is refused with the sealed `Rejected` detail, the way a real
     /// exit spends the first token that verifies and stops at the refusal.
     pub(crate) tokens_in_use: Arc<parking_lot::Mutex<Vec<[u8; SESSION_TOKEN_LEN]>>>,
+    /// Every `RouteAnchorRequest` datagram this exit read, in arrival order.
+    pub(crate) anchor_requests: Arc<parking_lot::Mutex<Vec<SeenAnchorRequest>>>,
+    /// Answers to the next anchor requests, one per request, in order: an
+    /// ack status (with 32 routes), or `None` to stay silent. Empty: silent.
+    pub(crate) anchor_script: Arc<parking_lot::Mutex<std::collections::VecDeque<Option<u8>>>>,
+    /// The setup reply to an `IpRequestRoute`; `None` admits it.
+    pub(crate) route_reply: Arc<parking_lot::Mutex<Option<WarrenControlMessage>>>,
+    /// Pushes a sealed control datagram to every admitted leg, optionally
+    /// followed by a close with the given code.
+    pub(crate) downlink: tokio::sync::broadcast::Sender<(WarrenControlMessage, Option<u32>)>,
     on_next_dial: NextDialHook,
     _server_ep: Endpoint,
+}
+
+/// What the fake exit read from one `RouteAnchorRequest`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SeenAnchorRequest {
+    /// The sealed anchor, raw.
+    pub(crate) sealed: [u8; warrenguard_multihop::SEALED_TO_API_LEN],
+    /// The token presented with it, raw.
+    pub(crate) token: Option<[u8; SESSION_TOKEN_LEN]>,
 }
 
 /// What the fake exit read from one setup request.
@@ -478,6 +497,8 @@ pub(crate) enum SeenSetupRequest {
     },
     /// A v7 `IpRequestV7` with its tokens in presentation order.
     Tokens(Vec<[u8; SESSION_TOKEN_LEN]>),
+    /// A route `IpRequestRoute` with its locator, raw.
+    Route([u8; warrenguard_multihop::SEALED_TO_API_LEN]),
     /// Anything else, or a plaintext that is no control message.
     Other,
 }
@@ -562,6 +583,10 @@ struct FakeExitBehaviour {
     lose_reply: ReplyLoss,
     setup_requests: Arc<parking_lot::Mutex<Vec<SeenSetupRequest>>>,
     tokens_in_use: Arc<parking_lot::Mutex<Vec<[u8; SESSION_TOKEN_LEN]>>>,
+    anchor_requests: Arc<parking_lot::Mutex<Vec<SeenAnchorRequest>>>,
+    anchor_script: Arc<parking_lot::Mutex<std::collections::VecDeque<Option<u8>>>>,
+    route_reply: Arc<parking_lot::Mutex<Option<WarrenControlMessage>>>,
+    downlink: tokio::sync::broadcast::Sender<(WarrenControlMessage, Option<u32>)>,
 }
 
 const FAKE_EXIT_IKM: [u8; 32] = [0x99; 32];
@@ -626,7 +651,14 @@ async fn serve_one_fake_exit_connection(
         Ok(Some(WarrenControlMessage::IpRequestV7 { session_tokens, .. })) => {
             SeenSetupRequest::Tokens(session_tokens.iter().map(|t| t.0).collect())
         }
+        Ok(Some(WarrenControlMessage::IpRequestRoute { route_locator, .. })) => {
+            SeenSetupRequest::Route(route_locator.to_bytes())
+        }
         _ => SeenSetupRequest::Other,
+    };
+    let route_refusal = match &seen {
+        SeenSetupRequest::Route(_) => behaviour.route_reply.lock().clone(),
+        _ => None,
     };
     let lead_token_in_use = match &seen {
         SeenSetupRequest::Tokens(tokens) => tokens
@@ -635,7 +667,9 @@ async fn serve_one_fake_exit_connection(
         _ => false,
     };
     behaviour.setup_requests.lock().push(seen);
-    let reply_msg = if behaviour.reject_banned.load(Ordering::Relaxed) {
+    let reply_msg = if let Some(refusal) = route_refusal {
+        refusal
+    } else if behaviour.reject_banned.load(Ordering::Relaxed) {
         WarrenControlMessage::RejectedBanned {
             reason_code: behaviour.ban_reason_code.load(Ordering::Relaxed),
         }
@@ -690,9 +724,34 @@ async fn serve_one_fake_exit_connection(
 
     // The setup reply was sealed at seq 0.
     let mut reverse_seq = 1u64;
+    let mut pushed = behaviour.downlink.subscribe();
+    let seal_control = |msg: &WarrenControlMessage, seq: u64| {
+        encode_control(msg)
+            .ok()
+            .and_then(|p| exit_session.seal_response(&p, 0, seq).ok())
+            .and_then(|f| encode_frame(&f).ok())
+    };
     loop {
-        let Ok(datagram) = conn.read_datagram().await else {
-            return;
+        let datagram = tokio::select! {
+            read = conn.read_datagram() => match read {
+                Ok(datagram) => datagram,
+                Err(_) => return,
+            },
+            push = pushed.recv(), if leg.is_some() => {
+                let Ok((msg, close)) = push else {
+                    continue;
+                };
+                if let Some(wire) = seal_control(&msg, reverse_seq) {
+                    reverse_seq += 1;
+                    let _ = conn.send_datagram(wire.into());
+                }
+                if let Some(code) = close {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    conn.close(quinn::VarInt::from_u32(code), &[]);
+                    return;
+                }
+                continue;
+            }
         };
         let Some(leg) = leg else {
             continue;
@@ -700,6 +759,30 @@ async fn serve_one_fake_exit_connection(
         let plaintext = decode_frame(&datagram)
             .ok()
             .and_then(|frame| exit_session.open(&frame).ok());
+        if let Some(Ok(Some(WarrenControlMessage::RouteAnchorRequest {
+            sealed_anchor,
+            session_token,
+        }))) = plaintext.as_deref().map(try_decode_control)
+        {
+            behaviour.anchor_requests.lock().push(SeenAnchorRequest {
+                sealed: sealed_anchor.to_bytes(),
+                token: session_token.map(|t| t.0),
+            });
+            let answer = behaviour.anchor_script.lock().pop_front().flatten();
+            if let Some(status) = answer
+                && let Some(wire) = seal_control(
+                    &WarrenControlMessage::RouteAnchorAck {
+                        status,
+                        max_routes: 32,
+                    },
+                    reverse_seq,
+                )
+            {
+                reverse_seq += 1;
+                let _ = conn.send_datagram(wire.into());
+            }
+            continue;
+        }
         let echo = plaintext.as_deref().and_then(echo_reply_for);
         {
             let mut legs = behaviour.legs.lock();
@@ -807,6 +890,10 @@ pub(crate) fn spawn_fake_multihop_exit_on(
         lose_reply: Arc::new(parking_lot::Mutex::new(None)),
         setup_requests: Arc::new(parking_lot::Mutex::new(Vec::new())),
         tokens_in_use: Arc::new(parking_lot::Mutex::new(Vec::new())),
+        anchor_requests: Arc::new(parking_lot::Mutex::new(Vec::new())),
+        anchor_script: Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
+        route_reply: Arc::new(parking_lot::Mutex::new(None)),
+        downlink: tokio::sync::broadcast::channel(16).0,
     };
 
     let refuse_handshake = Arc::new(AtomicBool::new(false));
@@ -869,6 +956,10 @@ pub(crate) fn spawn_fake_multihop_exit_on(
         lose_reply: behaviour.lose_reply,
         setup_requests: behaviour.setup_requests,
         tokens_in_use: behaviour.tokens_in_use,
+        anchor_requests: behaviour.anchor_requests,
+        anchor_script: behaviour.anchor_script,
+        route_reply: behaviour.route_reply,
+        downlink: behaviour.downlink,
         on_next_dial,
         _server_ep: server_ep,
     })

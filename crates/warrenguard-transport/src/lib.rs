@@ -36,6 +36,9 @@ pub mod path_health;
 // change watcher); consumers react through their own redial machinery.
 pub mod network_monitor;
 pub mod redial_policy;
+// Route admission by anchor: the main session's anchor and the route
+// sessions admitted on it.
+pub mod route_anchor;
 #[cfg(unix)]
 pub mod socket_protect;
 // `real_tun` drives `tun-rs::AsyncDevice`, which has no Android nor iOS backend.
