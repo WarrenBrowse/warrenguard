@@ -56,6 +56,9 @@ struct AnchorInner {
     secret: RouteAnchorSecret,
     kem: RouteKemPublicKey,
     state: watch::Sender<AnchorState>,
+    /// Bumped on every bound verdict, so a route supervisor can tell a bind
+    /// that happened after a refusal from the one that preceded it.
+    binds: std::sync::atomic::AtomicU64,
 }
 
 /// The anchor of one logical main session, shared (in process) by the main
@@ -72,6 +75,7 @@ impl RouteAnchorHandle {
             secret: RouteAnchorSecret::generate(),
             kem: config.kem,
             state: watch::channel(AnchorState::Unanchored).0,
+            binds: std::sync::atomic::AtomicU64::new(0),
         }))
     }
 
@@ -101,7 +105,17 @@ impl RouteAnchorHandle {
         seal_route_anchor(&self.0.kem, &self.0.secret, serial)
     }
 
+    /// How many bound verdicts this anchor has had.
+    pub(crate) fn binds(&self) -> u64 {
+        self.0.binds.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub(crate) fn set_state(&self, state: AnchorState) {
+        if matches!(state, AnchorState::Anchored { .. }) {
+            self.0
+                .binds
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
         let previous = self.0.state.send_replace(state);
         if previous != state {
             match state {
@@ -207,34 +221,57 @@ impl RouteDownlink {
 /// Sender half of a bundle's route control intercept.
 pub(crate) type RouteTap = mpsc::UnboundedSender<RouteDownlink>;
 
-/// Waits between two sends of one anchor request (doc 107 section 10.1:
-/// retried at 1, 2, 4, 8 and 16 s); after the last one with no ack the
-/// anchor is unavailable for this setup.
-pub(crate) const ANCHOR_RETRY_WAITS: [Duration; 5] = [
-    Duration::from_secs(1),
-    Duration::from_secs(2),
-    Duration::from_secs(4),
-    Duration::from_secs(8),
-    Duration::from_secs(16),
-];
+/// When an anchor request is re-sent, and when a new one may follow.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AnchorSchedule {
+    /// Waits between two sends of one request (doc 107 section 10.1: retried
+    /// at 1, 2, 4, 8 and 16 s); after the last one with no ack the anchor is
+    /// unavailable for this setup.
+    pub(crate) waits: [Duration; 5],
+    /// Pause before a new request after a verdict: the exit makes at most
+    /// one control-plane call per 2 s per session and would drop anything
+    /// sooner, and a hostile exit replaying verdicts cannot make the client
+    /// spin.
+    pub(crate) cycle_pause: Duration,
+    /// Wait before a new request after the control plane answered
+    /// `unavailable`.
+    pub(crate) unavailable_retry: Duration,
+}
 
-/// Wait before a new cycle after the control plane answered `unavailable`.
-const ANCHOR_UNAVAILABLE_RETRY: Duration = Duration::from_secs(16);
+impl AnchorSchedule {
+    /// The production schedule.
+    pub(crate) const DEFAULT: Self = Self {
+        waits: [
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(4),
+            Duration::from_secs(8),
+            Duration::from_secs(16),
+        ],
+        cycle_pause: Duration::from_secs(2),
+        unavailable_retry: Duration::from_secs(16),
+    };
+}
 
 /// Anchor one main session: send the request sealed to `serial`, follow the
-/// acks, re-send on `lost`, present a fresh token on `needs token`. Runs
-/// until the session's acks stop (the bundle is gone) or a verdict makes the
-/// anchor unavailable for this setup. The caller aborts it when the session
-/// is replaced.
+/// acks, re-send on `lost`, present a token on `needs token`. Runs until the
+/// session's acks stop (the bundle is gone) or a verdict makes the anchor
+/// unavailable for this setup. The caller aborts it when the session is
+/// replaced.
+///
+/// The token provider is asked at most once per setup: its stack is kept and
+/// walked one token per refusal, so a hostile exit answering `needs token`
+/// over and over cannot drain the store.
 pub(crate) async fn run_anchoring(
     anchor: RouteAnchorHandle,
     primary: Arc<MultiHopClient>,
     mut serial: [u8; 32],
     tokens: Option<SessionTokenProvider>,
     mut acks: mpsc::UnboundedReceiver<RouteDownlink>,
-    waits: [Duration; 5],
+    schedule: AnchorSchedule,
 ) {
     let mut token: Option<SessionToken> = None;
+    let mut stack: Option<std::collections::VecDeque<SessionToken>> = None;
     loop {
         let Ok(sealed) = anchor.seal_anchor(&serial) else {
             anchor.set_state(AnchorState::Unavailable);
@@ -247,11 +284,14 @@ pub(crate) async fn run_anchoring(
             anchor.set_state(AnchorState::Unavailable);
             return;
         };
+        // Acks carry no correlation: one still queued from an earlier cycle
+        // must not be read as this request's verdict.
+        while acks.try_recv().is_ok() {}
         // One sealed request per cycle, re-sent byte for byte: the exit
         // answers a repeat from its last verdict without calling its control
         // plane when only the ack was lost.
         let mut verdict = None;
-        for wait in waits {
+        for wait in schedule.waits {
             if primary.send_packet(&request).is_err() {
                 return;
             }
@@ -273,6 +313,8 @@ pub(crate) async fn run_anchoring(
         match status {
             RouteAnchorStatus::Bound => {
                 anchor.set_state(AnchorState::Anchored { max_routes });
+                // The session holds that token's lease now; a later request
+                // needs none.
                 token = None;
                 // Stay on the session: the exit reports a lost anchor.
                 loop {
@@ -285,20 +327,30 @@ pub(crate) async fn run_anchoring(
                 tracing::info!("route anchor lost; registering it again");
             }
             RouteAnchorStatus::Lost => {}
-            RouteAnchorStatus::NeedsToken => {
-                let lead = tokens
-                    .as_ref()
-                    .and_then(|provider| provider().into_iter().next());
-                let Some(lead) = lead else {
+            // A token is due: at first because the session holds no live lease
+            // (`needs token`), then again when the one presented was refused.
+            RouteAnchorStatus::NeedsToken | RouteAnchorStatus::Refused
+                if status == RouteAnchorStatus::NeedsToken || token.is_some() =>
+            {
+                let stack = stack.get_or_insert_with(|| {
+                    tokens
+                        .as_ref()
+                        .map(|provider| provider().into())
+                        .unwrap_or_default()
+                });
+                let Some(next) = stack.pop_front() else {
                     anchor.set_state(AnchorState::Unavailable);
                     return;
                 };
-                serial = session_token_serial(&lead);
-                token = Some(lead);
+                serial = session_token_serial(&next);
+                token = Some(next);
             }
             RouteAnchorStatus::Unavailable => {
                 anchor.set_state(AnchorState::Unavailable);
-                if tokio::time::timeout(ANCHOR_UNAVAILABLE_RETRY, drain_until_closed(&mut acks))
+                // A token presented in this cycle is presented again: the
+                // exit re-admits the serial it already holds for this
+                // session, so nothing is spent twice.
+                if tokio::time::timeout(schedule.unavailable_retry, drain_until_closed(&mut acks))
                     .await
                     .is_ok()
                 {
@@ -310,6 +362,12 @@ pub(crate) async fn run_anchoring(
                 anchor.set_state(AnchorState::Unavailable);
                 return;
             }
+        }
+        if tokio::time::timeout(schedule.cycle_pause, drain_until_closed(&mut acks))
+            .await
+            .is_ok()
+        {
+            return;
         }
     }
 }
