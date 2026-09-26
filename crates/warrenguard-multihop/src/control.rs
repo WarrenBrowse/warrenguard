@@ -311,6 +311,92 @@ pub enum WarrenControlMessage {
         /// invisible to the hostile relay (anti-oracle).
         reason_code: u8,
     },
+
+    /// Client -> exit, setup stream, **route admission** (discriminant 7). A
+    /// route session admitted against the device's live anchored main session
+    /// instead of a token of its own: it carries no token, no wallet key and
+    /// no proof of possession, only `route_locator`, the anchor secret sealed
+    /// to the control plane with this exit's id as associated data (see
+    /// [`crate::route_admission`]). The exit hands the locator to its deployer's
+    /// route admitter and never opens it. A deployed exit that predates the
+    /// variant decodes nothing and answers the sealed [`Self::Rejected`].
+    IpRequestRoute {
+        /// Optional client IPv4 preference (advisory), as in [`Self::IpRequestV7`].
+        prefer_ipv4: Option<[u8; 4]>,
+        /// Dual-stack request, as in [`Self::IpRequestV7`].
+        wants_ipv6: bool,
+        /// The anchor secret sealed for this exit (81 bytes, fixed).
+        route_locator: crate::route_admission::SealedToApi,
+        /// Traffic-analysis defense request, as in [`Self::IpRequestV7`].
+        wants_daita: bool,
+    },
+
+    /// Exit -> client, setup stream (discriminant 8). The route admission was
+    /// refused; sent sealed before the same single opaque close every policy
+    /// refusal uses, so the relay learns nothing. `reason_code` is a
+    /// [`crate::route_admission::RouteRejectCode`] on the wire as a plain `u8`
+    /// so an unknown code still decodes.
+    RouteRejected {
+        /// See [`crate::route_admission::RouteRejectCode`].
+        reason_code: u8,
+    },
+
+    /// Client -> exit, **uplink datagram** on a main session (discriminant 9).
+    /// Registers (or re-homes) the anchor: `sealed_anchor` is the anchor
+    /// secret sealed with the serial of the token the main setup was admitted
+    /// on as associated data. `session_token` is presented only after a
+    /// `needs token` ack. A deployed exit drops every uplink control datagram,
+    /// so an old exit simply never answers.
+    RouteAnchorRequest {
+        /// The anchor secret sealed to the control plane (81 bytes, fixed).
+        sealed_anchor: crate::route_admission::SealedToApi,
+        /// A fresh session token, only after a `needs token` ack. Boxed so
+        /// the enum stays small; serde encodes a box as its content, so the
+        /// wire is the raw token.
+        session_token: Option<Box<SessionToken>>,
+    },
+
+    /// Exit -> client, **downlink datagram** on a main session (discriminant
+    /// 10). The answer to a [`Self::RouteAnchorRequest`], or `lost` when the
+    /// exit's renewal found the anchor gone. `status` is a
+    /// [`crate::route_admission::RouteAnchorStatus`] as a plain `u8`;
+    /// `max_routes` (postcard varint) is how many routes the anchor admits.
+    RouteAnchorAck {
+        /// See [`crate::route_admission::RouteAnchorStatus`].
+        status: u8,
+        /// Routes the anchor admits at most (meaningful when bound).
+        max_routes: u16,
+    },
+
+    /// Exit -> client, **downlink datagram** on a route session (discriminant
+    /// 11), sent before the exit closes it. `reason_code` is a
+    /// [`crate::route_admission::RouteEndReason`] as a plain `u8`.
+    RouteEnded {
+        /// See [`crate::route_admission::RouteEndReason`].
+        reason_code: u8,
+    },
+}
+
+impl WarrenControlMessage {
+    /// The variant name, and never the body: a request carries a client
+    /// pubkey, tokens or a sealed blob, so logs name the variant only.
+    #[must_use]
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            Self::IpRequest { .. } => "IpRequest",
+            Self::IpAssign { .. } => "IpAssign",
+            Self::IpExhausted => "IpExhausted",
+            Self::Rejected => "Rejected",
+            Self::ExitDraining { .. } => "ExitDraining",
+            Self::IpRequestV7 { .. } => "IpRequestV7",
+            Self::RejectedBanned { .. } => "RejectedBanned",
+            Self::IpRequestRoute { .. } => "IpRequestRoute",
+            Self::RouteRejected { .. } => "RouteRejected",
+            Self::RouteAnchorRequest { .. } => "RouteAnchorRequest",
+            Self::RouteAnchorAck { .. } => "RouteAnchorAck",
+            Self::RouteEnded { .. } => "RouteEnded",
+        }
+    }
 }
 
 /// Encode a control message into the wire layout (marker + version +
@@ -727,6 +813,246 @@ mod tests {
             .expect("decode result")
             .expect("control message present");
         assert_eq!(decoded, msg, "ExitDraining must round-trip exactly");
+    }
+
+    // ---- Route admission (appended variants 7 to 11) ----
+
+    use crate::route_admission::{SEALED_TO_API_LEN, SealedToApi};
+
+    fn blob(fill: u8) -> SealedToApi {
+        SealedToApi::from_bytes(&[fill; SEALED_TO_API_LEN])
+    }
+
+    #[test]
+    fn ip_request_route_wire_layout_is_frozen() {
+        let minimal = encode_control(&WarrenControlMessage::IpRequestRoute {
+            prefer_ipv4: None,
+            wants_ipv6: false,
+            route_locator: blob(0x42),
+            wants_daita: false,
+        })
+        .unwrap();
+        let mut expected = vec![
+            0xC0, 0x03, 0x07, // marker, version, variant tag 7
+            0x00, // prefer_ipv4 = None
+            0x00, // wants_ipv6 = false
+        ];
+        expected.extend_from_slice(&[0x42; 81]); // locator raw, no length prefix
+        expected.push(0x00); // wants_daita = false
+        assert_eq!(minimal, expected, "IpRequestRoute wire layout drifted");
+        assert_eq!(minimal.len(), 87);
+
+        let full = encode_control(&WarrenControlMessage::IpRequestRoute {
+            prefer_ipv4: Some([10, 66, 0, 42]),
+            wants_ipv6: true,
+            route_locator: blob(0x42),
+            wants_daita: true,
+        })
+        .unwrap();
+        let mut expected = vec![0xC0, 0x03, 0x07, 0x01, 10, 66, 0, 42, 0x01];
+        expected.extend_from_slice(&[0x42; 81]);
+        expected.push(0x01);
+        assert_eq!(full, expected, "IpRequestRoute with options drifted");
+    }
+
+    #[test]
+    fn route_rejected_and_route_ended_wire_layouts_are_frozen() {
+        assert_eq!(
+            encode_control(&WarrenControlMessage::RouteRejected { reason_code: 2 }).unwrap(),
+            vec![0xC0, 0x03, 0x08, 0x02],
+            "RouteRejected is tag 8 then one reason byte"
+        );
+        assert_eq!(
+            encode_control(&WarrenControlMessage::RouteEnded { reason_code: 1 }).unwrap(),
+            vec![0xC0, 0x03, 0x0B, 0x01],
+            "RouteEnded is tag 11 then one reason byte"
+        );
+    }
+
+    #[test]
+    fn route_anchor_request_wire_layout_is_frozen() {
+        let bare = encode_control(&WarrenControlMessage::RouteAnchorRequest {
+            sealed_anchor: blob(0x5A),
+            session_token: None,
+        })
+        .unwrap();
+        let mut expected = vec![0xC0, 0x03, 0x09];
+        expected.extend_from_slice(&[0x5A; 81]);
+        expected.push(0x00); // session_token = None
+        assert_eq!(bare, expected, "RouteAnchorRequest wire layout drifted");
+        assert_eq!(
+            bare.len(),
+            85,
+            "doc 107 section 7.3: 85 bytes without a token"
+        );
+
+        let len = warrenguard_wire::SESSION_TOKEN_LEN;
+        let with_token = encode_control(&WarrenControlMessage::RouteAnchorRequest {
+            sealed_anchor: blob(0x5A),
+            session_token: Some(Box::new(SessionToken(
+                [0xCD; warrenguard_wire::SESSION_TOKEN_LEN],
+            ))),
+        })
+        .unwrap();
+        let mut expected = vec![0xC0, 0x03, 0x09];
+        expected.extend_from_slice(&[0x5A; 81]);
+        expected.push(0x01);
+        expected.extend_from_slice(&vec![0xCD; len]); // raw token, no length prefix
+        assert_eq!(with_token, expected);
+        assert_eq!(
+            with_token.len(),
+            439,
+            "doc 107 section 7.3: 439 bytes with a token"
+        );
+    }
+
+    #[test]
+    fn route_anchor_ack_wire_layout_is_frozen() {
+        assert_eq!(
+            encode_control(&WarrenControlMessage::RouteAnchorAck {
+                status: 0,
+                max_routes: 32
+            })
+            .unwrap(),
+            vec![0xC0, 0x03, 0x0A, 0x00, 0x20],
+            "RouteAnchorAck is tag 10, one status byte, max_routes as a varint"
+        );
+        assert_eq!(
+            encode_control(&WarrenControlMessage::RouteAnchorAck {
+                status: 5,
+                max_routes: 256
+            })
+            .unwrap(),
+            vec![0xC0, 0x03, 0x0A, 0x05, 0x80, 0x02],
+            "a two-byte varint for max_routes past 127"
+        );
+    }
+
+    #[test]
+    fn route_variants_round_trip() {
+        for msg in [
+            WarrenControlMessage::IpRequestRoute {
+                prefer_ipv4: Some([10, 66, 0, 9]),
+                wants_ipv6: true,
+                route_locator: blob(0x11),
+                wants_daita: false,
+            },
+            WarrenControlMessage::RouteRejected { reason_code: 4 },
+            WarrenControlMessage::RouteAnchorRequest {
+                sealed_anchor: blob(0x22),
+                session_token: Some(Box::new(SessionToken(
+                    [0x33; warrenguard_wire::SESSION_TOKEN_LEN],
+                ))),
+            },
+            WarrenControlMessage::RouteAnchorAck {
+                status: 1,
+                max_routes: u16::MAX,
+            },
+            WarrenControlMessage::RouteEnded { reason_code: 200 },
+        ] {
+            let decoded = try_decode_control(&encode_control(&msg).unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(decoded, msg, "{} must round-trip", msg.variant_name());
+        }
+    }
+
+    /// The control enum exactly as deployed peers still build it, before the
+    /// route variants were appended. What a deployed peer does with a new
+    /// variant is decided by this decoder, so the compatibility claim of doc
+    /// 107 section 7 is tested against it rather than asserted.
+    #[derive(Debug, Deserialize)]
+    #[allow(dead_code)] // Only decoded, to observe the refusal.
+    enum DeployedControlMessage {
+        IpRequest {
+            prefer_ipv4: Option<[u8; 4]>,
+            client_pubkey: Option<[u8; 32]>,
+            wants_ipv6: bool,
+            pop_sig: Option<PopSignature>,
+            wants_daita: bool,
+        },
+        IpAssign {
+            ipv4: [u8; 4],
+            prefix_len: u8,
+            gateway_ipv4: [u8; 4],
+            ipv6: Option<[u8; 16]>,
+            prefix_len_v6: u8,
+            gateway_ipv6: Option<[u8; 16]>,
+            daita_spec: Option<warrenguard_wire::DaitaConfig>,
+        },
+        IpExhausted,
+        Rejected,
+        ExitDraining {
+            deadline_unix_secs: u64,
+            reason_code: u8,
+        },
+        IpRequestV7 {
+            prefer_ipv4: Option<[u8; 4]>,
+            wants_ipv6: bool,
+            session_tokens: Vec<SessionToken>,
+            wants_daita: bool,
+        },
+        RejectedBanned {
+            reason_code: u8,
+        },
+    }
+
+    #[test]
+    fn a_deployed_decoder_refuses_every_route_variant_and_keeps_the_old_ones() {
+        let new_variants = [
+            WarrenControlMessage::IpRequestRoute {
+                prefer_ipv4: None,
+                wants_ipv6: false,
+                route_locator: blob(0x01),
+                wants_daita: false,
+            },
+            WarrenControlMessage::RouteRejected { reason_code: 1 },
+            WarrenControlMessage::RouteAnchorRequest {
+                sealed_anchor: blob(0x02),
+                session_token: None,
+            },
+            WarrenControlMessage::RouteAnchorAck {
+                status: 0,
+                max_routes: 32,
+            },
+            WarrenControlMessage::RouteEnded { reason_code: 1 },
+        ];
+        for msg in new_variants {
+            let bytes = encode_control(&msg).unwrap();
+            assert!(
+                postcard::from_bytes::<DeployedControlMessage>(&bytes[2..]).is_err(),
+                "a deployed peer must fail to decode {} (then drop it), never misread it",
+                msg.variant_name()
+            );
+        }
+        // And the appended variants did not renumber the deployed ones.
+        let banned =
+            encode_control(&WarrenControlMessage::RejectedBanned { reason_code: 3 }).unwrap();
+        assert!(matches!(
+            postcard::from_bytes::<DeployedControlMessage>(&banned[2..]),
+            Ok(DeployedControlMessage::RejectedBanned { reason_code: 3 })
+        ));
+        let rejected = encode_control(&WarrenControlMessage::Rejected).unwrap();
+        assert!(matches!(
+            postcard::from_bytes::<DeployedControlMessage>(&rejected[2..]),
+            Ok(DeployedControlMessage::Rejected)
+        ));
+    }
+
+    #[test]
+    fn variant_name_never_renders_the_body() {
+        let msg = WarrenControlMessage::RouteAnchorRequest {
+            sealed_anchor: blob(0x77),
+            session_token: Some(Box::new(SessionToken(
+                [0x77; warrenguard_wire::SESSION_TOKEN_LEN],
+            ))),
+        };
+        assert_eq!(msg.variant_name(), "RouteAnchorRequest");
+        let rendered = format!("{msg:?}");
+        assert!(
+            !rendered.contains("119, 119"),
+            "Debug must not render the sealed blob or the token: {rendered}"
+        );
     }
 
     // ---- Decoder hygiene ----
