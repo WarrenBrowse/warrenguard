@@ -207,6 +207,10 @@ pub struct MultiHopBundle {
     /// probe traffic never reaches the TUN nor the real-traffic
     /// counters.
     probe_tap: RwLock<Option<Arc<crate::path_health::ProbeTap>>>,
+    /// Route admission intercept, installed by the supervisor when the
+    /// session anchors or is a route: `recv()` hands it the anchor acks and
+    /// route ends, which never reach the consumer.
+    route_tap: RwLock<Option<crate::route_anchor::RouteTap>>,
     /// Cached per-leg MTU policy, refreshed every
     /// [`ROUTING_PLAN_REFRESH_PACKETS`] uplink packets and on every bundle
     /// width change. Read on the uplink hot path; never computed there.
@@ -281,6 +285,7 @@ impl MultiHopBundle {
             answerable_tx: AtomicU64::new(0),
             source_addresses: OnceLock::new(),
             probe_tap: RwLock::new(None),
+            route_tap: RwLock::new(None),
             routing: RwLock::new(plan),
             routing_tick: AtomicU64::new(0),
             unresponsive: PlMutex::new(Vec::new()),
@@ -565,6 +570,30 @@ impl MultiHopBundle {
         *self.probe_tap.write() = Some(tap);
     }
 
+    /// Installs the route admission intercept consulted by [`Self::recv`].
+    pub(crate) fn set_route_tap(&self, tap: crate::route_anchor::RouteTap) {
+        *self.route_tap.write() = Some(tap);
+    }
+
+    /// Hands a route control message to the route intercept. `true` when it
+    /// was one and was taken.
+    fn intercept_route_control(&self, payload: &[u8]) -> bool {
+        let tap = self.route_tap.read();
+        let Some(tap) = tap.as_ref() else {
+            return false;
+        };
+        let Ok(Some(msg)) = warrenguard_multihop::try_decode_control(payload) else {
+            return false;
+        };
+        match crate::route_anchor::RouteDownlink::from_control(&msg) {
+            Some(route) => {
+                let _ = tap.send(route);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Sends one DAITA padding frame on the next round-robin session,
     /// so cover traffic spreads across every bonded connection.
     ///
@@ -620,6 +649,11 @@ impl MultiHopBundle {
                         && payload[9] == 1
                         && let Some(tap) = self.probe_tap.read().as_ref()
                         && tap.try_intercept(&payload)
+                    {
+                        continue;
+                    }
+                    if payload.first() == Some(&warrenguard_multihop::CONTROL_FIRST_BYTE)
+                        && self.intercept_route_control(&payload)
                     {
                         continue;
                     }

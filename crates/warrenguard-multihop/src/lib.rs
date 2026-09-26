@@ -97,7 +97,7 @@ pub use route_admission::{
     ROUTE_ANCHOR_SECRET_LEN, ROUTE_TOKEN_SERIAL_LEN, RouteAnchorRef, RouteAnchorSecret,
     RouteAnchorStatus, RouteEndReason, RouteKemPublicKey, RouteKemSecretKey, RouteRejectCode,
     RouteSealError, RouteSerial, SEALED_TO_API_LEN, SealedToApi, seal_route_anchor,
-    seal_route_locator,
+    seal_route_locator, session_token_serial,
 };
 pub use session::{
     ClientSession, ExitId, ExitSession, WARREN_AAD_TOTAL_LEN, WarrenAead, WarrenKdf, WarrenKem,

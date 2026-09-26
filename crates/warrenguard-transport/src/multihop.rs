@@ -198,6 +198,12 @@ pub enum MultiHopError {
     /// request was sent. Carries no token material.
     #[error("no usable session token: {0}")]
     NoSessionToken(NoSessionTokenCause),
+    /// A route session (see
+    /// [`crate::supervisor::SessionAdmission::Route`]) was refused, or ended
+    /// by its exit. The consumer falls back to a token route; the refusal
+    /// never rotated a token and carries no identifier.
+    #[error("{0}")]
+    RouteRefused(crate::route_anchor::RouteRefusal),
 }
 
 /// Why a tokens-only session had no usable v7 token
@@ -310,6 +316,11 @@ impl MultiHopError {
         // subscription failure.
         if let MultiHopError::NoSessionToken(_) = self {
             return warrenguard_wire::Retryability::RetrySameTarget;
+        }
+        // The same route request meets the same refusal: the consumer moves
+        // to another admission (a token route), never a fatal account state.
+        if let MultiHopError::RouteRefused(_) = self {
+            return warrenguard_wire::Retryability::RetryReselect;
         }
         if self.dial_refusal().is_some() {
             return warrenguard_wire::Retryability::RetryReselect;
@@ -2425,7 +2436,21 @@ impl MultiHopClient {
             session_tokens,
             prefer_ipv4,
         );
-        let plaintext = encode_control(&request_msg).map_err(|e| match e {
+        self.setup_over_stream_request(&request_msg).await
+    }
+
+    /// The setup-stream round trip with an already-composed request: a route
+    /// admission (`IpRequestRoute`), which carries a sealed locator instead
+    /// of an identity or a token. Returns the opened reply plaintext.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::setup_over_stream`].
+    pub async fn setup_over_stream_request(
+        &self,
+        request_msg: &WarrenControlMessage,
+    ) -> Result<Vec<u8>, MultiHopError> {
+        let plaintext = encode_control(request_msg).map_err(|e| match e {
             warrenguard_multihop::ControlError::Decode(p) => MultiHopError::Encode(p),
             _ => MultiHopError::Encode(postcard::Error::SerializeBufferFull),
         })?;

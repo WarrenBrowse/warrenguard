@@ -91,6 +91,11 @@ pq-hpke = ["warrenguard-multihop/pq-hpke"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# The real exit termination loop and its admission seams, for the route
+# admission end-to-end test (no cycle: neither depends on this crate).
+warrenguard-multihop-server = { path = "../warrenguard-multihop-server" }
+warrenguard-server = { path = "../warrenguard-server" }
+parking_lot = { workspace = true }
 ed25519-dalek = { workspace = true }
 # Self-signed cover certificate for the carrier end-to-end test.
 rcgen = { workspace = true }

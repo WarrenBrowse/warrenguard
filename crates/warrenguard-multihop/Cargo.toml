@@ -103,6 +103,9 @@ rand_core = { version = "0.9", default-features = false, features = ["os_rng"] }
 
 [dev-dependencies]
 proptest = "1"
+# Cross-checks `session_token_serial` against the issuer crate's own serial.
+warrenguard-token = { path = "../warrenguard-token" }
+rand_v10 = { package = "rand", version = "0.10" }
 # Deterministic ChaCha20Rng for reproducible HPKE vector generation. Must be
 # the 0.9 line (uses rand_core 0.9 traits) to interop with hpke 0.13's
 # `setup_sender` rng parameter. See `tests/hpke_vectors_v1.rs`.
