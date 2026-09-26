@@ -1,14 +1,9 @@
 name: CI
 
-# Runs exclusively on the WarrenBrowse org self-hosted runners (Default runner
-# group). Label sets are matched against the live runners:
-#   [self-hosted, Linux, ARM64, macstudio-arm64] -> native arm64 Linux fleet
-#   [self-hosted, macOS, ARM64]  -> axiomStudio
-# Verification jobs run on the NATIVE arm64 Linux fleet: the x86-under-Rosetta
-# containers wedge cargo/nextest when rustc dies unreaped (zombie jobserver
-# deadlock, 2026-07-08 and 2026-07-16). Only jobs that must PRODUCE x86_64
-# artifacts belong on macstudio-rosetta; this workflow has none.
-# Do not switch any job to a GitHub-hosted runner.
+# The Linux jobs run on GitHub-hosted runners (ubuntu-24.04): free and
+# unlimited for a public repo, and several times faster than the self-hosted
+# libra pool was. The macOS jobs stay on the org's self-hosted Apple Silicon
+# runner ([self-hosted, macOS, ARM64]).
 
 on:
   push:
@@ -22,15 +17,15 @@ env:
   CARGO_INCREMENTAL: 0
 
 concurrency:
-  # A single self-hosted Linux runner serves these jobs; cancel superseded runs
-  # on the same ref so a burst of pushes cannot pile up a long serial backlog.
+  # Cancel superseded runs on the same ref so a burst of pushes does not burn
+  # runner time on commits nobody will look at.
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   fmt:
     name: cargo fmt
-    runs-on: [self-hosted, Linux, X64, libra]
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -41,7 +36,7 @@ jobs:
 
   anti-refrag:
     name: anti-refragmentation gate
-    runs-on: [self-hosted, Linux, X64, libra]
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -58,7 +53,7 @@ jobs:
       matrix:
         include:
           - name: linux
-            runner: [self-hosted, Linux, X64, libra]
+            runner: ubuntu-24.04
           - name: macos
             runner: [self-hosted, macOS, ARM64]
     steps:
@@ -67,12 +62,13 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-        # Persistent self-hosted runners already keep target/ across jobs;
-        # rust-cache's target prune drops .d dep-info and corrupts the restore
-        # (nextest "could not parse/generate dep info ... No such file"). Cache
-        # only the registry, let the runner's persistent target serve incremental.
+        # The persistent self-hosted macOS runner already keeps target/ across
+        # jobs, and rust-cache's target prune drops .d dep-info and corrupts the
+        # restore there, so it caches only the registry. The ephemeral hosted
+        # Linux runner starts empty and caches its target too.
         with:
-          cache-targets: "false"
+          cache-targets: ${{ matrix.name == 'linux' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # --all-features lints the cfg-gated per-OS datapath (the Apple fast path,
       # the pfctl killswitch, the experimental TUN) on each native runner.
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
@@ -104,7 +100,7 @@ jobs:
 
   test:
     name: cargo test
-    runs-on: [self-hosted, Linux, X64, libra]
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       # The shared golden vectors are a private submodule (warren-vectors); the
@@ -116,12 +112,8 @@ jobs:
           token: ${{ secrets.VECTORS_TOKEN }}
       - uses: dtolnay/rust-toolchain@1.89.0
       - uses: Swatinem/rust-cache@v2
-        # Persistent self-hosted runners already keep target/ across jobs;
-        # rust-cache's target prune drops .d dep-info and corrupts the restore
-        # (nextest "could not parse/generate dep info ... No such file"). Cache
-        # only the registry, let the runner's persistent target serve incremental.
         with:
-          cache-targets: "false"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: install cargo-nextest
         uses: taiki-e/install-action@v2
         with:
@@ -145,7 +137,7 @@ jobs:
 
   audit:
     name: cargo audit
-    runs-on: [self-hosted, Linux, X64, libra]
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -160,7 +152,7 @@ jobs:
 
   deny:
     name: cargo deny
-    runs-on: [self-hosted, Linux, X64, libra]
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -178,16 +170,14 @@ jobs:
     # never matches this lockfile. Without this gate a fork base version that
     # goes advisory-affected between two nightly runs reaches main unseen.
     name: warren-quinn fork advisory watch
-    runs-on: [self-hosted, Linux, X64, libra]
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Ensure a TOML parser for python < 3.11
-        # The runner is Debian bullseye (python 3.9, no tomllib); install the
-        # pure-python tomli backport. No-op when tomllib or tomli is already
-        # present. The container image ships python3 WITHOUT pip ("No module
-        # named pip"), so bootstrap pip through apt first (the runner has
-        # NOPASSWD sudo scoped to apt) instead of assuming it exists.
+        # ubuntu-24.04 ships python 3.12, whose tomllib makes this a no-op; it
+        # installs the pure-python tomli backport only on an older python
+        # (bootstrapping pip through apt when the image lacks it).
         run: |
           python3 -c "import tomllib" 2>/dev/null && exit 0
           python3 -c "import tomli" 2>/dev/null && exit 0

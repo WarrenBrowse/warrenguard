@@ -10,8 +10,7 @@ name: fingerprint nightly
 # real-network benches, not this workflow. These binaries also run in the main
 # workspace test on every push; the nightly is the scheduled explicit guard.
 #
-# Runs on the WarrenBrowse self-hosted runner (see ci.yml); do not switch to a
-# GitHub-hosted runner.
+# Runs on a GitHub-hosted runner, like the Linux jobs of ci.yml.
 
 on:
   schedule:
@@ -38,12 +37,14 @@ env:
 jobs:
   fingerprint-invariants:
     name: wire-fingerprint invariants I1-I7
-    runs-on: [self-hosted, Linux, X64, libra]
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.89.0
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: "I1, I2, I6, I7 - live ALPN + SNI handshake"
         run: cargo test -p warrenguard-tls --test fingerprint_invariants -- --nocapture
@@ -68,16 +69,14 @@ jobs:
 
   quinn-advisory-watch:
     name: warren-quinn fork advisory watch
-    runs-on: [self-hosted, Linux, X64, libra]
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Ensure a TOML parser for python < 3.11
-        # The runner is Debian bullseye (python 3.9, no tomllib); install the
-        # pure-python tomli backport. No-op when tomllib or tomli is already
-        # present. The container image ships python3 WITHOUT pip ("No module
-        # named pip"), so bootstrap pip through apt first (the runner has
-        # NOPASSWD sudo scoped to apt) instead of assuming it exists.
+        # ubuntu-24.04 ships python 3.12, whose tomllib makes this a no-op; it
+        # installs the pure-python tomli backport only on an older python
+        # (bootstrapping pip through apt when the image lacks it).
         run: |
           python3 -c "import tomllib" 2>/dev/null && exit 0
           python3 -c "import tomli" 2>/dev/null && exit 0
