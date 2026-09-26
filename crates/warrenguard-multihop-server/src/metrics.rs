@@ -453,6 +453,227 @@ impl RouteSnapshot {
     }
 }
 
+/// How a route session ended, for [`RouteAdmissionMetrics`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteTeardown {
+    /// The control plane lost the route's anchor; the exit sent `RouteEnded`.
+    AnchorGone,
+    /// The route's last connection ended, or the policy closed it for another
+    /// reason.
+    Close,
+    /// The exit shut down with the route still up (recorded by the deployer,
+    /// which owns shutdown).
+    Shutdown,
+}
+
+/// What became of an anchor registration, for [`RouteAdmissionMetrics`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorRequestResult {
+    /// The control plane bound (or re-homed) the anchor.
+    Bound,
+    /// The session holds no live lease; the client was asked for a token.
+    NeedsToken,
+    /// The session cannot anchor (wallet session, or route admission off).
+    NotEligible,
+    /// The blob or the presented token was refused.
+    Refused,
+    /// The control plane could not be asked.
+    Unavailable,
+    /// A `lost` ack the exit sent after its renewal found no anchor.
+    LostSent,
+    /// A byte-identical repeat answered from the last verdict, no API call.
+    Deduplicated,
+    /// Dropped: a call was in flight, or the last one was under 2 s ago.
+    Throttled,
+}
+
+impl AnchorRequestResult {
+    const LABELS: [&'static str; 8] = [
+        "bound",
+        "needs_token",
+        "not_eligible",
+        "refused",
+        "unavailable",
+        "lost_sent",
+        "deduplicated",
+        "throttled",
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Bound => 0,
+            Self::NeedsToken => 1,
+            Self::NotEligible => 2,
+            Self::Refused => 3,
+            Self::Unavailable => 4,
+            Self::LostSent => 5,
+            Self::Deduplicated => 6,
+            Self::Throttled => 7,
+        }
+    }
+
+    /// The result an ack status counts as.
+    pub(crate) const fn of_status(status: warrenguard_multihop::RouteAnchorStatus) -> Self {
+        use warrenguard_multihop::RouteAnchorStatus as S;
+        match status {
+            S::Bound => Self::Bound,
+            S::NeedsToken => Self::NeedsToken,
+            S::NotEligible => Self::NotEligible,
+            S::Unavailable => Self::Unavailable,
+            S::Lost => Self::LostSent,
+            // Refused, and any status a policy invents that this build does
+            // not know: the client reads either as a refusal.
+            _ => Self::Refused,
+        }
+    }
+}
+
+/// Node-wide accounting of route admission on this exit (doc 107 section
+/// 16): route setups by verdict, route teardowns by reason, and anchor
+/// registrations by outcome. The live route session gauge is
+/// [`crate::multihop::MultihopSessionRegistry::live_route_session_count`].
+///
+/// Same privacy contract as every block here: counters only, never a
+/// serial, a route serial, an anchor or a label naming a client.
+#[derive(Debug)]
+pub struct RouteAdmissionMetrics {
+    admitted: AtomicU64,
+    refused: [AtomicU64; 6],
+    teardown: [AtomicU64; 3],
+    anchor: [AtomicU64; 8],
+}
+
+static ROUTE_ADMISSION: RouteAdmissionMetrics = RouteAdmissionMetrics::new();
+
+/// The process-wide route admission block.
+#[must_use]
+pub fn route_admission_metrics() -> &'static RouteAdmissionMetrics {
+    &ROUTE_ADMISSION
+}
+
+/// Point-in-time read of the process-wide route admission block.
+#[must_use]
+pub fn route_admission_snapshot() -> RouteAdmissionSnapshot {
+    ROUTE_ADMISSION.snapshot()
+}
+
+impl Default for RouteAdmissionMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+const REFUSED_LABELS: [&str; 6] = [
+    "unspecified",
+    "anchor_unknown",
+    "route_limit",
+    "not_offered",
+    "unavailable",
+    "other",
+];
+
+const TEARDOWN_LABELS: [&str; 3] = ["anchor_gone", "close", "shutdown"];
+
+impl RouteAdmissionMetrics {
+    /// A zeroed block.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            admitted: AtomicU64::new(0),
+            refused: [const { AtomicU64::new(0) }; 6],
+            teardown: [const { AtomicU64::new(0) }; 3],
+            anchor: [const { AtomicU64::new(0) }; 8],
+        }
+    }
+
+    pub(crate) fn record_admitted(&self) {
+        self.admitted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_refused(&self, code: warrenguard_multihop::RouteRejectCode) {
+        use warrenguard_multihop::RouteRejectCode as C;
+        let slot = match code {
+            C::Unspecified => 0,
+            C::AnchorUnknown => 1,
+            C::RouteLimit => 2,
+            C::NotOffered => 3,
+            C::Unavailable => 4,
+            _ => 5,
+        };
+        self.refused[slot].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts one route teardown. Public for [`RouteTeardown::Shutdown`],
+    /// which only the deployer sees.
+    pub fn record_teardown(&self, reason: RouteTeardown) {
+        let slot = match reason {
+            RouteTeardown::AnchorGone => 0,
+            RouteTeardown::Close => 1,
+            RouteTeardown::Shutdown => 2,
+        };
+        self.teardown[slot].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_anchor(&self, result: AnchorRequestResult) {
+        self.anchor[result.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Reads every counter.
+    #[must_use]
+    pub fn snapshot(&self) -> RouteAdmissionSnapshot {
+        let read = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        RouteAdmissionSnapshot {
+            admitted: read(&self.admitted),
+            refused: self.refused.each_ref().map(read),
+            teardown: self.teardown.each_ref().map(read),
+            anchor: self.anchor.each_ref().map(read),
+        }
+    }
+}
+
+/// A point-in-time view of [`RouteAdmissionMetrics`]. The label strings live
+/// here so an exposition cannot drift from the verdicts that produce them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RouteAdmissionSnapshot {
+    admitted: u64,
+    refused: [u64; 6],
+    teardown: [u64; 3],
+    anchor: [u64; 8],
+}
+
+impl RouteAdmissionSnapshot {
+    /// `warren_exit_route_admit_total{result}`: `admitted` then one entry per
+    /// `RouteRejected` code.
+    #[must_use]
+    pub fn admit_by_result(&self) -> [(&'static str, u64); 7] {
+        let mut out = [("admitted", self.admitted); 7];
+        for (i, label) in REFUSED_LABELS.iter().enumerate() {
+            out[i + 1] = (label, self.refused[i]);
+        }
+        out
+    }
+
+    /// `warren_exit_route_teardown_total{reason}`.
+    #[must_use]
+    pub fn teardown_by_reason(&self) -> [(&'static str, u64); 3] {
+        let mut out = [("", 0); 3];
+        for (i, label) in TEARDOWN_LABELS.iter().enumerate() {
+            out[i] = (label, self.teardown[i]);
+        }
+        out
+    }
+
+    /// `warren_exit_anchor_requests_total{result}`.
+    #[must_use]
+    pub fn anchor_requests_by_result(&self) -> [(&'static str, u64); 8] {
+        let mut out = [("", 0); 8];
+        for (i, label) in AnchorRequestResult::LABELS.iter().enumerate() {
+            out[i] = (label, self.anchor[i]);
+        }
+        out
+    }
+}
+
 /// A point-in-time view of [`UplinkMetrics`]. Deliberately constructible
 /// by a consumer, so a deployer can unit-test its own exposition against a
 /// crafted reading instead of having to drive a live pump.
@@ -835,5 +1056,39 @@ mod tests {
             std::ptr::eq(uplink_metrics(), uplink_metrics()),
             "a second block would split the node's view in half"
         );
+    }
+    #[test]
+    fn route_admission_counters_land_under_their_own_label() {
+        let m = RouteAdmissionMetrics::new();
+        m.record_admitted();
+        m.record_refused(warrenguard_multihop::RouteRejectCode::RouteLimit);
+        m.record_refused(warrenguard_multihop::RouteRejectCode::Other(77));
+        m.record_teardown(RouteTeardown::AnchorGone);
+        m.record_teardown(RouteTeardown::Shutdown);
+        m.record_anchor(AnchorRequestResult::of_status(
+            warrenguard_multihop::RouteAnchorStatus::NeedsToken,
+        ));
+        m.record_anchor(AnchorRequestResult::Throttled);
+        let snap = m.snapshot();
+        assert_eq!(
+            snap.admit_by_result(),
+            [
+                ("admitted", 1),
+                ("unspecified", 0),
+                ("anchor_unknown", 0),
+                ("route_limit", 1),
+                ("not_offered", 0),
+                ("unavailable", 0),
+                ("other", 1),
+            ]
+        );
+        assert_eq!(
+            snap.teardown_by_reason(),
+            [("anchor_gone", 1), ("close", 0), ("shutdown", 1)]
+        );
+        let anchor = snap.anchor_requests_by_result();
+        assert_eq!(anchor[1], ("needs_token", 1));
+        assert_eq!(anchor[7], ("throttled", 1));
+        assert_eq!(anchor.iter().map(|(_, n)| n).sum::<u64>(), 2);
     }
 }

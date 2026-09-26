@@ -313,6 +313,13 @@ impl RateLimited {
     }
 }
 
+/// The anchor registration a main session sent as an uplink datagram.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct AnchorRequestFrame {
+    pub(crate) sealed_anchor: warrenguard_multihop::SealedToApi,
+    pub(crate) session_token: Option<Box<warrenguard_wire::SessionToken>>,
+}
+
 /// What an authenticated uplink datagram turned out to be, once it has
 /// cleared decode, exit-id, session lookup, AEAD open and anti-replay.
 #[derive(Debug, PartialEq, Eq)]
@@ -323,6 +330,9 @@ pub(crate) enum UplinkKind {
     /// stream carries the real control plane, and `0xC0` is not a valid IP
     /// version nibble.
     ControlFrame,
+    /// A `RouteAnchorRequest`: never forwarded either, but handed to the
+    /// session's anchor handler. Every other control frame is dropped.
+    AnchorRequest(Box<AnchorRequestFrame>),
     /// DAITA cover traffic. Dropped by design, before the TUN.
     DaitaDummy,
 }
@@ -336,6 +346,15 @@ pub(crate) enum UplinkKind {
 pub(crate) fn classify_uplink(plaintext: &[u8]) -> UplinkKind {
     match warrenguard_multihop::try_decode_control(plaintext) {
         Ok(None) => {}
+        Ok(Some(warrenguard_multihop::WarrenControlMessage::RouteAnchorRequest {
+            sealed_anchor,
+            session_token,
+        })) => {
+            return UplinkKind::AnchorRequest(Box::new(AnchorRequestFrame {
+                sealed_anchor,
+                session_token,
+            }));
+        }
         Ok(Some(_)) => return UplinkKind::ControlFrame,
         Err(e) => {
             tracing::debug!(error = %e, "rx_task control-message decode failed; dropping frame");
@@ -1391,6 +1410,35 @@ pub(crate) mod tests {
             classify_uplink(&control),
             UplinkKind::ControlFrame
         ));
+    }
+
+    #[test]
+    fn an_anchor_request_is_handed_over_and_every_other_control_frame_dropped() {
+        // The one uplink control datagram the exit acts on: the anchor
+        // registration of a main session. Every other one stays dropped.
+        let sealed = warrenguard_multihop::SealedToApi::from_bytes(&[0x5A; 81]);
+        let request = warrenguard_multihop::encode_control(
+            &warrenguard_multihop::WarrenControlMessage::RouteAnchorRequest {
+                sealed_anchor: sealed,
+                session_token: None,
+            },
+        )
+        .expect("encode");
+        match classify_uplink(&request) {
+            UplinkKind::AnchorRequest(frame) => {
+                assert_eq!(frame.sealed_anchor, sealed);
+                assert!(frame.session_token.is_none());
+            }
+            other => panic!("an anchor request must reach its handler, got {other:?}"),
+        }
+        let ack = warrenguard_multihop::encode_control(
+            &warrenguard_multihop::WarrenControlMessage::RouteAnchorAck {
+                status: 0,
+                max_routes: 32,
+            },
+        )
+        .expect("encode");
+        assert_eq!(classify_uplink(&ack), UplinkKind::ControlFrame);
     }
 
     #[test]

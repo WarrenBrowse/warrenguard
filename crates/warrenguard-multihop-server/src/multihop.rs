@@ -50,7 +50,9 @@ use warrenguard_multihop::{
 };
 use warrenguard_pump::DAITA_DUMMY_FIRST_BYTE;
 use warrenguard_ratelimit::{RateOverride, RatePolicyHandle, RateSpec};
-use warrenguard_server::{AllowlistHandle, SessionTokenAdmitter, TOKEN_SERIAL_LEN};
+use warrenguard_server::{
+    AllowlistHandle, RouteAdmission, RouteAdmitter, SessionTokenAdmitter, TOKEN_SERIAL_LEN,
+};
 use warrenguard_transport_core::PacketDevice;
 use warrenguard_transport_core::ip_parse::TunnelPool;
 use warrenguard_wire::WarrenPubkey;
@@ -62,6 +64,8 @@ use crate::datapath::{
 };
 use crate::ip_pool::{ConnId, IpAllocator, IpAllocatorV6, SessionIntent, SessionIntentV6};
 use crate::metrics::EvictReason;
+
+mod route;
 
 /// Retain anti-replay windows for at most this many recent epochs. Rekeys are
 /// infrequent, so a handful covers every in-flight frame around an epoch
@@ -427,6 +431,10 @@ struct ConnSetup {
     /// no identity at all: there is nothing to key a shared budget on, so
     /// such a session runs uncapped.
     session_rate_key: Option<SessionRateKey>,
+    /// The registry key this connection was admitted under, `None` when no
+    /// registry is wired or the session asserted no identity. Tells the
+    /// pump whether an anchor request comes from a v7 main session.
+    session_key: Option<SessionKey>,
 }
 
 /// Post-quantum (`/v2`) counterpart of [`ConnSetup`]: the established
@@ -447,6 +455,8 @@ struct ConnSetupPq {
     revocation_guard: Option<SessionGuard>,
     /// See [`ConnSetup::session_rate_key`].
     session_rate_key: Option<SessionRateKey>,
+    /// See [`ConnSetup::session_key`].
+    session_key: Option<SessionKey>,
 }
 
 /// Which datapath a completed setup selected. A `/v1` connection runs the
@@ -554,6 +564,7 @@ impl SetupTermination {
         wants_daita: bool,
         session_rate_key: Option<SessionRateKey>,
     ) -> SetupOutcome {
+        let session_key = revocation_guard.as_ref().map(|guard| guard.key);
         match self {
             Self::V1 { session, frame, .. } => SetupOutcome::V1(ConnSetup {
                 session,
@@ -563,6 +574,7 @@ impl SetupTermination {
                 revocation_guard,
                 wants_daita,
                 session_rate_key,
+                session_key,
             }),
             #[cfg(feature = "pq-hpke")]
             Self::V2 { session, frame, .. } => SetupOutcome::V2(ConnSetupPq {
@@ -573,6 +585,7 @@ impl SetupTermination {
                 assigned_ip_v6,
                 revocation_guard,
                 session_rate_key,
+                session_key,
             }),
         }
     }
@@ -679,6 +692,7 @@ async fn accept_setup_stream(
     allowlist: Option<&AllowlistHandle>,
     session_registry: Option<&Arc<MultihopSessionRegistry>>,
     token_admitter: Option<&Arc<dyn SessionTokenAdmitter>>,
+    route_admitter: Option<&Arc<dyn RouteAdmitter>>,
     offered_daita: Option<&warrenguard_wire::DaitaConfig>,
     #[cfg(feature = "pq-hpke")] pq: Option<&PqSetup>,
 ) -> Option<SetupOutcome> {
@@ -712,6 +726,7 @@ async fn accept_setup_stream(
         allowlist,
         session_registry,
         token_admitter,
+        route_admitter,
         offered_daita,
         #[cfg(feature = "pq-hpke")]
         pq,
@@ -750,6 +765,7 @@ async fn process_setup_frame(
     allowlist: Option<&AllowlistHandle>,
     session_registry: Option<&Arc<MultihopSessionRegistry>>,
     token_admitter: Option<&Arc<dyn SessionTokenAdmitter>>,
+    route_admitter: Option<&Arc<dyn RouteAdmitter>>,
     offered_daita: Option<&warrenguard_wire::DaitaConfig>,
     #[cfg(feature = "pq-hpke")] pq: Option<&PqSetup>,
 ) -> Option<SetupOutcome> {
@@ -820,6 +836,9 @@ async fn process_setup_frame(
     let token_serial: Option<[u8; 32]>;
     let (wants_ipv6, wants_daita): (bool, bool);
     let prefer_ipv4: Option<[u8; 4]>;
+    // Set only for an admitted route session: its route serial and the
+    // locator it presented, retained for the deployer's renewal.
+    let mut route: Option<([u8; 32], warrenguard_multihop::SealedToApi)> = None;
     (
         sticky_pubkey,
         wants_ipv6,
@@ -827,6 +846,61 @@ async fn process_setup_frame(
         token_serial,
         prefer_ipv4,
     ) = match control_msg.as_ref() {
+        //  - route `IpRequestRoute`: admitted against the device's anchored
+        //    main session through the injected `RouteAdmitter`; the route
+        //    serial becomes the sticky key. No admitter: not offered.
+        Some(WarrenControlMessage::IpRequestRoute {
+            prefer_ipv4,
+            wants_ipv6,
+            route_locator,
+            wants_daita,
+        }) => {
+            let verdict = match route_admitter {
+                Some(admitter) => admitter.admit_route(route_locator).await,
+                None => RouteAdmission::Refuse(warrenguard_multihop::RouteRejectCode::NotOffered),
+            };
+            match verdict {
+                RouteAdmission::Admit { route_serial } => {
+                    crate::metrics::route_admission_metrics().record_admitted();
+                    let serial = *route_serial.as_bytes();
+                    route = Some((serial, *route_locator));
+                    (Some(serial), *wants_ipv6, *wants_daita, None, *prefer_ipv4)
+                }
+                RouteAdmission::Refuse(code) => {
+                    crate::metrics::route_admission_metrics().record_refused(code);
+                    tracing::info!(
+                        code = code.as_str(),
+                        "multihop: route setup refused; sealed detail + opaque close"
+                    );
+                    reply_sealed_detail_then_close(
+                        &mut send,
+                        &term,
+                        epoch,
+                        reverse_seq,
+                        conn,
+                        &WarrenControlMessage::RouteRejected {
+                            reason_code: code.code(),
+                        },
+                    )
+                    .await;
+                    return None;
+                }
+                // `RouteAdmission` is non-exhaustive: a verdict this build
+                // does not know refuses, since route admission fails closed.
+                _ => {
+                    reply_sealed_detail_then_close(
+                        &mut send,
+                        &term,
+                        epoch,
+                        reverse_seq,
+                        conn,
+                        &WarrenControlMessage::RouteRejected { reason_code: 0 },
+                    )
+                    .await;
+                    return None;
+                }
+            }
+        }
         Some(WarrenControlMessage::IpRequestV7 {
             session_tokens,
             wants_ipv6,
@@ -931,15 +1005,20 @@ async fn process_setup_frame(
         sticky_pubkey.map(WarrenPubkey::from_bytes),
     ) {
         (Some(registry), Some(pubkey)) => {
-            if token_serial.is_some() {
-                registry.register_token(pubkey, conn_id, conn.clone());
+            let key = if token_serial.is_some() {
+                SessionKey::TokenSerial(pubkey)
+            } else if route.is_some() {
+                SessionKey::Route(pubkey)
             } else {
-                registry.register(pubkey, conn_id, conn.clone());
+                SessionKey::Wallet(pubkey)
+            };
+            registry.register_key(key, conn_id, conn.clone());
+            if let Some((serial, locator)) = route.as_ref() {
+                registry.route.retain_locator(*serial, locator);
             }
             let guard = SessionGuard {
                 registry: Arc::clone(registry),
-                pubkey,
-                is_token: token_serial.is_some(),
+                key,
                 conn_id,
             };
             // TOCTOU allowlist recheck applies ONLY to the v6 wallet path: a
@@ -947,6 +1026,7 @@ async fn process_setup_frame(
             // entry, so an `is_allowed_at` on it would spuriously reject. v7
             // authorization already happened at token spend above.
             if token_serial.is_none()
+                && route.is_none()
                 && let Some(al) = allowlist
                 && !al.is_allowed_at(&pubkey, warrenguard_config::unix_now())
             {
@@ -994,7 +1074,7 @@ async fn process_setup_frame(
     // it.
     router.register(spec.assigned, down_tx.clone());
     if let (Some(registry), Some(guard)) = (session_registry, revocation_guard.as_ref()) {
-        registry.record_assigned_ipv4(spec.assigned, guard.pubkey);
+        registry.record_assigned_ipv4(spec.assigned, guard.key.value());
     }
     // Dual-stack `/v2`: also register the v6 downlink route so the single TUN
     // reader fans out v6 reply packets to this conn by destination address.
@@ -1048,10 +1128,11 @@ async fn process_setup_frame(
     // Budget key: the v7 serial when one was admitted (an anonymous session
     // always runs the network default), else the asserted wallet pubkey so
     // every connection/device of one wallet shares one budget.
-    let session_rate_key = match (token_serial, sticky_pubkey) {
-        (Some(serial), _) => Some(SessionRateKey::TokenSerial(serial)),
-        (None, Some(wallet)) => Some(SessionRateKey::Wallet(wallet)),
-        (None, None) => None,
+    let session_rate_key = match (token_serial, route.as_ref(), sticky_pubkey) {
+        (Some(serial), _, _) => Some(SessionRateKey::TokenSerial(serial)),
+        (None, Some((serial, _)), _) => Some(SessionRateKey::RouteSerial(*serial)),
+        (None, None, Some(wallet)) => Some(SessionRateKey::Wallet(wallet)),
+        (None, None, None) => None,
     };
     Some(term.into_outcome(
         spec.assigned,
@@ -1081,6 +1162,7 @@ async fn run_setup(
     allowlist: Option<&AllowlistHandle>,
     session_registry: Option<&Arc<MultihopSessionRegistry>>,
     token_admitter: Option<&Arc<dyn SessionTokenAdmitter>>,
+    route_admitter: Option<&Arc<dyn RouteAdmitter>>,
     offered_daita: Option<&warrenguard_wire::DaitaConfig>,
     #[cfg(feature = "pq-hpke")] pq: Option<&PqSetup>,
 ) -> Option<SetupOutcome> {
@@ -1100,6 +1182,7 @@ async fn run_setup(
                 allowlist,
                 session_registry,
                 token_admitter,
+                route_admitter,
                 offered_daita,
                 #[cfg(feature = "pq-hpke")]
                 pq,
@@ -1123,6 +1206,7 @@ async fn run_setup(
                 allowlist,
                 session_registry,
                 token_admitter,
+                route_admitter,
                 offered_daita,
                 #[cfg(feature = "pq-hpke")]
                 pq,
@@ -3173,6 +3257,9 @@ pub struct MultihopSessionRegistry<C: ClosableConn = Connection> {
     /// Told the serial of a token session whose last connection just ended,
     /// see [`Self::set_token_session_end_observer`].
     token_end_observer: std::sync::OnceLock<TokenSessionEndObserver>,
+    /// Route admission state (control senders, anchors, retained locators),
+    /// see the `route` submodule.
+    route: route::RegistryRouteState,
 }
 
 /// Callback a deployer wires with
@@ -3185,7 +3272,26 @@ pub type TokenSessionEndObserver = Box<dyn Fn([u8; TOKEN_SERIAL_LEN]) + Send + S
 enum SessionKey {
     Wallet(WarrenPubkey),
     TokenSerial(WarrenPubkey),
+    /// A route session, keyed by its route serial. Never a token serial: a
+    /// route holds no token lease, so it never reaches
+    /// [`MultihopSessionRegistry::live_token_serials`].
+    Route(WarrenPubkey),
 }
+
+impl SessionKey {
+    /// The pubkey-shaped value the session is keyed and allocated on.
+    fn value(self) -> WarrenPubkey {
+        match self {
+            Self::Wallet(v) | Self::TokenSerial(v) | Self::Route(v) => v,
+        }
+    }
+}
+
+/// Callback a deployer wires with
+/// [`MultihopSessionRegistry::set_route_session_end_observer`]. Same contract
+/// as [`TokenSessionEndObserver`]: it runs synchronously on the teardown path
+/// and must hand the route serial off without blocking.
+pub type RouteSessionEndObserver = Box<dyn Fn([u8; 32]) + Send + Sync>;
 
 impl<C: ClosableConn> Default for MultihopSessionRegistry<C> {
     fn default() -> Self {
@@ -3193,6 +3299,7 @@ impl<C: ClosableConn> Default for MultihopSessionRegistry<C> {
             live: Mutex::new(HashMap::new()),
             ipv4_to_pubkey: Mutex::new(HashMap::new()),
             token_end_observer: std::sync::OnceLock::new(),
+            route: route::RegistryRouteState::default(),
         }
     }
 }
@@ -3208,10 +3315,12 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
     /// connection, right after the setup gate admits it. Re-registering
     /// the same `(pubkey, conn_id)` overwrites the previous handle (a
     /// sticky reconnect reusing the stable id), which is harmless.
+    #[cfg(test)]
     fn register(&self, pubkey: WarrenPubkey, conn_id: ConnId, conn: C) {
         self.register_key(SessionKey::Wallet(pubkey), conn_id, conn);
     }
 
+    #[cfg(test)]
     fn register_token(&self, serial: WarrenPubkey, conn_id: ConnId, conn: C) {
         self.register_key(SessionKey::TokenSerial(serial), conn_id, conn);
     }
@@ -3232,20 +3341,33 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
     }
 
     fn unregister_key(&self, key: SessionKey, conn_id: ConnId) {
+        self.route.detach_control(key, conn_id);
         let mut guard = self.live.lock();
         if let Some(conns) = guard.get_mut(&key) {
             conns.remove(&conn_id);
             if conns.is_empty() {
                 guard.remove(&key);
                 drop(guard);
-                let pubkey = match key {
-                    SessionKey::Wallet(pubkey) | SessionKey::TokenSerial(pubkey) => pubkey,
-                };
-                self.tombstone_attribution(&pubkey, Instant::now());
-                if let (SessionKey::TokenSerial(serial), Some(observer)) =
-                    (key, self.token_end_observer.get())
-                {
-                    observer(*serial.as_bytes());
+                self.tombstone_attribution(&key.value(), Instant::now());
+                match key {
+                    SessionKey::TokenSerial(serial) => {
+                        // The lease the session held last: the rebound one
+                        // when an anchor request presented a fresh token.
+                        let lease = self
+                            .route
+                            .forget_anchor(serial.as_bytes())
+                            .unwrap_or(*serial.as_bytes());
+                        if let Some(observer) = self.token_end_observer.get() {
+                            observer(lease);
+                        }
+                    }
+                    SessionKey::Route(route_serial) => {
+                        self.route.forget_route(route_serial.as_bytes());
+                        if let Some(observer) = self.route.end_observer() {
+                            observer(*route_serial.as_bytes());
+                        }
+                    }
+                    SessionKey::Wallet(_) => {}
                 }
             }
         }
@@ -3289,13 +3411,19 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
     /// same serial everywhere else in the meantime.
     #[must_use]
     pub fn live_token_serials(&self) -> Vec<[u8; TOKEN_SERIAL_LEN]> {
-        self.live
+        let keys: Vec<[u8; TOKEN_SERIAL_LEN]> = self
+            .live
             .lock()
             .keys()
             .filter_map(|key| match key {
                 SessionKey::TokenSerial(serial) => Some(*serial.as_bytes()),
-                SessionKey::Wallet(_) => None,
+                SessionKey::Wallet(_) | SessionKey::Route(_) => None,
             })
+            .collect();
+        // A session an anchor request rebound to a fresh token holds that
+        // token's lease now, not the one it was admitted on.
+        keys.into_iter()
+            .map(|key| self.route.lease_serial_of(&key).unwrap_or(key))
             .collect()
     }
 
@@ -3304,9 +3432,7 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
     /// that the same serial has not reconnected in the meantime.
     #[must_use]
     pub fn is_token_serial_live(&self, serial: &[u8; TOKEN_SERIAL_LEN]) -> bool {
-        self.live
-            .lock()
-            .contains_key(&SessionKey::TokenSerial(WarrenPubkey::from_bytes(*serial)))
+        self.live_token_serials().contains(serial)
     }
 
     /// Wire the callback told a token serial each time the last live
@@ -3525,19 +3651,13 @@ fn ipv4_source_of(addr: std::net::SocketAddr) -> Option<Ipv4Addr> {
 /// with no manual cleanup call to forget.
 struct SessionGuard {
     registry: Arc<MultihopSessionRegistry>,
-    pubkey: WarrenPubkey,
-    is_token: bool,
+    key: SessionKey,
     conn_id: ConnId,
 }
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        let key = if self.is_token {
-            SessionKey::TokenSerial(self.pubkey)
-        } else {
-            SessionKey::Wallet(self.pubkey)
-        };
-        self.registry.unregister_key(key, self.conn_id);
+        self.registry.unregister_key(self.key, self.conn_id);
     }
 }
 
@@ -3680,6 +3800,9 @@ pub enum SessionRateKey {
     Wallet([u8; 32]),
     /// v7 anonymous session: the admitted token serial.
     TokenSerial([u8; 32]),
+    /// Route session admitted against an anchor: its route serial. Runs the
+    /// network default like a token session.
+    RouteSerial([u8; 32]),
 }
 
 /// Cadence of the idle-bucket sweep spawned by
@@ -3823,6 +3946,12 @@ pub struct ExitTerminateCtx<T: PacketDevice + Clone> {
     /// is then admitted by verifying + spending a token offline (the exit never
     /// learns the wallet). `None` refuses v7 (the exit stays wallet-authenticated).
     token_admitter: Option<Arc<dyn SessionTokenAdmitter>>,
+    /// Route admission policy (route sessions and anchor registrations).
+    /// `Some` only when the deployer wires it via
+    /// [`ExitTerminateCtx::with_route_admitter`]; `None` answers every route
+    /// request `RouteRejected{not offered}` and every anchor request
+    /// `RouteAnchorAck{not eligible}`.
+    route_admitter: Option<Arc<dyn RouteAdmitter>>,
     /// Per-session bandwidth policy (doc: [`SessionRatePolicy`]). `Some`
     /// only when the deployer wires it via
     /// [`ExitTerminateCtx::with_session_rate_policy`]; `None` (the default,
@@ -3886,6 +4015,7 @@ impl<T: PacketDevice + Clone> ExitTerminateCtx<T> {
             session_registry: None,
             drain_rx: None,
             token_admitter: None,
+            route_admitter: None,
             session_rate: None,
             #[cfg(feature = "pq-hpke")]
             pq_cache: Arc::new(PqSessionCache::new()),
@@ -4012,6 +4142,16 @@ impl<T: PacketDevice + Clone> ExitTerminateCtx<T> {
     #[must_use]
     pub fn with_token_admitter(mut self, admitter: Option<Arc<dyn SessionTokenAdmitter>>) -> Self {
         self.token_admitter = admitter;
+        self
+    }
+
+    /// Attach a [`RouteAdmitter`] so this exit admits route sessions
+    /// (`IpRequestRoute`) and forwards the anchor registrations of its v7 main
+    /// sessions. Injected by the exit binary, which owns the control-plane
+    /// client; `None` keeps route admission off.
+    #[must_use]
+    pub fn with_route_admitter(mut self, admitter: Option<Arc<dyn RouteAdmitter>>) -> Self {
+        self.route_admitter = admitter;
         self
     }
 
@@ -4162,6 +4302,7 @@ pub async fn terminate_connection<T>(
         ctx.session_registry.clone(),
         ctx.drain_rx.clone(),
         ctx.token_admitter.clone(),
+        ctx.route_admitter.clone(),
         ctx.session_rate.clone(),
         #[cfg(feature = "pq-hpke")]
         ctx.pq_setup(),
@@ -4368,6 +4509,7 @@ async fn serve_terminating_connection<T>(
     session_registry: Option<Arc<MultihopSessionRegistry>>,
     drain_rx: Option<watch::Receiver<Option<DrainAdvisory>>>,
     token_admitter: Option<Arc<dyn SessionTokenAdmitter>>,
+    route_admitter: Option<Arc<dyn RouteAdmitter>>,
     session_rate: Option<SessionRatePolicy>,
     #[cfg(feature = "pq-hpke")] pq: Option<PqSetup>,
 ) where
@@ -4410,6 +4552,7 @@ async fn serve_terminating_connection<T>(
         allowlist.as_ref(),
         session_registry.as_ref(),
         token_admitter.as_ref(),
+        route_admitter.as_ref(),
         // Offer this connection's own machine: the grant in the IpAssign is
         // the exact spec padding this exit's downlink, so client and exit
         // drive the same defense, one per direction.
@@ -4453,6 +4596,12 @@ async fn serve_terminating_connection<T>(
                     rate,
                     pool,
                     drain_rx,
+                    PqRouteControl {
+                        registry: session_registry,
+                        conn_id,
+                        token_admitter,
+                        route_admitter,
+                    },
                 )
                 .await;
             }
@@ -4497,6 +4646,24 @@ async fn serve_terminating_connection<T>(
         seal_current_v1(current.clone()),
         reverse_seq.clone(),
         conn.clone(),
+    );
+
+    // Downlink control messages the registry and the anchor handler send this
+    // connection (anchor acks, route ends), sealed with its current session.
+    let (control_tx, control_rx) = tokio::sync::mpsc::channel(route::CONTROL_QUEUE);
+    let control_task = route::spawn_control_emitter(
+        control_rx,
+        seal_current_v1(current.clone()),
+        reverse_seq.clone(),
+        conn.clone(),
+    );
+    let anchor = attach_route_control(
+        session_registry.as_ref(),
+        setup.session_key,
+        conn_id,
+        control_tx,
+        token_admitter,
+        route_admitter,
     );
 
     // Transport path probe (Lever 1a): the unified prod dispatcher terminates
@@ -4604,6 +4771,11 @@ async fn serve_terminating_connection<T>(
                 UplinkKind::Packet => {}
                 UplinkKind::ControlFrame => {
                     report.control_frames += 1;
+                    continue;
+                }
+                UplinkKind::AnchorRequest(frame) => {
+                    report.control_frames += 1;
+                    anchor.submit(&plaintext, *frame);
                     continue;
                 }
                 UplinkKind::DaitaDummy => {
@@ -4740,7 +4912,7 @@ async fn serve_terminating_connection<T>(
     // or sleeping between re-emits; abort AND join it so a deadline
     // hard-close in flight settles before the pump's own close, keeping the
     // client-visible close code deterministic (WARREN_MH_DRAINING wins).
-    for task in [Some(tx_task), timer_task, drain_task]
+    for task in [Some(tx_task), timer_task, drain_task, Some(control_task)]
         .into_iter()
         .flatten()
     {
@@ -4813,6 +4985,7 @@ async fn serve_pq_datagram_pump<T>(
     rate: Option<(SessionRatePolicy, SessionRateKey)>,
     pool: TunnelPool,
     drain_rx: Option<watch::Receiver<Option<DrainAdvisory>>>,
+    route_control: PqRouteControl,
 ) where
     T: PacketDevice + Clone,
 {
@@ -4849,6 +5022,21 @@ async fn serve_pq_datagram_pump<T>(
         seal_current_v2(current.clone()),
         reverse_seq.clone(),
         conn.clone(),
+    );
+    let (control_tx, control_rx) = tokio::sync::mpsc::channel(route::CONTROL_QUEUE);
+    let control_task = route::spawn_control_emitter(
+        control_rx,
+        seal_current_v2(current.clone()),
+        reverse_seq.clone(),
+        conn.clone(),
+    );
+    let anchor = attach_route_control(
+        route_control.registry.as_ref(),
+        setup.session_key,
+        route_control.conn_id,
+        control_tx,
+        route_control.token_admitter,
+        route_control.route_admitter,
     );
 
     drop(warrenguard_transport_core::spawn_path_probe(
@@ -4971,6 +5159,11 @@ async fn serve_pq_datagram_pump<T>(
                 UplinkKind::Packet => {}
                 UplinkKind::ControlFrame => {
                     report.control_frames += 1;
+                    continue;
+                }
+                UplinkKind::AnchorRequest(frame) => {
+                    report.control_frames += 1;
+                    anchor.submit(&plaintext, *frame);
                     continue;
                 }
                 UplinkKind::DaitaDummy => {
@@ -5108,9 +5301,14 @@ async fn serve_pq_datagram_pump<T>(
     let _ = rx_task.await;
     // Joining the drain emitter before the pump's own close keeps the drain
     // code the one the client sees when the deadline closed the connection.
-    for task in [Some(tx_task), Some(keepalive_task), drain_task]
-        .into_iter()
-        .flatten()
+    for task in [
+        Some(tx_task),
+        Some(keepalive_task),
+        drain_task,
+        Some(control_task),
+    ]
+    .into_iter()
+    .flatten()
     {
         task.abort();
         let _ = task.await;
@@ -5120,6 +5318,38 @@ async fn serve_pq_datagram_pump<T>(
         router.unregister_v6_if_owner(ip6, &down_tx);
     }
     conn.close(quinn::VarInt::from_u32(0), b"exit pq pumps ended");
+}
+
+/// Route admission material the `/v2` pump needs, bundled so the pump's
+/// argument list does not grow by four.
+#[cfg(feature = "pq-hpke")]
+struct PqRouteControl {
+    registry: Option<Arc<MultihopSessionRegistry>>,
+    conn_id: ConnId,
+    token_admitter: Option<Arc<dyn SessionTokenAdmitter>>,
+    route_admitter: Option<Arc<dyn RouteAdmitter>>,
+}
+
+/// Hook this connection's control emitter to its registry session, and build
+/// the handler its rx pump hands anchor requests to.
+fn attach_route_control(
+    registry: Option<&Arc<MultihopSessionRegistry>>,
+    key: Option<SessionKey>,
+    conn_id: ConnId,
+    control_tx: route::ControlTx,
+    token_admitter: Option<Arc<dyn SessionTokenAdmitter>>,
+    route_admitter: Option<Arc<dyn RouteAdmitter>>,
+) -> route::AnchorContext {
+    if let (Some(registry), Some(key)) = (registry, key) {
+        registry.attach_control(key, conn_id, control_tx.clone());
+    }
+    route::AnchorContext {
+        registry: registry.cloned(),
+        key,
+        reply: control_tx,
+        token_admitter,
+        route_admitter,
+    }
 }
 
 /// Format the X25519 multihop pubkey as 64 lowercase hex chars on a
