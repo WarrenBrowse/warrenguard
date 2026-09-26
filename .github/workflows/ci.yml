@@ -30,7 +30,7 @@ concurrency:
 jobs:
   fmt:
     name: cargo fmt
-    runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
+    runs-on: [self-hosted, Linux, X64, libra]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -41,7 +41,7 @@ jobs:
 
   anti-refrag:
     name: anti-refragmentation gate
-    runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
+    runs-on: [self-hosted, Linux, X64, libra]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -58,7 +58,7 @@ jobs:
       matrix:
         include:
           - name: linux
-            runner: [self-hosted, Linux, ARM64, macstudio-arm64]
+            runner: [self-hosted, Linux, X64, libra]
           - name: macos
             runner: [self-hosted, macOS, ARM64]
     steps:
@@ -104,7 +104,7 @@ jobs:
 
   test:
     name: cargo test
-    runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
+    runs-on: [self-hosted, Linux, X64, libra]
     timeout-minutes: 60
     steps:
       # The shared golden vectors are a private submodule (warren-vectors); the
@@ -145,7 +145,7 @@ jobs:
 
   audit:
     name: cargo audit
-    runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
+    runs-on: [self-hosted, Linux, X64, libra]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -160,7 +160,7 @@ jobs:
 
   deny:
     name: cargo deny
-    runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
+    runs-on: [self-hosted, Linux, X64, libra]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -178,7 +178,7 @@ jobs:
     # never matches this lockfile. Without this gate a fork base version that
     # goes advisory-affected between two nightly runs reaches main unseen.
     name: warren-quinn fork advisory watch
-    runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
+    runs-on: [self-hosted, Linux, X64, libra]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
