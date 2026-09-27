@@ -63,9 +63,15 @@ use warrenguard_tls::{
 
 use crate::tcp_fallback::{COVER_TCP_PORT, build_cover_client_config, connect_tcp_carrier};
 use warrenguard_transport_core::{
-    warren_transport_config_client_multihop_with_gso, warren_transport_config_client_with_gso,
+    DATAGRAM_MAX_REORDER, warren_transport_config_client_multihop_with_gso,
+    warren_transport_config_client_with_gso,
 };
 use warrenguard_wire::{SessionToken, WarrenPubkey};
+
+// The transport's datagram scheduler must never reorder a connection's frames
+// past the peer's anti-replay window, or the frames it leaves behind arrive
+// too old and are discarded as replays.
+const _: () = assert!(DATAGRAM_MAX_REORDER < warrenguard_multihop::REPLAY_WINDOW_SIZE);
 
 /// Wall-clock ceiling for receiving the entry relay's in-band identity proof
 /// in X.509 cover-domain mode. The proof rides a server-initiated

@@ -171,6 +171,19 @@ fn apply_datagram_aqm(cfg: &mut TransportConfig) {
     );
 }
 
+/// How far the fork's per-flow datagram scheduler may reorder a connection's
+/// datagrams, counted in datagrams.
+///
+/// Every sealed multihop frame carries a sequence number that the other side
+/// checks against a 1024-wide anti-replay window
+/// (`warrenguard_multihop::REPLAY_WINDOW_SIZE`), which discards a frame more
+/// than the window behind the newest one it has received. Fair queueing sends
+/// a sparse flow ahead of a bulk flow's backlog, so an unbounded scheduler
+/// turns any backlog deeper than the window into authentic frames rejected as
+/// too old. Three quarters of the window: the rest is left for reordering on
+/// the path.
+pub const DATAGRAM_MAX_REORDER: u64 = 768;
+
 /// Pure seam of [`apply_datagram_aqm`], testable without the process
 /// environment.
 fn apply_datagram_aqm_values(
@@ -187,7 +200,8 @@ fn apply_datagram_aqm_values(
     let mut aqm = DatagramAqmConfig::default();
     aqm.target(Duration::from_millis(target_ms))
         .interval(Duration::from_millis(interval_ms))
-        .flow_queues(flow_queues);
+        .flow_queues(flow_queues)
+        .max_reorder(Some(DATAGRAM_MAX_REORDER));
     cfg.datagram_send_aqm(Some(aqm));
 }
 
@@ -826,6 +840,23 @@ mod tests {
                 && rendered.contains("flow_queues: 128"),
             "tuned AQM values must reach the transport config, got: {rendered}"
         );
+    }
+
+    #[test]
+    fn datagram_aqm_bounds_reordering_inside_the_replay_window() {
+        // Per-flow scheduling sends a sparse flow ahead of a bulk backlog; the
+        // peer's 1024-wide anti-replay window rejects every frame left more
+        // than the window behind, so the bound must reach the config on every
+        // AQM path, whatever the other knobs say.
+        for flow_queues in [1, 1024] {
+            let mut cfg = TransportConfig::default();
+            apply_datagram_aqm_values(&mut cfg, true, 15, 100, flow_queues);
+            let rendered = format!("{cfg:?}");
+            assert!(
+                rendered.contains(&format!("max_reorder: Some({DATAGRAM_MAX_REORDER})")),
+                "the reorder bound must reach the transport config, got: {rendered}"
+            );
+        }
     }
 
     #[test]
