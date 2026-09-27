@@ -656,6 +656,9 @@ pub struct MultiHopSupervisor {
     /// the supervisor keeps redialing (a late recovery still heals), but
     /// subscribers must stop presenting the tunnel as healthy.
     datapath_dead_tx: watch::Sender<bool>,
+    /// Whether the live session was admitted on a token (`false`: the wallet
+    /// signed it in); `None` until the first session.
+    token_admission: watch::Sender<Option<bool>>,
     metrics: Arc<SupervisorMetrics>,
     /// Make-before-break overlap trigger. `SupervisorHandle`s share a
     /// clone and `notify_one()` it; the serve select parks on `notified()`.
@@ -800,6 +803,7 @@ impl MultiHopSupervisor {
             tx,
             fatal_tx,
             datapath_dead_tx,
+            token_admission: watch::channel(None).0,
             metrics: Arc::new(SupervisorMetrics::default()),
             overlap: Arc::new(Notify::new()),
             target,
@@ -865,6 +869,17 @@ impl MultiHopSupervisor {
     #[must_use]
     pub fn fatal_rx(&self) -> watch::Receiver<Option<RejectionReason>> {
         self.fatal_tx.subscribe()
+    }
+
+    /// Follow whether the live main session was admitted on a token: `true`
+    /// for an anonymous session, `false` for one the wallet signed in (no
+    /// token was at hand), `None` before the first session. A consumer that
+    /// later holds tokens can ask for a make-before-break setup
+    /// ([`MigrateHandle::overlap_reconnect`]) to leave the wallet session.
+    /// Call this before [`Self::run`] consumes `self`.
+    #[must_use]
+    pub fn token_admission_rx(&self) -> watch::Receiver<Option<bool>> {
+        self.token_admission.subscribe()
     }
 
     /// Continue the session that `assigned_v4` belongs to instead of starting
@@ -1517,6 +1532,7 @@ impl MultiHopSupervisor {
                 awaiting_key: None,
             };
         }
+        self.token_admission.send_replace(Some(lead.is_some()));
         let Some(lead) = lead else {
             if let Some(anchor) = self.route_anchor.as_ref() {
                 anchor.set_state(crate::route_anchor::AnchorState::Unavailable);
@@ -5907,6 +5923,43 @@ mod route_run_tests {
             &seen[0].sealed,
             &session_token_serial(&token(0x1B))
         ));
+        task.abort();
+        reader.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_supervisor_says_whether_its_live_session_was_admitted_on_a_token() {
+        let operational_key = SigningKey::from_bytes(&[0x8C; 32]);
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x9C; 16]));
+        let (tokens, _) = provider(vec![Vec::new(), vec![token(0x1C)]]);
+        let mut config = config(&exit, &operational_key);
+        config.session_token_provider = Some(tokens);
+        let (supervisor, rx) = MultiHopSupervisor::new(config);
+        let mut admission = supervisor.token_admission_rx();
+        let migrate = supervisor.migrate_handle();
+        let reader = spawn_reader(rx);
+        assert_eq!(*admission.borrow(), None, "no session yet");
+        let task = tokio::spawn(supervisor.run());
+
+        tokio::time::timeout(Duration::from_secs(10), admission.wait_for(Option::is_some))
+            .await
+            .expect("a session")
+            .expect("supervisor alive");
+        assert_eq!(
+            *admission.borrow(),
+            Some(false),
+            "the wallet session had no token"
+        );
+
+        migrate.overlap_reconnect();
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            admission.wait_for(|a| *a == Some(true)),
+        )
+        .await
+        .expect("the overlap session is admitted on a token")
+        .expect("supervisor alive");
         task.abort();
         reader.abort();
     }
