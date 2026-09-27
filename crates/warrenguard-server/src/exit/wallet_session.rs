@@ -4,14 +4,20 @@
 //! signature), so every device of one account presents the same key and the
 //! exit alone cannot bound how many of them run at once across a fleet. The
 //! deployer can: the engine hands each NEW wallet session to a
-//! [`WalletSessionGate`] before assigning it an address, and the gate answers
-//! from whatever fleet-wide count the deployer keeps.
+//! [`WalletSessionGate`] before serving it, and the gate answers from whatever
+//! fleet-wide count the deployer keeps.
 //!
 //! A session here is one tunnel address a wallet holds on this exit: every
 //! connection of a bonded client, and every reconnect that joins the address
 //! it held, belongs to the same session and is never asked about again. The
 //! exit draws a random [`WalletSession::id`] for each session, so the deployer
 //! can count sessions without learning the tunnel address.
+//!
+//! On one exit this bounds distinct addresses, not devices: devices of one
+//! account that share an address (a client that sends no placement hint, or
+//! one that names another live session's address) count once. They also share
+//! that address's downlink, which is what makes the sharing useless as a way
+//! around the count.
 //!
 //! Renewal and release stay with the deployer, which reads the live sessions
 //! and their ends from the multi-hop session registry, as it does for token
@@ -74,10 +80,16 @@ pub enum WalletAdmission {
 /// Injected hook the exit calls before serving a new wallet-signed session.
 /// Implemented in the deployer's exit binary; stubbed in tests.
 ///
-/// Called once per session, from the setup of its first connection, and never
-/// for a connection that joins a session the gate already admitted. A refused
-/// session is closed with the sealed `RejectedDeviceLimit` detail whichever
-/// refusal the gate gave.
+/// Asked about a session from the setup of its first connection, and never
+/// for a connection that joins a session the gate already admitted. It can be
+/// asked several times, concurrently, about the same session
+/// ([`WalletSession::id`] unchanged): every connection that joins while the
+/// first answer is still pending asks too. The answer must therefore be
+/// idempotent per id, counting a session once however often it is asked.
+///
+/// The client's setup waits on the answer, so the deployer bounds its own
+/// latency. A refused connection is closed with the sealed
+/// `RejectedDeviceLimit` detail whichever refusal the gate gave.
 pub trait WalletSessionGate: Send + Sync {
     /// Admit `session`, or refuse it.
     fn open<'a>(&'a self, session: &'a WalletSession) -> BoxFuture<'a, WalletAdmission>;

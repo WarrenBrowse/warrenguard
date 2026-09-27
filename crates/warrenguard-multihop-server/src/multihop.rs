@@ -1087,9 +1087,10 @@ async fn process_setup_frame(
         .await;
         return None;
     };
-    // A new wallet session is counted fleet-wide before it gets its address;
-    // a connection joining one the gate admitted is not asked again. A
-    // refused session's address goes back to the pool when the caller
+    // A new wallet session is counted by the deployer's gate before it is
+    // served (its address is what identifies the session, so it is allocated
+    // first); a connection joining one the gate admitted is not asked again.
+    // A refused session's address goes back to the pool when the caller
     // releases this connection.
     if let (Some(gate), Some(registry), Some(pubkey), None, None) = (
         wallet_gate,
@@ -3543,13 +3544,6 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
     #[must_use]
     pub fn live_wallet_sessions(&self) -> Vec<WalletSession> {
         self.wallet.live()
-    }
-
-    /// Whether `session` still holds a live connection. Lets a deployer that
-    /// heard a session end check it did not come back before releasing it.
-    #[must_use]
-    pub fn is_wallet_session_live(&self, session: &WalletSession) -> bool {
-        self.wallet.is_live(session)
     }
 
     /// Wire the callback told each wallet session the gate admitted once its
@@ -8921,10 +8915,15 @@ mod tests {
     async fn v7_ip_request_with_a_valid_token_is_admitted_bypassing_the_allowlist() {
         let admitter = Arc::new(FakeMhAdmitter { deny: false }) as Arc<dyn SessionTokenAdmitter>;
         let exit = spawn_terminating_exit_v7(v4_alloc(), admitter);
+        let before = crate::metrics::admission_snapshot().count(SetupAdmission::TokenAdmitted);
         let (detail, _close) = client_setup_roundtrip(&exit, |s| {
             s.build_ip_request_v7(vec![a_session_token(0xAB)], None, false, false)
         })
         .await;
+        assert!(
+            crate::metrics::admission_snapshot().count(SetupAdmission::TokenAdmitted) > before,
+            "a token admission is counted as one"
+        );
         match detail {
             Some(WarrenControlMessage::IpAssign { ipv4, .. }) => {
                 assert_eq!(
@@ -9013,14 +9012,20 @@ mod tests {
     struct CountingWalletGate {
         max: usize,
         refusal: WalletAdmission,
+        delay: Duration,
         seen: parking_lot::Mutex<Vec<WalletSession>>,
     }
 
     impl CountingWalletGate {
         fn new(max: usize, refusal: WalletAdmission) -> Arc<Self> {
+            Self::slow(max, refusal, Duration::ZERO)
+        }
+
+        fn slow(max: usize, refusal: WalletAdmission, delay: Duration) -> Arc<Self> {
             Arc::new(Self {
                 max,
                 refusal,
+                delay,
                 seen: parking_lot::Mutex::new(Vec::new()),
             })
         }
@@ -9036,8 +9041,14 @@ mod tests {
             session: &'a WalletSession,
         ) -> warrenguard_server::BoxFuture<'a, WalletAdmission> {
             Box::pin(async move {
+                tokio::time::sleep(self.delay).await;
                 let mut seen = self.seen.lock();
-                let admitted_before = seen.iter().filter(|s| s.id() != session.id()).count();
+                let admitted_before = seen
+                    .iter()
+                    .map(WalletSession::id)
+                    .filter(|id| *id != session.id())
+                    .collect::<std::collections::HashSet<_>>()
+                    .len();
                 seen.push(*session);
                 if admitted_before < self.max {
                     WalletAdmission::Admit
@@ -9099,6 +9110,7 @@ mod tests {
     async fn a_wallet_session_past_the_gate_limit_is_refused_with_the_device_limit_detail() {
         let gate = CountingWalletGate::new(2, WalletAdmission::DeviceLimit);
         let (exit, registry) = spawn_terminating_exit_with_wallet_gate(gate.clone());
+        let before = crate::metrics::admission_snapshot();
         let fresh = Some([0, 0, 0, 0]);
         let (_c1, _) = client_setup_admitted(&exit, wallet_request(fresh)).await;
         let (_c2, _) = client_setup_admitted(&exit, wallet_request(fresh)).await;
@@ -9123,6 +9135,45 @@ mod tests {
             2,
             "a refused session holds nothing the deployer must renew"
         );
+        assert_eq!(
+            registry.wallet.tracked_conns(),
+            2,
+            "the refused connection leaves no entry behind"
+        );
+        let after = crate::metrics::admission_snapshot();
+        assert!(
+            after.count(SetupAdmission::WalletAdmitted)
+                >= before.count(SetupAdmission::WalletAdmitted) + 2
+        );
+        assert!(
+            after.count(SetupAdmission::WalletDeviceLimit)
+                > before.count(SetupAdmission::WalletDeviceLimit),
+            "the refusal is counted as a device limit"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn connections_joining_a_session_whose_admission_is_pending_ask_under_one_id() {
+        // After an exit restart a bonded client redials all its connections
+        // at once, and connections of one key without a hint share an
+        // address: each asks the gate while the first answer is pending, and
+        // the gate must see one session, not several.
+        let gate =
+            CountingWalletGate::slow(1, WalletAdmission::DeviceLimit, Duration::from_millis(300));
+        let (exit, registry) = spawn_terminating_exit_with_wallet_gate(gate.clone());
+
+        let ((_a, ip_a), (_b, ip_b)) = tokio::join!(
+            client_setup_admitted(&exit, wallet_request(None)),
+            client_setup_admitted(&exit, wallet_request(None)),
+        );
+
+        assert_eq!(
+            ip_a, ip_b,
+            "hint-less connections of one key share an address"
+        );
+        let ids: std::collections::HashSet<_> = gate.seen.lock().iter().map(|s| *s.id()).collect();
+        assert_eq!(ids.len(), 1, "every question names the same session");
+        assert_eq!(registry.live_wallet_sessions().len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -9164,6 +9215,10 @@ mod tests {
         assert!(registry.set_wallet_session_end_observer(Box::new(move |s| {
             let _ = ended_tx.send(s);
         })));
+        assert!(
+            !registry.set_wallet_session_end_observer(Box::new(|_| {})),
+            "the first observer wired is kept"
+        );
         let (client, _) = client_setup_admitted(&exit, wallet_request(Some([0, 0, 0, 0]))).await;
         let admitted = registry.live_wallet_sessions();
 
@@ -9179,7 +9234,7 @@ mod tests {
             admitted,
             "the session the gate admitted is the one released"
         );
-        assert!(!registry.is_wallet_session_live(&ended));
+        assert!(registry.live_wallet_sessions().is_empty());
         assert_eq!(ended.pubkey(), &[0x5A; 32]);
     }
 
@@ -9187,10 +9242,15 @@ mod tests {
     async fn v7_ip_request_with_a_denied_token_is_rejected() {
         let admitter = Arc::new(FakeMhAdmitter { deny: true }) as Arc<dyn SessionTokenAdmitter>;
         let exit = spawn_terminating_exit_v7(v4_alloc(), admitter);
+        let before = crate::metrics::admission_snapshot().count(SetupAdmission::TokenRefused);
         let (detail, _close) = client_setup_roundtrip(&exit, |s| {
             s.build_ip_request_v7(vec![a_session_token(0x11)], None, false, false)
         })
         .await;
+        assert!(
+            crate::metrics::admission_snapshot().count(SetupAdmission::TokenRefused) > before,
+            "a token refusal is counted as one"
+        );
         assert!(
             matches!(detail, Some(WarrenControlMessage::Rejected)),
             "a denied v7 token must yield a sealed Rejected, got {detail:?}"
@@ -9635,8 +9695,15 @@ mod tests {
         //    are not secret (allowlist snapshots, API headers); admitting
         //    a bare assertion hands egress to anyone who knows one.
         let exit = spawn_terminating_exit(Some(allowlist_with(&[account_pubkey])), v4_alloc());
+        let refused_before =
+            crate::metrics::admission_snapshot().count(SetupAdmission::WalletRefused);
         let (detail, _) =
             client_setup_roundtrip(&exit, |_| ip_request(Some(account_pubkey), None)).await;
+        assert!(
+            crate::metrics::admission_snapshot().count(SetupAdmission::WalletRefused)
+                > refused_before,
+            "a wallet setup the gate refuses is counted as refused"
+        );
         assert_eq!(
             detail,
             Some(WarrenControlMessage::Rejected),

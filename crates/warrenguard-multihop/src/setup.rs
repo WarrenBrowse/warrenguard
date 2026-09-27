@@ -560,8 +560,23 @@ mod tests {
     }
 
     #[test]
+    fn ip_assignment_from_plaintext_maps_a_device_limit_to_its_own_error() {
+        let plaintext = encode_control(&WarrenControlMessage::RejectedDeviceLimit).unwrap();
+
+        assert!(matches!(
+            ip_assignment_from_setup_plaintext(&plaintext),
+            Err(SetupError::DeviceLimit)
+        ));
+    }
+
+    #[test]
     fn setup_error_verdicts_are_pinned() {
         use warrenguard_wire::{FatalCause, Retryability};
+        assert_eq!(
+            SetupError::DeviceLimit.retryability(),
+            Retryability::Fatal(FatalCause::DeviceLimit),
+            "a device limit stops the client with its own cause, not an expired subscription"
+        );
         assert_eq!(
             SetupError::Rejected.retryability(),
             Retryability::Fatal(FatalCause::NotAuthorized),

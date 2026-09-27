@@ -678,6 +678,7 @@ impl RouteAdmissionSnapshot {
 /// asked for: wallet-signed (`IpRequest`) or anonymous token (`IpRequestV7`).
 /// Route setups have their own block ([`RouteAdmissionMetrics`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SetupAdmission {
     /// A wallet-signed setup was served.
     WalletAdmitted,
@@ -720,9 +721,8 @@ impl SetupAdmission {
 }
 
 /// Node-wide count of setups by admission kind and verdict, one per setup
-/// frame (a bonded client counts each of its connections). The share of
-/// wallet-signed admissions is what tells a deployer when that path can be
-/// retired.
+/// frame (a bonded client counts each of its connections), so a deployer can
+/// read how much of its traffic still uses the wallet-signed path.
 ///
 /// Same privacy contract as every block here: counters only, never a key, a
 /// serial or a label naming a client.
@@ -1183,6 +1183,7 @@ mod tests {
             "a second block would split the node's view in half"
         );
     }
+
     #[test]
     fn route_admission_counters_land_under_their_own_label() {
         let m = RouteAdmissionMetrics::new();
@@ -1217,6 +1218,7 @@ mod tests {
         assert_eq!(anchor[7], ("throttled", 1));
         assert_eq!(anchor.iter().map(|(_, n)| n).sum::<u64>(), 2);
     }
+
     #[test]
     fn setup_admissions_count_per_kind_and_result() {
         let m = AdmissionMetrics::new();

@@ -84,9 +84,9 @@ pub enum RejectionReason {
     IpExhausted,
     /// The account already holds the deployer's maximum of simultaneous
     /// wallet-signed sessions, or the deployer no longer admits them for it.
-    /// Learned from the HPKE-sealed `RejectedDeviceLimit` detail. Fatal: every
-    /// exit asks the same fleet-wide ledger, so only another session of the
-    /// account ending lifts it.
+    /// Learned from the HPKE-sealed `RejectedDeviceLimit` detail. Fatal: the
+    /// count is the account's own, so another exit is unlikely to answer
+    /// differently until one of its other sessions ends.
     DeviceLimit,
     /// The exit closed with the opaque policy-rejection code but the
     /// sealed detail did not arrive (e.g. the reply stream was cut).

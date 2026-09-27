@@ -97,6 +97,12 @@ impl RegistryWalletState {
         entry.admitted.then(|| WalletSession::new(key.0, entry.id))
     }
 
+    /// How many connections the table tracks, admitted or not.
+    #[cfg(test)]
+    pub(crate) fn tracked_conns(&self) -> usize {
+        self.inner.lock().by_conn.len()
+    }
+
     /// Every admitted session holding at least one connection.
     pub(crate) fn live(&self) -> Vec<WalletSession> {
         self.inner
@@ -106,17 +112,6 @@ impl RegistryWalletState {
             .filter(|(_, entry)| entry.admitted)
             .map(|((pubkey, _), entry)| WalletSession::new(*pubkey, entry.id))
             .collect()
-    }
-
-    /// Whether `session` is admitted and holds a connection.
-    pub(crate) fn is_live(&self, session: &WalletSession) -> bool {
-        self.inner
-            .lock()
-            .sessions
-            .iter()
-            .any(|((pubkey, _), entry)| {
-                entry.admitted && entry.id == *session.id() && pubkey == session.pubkey()
-            })
     }
 }
 
@@ -197,7 +192,6 @@ mod tests {
         assert_eq!(state.leave(1), None, "a bonded sibling still holds it");
         assert_eq!(state.leave(2), Some(session));
         assert!(state.live().is_empty());
-        assert!(!state.is_live(&session));
     }
 
     #[test]
@@ -220,8 +214,7 @@ mod tests {
         let pending = needs_gate(state.slot(WALLET, IP2, 2));
 
         assert_eq!(state.live(), vec![admitted]);
-        assert!(state.is_live(&admitted));
-        assert!(!state.is_live(&pending));
+        assert!(!state.live().contains(&pending));
     }
 
     #[test]
