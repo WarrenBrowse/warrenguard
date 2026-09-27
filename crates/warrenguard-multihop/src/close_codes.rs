@@ -82,6 +82,12 @@ pub enum RejectionReason {
     /// Exit IP pool exhausted. Learned from the HPKE-sealed
     /// `IpExhausted` detail.
     IpExhausted,
+    /// The account already holds the deployer's maximum of simultaneous
+    /// wallet-signed sessions, or the deployer no longer admits them for it.
+    /// Learned from the HPKE-sealed `RejectedDeviceLimit` detail. Fatal: every
+    /// exit asks the same fleet-wide ledger, so only another session of the
+    /// account ending lifts it.
+    DeviceLimit,
     /// The exit closed with the opaque policy-rejection code but the
     /// sealed detail did not arrive (e.g. the reply stream was cut).
     /// Definitive all the same: an immediate redial would hit the same
@@ -121,6 +127,7 @@ impl RejectionReason {
                 Some(Self::Banned(*reason_code))
             }
             crate::WarrenControlMessage::IpExhausted => Some(Self::IpExhausted),
+            crate::WarrenControlMessage::RejectedDeviceLimit => Some(Self::DeviceLimit),
             crate::WarrenControlMessage::IpRequest { .. }
             | crate::WarrenControlMessage::IpRequestV7 { .. }
             | crate::WarrenControlMessage::IpAssign { .. }
@@ -147,6 +154,7 @@ impl RejectionReason {
             Self::NotAllowlisted => "not-allowlisted",
             Self::Banned(_) => "banned",
             Self::IpExhausted => "ip-pool-exhausted",
+            Self::DeviceLimit => "device-limit",
             Self::PolicyRefused => "policy-refused",
         }
     }
@@ -170,6 +178,7 @@ impl RejectionReason {
             // marker and does not carry the code.
             Self::Banned(_) => Retryability::Fatal(FatalCause::Banned),
             Self::PolicyRefused => Retryability::Fatal(FatalCause::PolicyRefused),
+            Self::DeviceLimit => Retryability::Fatal(FatalCause::DeviceLimit),
             Self::IpExhausted => Retryability::RetryReselect,
         }
     }
@@ -195,6 +204,7 @@ mod tests {
             RejectionReason::NotAllowlisted,
             RejectionReason::Banned(0),
             RejectionReason::IpExhausted,
+            RejectionReason::DeviceLimit,
             RejectionReason::PolicyRefused,
         ] {
             assert_eq!(
@@ -287,6 +297,14 @@ mod tests {
             Retryability::Fatal(FatalCause::Banned),
             "the reason code must not change the fatal verdict"
         );
+        // A device limit is the account's own other sessions, counted
+        // fleet-wide: another exit meets the same count, so it is fatal, and
+        // its distinct cause keeps it from reading as an expired subscription.
+        assert_eq!(
+            RejectionReason::DeviceLimit.retryability(),
+            Retryability::Fatal(FatalCause::DeviceLimit),
+            "a device limit must be fatal and carry the distinct DeviceLimit cause"
+        );
         // Exhaustion is a capacity issue on THIS exit, not the account: reselect.
         assert_eq!(
             RejectionReason::IpExhausted.retryability(),
@@ -318,6 +336,11 @@ mod tests {
         assert_eq!(
             RejectionReason::from_sealed_detail(&WarrenControlMessage::IpExhausted),
             Some(RejectionReason::IpExhausted)
+        );
+        assert_eq!(
+            RejectionReason::from_sealed_detail(&WarrenControlMessage::RejectedDeviceLimit),
+            Some(RejectionReason::DeviceLimit),
+            "the sealed device limit detail refines the opaque close into a device limit"
         );
         let assign = WarrenControlMessage::IpAssign {
             ipv4: [10, 66, 0, 2],

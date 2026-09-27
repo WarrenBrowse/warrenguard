@@ -245,6 +245,7 @@ fn message_for(v: &ControlVec) -> WarrenControlMessage {
         "route_ended_anchor_gone" => WarrenControlMessage::RouteEnded {
             reason_code: v.reason_code.expect("reason_code"),
         },
+        "rejected_device_limit" => WarrenControlMessage::RejectedDeviceLimit,
         other => panic!("unknown control vector name: {other}"),
     }
 }

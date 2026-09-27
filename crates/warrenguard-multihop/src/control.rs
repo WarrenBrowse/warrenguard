@@ -375,6 +375,18 @@ pub enum WarrenControlMessage {
         /// See [`crate::route_admission::RouteEndReason`].
         reason_code: u8,
     },
+
+    /// Exit -> client, setup stream (discriminant 12). A wallet-signed
+    /// [`Self::IpRequest`] was refused because the account already holds the
+    /// deployer's maximum of simultaneous sessions, or because the deployer no
+    /// longer admits wallet-signed sessions for it. Sealed before the same
+    /// single opaque close as every policy refusal, so the relay cannot tell
+    /// it from [`Self::Rejected`]; only the client learns the cause, and shows
+    /// a device limit rather than a renew prompt.
+    ///
+    /// A client that predates the variant fails to decode it and falls back
+    /// to the opaque close, which it reads as a fatal policy refusal.
+    RejectedDeviceLimit,
 }
 
 impl WarrenControlMessage {
@@ -395,6 +407,7 @@ impl WarrenControlMessage {
             Self::RouteAnchorRequest { .. } => "RouteAnchorRequest",
             Self::RouteAnchorAck { .. } => "RouteAnchorAck",
             Self::RouteEnded { .. } => "RouteEnded",
+            Self::RejectedDeviceLimit => "RejectedDeviceLimit",
         }
     }
 }
@@ -1016,6 +1029,7 @@ mod tests {
                 max_routes: 32,
             },
             WarrenControlMessage::RouteEnded { reason_code: 1 },
+            WarrenControlMessage::RejectedDeviceLimit,
         ];
         for msg in new_variants {
             let bytes = encode_control(&msg).unwrap();

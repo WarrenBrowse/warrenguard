@@ -417,6 +417,9 @@ pub(crate) struct FakeMultihopExit {
     /// `reject_banned` is set, so a test can assert the code reaches the
     /// client's `RejectionReason::Banned` intact.
     pub(crate) ban_reason_code: Arc<AtomicU8>,
+    /// When set, every subsequent setup reply is a sealed
+    /// `RejectedDeviceLimit` detail (after `reject_banned`, before `reject`).
+    pub(crate) reject_device_limit: Arc<AtomicBool>,
     /// When set, the setup request is read and NEVER answered, and the
     /// connection is held open. The censor shape reported from Russia on
     /// 2026-09-10: the handshake passes, the setup reply never comes back.
@@ -572,6 +575,7 @@ struct FakeExitBehaviour {
     reject: Arc<AtomicBool>,
     reject_banned: Arc<AtomicBool>,
     ban_reason_code: Arc<AtomicU8>,
+    reject_device_limit: Arc<AtomicBool>,
     swallow_setup: Arc<AtomicBool>,
     refuse_setup: Arc<AtomicU32>,
     close_after_setup: Arc<AtomicBool>,
@@ -673,6 +677,8 @@ async fn serve_one_fake_exit_connection(
         WarrenControlMessage::RejectedBanned {
             reason_code: behaviour.ban_reason_code.load(Ordering::Relaxed),
         }
+    } else if behaviour.reject_device_limit.load(Ordering::Relaxed) {
+        WarrenControlMessage::RejectedDeviceLimit
     } else if behaviour.reject.load(Ordering::Relaxed) || lead_token_in_use {
         WarrenControlMessage::Rejected
     } else {
@@ -879,6 +885,7 @@ pub(crate) fn spawn_fake_multihop_exit_on(
         reject: Arc::new(AtomicBool::new(false)),
         reject_banned: Arc::new(AtomicBool::new(false)),
         ban_reason_code: Arc::new(AtomicU8::new(0)),
+        reject_device_limit: Arc::new(AtomicBool::new(false)),
         swallow_setup: Arc::new(AtomicBool::new(false)),
         refuse_setup: Arc::new(AtomicU32::new(0)),
         close_after_setup: Arc::new(AtomicBool::new(false)),
@@ -943,6 +950,7 @@ pub(crate) fn spawn_fake_multihop_exit_on(
         reject: behaviour.reject,
         reject_banned: behaviour.reject_banned,
         ban_reason_code: behaviour.ban_reason_code,
+        reject_device_limit: behaviour.reject_device_limit,
         swallow_setup: behaviour.swallow_setup,
         refuse_setup: behaviour.refuse_setup,
         close_after_setup: behaviour.close_after_setup,

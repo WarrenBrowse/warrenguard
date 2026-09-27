@@ -94,6 +94,12 @@ pub enum SetupError {
     /// The exit's address pool is exhausted.
     #[error("multihop exit ip pool exhausted")]
     IpExhausted,
+    /// The exit refused the wallet-signed setup: the account already holds its
+    /// maximum of simultaneous sessions, or wallet-signed sessions are no
+    /// longer admitted for it (sealed
+    /// [`WarrenControlMessage::RejectedDeviceLimit`]).
+    #[error("multihop setup rejected: device limit reached")]
+    DeviceLimit,
     /// The exit refused a route admission (`IpRequestRoute`). Carries the
     /// wire code of [`crate::RouteRejectCode`].
     #[error("multihop route admission refused")]
@@ -130,6 +136,7 @@ impl SetupError {
         match self {
             SetupError::Rejected => Retryability::Fatal(FatalCause::NotAuthorized),
             SetupError::Banned(_) => Retryability::Fatal(FatalCause::Banned),
+            SetupError::DeviceLimit => Retryability::Fatal(FatalCause::DeviceLimit),
             // The same request meets the same refusal; the route admission
             // path falls back to another admission rather than redialling.
             SetupError::IpExhausted | SetupError::RouteRejected(_) => Retryability::RetryReselect,
@@ -180,6 +187,7 @@ pub fn ip_assignment_from_setup_plaintext(plaintext: &[u8]) -> Result<IpAssignme
             Err(SetupError::Banned(reason_code))
         }
         Some(WarrenControlMessage::IpExhausted) => Err(SetupError::IpExhausted),
+        Some(WarrenControlMessage::RejectedDeviceLimit) => Err(SetupError::DeviceLimit),
         Some(WarrenControlMessage::RouteRejected { reason_code }) => {
             Err(SetupError::RouteRejected(reason_code))
         }

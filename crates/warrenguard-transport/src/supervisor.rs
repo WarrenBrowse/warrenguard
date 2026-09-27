@@ -5014,6 +5014,45 @@ mod run_tests {
     }
 
     #[tokio::test]
+    async fn run_surfaces_a_device_limit_rejection_distinctly_and_fatally() {
+        // A sealed RejectedDeviceLimit must surface as the distinct
+        // DeviceLimit reason, fatal with the DeviceLimit cause, so the app
+        // says the account's other devices hold every slot instead of
+        // showing an expired subscription or redialling into the same count.
+        let operational_key = SigningKey::from_bytes(&[0x48; 32]);
+        let exit_id = ExitId::from_bytes([0x57; 16]);
+        let exit = spawn_fake_multihop_exit(&operational_key, exit_id);
+        exit.reject_device_limit
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let config = config_with_fake_exit(&exit, &operational_key);
+        let (supervisor, _rx) = MultiHopSupervisor::new(config);
+        let mut fatal_rx = supervisor.fatal_rx();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), supervisor.run())
+            .await
+            .expect("run() must not hang retrying a device limit");
+
+        match result {
+            Err(MultiHopError::Rejected(reason)) => {
+                assert_eq!(reason, RejectionReason::DeviceLimit);
+                assert_eq!(
+                    reason.retryability(),
+                    warrenguard_wire::Retryability::Fatal(
+                        warrenguard_wire::FatalCause::DeviceLimit
+                    ),
+                    "a device limit must be fatal and carry the DeviceLimit cause"
+                );
+            }
+            other => panic!("expected Err(MultiHopError::Rejected(DeviceLimit)), got {other:?}"),
+        }
+        assert_eq!(
+            *fatal_rx.borrow_and_update(),
+            Some(RejectionReason::DeviceLimit),
+            "fatal_rx must observe the device limit run() returned"
+        );
+    }
+
+    #[tokio::test]
     async fn run_surfaces_a_banned_rejection_distinctly_and_fatally() {
         // A sealed RejectedBanned detail must surface as the distinct Banned
         // reason (not the generic NotAllowlisted), so the app can show a
