@@ -624,6 +624,15 @@ impl MigrateHandle {
         }
         self.overlap.notify_one();
     }
+
+    /// Make-before-break re-dial of the current circuit, the same as
+    /// [`SupervisorHandle::overlap_reconnect`], from a handle that keeps no
+    /// supervisor alive. The new session asks the token provider afresh, so
+    /// a session that logged in with the wallet for want of a token is
+    /// admitted on one once the provider has some.
+    pub fn overlap_reconnect(&self) {
+        self.overlap.notify_one();
+    }
 }
 
 /// Long-lived task that keeps a [`MultiHopClient`] alive across
@@ -5874,7 +5883,8 @@ mod route_run_tests {
         let anchor = RouteAnchorHandle::awaiting_key();
         let (tokens, _) = provider(vec![Vec::new(), vec![token(0x1B)]]);
         let (supervisor, rx) = main_supervisor(&exit, &operational_key, Some(tokens), &anchor);
-        let handle = supervisor.handle();
+        // The receiver-free handle a consumer keeps for the tunnel's life.
+        let migrate = supervisor.migrate_handle();
         let reader = spawn_reader(rx);
         let task = tokio::spawn(supervisor.run());
         wait_for("the wallet setup", || exit.setup_requests.lock().len() == 1).await;
@@ -5888,7 +5898,7 @@ mod route_run_tests {
         );
         assert!(exit.anchor_requests.lock().is_empty());
 
-        handle.overlap_reconnect();
+        migrate.overlap_reconnect();
 
         wait_state(&anchor, AnchorState::Anchored { max_routes: 32 }).await;
         let seen = exit.anchor_requests.lock().clone();
@@ -5897,7 +5907,6 @@ mod route_run_tests {
             &seen[0].sealed,
             &session_token_serial(&token(0x1B))
         ));
-        drop(handle);
         task.abort();
         reader.abort();
     }
