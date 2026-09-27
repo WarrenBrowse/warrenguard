@@ -13,7 +13,7 @@ pub use allowlist::{AllowlistHandle, AllowlistSnapshot};
 pub use authorizer::{AllowAll, Authorizer, StaticAllowlist};
 pub use exit::{
     AnchorVerdict, BoxFuture, ExitRevocationHandle, ExitSessionsHandle, RouteAdmission,
-    RouteAdmitter, SessionTokenAdmitter, TOKEN_SERIAL_LEN, TokenAdmission,
-    attach_secret_for_serial, session_key_value,
+    RouteAdmitter, SessionTokenAdmitter, TOKEN_SERIAL_LEN, TokenAdmission, WALLET_SESSION_ID_LEN,
+    WalletAdmission, WalletSession, WalletSessionGate, attach_secret_for_serial, session_key_value,
 };
 pub use unauthenticated::{UnauthenticatedHandler, UnauthenticatedProbe};

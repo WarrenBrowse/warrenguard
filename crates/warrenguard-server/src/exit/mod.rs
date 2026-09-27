@@ -7,6 +7,7 @@ use std::pin::Pin;
 mod route_admission;
 mod session;
 mod session_token;
+mod wallet_session;
 
 /// A `Send` future returning `T`, boxed so a trait using it stays
 /// `dyn`-compatible. The engine carries no `async-trait` dependency, and a
@@ -20,4 +21,7 @@ pub use session::{ExitRevocationHandle, ExitSessionsHandle};
 pub use session_token::{
     SessionTokenAdmitter, TOKEN_SERIAL_LEN, TokenAdmission, attach_secret_for_serial,
     session_key_value,
+};
+pub use wallet_session::{
+    WALLET_SESSION_ID_LEN, WalletAdmission, WalletSession, WalletSessionGate,
 };

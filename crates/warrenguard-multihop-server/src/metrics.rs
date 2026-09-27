@@ -674,6 +674,132 @@ impl RouteAdmissionSnapshot {
     }
 }
 
+/// How one setup was admitted or refused, by the kind of admission the client
+/// asked for: wallet-signed (`IpRequest`) or anonymous token (`IpRequestV7`).
+/// Route setups have their own block ([`RouteAdmissionMetrics`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupAdmission {
+    /// A wallet-signed setup was served.
+    WalletAdmitted,
+    /// A wallet-signed setup failed the authorization gate (not allowlisted,
+    /// no valid proof of possession, banned).
+    WalletRefused,
+    /// A wallet-signed setup was refused because the account already holds
+    /// its maximum of simultaneous sessions.
+    WalletDeviceLimit,
+    /// A wallet-signed setup was refused because the deployer no longer
+    /// admits wallet-signed sessions for the account.
+    WalletRetired,
+    /// A token setup was served.
+    TokenAdmitted,
+    /// A token setup was refused (no valid token, or its serial is held
+    /// elsewhere).
+    TokenRefused,
+}
+
+impl SetupAdmission {
+    const LABELS: [(&'static str, &'static str); 6] = [
+        ("wallet", "admitted"),
+        ("wallet", "refused"),
+        ("wallet", "device_limit"),
+        ("wallet", "retired"),
+        ("token", "admitted"),
+        ("token", "refused"),
+    ];
+
+    fn index(self) -> usize {
+        match self {
+            Self::WalletAdmitted => 0,
+            Self::WalletRefused => 1,
+            Self::WalletDeviceLimit => 2,
+            Self::WalletRetired => 3,
+            Self::TokenAdmitted => 4,
+            Self::TokenRefused => 5,
+        }
+    }
+}
+
+/// Node-wide count of setups by admission kind and verdict, one per setup
+/// frame (a bonded client counts each of its connections). The share of
+/// wallet-signed admissions is what tells a deployer when that path can be
+/// retired.
+///
+/// Same privacy contract as every block here: counters only, never a key, a
+/// serial or a label naming a client.
+#[derive(Debug)]
+pub struct AdmissionMetrics {
+    counts: [AtomicU64; 6],
+}
+
+static ADMISSIONS: AdmissionMetrics = AdmissionMetrics::new();
+
+/// The process-wide setup admission block.
+#[must_use]
+pub fn admission_metrics() -> &'static AdmissionMetrics {
+    &ADMISSIONS
+}
+
+/// Point-in-time read of the process-wide setup admission block.
+#[must_use]
+pub fn admission_snapshot() -> AdmissionSnapshot {
+    ADMISSIONS.snapshot()
+}
+
+impl Default for AdmissionMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AdmissionMetrics {
+    /// A zeroed block.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            counts: [const { AtomicU64::new(0) }; 6],
+        }
+    }
+
+    /// Counts one setup verdict.
+    pub fn record(&self, verdict: SetupAdmission) {
+        self.counts[verdict.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Reads every counter.
+    #[must_use]
+    pub fn snapshot(&self) -> AdmissionSnapshot {
+        AdmissionSnapshot {
+            counts: self.counts.each_ref().map(|a| a.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+/// A point-in-time view of [`AdmissionMetrics`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AdmissionSnapshot {
+    counts: [u64; 6],
+}
+
+impl AdmissionSnapshot {
+    /// `(kind, result, count)` for every series, in a fixed order: `kind` is
+    /// `wallet` or `token`, `result` one of `admitted`, `refused`,
+    /// `device_limit`, `retired` (the last two for wallet setups only).
+    #[must_use]
+    pub fn by_kind_and_result(&self) -> [(&'static str, &'static str, u64); 6] {
+        let mut out = [("", "", 0); 6];
+        for (i, (kind, result)) in SetupAdmission::LABELS.iter().enumerate() {
+            out[i] = (kind, result, self.counts[i]);
+        }
+        out
+    }
+
+    /// The count of one verdict.
+    #[must_use]
+    pub fn count(&self, verdict: SetupAdmission) -> u64 {
+        self.counts[verdict.index()]
+    }
+}
+
 /// A point-in-time view of [`UplinkMetrics`]. Deliberately constructible
 /// by a consumer, so a deployer can unit-test its own exposition against a
 /// crafted reading instead of having to drive a live pump.
@@ -1090,5 +1216,32 @@ mod tests {
         assert_eq!(anchor[1], ("needs_token", 1));
         assert_eq!(anchor[7], ("throttled", 1));
         assert_eq!(anchor.iter().map(|(_, n)| n).sum::<u64>(), 2);
+    }
+    #[test]
+    fn setup_admissions_count_per_kind_and_result() {
+        let m = AdmissionMetrics::new();
+        m.record(SetupAdmission::WalletAdmitted);
+        m.record(SetupAdmission::WalletAdmitted);
+        m.record(SetupAdmission::WalletDeviceLimit);
+        m.record(SetupAdmission::WalletRetired);
+        m.record(SetupAdmission::WalletRefused);
+        m.record(SetupAdmission::TokenAdmitted);
+        m.record(SetupAdmission::TokenRefused);
+        m.record(SetupAdmission::TokenRefused);
+
+        assert_eq!(
+            m.snapshot().by_kind_and_result(),
+            [
+                ("wallet", "admitted", 2),
+                ("wallet", "refused", 1),
+                ("wallet", "device_limit", 1),
+                ("wallet", "retired", 1),
+                ("token", "admitted", 1),
+                ("token", "refused", 2),
+            ],
+            "the retirement criterion reads the wallet share of admissions off these series"
+        );
+        assert_eq!(m.snapshot().count(SetupAdmission::WalletAdmitted), 2);
+        assert_eq!(m.snapshot().count(SetupAdmission::TokenRefused), 2);
     }
 }

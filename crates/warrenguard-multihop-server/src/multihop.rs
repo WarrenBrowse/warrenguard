@@ -52,6 +52,7 @@ use warrenguard_pump::DAITA_DUMMY_FIRST_BYTE;
 use warrenguard_ratelimit::{RateOverride, RatePolicyHandle, RateSpec};
 use warrenguard_server::{
     AllowlistHandle, RouteAdmission, RouteAdmitter, SessionTokenAdmitter, TOKEN_SERIAL_LEN,
+    WalletAdmission, WalletSession, WalletSessionGate,
 };
 use warrenguard_transport_core::PacketDevice;
 use warrenguard_transport_core::ip_parse::TunnelPool;
@@ -63,9 +64,10 @@ use crate::datapath::{
     clamp_uplink_syn, classify_uplink, dst_ipv4, next_sealable, send_sealed, src_ipv4,
 };
 use crate::ip_pool::{ConnId, IpAllocator, IpAllocatorV6, SessionIntent, SessionIntentV6};
-use crate::metrics::EvictReason;
+use crate::metrics::{EvictReason, SetupAdmission};
 
 mod route;
+mod wallet;
 
 /// Retain anti-replay windows for at most this many recent epochs. Rekeys are
 /// infrequent, so a handful covers every in-flight frame around an epoch
@@ -692,6 +694,7 @@ async fn accept_setup_stream(
     allowlist: Option<&AllowlistHandle>,
     session_registry: Option<&Arc<MultihopSessionRegistry>>,
     token_admitter: Option<&Arc<dyn SessionTokenAdmitter>>,
+    wallet_gate: Option<&Arc<dyn WalletSessionGate>>,
     route_admitter: Option<&route::RouteGate>,
     offered_daita: Option<&warrenguard_wire::DaitaConfig>,
     #[cfg(feature = "pq-hpke")] pq: Option<&PqSetup>,
@@ -726,6 +729,7 @@ async fn accept_setup_stream(
         allowlist,
         session_registry,
         token_admitter,
+        wallet_gate,
         route_admitter,
         offered_daita,
         #[cfg(feature = "pq-hpke")]
@@ -765,6 +769,7 @@ async fn process_setup_frame(
     allowlist: Option<&AllowlistHandle>,
     session_registry: Option<&Arc<MultihopSessionRegistry>>,
     token_admitter: Option<&Arc<dyn SessionTokenAdmitter>>,
+    wallet_gate: Option<&Arc<dyn WalletSessionGate>>,
     route_admitter: Option<&route::RouteGate>,
     offered_daita: Option<&warrenguard_wire::DaitaConfig>,
     #[cfg(feature = "pq-hpke")] pq: Option<&PqSetup>,
@@ -801,6 +806,7 @@ async fn process_setup_frame(
     let control_msg = warrenguard_multihop::try_decode_control(&plaintext)
         .ok()
         .flatten();
+    let is_wallet_request = matches!(control_msg, Some(WarrenControlMessage::IpRequest { .. }));
 
     // Cold-start grace (deploy / reboot / fresh immutable host with no
     // disk cache): the in-memory allowlist is empty until the refresh
@@ -918,14 +924,18 @@ async fn process_setup_frame(
                 None => warrenguard_server::TokenAdmission::Reject,
             };
             match admitted {
-                warrenguard_server::TokenAdmission::Admit { serial } => (
-                    Some(serial),
-                    *wants_ipv6,
-                    *wants_daita,
-                    Some(serial),
-                    *prefer_ipv4,
-                ),
+                warrenguard_server::TokenAdmission::Admit { serial } => {
+                    crate::metrics::admission_metrics().record(SetupAdmission::TokenAdmitted);
+                    (
+                        Some(serial),
+                        *wants_ipv6,
+                        *wants_daita,
+                        Some(serial),
+                        *prefer_ipv4,
+                    )
+                }
                 _ => {
+                    crate::metrics::admission_metrics().record(SetupAdmission::TokenRefused);
                     tracing::warn!(
                         "multihop: v7 setup rejected - token invalid/denied; sealed detail + opaque close"
                     );
@@ -946,6 +956,9 @@ async fn process_setup_frame(
             match classify_admission(allowlist, other, &exit_id, &encapsulated_key) {
                 Admission::Admitted => {}
                 verdict => {
+                    if is_wallet_request {
+                        crate::metrics::admission_metrics().record(SetupAdmission::WalletRefused);
+                    }
                     // Same opaque close for both (anti-oracle); only the
                     // client-sealed detail distinguishes a ban (suspension)
                     // from a lapsed/absent subscription (renew). A ban carries
@@ -1034,6 +1047,7 @@ async fn process_setup_frame(
                 && let Some(al) = allowlist
                 && !al.is_allowed_at(&pubkey, warrenguard_config::unix_now())
             {
+                crate::metrics::admission_metrics().record(SetupAdmission::WalletRefused);
                 tracing::warn!(
                     "multihop: setup rejected - pubkey revoked during setup (TOCTOU recheck)"
                 );
@@ -1073,6 +1087,48 @@ async fn process_setup_frame(
         .await;
         return None;
     };
+    // A new wallet session is counted fleet-wide before it gets its address;
+    // a connection joining one the gate admitted is not asked again. A
+    // refused session's address goes back to the pool when the caller
+    // releases this connection.
+    if let (Some(gate), Some(registry), Some(pubkey), None, None) = (
+        wallet_gate,
+        session_registry,
+        sticky_pubkey,
+        token_serial,
+        route.as_ref(),
+    ) && let wallet::WalletSlot::NeedsGate(session) =
+        registry.wallet.slot(pubkey, spec.assigned, conn_id)
+    {
+        let refusal = match gate.open(&session).await {
+            WalletAdmission::Admit => None,
+            WalletAdmission::Retired => Some(SetupAdmission::WalletRetired),
+            _ => Some(SetupAdmission::WalletDeviceLimit),
+        };
+        match refusal {
+            None => registry.wallet.mark_admitted(&session),
+            Some(verdict) => {
+                crate::metrics::admission_metrics().record(verdict);
+                tracing::info!(
+                    retired = verdict == SetupAdmission::WalletRetired,
+                    "multihop: wallet session refused by the session gate; sealed detail + opaque close"
+                );
+                reply_sealed_detail_then_close(
+                    &mut send,
+                    &term,
+                    epoch,
+                    reverse_seq,
+                    conn,
+                    &WarrenControlMessage::RejectedDeviceLimit,
+                )
+                .await;
+                return None;
+            }
+        }
+    }
+    if is_wallet_request {
+        crate::metrics::admission_metrics().record(SetupAdmission::WalletAdmitted);
+    }
     // Registering the downlink route is what makes an allocated address real:
     // the rx pump gates inner packets against it and the tx task fans out by
     // it.
@@ -1166,6 +1222,7 @@ async fn run_setup(
     allowlist: Option<&AllowlistHandle>,
     session_registry: Option<&Arc<MultihopSessionRegistry>>,
     token_admitter: Option<&Arc<dyn SessionTokenAdmitter>>,
+    wallet_gate: Option<&Arc<dyn WalletSessionGate>>,
     route_admitter: Option<&route::RouteGate>,
     offered_daita: Option<&warrenguard_wire::DaitaConfig>,
     #[cfg(feature = "pq-hpke")] pq: Option<&PqSetup>,
@@ -1186,6 +1243,7 @@ async fn run_setup(
                 allowlist,
                 session_registry,
                 token_admitter,
+                wallet_gate,
                 route_admitter,
                 offered_daita,
                 #[cfg(feature = "pq-hpke")]
@@ -1210,6 +1268,7 @@ async fn run_setup(
                 allowlist,
                 session_registry,
                 token_admitter,
+                wallet_gate,
                 route_admitter,
                 offered_daita,
                 #[cfg(feature = "pq-hpke")]
@@ -3264,7 +3323,18 @@ pub struct MultihopSessionRegistry<C: ClosableConn = Connection> {
     /// Route admission state (control senders, anchors, retained locators),
     /// see the `route` submodule.
     route: route::RegistryRouteState,
+    /// Wallet-signed sessions by tunnel address, see the `wallet` submodule.
+    wallet: wallet::RegistryWalletState,
+    /// Told each wallet session the gate admitted once its last connection
+    /// ends, see [`Self::set_wallet_session_end_observer`].
+    wallet_end_observer: std::sync::OnceLock<WalletSessionEndObserver>,
 }
+
+/// Callback a deployer wires with
+/// [`MultihopSessionRegistry::set_wallet_session_end_observer`]. Same contract
+/// as [`TokenSessionEndObserver`]: it runs synchronously on the teardown path
+/// and must hand the session off without blocking.
+pub type WalletSessionEndObserver = Box<dyn Fn(WalletSession) + Send + Sync>;
 
 /// Callback a deployer wires with
 /// [`MultihopSessionRegistry::set_token_session_end_observer`]. It runs on the
@@ -3304,6 +3374,8 @@ impl<C: ClosableConn> Default for MultihopSessionRegistry<C> {
             ipv4_to_pubkey: Mutex::new(HashMap::new()),
             token_end_observer: std::sync::OnceLock::new(),
             route: route::RegistryRouteState::default(),
+            wallet: wallet::RegistryWalletState::default(),
+            wallet_end_observer: std::sync::OnceLock::new(),
         }
     }
 }
@@ -3347,6 +3419,14 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
 
     fn unregister_key(&self, key: SessionKey, conn_id: ConnId) {
         self.route.detach_control(key, conn_id);
+        // One wallet key spans every device of the account on this exit, so
+        // a wallet session ends on its own address, not on the key.
+        if let SessionKey::Wallet(_) = key
+            && let Some(ended) = self.wallet.leave(conn_id)
+            && let Some(observer) = self.wallet_end_observer.get()
+        {
+            observer(ended);
+        }
         let mut guard = self.live.lock();
         if let Some(conns) = guard.get_mut(&key) {
             conns.remove(&conn_id);
@@ -3456,6 +3536,29 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
     /// Set once. Returns `false`, keeping the first, when one is already wired.
     pub fn set_token_session_end_observer(&self, observer: TokenSessionEndObserver) -> bool {
         self.token_end_observer.set(observer).is_ok()
+    }
+
+    /// The wallet-signed sessions the gate admitted that hold at least one
+    /// live connection: the set a deployer counting them must renew.
+    #[must_use]
+    pub fn live_wallet_sessions(&self) -> Vec<WalletSession> {
+        self.wallet.live()
+    }
+
+    /// Whether `session` still holds a live connection. Lets a deployer that
+    /// heard a session end check it did not come back before releasing it.
+    #[must_use]
+    pub fn is_wallet_session_live(&self, session: &WalletSession) -> bool {
+        self.wallet.is_live(session)
+    }
+
+    /// Wire the callback told each wallet session the gate admitted once its
+    /// last connection ends: the moment a deployer can release its count
+    /// instead of letting it lapse. A session the gate refused never fires it.
+    ///
+    /// Set once. Returns `false`, keeping the first, when one is already wired.
+    pub fn set_wallet_session_end_observer(&self, observer: WalletSessionEndObserver) -> bool {
+        self.wallet_end_observer.set(observer).is_ok()
     }
 
     /// Snapshot of `tunnel IPv4 -> 64-char pubkey hex`, consumed by
@@ -3958,6 +4061,10 @@ pub struct ExitTerminateCtx<T: PacketDevice + Clone> {
     /// is then admitted by verifying + spending a token offline (the exit never
     /// learns the wallet). `None` refuses v7 (the exit stays wallet-authenticated).
     token_admitter: Option<Arc<dyn SessionTokenAdmitter>>,
+    /// Gate for new wallet-signed sessions. `Some` only when the deployer
+    /// wires it via [`ExitTerminateCtx::with_wallet_session_gate`], together
+    /// with a session registry; `None` serves every authorized wallet setup.
+    wallet_gate: Option<Arc<dyn WalletSessionGate>>,
     /// Route admission policy (route sessions and anchor registrations).
     /// `Some` only when the deployer wires it via
     /// [`ExitTerminateCtx::with_route_admitter`]; `None` answers every route
@@ -4027,6 +4134,7 @@ impl<T: PacketDevice + Clone> ExitTerminateCtx<T> {
             session_registry: None,
             drain_rx: None,
             token_admitter: None,
+            wallet_gate: None,
             route_admitter: None,
             session_rate: None,
             #[cfg(feature = "pq-hpke")]
@@ -4154,6 +4262,17 @@ impl<T: PacketDevice + Clone> ExitTerminateCtx<T> {
     #[must_use]
     pub fn with_token_admitter(mut self, admitter: Option<Arc<dyn SessionTokenAdmitter>>) -> Self {
         self.token_admitter = admitter;
+        self
+    }
+
+    /// Attach a [`WalletSessionGate`] so each new wallet-signed session is
+    /// admitted by the deployer's fleet-wide count before it gets an address.
+    /// Takes effect only beside a session registry
+    /// ([`Self::with_session_registry`]), which tracks the sessions the gate
+    /// admitted so the deployer can renew and release them.
+    #[must_use]
+    pub fn with_wallet_session_gate(mut self, gate: Option<Arc<dyn WalletSessionGate>>) -> Self {
+        self.wallet_gate = gate;
         self
     }
 
@@ -4314,6 +4433,7 @@ pub async fn terminate_connection<T>(
         ctx.session_registry.clone(),
         ctx.drain_rx.clone(),
         ctx.token_admitter.clone(),
+        ctx.wallet_gate.clone(),
         ctx.route_admitter.clone(),
         ctx.session_rate.clone(),
         #[cfg(feature = "pq-hpke")]
@@ -4521,6 +4641,7 @@ async fn serve_terminating_connection<T>(
     session_registry: Option<Arc<MultihopSessionRegistry>>,
     drain_rx: Option<watch::Receiver<Option<DrainAdvisory>>>,
     token_admitter: Option<Arc<dyn SessionTokenAdmitter>>,
+    wallet_gate: Option<Arc<dyn WalletSessionGate>>,
     route_admitter: Option<route::RouteGate>,
     session_rate: Option<SessionRatePolicy>,
     #[cfg(feature = "pq-hpke")] pq: Option<PqSetup>,
@@ -4564,6 +4685,7 @@ async fn serve_terminating_connection<T>(
         allowlist.as_ref(),
         session_registry.as_ref(),
         token_admitter.as_ref(),
+        wallet_gate.as_ref(),
         route_admitter.as_ref(),
         // Offer this connection's own machine: the grant in the IpAssign is
         // the exact spec padding this exit's downlink, so client and exit
@@ -8884,6 +9006,181 @@ mod tests {
             }
             other => panic!("expected an IpAssign for a real blind-RSA token, got {other:?}"),
         }
+    }
+
+    /// Session gate that admits up to `max` distinct sessions and answers
+    /// `refusal` past that, counting every question it is asked.
+    struct CountingWalletGate {
+        max: usize,
+        refusal: WalletAdmission,
+        seen: parking_lot::Mutex<Vec<WalletSession>>,
+    }
+
+    impl CountingWalletGate {
+        fn new(max: usize, refusal: WalletAdmission) -> Arc<Self> {
+            Arc::new(Self {
+                max,
+                refusal,
+                seen: parking_lot::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn questions(&self) -> usize {
+            self.seen.lock().len()
+        }
+    }
+
+    impl WalletSessionGate for CountingWalletGate {
+        fn open<'a>(
+            &'a self,
+            session: &'a WalletSession,
+        ) -> warrenguard_server::BoxFuture<'a, WalletAdmission> {
+            Box::pin(async move {
+                let mut seen = self.seen.lock();
+                let admitted_before = seen.iter().filter(|s| s.id() != session.id()).count();
+                seen.push(*session);
+                if admitted_before < self.max {
+                    WalletAdmission::Admit
+                } else {
+                    self.refusal
+                }
+            })
+        }
+    }
+
+    fn spawn_terminating_exit_with_wallet_gate(
+        gate: Arc<dyn WalletSessionGate>,
+    ) -> (TerminatingExit, Arc<MultihopSessionRegistry>) {
+        let exit_key = SigningKey::from_bytes(&[0x42; 32]);
+        let (privkey, exit_pub) =
+            derive_x25519_keypair(&ANTI_ORACLE_EXIT_IKM).expect("x25519 keypair derives");
+        let registry = MultihopSessionRegistry::new();
+        let ctx = ExitTerminateCtx::new(
+            privkey,
+            ExitId::from_bytes(ANTI_ORACLE_EXIT_ID),
+            warrenguard_transport_core::FakeTun::new(),
+            None,
+            None,
+            v4_alloc(),
+            None,
+            None,
+        )
+        .with_session_registry(registry.clone())
+        .with_wallet_session_gate(Some(gate));
+        let ExitHarness {
+            addr,
+            sni,
+            endpoint,
+            accept_task,
+        } = spawn_exit_accept_loop(&exit_key, ctx);
+        (
+            TerminatingExit {
+                addr,
+                sni,
+                exit_pub,
+                _endpoint: endpoint,
+                accept_task,
+            },
+            registry,
+        )
+    }
+
+    fn wallet_request(prefer_ipv4: Option<[u8; 4]>) -> WarrenControlMessage {
+        WarrenControlMessage::IpRequest {
+            prefer_ipv4,
+            client_pubkey: Some([0x5A; 32]),
+            wants_ipv6: false,
+            pop_sig: None,
+            wants_daita: false,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wallet_session_past_the_gate_limit_is_refused_with_the_device_limit_detail() {
+        let gate = CountingWalletGate::new(2, WalletAdmission::DeviceLimit);
+        let (exit, registry) = spawn_terminating_exit_with_wallet_gate(gate.clone());
+        let fresh = Some([0, 0, 0, 0]);
+        let (_c1, _) = client_setup_admitted(&exit, wallet_request(fresh)).await;
+        let (_c2, _) = client_setup_admitted(&exit, wallet_request(fresh)).await;
+
+        let (detail, close) = client_setup_roundtrip(&exit, |_| wallet_request(fresh)).await;
+
+        assert_eq!(
+            detail,
+            Some(WarrenControlMessage::RejectedDeviceLimit),
+            "the third session of a wallet capped at two must learn the device limit"
+        );
+        match close {
+            Some(quinn::ConnectionError::ApplicationClosed(ac)) => assert_eq!(
+                u64::from(ac.error_code),
+                u64::from(WARREN_MH_REJECTED),
+                "ANTI-ORACLE: the relay sees the single opaque close"
+            ),
+            other => panic!("expected the opaque application close, got {other:?}"),
+        }
+        assert_eq!(
+            registry.live_wallet_sessions().len(),
+            2,
+            "a refused session holds nothing the deployer must renew"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_connection_joining_an_admitted_wallet_session_is_served_without_asking_the_gate() {
+        let gate = CountingWalletGate::new(1, WalletAdmission::DeviceLimit);
+        let (exit, registry) = spawn_terminating_exit_with_wallet_gate(gate.clone());
+        let (_primary, ip) = client_setup_admitted(&exit, wallet_request(Some([0, 0, 0, 0]))).await;
+
+        let (_secondary, joined) = client_setup_admitted(&exit, wallet_request(Some(ip))).await;
+
+        assert_eq!(
+            joined, ip,
+            "a bonded secondary lands on its session's address"
+        );
+        assert_eq!(gate.questions(), 1, "one session, one question to the gate");
+        assert_eq!(registry.live_wallet_sessions().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_retired_answer_refuses_with_the_device_limit_detail_and_counts_as_retired() {
+        let gate = CountingWalletGate::new(0, WalletAdmission::Retired);
+        let (exit, _registry) = spawn_terminating_exit_with_wallet_gate(gate);
+        let before = crate::metrics::admission_snapshot().count(SetupAdmission::WalletRetired);
+
+        let (detail, _) = client_setup_roundtrip(&exit, |_| wallet_request(None)).await;
+
+        assert_eq!(detail, Some(WarrenControlMessage::RejectedDeviceLimit));
+        assert!(
+            crate::metrics::admission_snapshot().count(SetupAdmission::WalletRetired) > before,
+            "a retirement refusal is counted apart from the device limit"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_end_of_an_admitted_wallet_session_is_reported_once_its_last_connection_closes() {
+        let gate = CountingWalletGate::new(1, WalletAdmission::DeviceLimit);
+        let (exit, registry) = spawn_terminating_exit_with_wallet_gate(gate.clone());
+        let (ended_tx, mut ended_rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(registry.set_wallet_session_end_observer(Box::new(move |s| {
+            let _ = ended_tx.send(s);
+        })));
+        let (client, _) = client_setup_admitted(&exit, wallet_request(Some([0, 0, 0, 0]))).await;
+        let admitted = registry.live_wallet_sessions();
+
+        client._conn.close(0u32.into(), b"");
+        drop(client);
+        let ended = tokio::time::timeout(Duration::from_secs(5), ended_rx.recv())
+            .await
+            .expect("the end is reported")
+            .expect("observer channel open");
+
+        assert_eq!(
+            vec![ended],
+            admitted,
+            "the session the gate admitted is the one released"
+        );
+        assert!(!registry.is_wallet_session_live(&ended));
+        assert_eq!(ended.pubkey(), &[0x5A; 32]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
