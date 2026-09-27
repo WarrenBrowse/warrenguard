@@ -104,6 +104,12 @@ pub enum SetupError {
     /// wire code of [`crate::RouteRejectCode`].
     #[error("multihop route admission refused")]
     RouteRejected(u8),
+    /// The exit refused the token of an `IpRequestV7Detailed` (sealed
+    /// [`WarrenControlMessage::TokenRejected`]). Carries the wire code of
+    /// [`crate::TokenRejectCode`]: a serial in use is another device of the
+    /// wallet holding that token's slot.
+    #[error("multihop token refused")]
+    TokenRejected(u8),
     /// The reply was not a control message, or was a control message the client
     /// never expects to receive (e.g. an `IpRequest`).
     #[error("unexpected multihop setup reply")]
@@ -137,6 +143,12 @@ impl SetupError {
             SetupError::Rejected => Retryability::Fatal(FatalCause::NotAuthorized),
             SetupError::Banned(_) => Retryability::Fatal(FatalCause::Banned),
             SetupError::DeviceLimit => Retryability::Fatal(FatalCause::DeviceLimit),
+            // As the last word on a stack: every token refused this way means
+            // every device slot of the wallet is taken.
+            SetupError::TokenRejected(code) => match crate::TokenRejectCode::from_code(*code) {
+                crate::TokenRejectCode::SerialInUse => Retryability::Fatal(FatalCause::DeviceLimit),
+                _ => Retryability::Fatal(FatalCause::NotAuthorized),
+            },
             // The same request meets the same refusal; the route admission
             // path falls back to another admission rather than redialling.
             SetupError::IpExhausted | SetupError::RouteRejected(_) => Retryability::RetryReselect,
@@ -191,6 +203,9 @@ pub fn ip_assignment_from_setup_plaintext(plaintext: &[u8]) -> Result<IpAssignme
         Some(WarrenControlMessage::RouteRejected { reason_code }) => {
             Err(SetupError::RouteRejected(reason_code))
         }
+        Some(WarrenControlMessage::TokenRejected { reason_code }) => {
+            Err(SetupError::TokenRejected(reason_code))
+        }
         // An IpRequest (client->exit direction), a mid-session ExitDraining
         // advisory (data-plane only, never a setup reply), or a non-control
         // plaintext on the reply path is a protocol violation by the peer. The
@@ -199,6 +214,7 @@ pub fn ip_assignment_from_setup_plaintext(plaintext: &[u8]) -> Result<IpAssignme
         Some(
             WarrenControlMessage::IpRequest { .. }
             | WarrenControlMessage::IpRequestV7 { .. }
+            | WarrenControlMessage::IpRequestV7Detailed { .. }
             | WarrenControlMessage::ExitDraining { .. }
             | WarrenControlMessage::IpRequestRoute { .. }
             | WarrenControlMessage::RouteAnchorRequest { .. }
@@ -569,6 +585,26 @@ mod tests {
             ip_assignment_from_setup_plaintext(&plaintext),
             Err(SetupError::DeviceLimit)
         ));
+    }
+
+    #[test]
+    fn a_token_refusal_keeps_its_code_and_a_serial_in_use_reads_as_the_device_limit() {
+        let in_use =
+            encode_control(&WarrenControlMessage::TokenRejected { reason_code: 1 }).unwrap();
+        let refusal = ip_assignment_from_setup_plaintext(&in_use).expect_err("a refusal");
+        assert!(matches!(refusal, SetupError::TokenRejected(1)));
+        assert_eq!(
+            refusal.retryability(),
+            warrenguard_wire::Retryability::Fatal(warrenguard_wire::FatalCause::DeviceLimit),
+            "a serial another device holds is the device limit, not an expired subscription"
+        );
+        for unspecified in [0u8, 9] {
+            assert_eq!(
+                SetupError::TokenRejected(unspecified).retryability(),
+                warrenguard_wire::Retryability::Fatal(warrenguard_wire::FatalCause::NotAuthorized),
+                "code {unspecified} is a token that did not verify"
+            );
+        }
     }
 
     #[test]

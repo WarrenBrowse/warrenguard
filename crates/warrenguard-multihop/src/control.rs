@@ -411,6 +411,40 @@ pub enum WarrenControlMessage {
         /// See [`crate::LeaseRefreshStatus`].
         status: u8,
     },
+
+    /// Client -> exit, setup stream (discriminant 15). An
+    /// [`Self::IpRequestV7`] from a client that decodes
+    /// [`Self::TokenRejected`], with the same fields in the same order. An
+    /// exit answers a refused `IpRequestV7Detailed` with `TokenRejected`,
+    /// which says why, and a refused `IpRequestV7` with the plain
+    /// [`Self::Rejected`]: a client that predates `TokenRejected` cannot
+    /// decode it, reads the reply as a failed setup and presents the refused
+    /// token again instead of the next one, so an exit sends it only to a
+    /// client that asked for it.
+    ///
+    /// A deployed exit that predates the variant decodes nothing and answers
+    /// the plain `Rejected`, which tells the client to present the same token
+    /// to that exit as an `IpRequestV7`.
+    IpRequestV7Detailed {
+        /// As [`Self::IpRequestV7::prefer_ipv4`].
+        prefer_ipv4: Option<[u8; 4]>,
+        /// As [`Self::IpRequestV7::wants_ipv6`].
+        wants_ipv6: bool,
+        /// As [`Self::IpRequestV7::session_tokens`].
+        session_tokens: Vec<SessionToken>,
+        /// As [`Self::IpRequestV7::wants_daita`].
+        wants_daita: bool,
+    },
+
+    /// Exit -> client, setup stream (discriminant 16). The answer to a
+    /// refused [`Self::IpRequestV7Detailed`], sealed before the same single
+    /// opaque close as every policy refusal, so the relay learns nothing new.
+    /// `reason_code` is a [`crate::TokenRejectCode`] as a plain `u8` so an
+    /// unknown code still decodes.
+    TokenRejected {
+        /// See [`crate::TokenRejectCode`].
+        reason_code: u8,
+    },
 }
 
 impl WarrenControlMessage {
@@ -434,6 +468,8 @@ impl WarrenControlMessage {
             Self::RejectedDeviceLimit => "RejectedDeviceLimit",
             Self::LeaseRefresh { .. } => "LeaseRefresh",
             Self::LeaseRefreshAck { .. } => "LeaseRefreshAck",
+            Self::IpRequestV7Detailed { .. } => "IpRequestV7Detailed",
+            Self::TokenRejected { .. } => "TokenRejected",
         }
     }
 }
@@ -1000,6 +1036,40 @@ mod tests {
     }
 
     #[test]
+    fn ip_request_v7_detailed_carries_the_fields_of_ip_request_v7_under_tag_15() {
+        let tokens = vec![SessionToken([0xCD; warrenguard_wire::SESSION_TOKEN_LEN])];
+        let plain = encode_control(&WarrenControlMessage::IpRequestV7 {
+            prefer_ipv4: Some([10, 66, 0, 9]),
+            wants_ipv6: true,
+            session_tokens: tokens.clone(),
+            wants_daita: true,
+        })
+        .unwrap();
+        let detailed = encode_control(&WarrenControlMessage::IpRequestV7Detailed {
+            prefer_ipv4: Some([10, 66, 0, 9]),
+            wants_ipv6: true,
+            session_tokens: tokens,
+            wants_daita: true,
+        })
+        .unwrap();
+        assert_eq!(detailed[2], 0x0F, "IpRequestV7Detailed is tag 15");
+        assert_eq!(
+            detailed[3..],
+            plain[3..],
+            "the fields follow the tag exactly as in IpRequestV7"
+        );
+    }
+
+    #[test]
+    fn token_rejected_wire_layout_is_frozen() {
+        assert_eq!(
+            encode_control(&WarrenControlMessage::TokenRejected { reason_code: 1 }).unwrap(),
+            vec![0xC0, 0x03, 0x10, 0x01],
+            "TokenRejected is tag 16 then one reason byte"
+        );
+    }
+
+    #[test]
     fn route_variants_round_trip() {
         for msg in [
             WarrenControlMessage::IpRequestRoute {
@@ -1101,6 +1171,13 @@ mod tests {
                 session_token: None,
             },
             WarrenControlMessage::LeaseRefreshAck { status: 1 },
+            WarrenControlMessage::IpRequestV7Detailed {
+                prefer_ipv4: None,
+                wants_ipv6: false,
+                session_tokens: vec![SessionToken([0x01; warrenguard_wire::SESSION_TOKEN_LEN])],
+                wants_daita: false,
+            },
+            WarrenControlMessage::TokenRejected { reason_code: 1 },
         ];
         for msg in new_variants {
             let bytes = encode_control(&msg).unwrap();

@@ -51,6 +51,7 @@ mod replay;
 pub mod route_admission;
 mod session;
 mod setup;
+mod token_refusal;
 mod wire_format;
 // The `/v2` PQ frame struct is wire, not crypto: it decodes on every build so
 // a classical-only node recognizes (and cleanly refuses) a PQ frame instead of
@@ -107,6 +108,7 @@ pub use session::{
     compose_aad, parse_exit_x25519_pubkey,
 };
 pub use setup::{IpAssignment, SetupError, ip_assignment_from_setup_plaintext};
+pub use token_refusal::TokenRejectCode;
 pub use wire_format::{
     EncapsulatedKeyBytes, MULTIHOP_FRAME_MAX_OVERHEAD, WARREN_HPKE_VERSION, WarrenMultihopFrame,
     decode_frame, encode_frame,

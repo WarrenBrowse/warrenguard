@@ -100,6 +100,13 @@ pub enum RejectionReason {
     /// count is the account's own, so another exit is unlikely to answer
     /// differently until one of its other sessions ends.
     DeviceLimit,
+    /// The exit verified the presented token but its serial is leased to a
+    /// live session elsewhere, which is another device of the same wallet.
+    /// Learned from the HPKE-sealed `TokenRejected` detail, which an exit
+    /// sends only in answer to an `IpRequestV7Detailed`. A token refusal: a
+    /// client walking a stack presents its next token, and reports
+    /// [`Self::DeviceLimit`] once every token was refused this way.
+    SerialInUse,
     /// The exit closed with the opaque policy-rejection code but the
     /// sealed detail did not arrive (e.g. the reply stream was cut).
     /// Definitive all the same: an immediate redial would hit the same
@@ -140,8 +147,17 @@ impl RejectionReason {
             }
             crate::WarrenControlMessage::IpExhausted => Some(Self::IpExhausted),
             crate::WarrenControlMessage::RejectedDeviceLimit => Some(Self::DeviceLimit),
+            // A code this build does not know reads as a token that did not
+            // verify, like the plain `Rejected`.
+            crate::WarrenControlMessage::TokenRejected { reason_code } => {
+                Some(match crate::TokenRejectCode::from_code(*reason_code) {
+                    crate::TokenRejectCode::SerialInUse => Self::SerialInUse,
+                    _ => Self::NotAllowlisted,
+                })
+            }
             crate::WarrenControlMessage::IpRequest { .. }
             | crate::WarrenControlMessage::IpRequestV7 { .. }
+            | crate::WarrenControlMessage::IpRequestV7Detailed { .. }
             | crate::WarrenControlMessage::IpAssign { .. }
             // A drain advisory is operational, not a setup rejection: it
             // must NOT map to a fatal RejectionReason (same contract as
@@ -171,6 +187,7 @@ impl RejectionReason {
             Self::Banned(_) => "banned",
             Self::IpExhausted => "ip-pool-exhausted",
             Self::DeviceLimit => "device-limit",
+            Self::SerialInUse => "serial-in-use",
             Self::PolicyRefused => "policy-refused",
         }
     }
@@ -195,6 +212,8 @@ impl RejectionReason {
             Self::Banned(_) => Retryability::Fatal(FatalCause::Banned),
             Self::PolicyRefused => Retryability::Fatal(FatalCause::PolicyRefused),
             Self::DeviceLimit => Retryability::Fatal(FatalCause::DeviceLimit),
+            // As the last word on a stack, see the variant.
+            Self::SerialInUse => Retryability::Fatal(FatalCause::DeviceLimit),
             Self::IpExhausted => Retryability::RetryReselect,
         }
     }
@@ -221,6 +240,7 @@ mod tests {
             RejectionReason::Banned(0),
             RejectionReason::IpExhausted,
             RejectionReason::DeviceLimit,
+            RejectionReason::SerialInUse,
             RejectionReason::PolicyRefused,
         ] {
             assert_eq!(
@@ -382,6 +402,22 @@ mod tests {
             Some(RejectionReason::DeviceLimit),
             "the sealed device limit detail refines the opaque close into a device limit"
         );
+        assert_eq!(
+            RejectionReason::from_sealed_detail(&WarrenControlMessage::TokenRejected {
+                reason_code: 1
+            }),
+            Some(RejectionReason::SerialInUse),
+            "a token whose serial another device holds is told apart from an invalid one"
+        );
+        for unspecified in [0u8, 200] {
+            assert_eq!(
+                RejectionReason::from_sealed_detail(&WarrenControlMessage::TokenRejected {
+                    reason_code: unspecified
+                }),
+                Some(RejectionReason::NotAllowlisted),
+                "token refusal code {unspecified} reads as a token that did not verify"
+            );
+        }
         let assign = WarrenControlMessage::IpAssign {
             ipv4: [10, 66, 0, 2],
             prefix_len: 24,
