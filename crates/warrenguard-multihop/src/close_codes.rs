@@ -107,6 +107,14 @@ pub enum RejectionReason {
     /// client walking a stack presents its next token, and reports
     /// [`Self::DeviceLimit`] once every token was refused this way.
     SerialInUse,
+    /// The exit refused every token of the stack a client walked, and none
+    /// of those refusals said why: the exit predates `TokenRejected`, or the
+    /// detail was lost. Each token either did not verify or had its serial in
+    /// use elsewhere, and the client cannot tell which. Fatal like
+    /// [`Self::NotAllowlisted`]; a deployer that knows the subscription is
+    /// active reads it as the device limit. Never a sealed detail: the
+    /// supervisor's verdict on a whole stack.
+    TokensRefusedWithoutReason,
     /// The exit closed with the opaque policy-rejection code but the
     /// sealed detail did not arrive (e.g. the reply stream was cut).
     /// Definitive all the same: an immediate redial would hit the same
@@ -188,6 +196,7 @@ impl RejectionReason {
             Self::IpExhausted => "ip-pool-exhausted",
             Self::DeviceLimit => "device-limit",
             Self::SerialInUse => "serial-in-use",
+            Self::TokensRefusedWithoutReason => "tokens-refused-without-reason",
             Self::PolicyRefused => "policy-refused",
         }
     }
@@ -204,7 +213,9 @@ impl RejectionReason {
     pub fn retryability(self) -> warrenguard_wire::Retryability {
         use warrenguard_wire::{FatalCause, Retryability};
         match self {
-            Self::NotAllowlisted => Retryability::Fatal(FatalCause::NotAuthorized),
+            Self::NotAllowlisted | Self::TokensRefusedWithoutReason => {
+                Retryability::Fatal(FatalCause::NotAuthorized)
+            }
             // The reason code carries no retry semantics: every ban is fatal
             // and fleet-wide. It only refines the user-facing message
             // (surfaced separately by the client), so FatalCause stays a plain
@@ -241,6 +252,7 @@ mod tests {
             RejectionReason::IpExhausted,
             RejectionReason::DeviceLimit,
             RejectionReason::SerialInUse,
+            RejectionReason::TokensRefusedWithoutReason,
             RejectionReason::PolicyRefused,
         ] {
             assert_eq!(
