@@ -54,7 +54,10 @@ pub enum AnchorState {
 
 struct AnchorInner {
     secret: RouteAnchorSecret,
-    kem: RouteKemPublicKey,
+    /// The control plane's key, set once: at construction, or later through
+    /// [`RouteAnchorHandle::provide_key`] for an anchor built before its
+    /// consumer knew it.
+    kem: watch::Sender<Option<RouteKemPublicKey>>,
     state: watch::Sender<AnchorState>,
     /// Bumped on every bound verdict, so a route supervisor can tell a bind
     /// that happened after a refusal from the one that preceded it.
@@ -71,12 +74,55 @@ impl RouteAnchorHandle {
     /// A fresh anchor with a newly drawn secret.
     #[must_use]
     pub fn new(config: RouteAnchorConfig) -> Self {
+        Self::with_key(Some(config.kem), AnchorState::Unanchored)
+    }
+
+    /// A fresh anchor whose control-plane key is not known yet, for a main
+    /// session that starts before its consumer read the key: it reads
+    /// [`AnchorState::Unavailable`], so routes run on tokens, until
+    /// [`Self::provide_key`] hands it the key. A main supervisor holding it
+    /// then anchors its live session at once when that session was admitted on
+    /// a token, and at its next setup on a token otherwise.
+    #[must_use]
+    pub fn awaiting_key() -> Self {
+        Self::with_key(None, AnchorState::Unavailable)
+    }
+
+    fn with_key(kem: Option<RouteKemPublicKey>, state: AnchorState) -> Self {
         Self(Arc::new(AnchorInner {
             secret: RouteAnchorSecret::generate(),
-            kem: config.kem,
-            state: watch::channel(AnchorState::Unanchored).0,
+            kem: watch::channel(kem).0,
+            state: watch::channel(state).0,
             binds: std::sync::atomic::AtomicU64::new(0),
         }))
+    }
+
+    /// Hands an anchor built by [`Self::awaiting_key`] its control-plane key.
+    /// The first key is the anchor's for its whole life, since the control
+    /// plane binds the secret sealed to it: returns `false`, and changes
+    /// nothing, when the anchor already has one.
+    #[must_use = "false means the anchor kept the key it already had"]
+    pub fn provide_key(&self, kem: RouteKemPublicKey) -> bool {
+        self.0.kem.send_if_modified(|current| {
+            if current.is_some() {
+                return false;
+            }
+            *current = Some(kem);
+            true
+        })
+    }
+
+    /// Whether the anchor has its control-plane key.
+    #[must_use]
+    pub fn has_key(&self) -> bool {
+        self.0.kem.borrow().is_some()
+    }
+
+    /// Resolves once the anchor has its control-plane key.
+    pub(crate) async fn key_provided(&self) {
+        let mut kem = self.0.kem.subscribe();
+        // The sender lives as long as this handle, so the wait cannot fail.
+        let _ = kem.wait_for(Option::is_some).await;
     }
 
     /// Follow the anchor state.
@@ -96,13 +142,18 @@ impl RouteAnchorHandle {
     ///
     /// # Errors
     ///
-    /// [`RouteSealError`] when the route KEM key refuses the seal.
+    /// [`RouteSealError`] when the route KEM key refuses the seal, and
+    /// [`RouteSealError::Seal`] when the anchor has no key yet.
     pub fn seal_locator(&self, exit_id: &ExitId) -> Result<SealedToApi, RouteSealError> {
-        seal_route_locator(&self.0.kem, &self.0.secret, exit_id)
+        let kem = self.0.kem.borrow();
+        let kem = kem.as_ref().ok_or(RouteSealError::Seal)?;
+        seal_route_locator(kem, &self.0.secret, exit_id)
     }
 
     fn seal_anchor(&self, serial: &[u8; 32]) -> Result<SealedToApi, RouteSealError> {
-        seal_route_anchor(&self.0.kem, &self.0.secret, serial)
+        let kem = self.0.kem.borrow();
+        let kem = kem.as_ref().ok_or(RouteSealError::Seal)?;
+        seal_route_anchor(kem, &self.0.secret, serial)
     }
 
     /// How many bound verdicts this anchor has had.
@@ -484,6 +535,25 @@ mod tests {
             rendered, "RouteAnchorHandle { state: Unanchored, .. }",
             "Debug renders the state only"
         );
+    }
+
+    #[test]
+    fn an_anchor_awaiting_its_key_is_unavailable_and_takes_the_first_key_only() {
+        let key = RouteKemSecretKey::derive(&[0x72; 32], 1).expect("kem");
+        let other = RouteKemSecretKey::derive(&[0x73; 32], 2).expect("kem");
+        let handle = RouteAnchorHandle::awaiting_key();
+        let exit = ExitId::from_bytes([3; 16]);
+        assert_eq!(handle.current_state(), AnchorState::Unavailable);
+        assert!(
+            handle.seal_locator(&exit).is_err(),
+            "nothing to seal to yet"
+        );
+
+        assert!(handle.provide_key(key.public_key().clone()));
+        assert!(!handle.provide_key(other.public_key().clone()));
+
+        key.open_locator(&handle.seal_locator(&exit).expect("seal"), &exit)
+            .expect("sealed to the first key");
     }
 
     #[test]

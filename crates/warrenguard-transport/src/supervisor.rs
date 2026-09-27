@@ -1297,6 +1297,15 @@ impl MultiHopSupervisor {
                         bundle.force_close_for_reconnect();
                         bundle.closed().await
                     }
+                    () = key_provided(
+                        route_control.awaiting_key.as_ref().map(|(anchor, _)| anchor.clone())
+                    ) => {
+                        if let Some((anchor, serial)) = route_control.awaiting_key.take() {
+                            route_control.anchoring =
+                                Some(self.spawn_anchoring(anchor, &bundle, &primary, serial));
+                        }
+                        continue;
+                    }
                     reason = route_control.ended() => {
                         // The exit ended this route (its anchor is gone): end
                         // the run so the consumer falls back to a token route.
@@ -1496,6 +1505,7 @@ impl MultiHopSupervisor {
                 events: Some(events),
                 anchoring: None,
                 lease: None,
+                awaiting_key: None,
             };
         }
         let Some(lead) = lead else {
@@ -1520,8 +1530,37 @@ impl MultiHopSupervisor {
                 events: None,
                 anchoring: None,
                 lease,
+                awaiting_key: None,
             };
         };
+        if !anchor.has_key() {
+            // Anchored as soon as the key arrives, on this same session.
+            anchor.set_state(crate::route_anchor::AnchorState::Unavailable);
+            return SessionRouteControl {
+                events: None,
+                anchoring: None,
+                lease,
+                awaiting_key: Some((anchor, serial_rx)),
+            };
+        }
+        let anchoring = self.spawn_anchoring(anchor, bundle, primary, serial_rx);
+        SessionRouteControl {
+            events: None,
+            anchoring: Some(anchoring),
+            lease,
+            awaiting_key: None,
+        }
+    }
+
+    /// Register `anchor` for the session `primary` leads, on the serial of
+    /// the lease it holds, and keep it registered.
+    fn spawn_anchoring(
+        &self,
+        anchor: crate::route_anchor::RouteAnchorHandle,
+        bundle: &Arc<MultiHopBundle>,
+        primary: &Arc<MultiHopClient>,
+        serial: watch::Receiver<[u8; 32]>,
+    ) -> tokio::task::JoinHandle<()> {
         // A new setup starts over: an earlier setup's "unavailable" says
         // nothing about this one. A bound anchor stays bound meanwhile, since
         // the control plane keeps it through a reconnect.
@@ -1530,19 +1569,14 @@ impl MultiHopSupervisor {
         }
         let (tap, acks) = tokio::sync::mpsc::unbounded_channel();
         bundle.set_route_tap(tap);
-        let anchoring = tokio::spawn(crate::route_anchor::run_anchoring(
+        tokio::spawn(crate::route_anchor::run_anchoring(
             anchor,
             Arc::clone(primary),
-            serial_rx,
+            serial,
             self.config.session_token_provider.clone(),
             acks,
             self.anchor_schedule,
-        ));
-        SessionRouteControl {
-            events: None,
-            anchoring: Some(anchoring),
-            lease,
-        }
+        ))
     }
 
     /// Snapshot the live circuit target (relay + exit), cloning out of the
@@ -2429,6 +2463,21 @@ struct SessionRouteControl {
     anchoring: Option<tokio::task::JoinHandle<()>>,
     /// The session's lease refresh, for a session admitted on a token.
     lease: Option<tokio::task::JoinHandle<()>>,
+    /// The anchor of a main session admitted on a token before the anchor had
+    /// its key, with the serial of the lease the session holds.
+    awaiting_key: Option<(
+        crate::route_anchor::RouteAnchorHandle,
+        watch::Receiver<[u8; 32]>,
+    )>,
+}
+
+/// Resolves once `anchor`, which a main session could not register for want
+/// of a key, has one; never without an anchor.
+async fn key_provided(anchor: Option<crate::route_anchor::RouteAnchorHandle>) {
+    match anchor {
+        Some(anchor) => anchor.key_provided().await,
+        None => std::future::pending().await,
+    }
 }
 
 impl SessionRouteControl {
@@ -5780,6 +5829,75 @@ mod route_run_tests {
             opens_for_serial(&kem, &seen[0].sealed, &session_token_serial(&token(1))),
             "the anchor is sealed to the serial the setup was admitted on"
         );
+        task.abort();
+        reader.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_main_session_set_up_before_its_key_anchors_once_the_key_arrives_without_a_new_setup()
+    {
+        let (operational_key, kem) = (SigningKey::from_bytes(&[0x8A; 32]), kem());
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x9A; 16]));
+        exit.anchor_script.lock().push_back(Some(0));
+        let anchor = RouteAnchorHandle::awaiting_key();
+        let (tokens, _) = provider(vec![vec![token(0x1A)]]);
+        let (supervisor, rx) = main_supervisor(&exit, &operational_key, Some(tokens), &anchor);
+        let reader = spawn_reader(rx);
+        let task = tokio::spawn(supervisor.run());
+        wait_for("the first setup", || exit.setup_requests.lock().len() == 1).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(anchor.current_state(), AnchorState::Unavailable);
+        assert!(exit.anchor_requests.lock().is_empty(), "no key, no request");
+
+        assert!(anchor.provide_key(kem.public_key().clone()));
+
+        wait_state(&anchor, AnchorState::Anchored { max_routes: 32 }).await;
+        assert_eq!(
+            exit.setup_requests.lock().len(),
+            1,
+            "the live session anchors, it is not set up again"
+        );
+        let seen = exit.anchor_requests.lock().clone();
+        assert!(
+            opens_for_serial(&kem, &seen[0].sealed, &session_token_serial(&token(0x1A))),
+            "sealed to the serial the live session was admitted on"
+        );
+        task.abort();
+        reader.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wallet_main_session_given_its_key_anchors_at_its_next_setup_on_a_token() {
+        let (operational_key, kem) = (SigningKey::from_bytes(&[0x8B; 32]), kem());
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x9B; 16]));
+        exit.anchor_script.lock().push_back(Some(0));
+        let anchor = RouteAnchorHandle::awaiting_key();
+        let (tokens, _) = provider(vec![Vec::new(), vec![token(0x1B)]]);
+        let (supervisor, rx) = main_supervisor(&exit, &operational_key, Some(tokens), &anchor);
+        let handle = supervisor.handle();
+        let reader = spawn_reader(rx);
+        let task = tokio::spawn(supervisor.run());
+        wait_for("the wallet setup", || exit.setup_requests.lock().len() == 1).await;
+
+        assert!(anchor.provide_key(kem.public_key().clone()));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            anchor.current_state(),
+            AnchorState::Unavailable,
+            "a wallet session has no serial to anchor on"
+        );
+        assert!(exit.anchor_requests.lock().is_empty());
+
+        handle.overlap_reconnect();
+
+        wait_state(&anchor, AnchorState::Anchored { max_routes: 32 }).await;
+        let seen = exit.anchor_requests.lock().clone();
+        assert!(opens_for_serial(
+            &kem,
+            &seen[0].sealed,
+            &session_token_serial(&token(0x1B))
+        ));
+        drop(handle);
         task.abort();
         reader.abort();
     }
