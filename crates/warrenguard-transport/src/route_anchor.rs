@@ -253,11 +253,12 @@ impl AnchorSchedule {
     };
 }
 
-/// Anchor one main session: send the request sealed to `serial`, follow the
-/// acks, re-send on `lost`, present a token on `needs token`. Runs until the
-/// session's acks stop (the bundle is gone) or a verdict makes the anchor
-/// unavailable for this setup. The caller aborts it when the session is
-/// replaced.
+/// Anchor one main session: send the request sealed to the serial of the
+/// lease the session holds (`lease_serial`, which a lease refresh moves),
+/// follow the acks, re-send on `lost` and when the lease moves, present a
+/// token on `needs token`. Runs until the session's acks stop (the bundle is
+/// gone) or a verdict makes the anchor unavailable for this setup. The caller
+/// aborts it when the session is replaced.
 ///
 /// The token provider is asked at most once per setup: its stack is kept and
 /// walked one token per refusal, so a hostile exit answering `needs token`
@@ -265,14 +266,26 @@ impl AnchorSchedule {
 pub(crate) async fn run_anchoring(
     anchor: RouteAnchorHandle,
     primary: Arc<MultiHopClient>,
-    mut serial: [u8; 32],
+    mut lease_serial: watch::Receiver<[u8; 32]>,
     tokens: Option<SessionTokenProvider>,
     mut acks: mpsc::UnboundedReceiver<RouteDownlink>,
     schedule: AnchorSchedule,
 ) {
+    let mut refreshed = *lease_serial.borrow_and_update();
+    let mut serial = refreshed;
     let mut token: Option<SessionToken> = None;
     let mut stack: Option<std::collections::VecDeque<SessionToken>> = None;
     loop {
+        // The lease moved onto a refreshed token: the anchor follows it, and
+        // the session needs no token for that. Compared with the last value
+        // seen rather than with `serial`, which a token this task presented
+        // moved on its own.
+        let current = *lease_serial.borrow();
+        if current != refreshed {
+            refreshed = current;
+            serial = current;
+            token = None;
+        }
         let Ok(sealed) = anchor.seal_anchor(&serial) else {
             anchor.set_state(AnchorState::Unavailable);
             return;
@@ -316,15 +329,11 @@ pub(crate) async fn run_anchoring(
                 // The session holds that token's lease now; a later request
                 // needs none.
                 token = None;
-                // Stay on the session: the exit reports a lost anchor.
-                loop {
-                    match next_ack(&mut acks).await {
-                        None => return,
-                        Some((RouteAnchorStatus::Lost, _)) => break,
-                        Some(_) => {}
-                    }
+                // Stay on the session: the exit reports a lost anchor, and a
+                // lease refresh moves the serial the anchor must hang on.
+                if !wait_for_rehome(&mut acks, &mut lease_serial).await {
+                    return;
                 }
-                tracing::info!("route anchor lost; registering it again");
             }
             RouteAnchorStatus::Lost => {}
             // A token is due: at first because the session holds no live lease
@@ -368,6 +377,37 @@ pub(crate) async fn run_anchoring(
             .is_ok()
         {
             return;
+        }
+    }
+}
+
+/// Wait, on a bound anchor, for a reason to register it again: the exit
+/// reports it lost, or the session's lease moved to another serial. `false`
+/// once the session is gone.
+async fn wait_for_rehome(
+    acks: &mut mpsc::UnboundedReceiver<RouteDownlink>,
+    lease_serial: &mut watch::Receiver<[u8; 32]>,
+) -> bool {
+    // Once the lease refresh ended (an exit that does not refresh), its
+    // watch never changes again: only the acks are followed.
+    let mut refreshing = true;
+    loop {
+        tokio::select! {
+            ack = next_ack(acks) => match ack {
+                None => return false,
+                Some((RouteAnchorStatus::Lost, _)) => {
+                    tracing::info!("route anchor lost; registering it again");
+                    return true;
+                }
+                Some(_) => {}
+            },
+            changed = lease_serial.changed(), if refreshing => {
+                if changed.is_ok() {
+                    tracing::info!("session lease refreshed; moving the route anchor onto it");
+                    return true;
+                }
+                refreshing = false;
+            }
         }
     }
 }

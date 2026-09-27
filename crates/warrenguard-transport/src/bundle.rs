@@ -211,6 +211,10 @@ pub struct MultiHopBundle {
     /// session anchors or is a route: `recv()` hands it the anchor acks and
     /// route ends, which never reach the consumer.
     route_tap: RwLock<Option<crate::route_anchor::RouteTap>>,
+    /// Lease refresh intercept, installed by the supervisor on a session
+    /// admitted on a token: `recv()` hands it the lease refresh acks, which
+    /// never reach the consumer.
+    lease_tap: RwLock<Option<crate::lease_refresh::LeaseTap>>,
     /// Cached per-leg MTU policy, refreshed every
     /// [`ROUTING_PLAN_REFRESH_PACKETS`] uplink packets and on every bundle
     /// width change. Read on the uplink hot path; never computed there.
@@ -286,6 +290,7 @@ impl MultiHopBundle {
             source_addresses: OnceLock::new(),
             probe_tap: RwLock::new(None),
             route_tap: RwLock::new(None),
+            lease_tap: RwLock::new(None),
             routing: RwLock::new(plan),
             routing_tick: AtomicU64::new(0),
             unresponsive: PlMutex::new(Vec::new()),
@@ -575,14 +580,29 @@ impl MultiHopBundle {
         *self.route_tap.write() = Some(tap);
     }
 
-    /// Hands a route control message to the route intercept. `true` when it
-    /// was one and was taken.
+    /// Installs the lease refresh intercept consulted by [`Self::recv`].
+    pub(crate) fn set_lease_tap(&self, tap: crate::lease_refresh::LeaseTap) {
+        *self.lease_tap.write() = Some(tap);
+    }
+
+    /// Hands a route or lease control message to its intercept. `true` when
+    /// it was one and was taken.
     fn intercept_route_control(&self, payload: &[u8]) -> bool {
-        let tap = self.route_tap.read();
-        let Some(tap) = tap.as_ref() else {
+        let route_tap = self.route_tap.read();
+        let lease_tap = self.lease_tap.read();
+        if route_tap.is_none() && lease_tap.is_none() {
+            return false;
+        }
+        let Ok(Some(msg)) = warrenguard_multihop::try_decode_control(payload) else {
             return false;
         };
-        let Ok(Some(msg)) = warrenguard_multihop::try_decode_control(payload) else {
+        if let Some(tap) = lease_tap.as_ref()
+            && let warrenguard_multihop::WarrenControlMessage::LeaseRefreshAck { status } = msg
+        {
+            let _ = tap.send(warrenguard_multihop::LeaseRefreshStatus::from_code(status));
+            return true;
+        }
+        let Some(tap) = route_tap.as_ref() else {
             return false;
         };
         match crate::route_anchor::RouteDownlink::from_control(&msg) {

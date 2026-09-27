@@ -474,6 +474,12 @@ pub(crate) struct FakeMultihopExit {
     pub(crate) anchor_script: Arc<parking_lot::Mutex<std::collections::VecDeque<Option<u8>>>>,
     /// The setup reply to an `IpRequestRoute`; `None` admits it.
     pub(crate) route_reply: Arc<parking_lot::Mutex<Option<WarrenControlMessage>>>,
+    /// Every `LeaseRefresh` datagram this exit read, in arrival order: the
+    /// token it carried, raw, or `None` for the announcement.
+    pub(crate) lease_requests: Arc<parking_lot::Mutex<Vec<Option<[u8; SESSION_TOKEN_LEN]>>>>,
+    /// Answers to the next lease refresh requests, one per request, in order:
+    /// a `LeaseRefreshAck` status, or `None` to stay silent. Empty: silent.
+    pub(crate) lease_script: Arc<parking_lot::Mutex<std::collections::VecDeque<Option<u8>>>>,
     /// Pushes a sealed control datagram to every admitted leg, optionally
     /// followed by a close with the given code.
     pub(crate) downlink: tokio::sync::broadcast::Sender<(WarrenControlMessage, Option<u32>)>,
@@ -590,6 +596,8 @@ struct FakeExitBehaviour {
     anchor_requests: Arc<parking_lot::Mutex<Vec<SeenAnchorRequest>>>,
     anchor_script: Arc<parking_lot::Mutex<std::collections::VecDeque<Option<u8>>>>,
     route_reply: Arc<parking_lot::Mutex<Option<WarrenControlMessage>>>,
+    lease_requests: Arc<parking_lot::Mutex<Vec<Option<[u8; SESSION_TOKEN_LEN]>>>>,
+    lease_script: Arc<parking_lot::Mutex<std::collections::VecDeque<Option<u8>>>>,
     downlink: tokio::sync::broadcast::Sender<(WarrenControlMessage, Option<u32>)>,
 }
 
@@ -789,6 +797,25 @@ async fn serve_one_fake_exit_connection(
             }
             continue;
         }
+        if let Some(Ok(Some(WarrenControlMessage::LeaseRefresh { session_token }))) =
+            plaintext.as_deref().map(try_decode_control)
+        {
+            behaviour
+                .lease_requests
+                .lock()
+                .push(session_token.map(|t| t.0));
+            let answer = behaviour.lease_script.lock().pop_front().flatten();
+            if let Some(status) = answer
+                && let Some(wire) = seal_control(
+                    &WarrenControlMessage::LeaseRefreshAck { status },
+                    reverse_seq,
+                )
+            {
+                reverse_seq += 1;
+                let _ = conn.send_datagram(wire.into());
+            }
+            continue;
+        }
         let echo = plaintext.as_deref().and_then(echo_reply_for);
         {
             let mut legs = behaviour.legs.lock();
@@ -900,6 +927,8 @@ pub(crate) fn spawn_fake_multihop_exit_on(
         anchor_requests: Arc::new(parking_lot::Mutex::new(Vec::new())),
         anchor_script: Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
         route_reply: Arc::new(parking_lot::Mutex::new(None)),
+        lease_requests: Arc::new(parking_lot::Mutex::new(Vec::new())),
+        lease_script: Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
         downlink: tokio::sync::broadcast::channel(16).0,
     };
 
@@ -967,6 +996,8 @@ pub(crate) fn spawn_fake_multihop_exit_on(
         anchor_requests: behaviour.anchor_requests,
         anchor_script: behaviour.anchor_script,
         route_reply: behaviour.route_reply,
+        lease_requests: behaviour.lease_requests,
+        lease_script: behaviour.lease_script,
         downlink: behaviour.downlink,
         on_next_dial,
         _server_ep: server_ep,

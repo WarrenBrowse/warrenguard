@@ -682,6 +682,8 @@ pub struct MultiHopSupervisor {
     /// When anchor requests are re-sent. The doc 107 schedule in
     /// production; shortened by tests only.
     anchor_schedule: crate::route_anchor::AnchorSchedule,
+    /// When lease refresh requests are sent. Shortened by tests only.
+    lease_schedule: crate::lease_refresh::LeaseSchedule,
 }
 
 /// Consecutive watchdog-forced redials, each of a session whose ENTIRE life
@@ -797,6 +799,7 @@ impl MultiHopSupervisor {
             admission: SessionAdmission::default(),
             route_anchor: None,
             anchor_schedule: crate::route_anchor::AnchorSchedule::DEFAULT,
+            lease_schedule: crate::lease_refresh::LeaseSchedule::DEFAULT,
         };
         (supervisor, rx)
     }
@@ -821,6 +824,15 @@ impl MultiHopSupervisor {
     #[must_use]
     pub fn with_route_anchor(mut self, anchor: crate::route_anchor::RouteAnchorHandle) -> Self {
         self.route_anchor = Some(anchor);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_lease_schedule(
+        mut self,
+        schedule: crate::lease_refresh::LeaseSchedule,
+    ) -> Self {
+        self.lease_schedule = schedule;
         self
     }
 
@@ -1466,10 +1478,11 @@ impl MultiHopSupervisor {
         }
     }
 
-    /// Hook the route admission of a freshly published session: a route
-    /// session listens for its exit ending it; a main session with an anchor
-    /// registers it on the serial `lead` was admitted with (a wallet session,
-    /// with no `lead`, never anchors).
+    /// Hook the control of a freshly published session: a route session
+    /// listens for its exit ending it; a session admitted on a token keeps
+    /// its lease refreshed across epochs, and a main session with an anchor
+    /// registers it on the serial of the lease it holds, `lead`'s at first (a
+    /// wallet session, with no `lead`, does neither).
     fn start_route_control(
         &self,
         bundle: &Arc<MultiHopBundle>,
@@ -1482,14 +1495,32 @@ impl MultiHopSupervisor {
             return SessionRouteControl {
                 events: Some(events),
                 anchoring: None,
+                lease: None,
             };
         }
-        let Some(anchor) = self.route_anchor.clone() else {
+        let Some(lead) = lead else {
+            if let Some(anchor) = self.route_anchor.as_ref() {
+                anchor.set_state(crate::route_anchor::AnchorState::Unavailable);
+            }
             return SessionRouteControl::default();
         };
-        let Some(lead) = lead else {
-            anchor.set_state(crate::route_anchor::AnchorState::Unavailable);
-            return SessionRouteControl::default();
+        let (lease_tap, lease_acks) = tokio::sync::mpsc::unbounded_channel();
+        bundle.set_lease_tap(lease_tap);
+        let (serial_tx, serial_rx) =
+            watch::channel(warrenguard_multihop::session_token_serial(&lead));
+        let lease = Some(tokio::spawn(crate::lease_refresh::run_lease_refresh(
+            Arc::clone(primary),
+            self.config.session_token_provider.clone(),
+            lease_acks,
+            serial_tx,
+            self.lease_schedule,
+        )));
+        let Some(anchor) = self.route_anchor.clone() else {
+            return SessionRouteControl {
+                events: None,
+                anchoring: None,
+                lease,
+            };
         };
         // A new setup starts over: an earlier setup's "unavailable" says
         // nothing about this one. A bound anchor stays bound meanwhile, since
@@ -1502,7 +1533,7 @@ impl MultiHopSupervisor {
         let anchoring = tokio::spawn(crate::route_anchor::run_anchoring(
             anchor,
             Arc::clone(primary),
-            warrenguard_multihop::session_token_serial(&lead),
+            serial_rx,
             self.config.session_token_provider.clone(),
             acks,
             self.anchor_schedule,
@@ -1510,6 +1541,7 @@ impl MultiHopSupervisor {
         SessionRouteControl {
             events: None,
             anchoring: Some(anchoring),
+            lease,
         }
     }
 
@@ -2395,6 +2427,8 @@ const ROUTE_ANCHOR_UNKNOWN_REDIALS: u32 = 3;
 struct SessionRouteControl {
     events: Option<tokio::sync::mpsc::UnboundedReceiver<crate::route_anchor::RouteDownlink>>,
     anchoring: Option<tokio::task::JoinHandle<()>>,
+    /// The session's lease refresh, for a session admitted on a token.
+    lease: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl SessionRouteControl {
@@ -2427,7 +2461,10 @@ impl SessionRouteControl {
 
 impl Drop for SessionRouteControl {
     fn drop(&mut self) {
-        if let Some(task) = self.anchoring.take() {
+        for task in [self.anchoring.take(), self.lease.take()]
+            .into_iter()
+            .flatten()
+        {
             task.abort();
         }
     }
@@ -6239,5 +6276,211 @@ mod route_run_tests {
             exit.setup_requests.lock().len(),
             ROUTE_ANCHOR_UNKNOWN_REDIALS as usize + 1
         );
+    }
+
+    const FAST_LEASE: crate::lease_refresh::LeaseSchedule = crate::lease_refresh::LeaseSchedule {
+        waits: [Duration::from_millis(40); 5],
+        jitter_max: Duration::from_millis(20),
+        refused_pause: Duration::from_millis(10),
+        unavailable_retry: Duration::from_millis(40),
+        unavailable_tries: 2,
+    };
+
+    const REGISTERED: u8 = 0;
+    const REFRESHED: u8 = 1;
+    const REFUSED: u8 = 2;
+    const DUE: u8 = 5;
+
+    /// A token session supervisor (no anchor) on the fast lease schedule.
+    fn token_supervisor(
+        exit: &FakeMultihopExit,
+        operational_key: &SigningKey,
+        tokens: SessionTokenProvider,
+    ) -> (MultiHopSupervisor, ClientWatch) {
+        let mut config = config(exit, operational_key);
+        config.session_token_provider = Some(tokens);
+        let (supervisor, rx) = MultiHopSupervisor::new(config);
+        (supervisor.with_lease_schedule(FAST_LEASE), rx)
+    }
+
+    fn ask_for_a_token(exit: &FakeMultihopExit) {
+        let _ = exit
+            .downlink
+            .send((WarrenControlMessage::LeaseRefreshAck { status: DUE }, None));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_token_session_announces_it_refreshes_its_lease_and_waits_to_be_asked() {
+        let operational_key = SigningKey::from_bytes(&[0xB1; 32]);
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0xC1; 16]));
+        exit.lease_script.lock().push_back(Some(REGISTERED));
+        let (tokens, calls) = provider(vec![vec![token(0x11)]]);
+        let (supervisor, rx) = token_supervisor(&exit, &operational_key, tokens);
+        let reader = spawn_reader(rx);
+        let task = tokio::spawn(supervisor.run());
+
+        wait_for("the announcement", || exit.lease_requests.lock().len() == 1).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            *exit.lease_requests.lock(),
+            vec![None],
+            "one announcement, acknowledged, and no token until the exit asks"
+        );
+        assert_eq!(
+            calls.load(AtomicOrdering::Relaxed),
+            1,
+            "only the setup took a stack"
+        );
+        task.abort();
+        reader.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn when_asked_it_walks_the_providers_tokens_until_the_exit_refreshes_one() {
+        let operational_key = SigningKey::from_bytes(&[0xB2; 32]);
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0xC2; 16]));
+        exit.lease_script
+            .lock()
+            .extend([Some(REGISTERED), Some(REFUSED), Some(REFRESHED)]);
+        let (tokens, _) = provider(vec![vec![token(0x12)], vec![token(0x21), token(0x22)]]);
+        let (supervisor, rx) = token_supervisor(&exit, &operational_key, tokens);
+        let reader = spawn_reader(rx);
+        let task = tokio::spawn(supervisor.run());
+        wait_for("the announcement", || exit.lease_requests.lock().len() == 1).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        ask_for_a_token(&exit);
+
+        wait_for("the refresh", || exit.lease_requests.lock().len() == 3).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            *exit.lease_requests.lock(),
+            vec![None, Some(token(0x21).0), Some(token(0x22).0)],
+            "the refused token is followed by the next, one per request, and nothing after the refresh"
+        );
+        task.abort();
+        reader.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_exit_that_never_answers_the_announcement_is_never_sent_a_token() {
+        let operational_key = SigningKey::from_bytes(&[0xB3; 32]);
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0xC3; 16]));
+        let (tokens, calls) = provider(vec![vec![token(0x13)], vec![token(0x31)]]);
+        let (supervisor, rx) = token_supervisor(&exit, &operational_key, tokens);
+        let reader = spawn_reader(rx);
+        let task = tokio::spawn(supervisor.run());
+
+        wait_for("every retry", || exit.lease_requests.lock().len() == 5).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        ask_for_a_token(&exit);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            *exit.lease_requests.lock(),
+            vec![None; 5],
+            "an exit that predates the refresh is announced to five times, then left alone"
+        );
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
+        task.abort();
+        reader.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wallet_session_never_announces_a_lease_refresh() {
+        let operational_key = SigningKey::from_bytes(&[0xB4; 32]);
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0xC4; 16]));
+        let (tokens, _) = provider(Vec::new());
+        let (supervisor, rx) = token_supervisor(&exit, &operational_key, tokens);
+        let reader = spawn_reader(rx);
+        let task = tokio::spawn(supervisor.run());
+        wait_for("the wallet setup", || exit.setup_requests.lock().len() == 1).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            exit.lease_requests.lock().is_empty(),
+            "a wallet session holds no lease"
+        );
+        task.abort();
+        reader.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_anchor_moves_onto_the_serial_of_the_refreshed_lease() {
+        let (operational_key, kem) = (SigningKey::from_bytes(&[0xB5; 32]), kem());
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0xC5; 16]));
+        exit.anchor_script.lock().extend([Some(0), Some(0)]);
+        exit.lease_script
+            .lock()
+            .extend([Some(REGISTERED), Some(REFRESHED)]);
+        let anchor = anchor(&kem);
+        let (tokens, _) = provider(vec![vec![token(0x15)], vec![token(0x51)]]);
+        let (supervisor, rx) = main_supervisor(&exit, &operational_key, Some(tokens), &anchor);
+        let supervisor = supervisor.with_lease_schedule(FAST_LEASE);
+        let reader = spawn_reader(rx);
+        let task = tokio::spawn(supervisor.run());
+        wait_state(&anchor, AnchorState::Anchored { max_routes: 32 }).await;
+        wait_for("the announcement", || exit.lease_requests.lock().len() == 1).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        ask_for_a_token(&exit);
+
+        wait_for("the anchor to follow", || {
+            exit.anchor_requests.lock().len() == 2
+        })
+        .await;
+        let seen = exit.anchor_requests.lock().clone();
+        assert!(
+            opens_for_serial(&kem, &seen[1].sealed, &session_token_serial(&token(0x51))),
+            "the anchor is sealed to the refreshed serial"
+        );
+        assert!(
+            seen[1].token.is_none(),
+            "the lease is already on that serial: no token is spent for the anchor"
+        );
+        assert_eq!(
+            exit.setup_requests.lock().len(),
+            1,
+            "the session was never set up again"
+        );
+        task.abort();
+        reader.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_session_ended_for_an_expired_lease_is_redialled_on_fresh_tokens_and_is_not_fatal() {
+        let operational_key = SigningKey::from_bytes(&[0xB6; 32]);
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0xC6; 16]));
+        exit.lease_script.lock().push_back(Some(REGISTERED));
+        let (tokens, _) = provider(vec![vec![token(0x16)], vec![token(0x61)]]);
+        let mut config = config(&exit, &operational_key);
+        config.session_token_provider = Some(tokens);
+        config.backoff = Backoff {
+            base: Duration::from_millis(10),
+            max: Duration::from_millis(20),
+        };
+        let (supervisor, rx) = MultiHopSupervisor::new(config);
+        let supervisor = supervisor.with_lease_schedule(FAST_LEASE);
+        let fatal = supervisor.fatal_rx();
+        let reader = spawn_reader(rx);
+        let task = tokio::spawn(supervisor.run());
+        wait_for("the announcement", || exit.lease_requests.lock().len() == 1).await;
+
+        let _ = exit.downlink.send((
+            WarrenControlMessage::LeaseRefreshAck { status: 6 },
+            Some(warrenguard_multihop::WARREN_MH_LEASE_EXPIRED),
+        ));
+
+        wait_for("the redial", || exit.setup_requests.lock().len() == 2).await;
+        assert_eq!(
+            exit.setup_requests.lock()[1],
+            SeenSetupRequest::Tokens(vec![token(0x61).0]),
+            "the redial presents a fresh stack"
+        );
+        assert!(
+            fatal.borrow().is_none(),
+            "an expired lease is not a rejection"
+        );
+        assert!(!task.is_finished());
+        task.abort();
+        reader.abort();
     }
 }

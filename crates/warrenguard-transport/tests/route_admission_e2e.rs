@@ -1,7 +1,8 @@
 //! Route admission by anchor end to end: the real client supervisors (a main
 //! session that anchors, a route session admitted on it) against the real
 //! exit termination loop over loopback QUIC, with a fake control plane that
-//! holds a real route KEM key and opens every blob the way the API does.
+//! holds a real route KEM key and opens every blob the way the API does. The
+//! main session refreshes its lease across epochs and the anchor follows it.
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -421,6 +422,75 @@ async fn the_anchor_follows_the_main_session_across_a_reconnect() {
     .await;
     assert_eq!(route_exit.registry.live_route_session_count(), 1);
     assert!(!route_task.is_finished(), "the route session is untouched");
+    main.abort();
+    main_reader.abort();
+    route_task.abort();
+    route_reader.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_lease_is_refreshed_in_place_and_an_expired_one_redials_with_the_routes_untouched()
+{
+    let (kem, anchors): (_, Anchors) = (kem(), Arc::default());
+    let main_exit = spawn_exit(0x37, &kem, &anchors, true);
+    let route_exit = spawn_exit(0x38, &kem, &anchors, true);
+    let anchor = RouteAnchorHandle::new(RouteAnchorConfig {
+        kem: kem.public_key().clone(),
+    });
+    // The setup, the refresh, then the redial after the expiry each take one
+    // stack from the provider.
+    let (main, main_reader, _) = run_main(&main_exit, &anchor, vec![0x15, 0x16, 0x17]);
+    wait_state(&anchor, AnchorState::Anchored { max_routes: 32 }).await;
+    let serial = |fill: u8| session_token_serial(&SessionToken([fill; SESSION_TOKEN_LEN]));
+    let (route, rx) = route_supervisor(&route_exit, &anchor, true);
+    let route_reader = spawn_reader(rx);
+    let route_task = tokio::spawn(route.run());
+    wait_for("the admitted route session", || {
+        route_exit.registry.live_route_session_count() == 1
+    })
+    .await;
+
+    // The deployer's renewal finds the main's lease of a past epoch, once the
+    // client has announced that it refreshes.
+    wait_for("the refresh announcement", || {
+        main_exit
+            .registry
+            .lease_refresh_due(&serial(0x15))
+            .is_some_and(|stale| stale.capable)
+    })
+    .await;
+    // The client waits a random delay of up to 20 s, then presents a token.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while main_exit.registry.live_token_serials() != vec![serial(0x16)] {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the lease moved onto the refresh token");
+    wait_for("the anchor re-homed on the refreshed serial", || {
+        anchors.lock().values().copied().collect::<Vec<_>>() == vec![serial(0x16)]
+    })
+    .await;
+    assert_eq!(
+        route_exit.registry.live_route_session_count(),
+        1,
+        "the route never noticed"
+    );
+
+    // A session that does not refresh in time is ended; the client redials on
+    // a fresh token and re-homes the anchor, and the route is still untouched.
+    assert_eq!(main_exit.registry.end_expired_lease(&serial(0x16)), 1);
+    wait_for("the redialled main session", || {
+        main_exit.registry.live_token_serials() == vec![serial(0x17)]
+    })
+    .await;
+    wait_for("the anchor re-homed after the redial", || {
+        anchors.lock().values().copied().collect::<Vec<_>>() == vec![serial(0x17)]
+    })
+    .await;
+    assert!(!main.is_finished(), "an expired lease is not fatal");
+    assert_eq!(route_exit.registry.live_route_session_count(), 1);
+    assert!(!route_task.is_finished());
     main.abort();
     main_reader.abort();
     route_task.abort();

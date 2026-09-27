@@ -21,6 +21,9 @@ pub mod drain_policy;
 mod dial_target;
 pub mod egress_probe;
 pub mod ip_assign;
+/// Epoch lease refresh, client side: a session admitted on a token presents
+/// a token of each new epoch when its exit asks for one.
+pub(crate) mod lease_refresh;
 // `ios_tun` is portable (pure tokio + mpsc) so it compiles on every target for
 // host-side unit tests; public exposure is gated to iOS below.
 mod ios_tun;
