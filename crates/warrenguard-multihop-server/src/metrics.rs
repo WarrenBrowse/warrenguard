@@ -674,6 +674,160 @@ impl RouteAdmissionSnapshot {
     }
 }
 
+/// What became of an epoch lease refresh event on this exit, for
+/// [`LeaseRefreshMetrics`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LeaseRefreshResult {
+    /// A client announced it refreshes its lease (`LeaseRefresh` with no token).
+    Announced,
+    /// A presented token was spent and the session's lease moved onto it.
+    Refreshed,
+    /// A presented token was refused.
+    Refused,
+    /// The control plane could not be asked in time.
+    Unavailable,
+    /// A request on a session that holds no token lease.
+    NotEligible,
+    /// A byte-identical repeat answered from the last verdict, no spend.
+    Deduplicated,
+    /// Dropped: a spend was in flight, or the last one was under 2 s ago.
+    Throttled,
+    /// A `due` ack the exit sent to a session whose lease went stale.
+    DueSent,
+    /// A session found holding a lease of a past epoch, whose client had
+    /// announced the capability. Counted once per stale lease.
+    StaleCapable,
+    /// The same, for a client that had not: an older client, or one that
+    /// withholds the announcement. Its share of the stale sessions is the
+    /// adoption signal the enforcement switch waits on.
+    StaleIncapable,
+    /// A session the exit ended because its lease was not refreshed in time.
+    Expired,
+}
+
+impl LeaseRefreshResult {
+    const LABELS: [&'static str; 11] = [
+        "announced",
+        "refreshed",
+        "refused",
+        "unavailable",
+        "not_eligible",
+        "deduplicated",
+        "throttled",
+        "due_sent",
+        "stale_capable",
+        "stale_incapable",
+        "expired",
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Announced => 0,
+            Self::Refreshed => 1,
+            Self::Refused => 2,
+            Self::Unavailable => 3,
+            Self::NotEligible => 4,
+            Self::Deduplicated => 5,
+            Self::Throttled => 6,
+            Self::DueSent => 7,
+            Self::StaleCapable => 8,
+            Self::StaleIncapable => 9,
+            Self::Expired => 10,
+        }
+    }
+
+    /// The result an ack status counts as.
+    pub(crate) const fn of_status(status: warrenguard_multihop::LeaseRefreshStatus) -> Self {
+        use warrenguard_multihop::LeaseRefreshStatus as S;
+        match status {
+            S::Registered => Self::Announced,
+            S::Refreshed => Self::Refreshed,
+            S::Unavailable => Self::Unavailable,
+            S::NotEligible => Self::NotEligible,
+            S::Due => Self::DueSent,
+            S::Expired => Self::Expired,
+            _ => Self::Refused,
+        }
+    }
+}
+
+/// Node-wide accounting of epoch lease refresh on this exit (warren-core doc
+/// 107 section 5.5): `warren_exit_lease_refresh_total{result}`.
+///
+/// Same privacy contract as every block here: counters only, never a serial
+/// or a label naming a client.
+#[derive(Debug)]
+pub struct LeaseRefreshMetrics {
+    counts: [AtomicU64; 11],
+}
+
+static LEASE_REFRESH: LeaseRefreshMetrics = LeaseRefreshMetrics::new();
+
+/// The process-wide lease refresh block.
+#[must_use]
+pub fn lease_refresh_metrics() -> &'static LeaseRefreshMetrics {
+    &LEASE_REFRESH
+}
+
+/// Point-in-time read of the process-wide lease refresh block.
+#[must_use]
+pub fn lease_refresh_snapshot() -> LeaseRefreshSnapshot {
+    LEASE_REFRESH.snapshot()
+}
+
+impl Default for LeaseRefreshMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LeaseRefreshMetrics {
+    /// A zeroed block.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            counts: [const { AtomicU64::new(0) }; 11],
+        }
+    }
+
+    pub(crate) fn record(&self, result: LeaseRefreshResult) {
+        self.counts[result.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Reads every counter.
+    #[must_use]
+    pub fn snapshot(&self) -> LeaseRefreshSnapshot {
+        LeaseRefreshSnapshot {
+            counts: self.counts.each_ref().map(|a| a.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+/// A point-in-time view of [`LeaseRefreshMetrics`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LeaseRefreshSnapshot {
+    counts: [u64; 11],
+}
+
+impl LeaseRefreshSnapshot {
+    /// `warren_exit_lease_refresh_total{result}`.
+    #[must_use]
+    pub fn by_result(&self) -> [(&'static str, u64); 11] {
+        let mut out = [("", 0); 11];
+        for (i, label) in LeaseRefreshResult::LABELS.iter().enumerate() {
+            out[i] = (label, self.counts[i]);
+        }
+        out
+    }
+
+    /// One counter.
+    #[must_use]
+    pub const fn count(&self, result: LeaseRefreshResult) -> u64 {
+        self.counts[result.index()]
+    }
+}
+
 /// How one setup was admitted or refused, by the kind of admission the client
 /// asked for: wallet-signed (`IpRequest`) or anonymous token (`IpRequestV7`).
 /// Route setups have their own block ([`RouteAdmissionMetrics`]).
@@ -1217,6 +1371,36 @@ mod tests {
         assert_eq!(anchor[1], ("needs_token", 1));
         assert_eq!(anchor[7], ("throttled", 1));
         assert_eq!(anchor.iter().map(|(_, n)| n).sum::<u64>(), 2);
+    }
+
+    #[test]
+    fn lease_refresh_events_count_under_their_own_label() {
+        let m = LeaseRefreshMetrics::new();
+        m.record(LeaseRefreshResult::of_status(
+            warrenguard_multihop::LeaseRefreshStatus::Registered,
+        ));
+        m.record(LeaseRefreshResult::of_status(
+            warrenguard_multihop::LeaseRefreshStatus::Other(99),
+        ));
+        m.record(LeaseRefreshResult::StaleIncapable);
+        m.record(LeaseRefreshResult::StaleIncapable);
+        m.record(LeaseRefreshResult::Expired);
+        let snap = m.snapshot();
+        let by = snap.by_result();
+        assert_eq!(by[0], ("announced", 1));
+        assert_eq!(
+            by[2],
+            ("refused", 1),
+            "an unknown status reads as a refusal"
+        );
+        assert_eq!(
+            by[9],
+            ("stale_incapable", 2),
+            "the adoption signal of the enforcement switch"
+        );
+        assert_eq!(by[10], ("expired", 1));
+        assert_eq!(by.iter().map(|(_, n)| n).sum::<u64>(), 5);
+        assert_eq!(snap.count(LeaseRefreshResult::StaleIncapable), 2);
     }
 
     #[test]

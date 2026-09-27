@@ -20,8 +20,8 @@ use quinn::{Connection, SendDatagramError, VarInt};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use warrenguard_multihop::{
-    RouteAnchorStatus, RouteEndReason, RouteRejectCode, SEALED_TO_API_LEN, SealedToApi,
-    WARREN_MH_REJECTED, WarrenControlMessage, encode_control,
+    LeaseRefreshStatus, RouteAnchorStatus, RouteEndReason, RouteRejectCode, SEALED_TO_API_LEN,
+    SealedToApi, WARREN_MH_LEASE_EXPIRED, WARREN_MH_REJECTED, WarrenControlMessage, encode_control,
 };
 use warrenguard_server::{
     AnchorVerdict, RouteAdmission, RouteAdmitter, SessionTokenAdmitter, TOKEN_SERIAL_LEN,
@@ -126,6 +126,9 @@ pub(crate) enum Outbound {
     Control(WarrenControlMessage),
     /// Tell a route session why it ends, then close it.
     EndRoute(RouteEndReason),
+    /// Tell a token session its lease expired, then close it with the
+    /// operational lease-expired code, which its client redials after.
+    EndLease,
 }
 
 /// Sender half of a connection's control emitter.
@@ -168,18 +171,22 @@ where
                     let msg = WarrenControlMessage::RouteEnded {
                         reason_code: reason.code(),
                     };
-                    for i in 0..ROUTE_END_REPEATS {
-                        if !send(&msg) {
-                            return;
-                        }
-                        if i + 1 < ROUTE_END_REPEATS {
-                            tokio::time::sleep(ROUTE_END_SPACING).await;
-                        }
+                    if !send_repeated(&send, &msg).await {
+                        return;
                     }
-                    tokio::time::sleep(ROUTE_END_SPACING).await;
                     // The same single opaque close every policy refusal uses:
                     // the relay learns nothing, the client read `RouteEnded`.
                     conn.close(VarInt::from_u32(WARREN_MH_REJECTED), &[]);
+                    return;
+                }
+                Outbound::EndLease => {
+                    let msg = WarrenControlMessage::LeaseRefreshAck {
+                        status: LeaseRefreshStatus::Expired.code(),
+                    };
+                    if !send_repeated(&send, &msg).await {
+                        return;
+                    }
+                    conn.close(VarInt::from_u32(WARREN_MH_LEASE_EXPIRED), &[]);
                     return;
                 }
             }
@@ -187,12 +194,31 @@ where
     })
 }
 
-/// One v7 main session's anchor bookkeeping, keyed by the serial the session
-/// was admitted on (its registry key).
-struct AnchorSlot {
+/// Send `msg` [`ROUTE_END_REPEATS`] times, spaced so the close that follows
+/// cannot discard them all. `false` once the connection is lost.
+async fn send_repeated(
+    send: &impl Fn(&WarrenControlMessage) -> bool,
+    msg: &WarrenControlMessage,
+) -> bool {
+    for i in 0..ROUTE_END_REPEATS {
+        if !send(msg) {
+            return false;
+        }
+        if i + 1 < ROUTE_END_REPEATS {
+            tokio::time::sleep(ROUTE_END_SPACING).await;
+        }
+    }
+    tokio::time::sleep(ROUTE_END_SPACING).await;
+    true
+}
+
+/// One v7 main session's anchor and lease bookkeeping, keyed by the serial
+/// the session was admitted on (its registry key).
+pub(super) struct AnchorSlot {
     /// The serial whose lease the session holds now: the admission serial,
-    /// or the serial of the token an anchor request presented since.
-    lease_serial: [u8; TOKEN_SERIAL_LEN],
+    /// or the serial of the token an anchor request or a lease refresh
+    /// presented since.
+    pub(super) lease_serial: [u8; TOKEN_SERIAL_LEN],
     /// The control plane bound the anchor and has not reported it lost.
     anchored: bool,
     /// A control-plane call for this session is running.
@@ -202,16 +228,19 @@ struct AnchorSlot {
     /// Digest of the last request that reached the control plane, and its
     /// verdict: a byte-identical repeat is answered from it.
     last: Option<([u8; 32], AnchorVerdict)>,
+    /// Epoch lease refresh state, see the `lease` submodule.
+    pub(super) lease: super::lease::LeaseSlot,
 }
 
 impl AnchorSlot {
-    fn new(serial: [u8; TOKEN_SERIAL_LEN]) -> Self {
+    pub(super) fn new(serial: [u8; TOKEN_SERIAL_LEN]) -> Self {
         Self {
             lease_serial: serial,
             anchored: false,
             in_flight: false,
             last_call: None,
             last: None,
+            lease: super::lease::LeaseSlot::default(),
         }
     }
 }
@@ -220,7 +249,7 @@ impl AnchorSlot {
 #[derive(Default)]
 pub(super) struct RegistryRouteState {
     control: Mutex<HashMap<(SessionKey, ConnId), ControlTx>>,
-    anchors: Mutex<HashMap<[u8; TOKEN_SERIAL_LEN], AnchorSlot>>,
+    pub(super) anchors: Mutex<HashMap<[u8; TOKEN_SERIAL_LEN], AnchorSlot>>,
     /// Locator each live route session presented, retained so the deployer
     /// can re-submit it after its control plane restarted.
     locators: Mutex<HashMap<[u8; 32], Zeroizing<[u8; SEALED_TO_API_LEN]>>>,
@@ -239,7 +268,7 @@ impl RegistryRouteState {
         self.control.lock().remove(&(key, conn_id));
     }
 
-    fn controls_of(&self, key: SessionKey) -> Vec<(ConnId, ControlTx)> {
+    pub(super) fn controls_of(&self, key: SessionKey) -> Vec<(ConnId, ControlTx)> {
         self.control
             .lock()
             .iter()
@@ -361,7 +390,7 @@ enum AnchorDecision {
 }
 
 /// What rebinding a session to a freshly spent serial came to.
-enum Rebind {
+pub(super) enum Rebind {
     /// The session holds the new lease now.
     Done,
     /// Another live session of this exit holds that serial: never rebind onto
@@ -498,7 +527,11 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
     /// exit holds `new` (the control plane re-admits a same-exit duplicate,
     /// so only this registry can tell), and when the session ended
     /// meanwhile, in which case `new` is released since nobody holds it.
-    fn rebind(&self, key_serial: [u8; TOKEN_SERIAL_LEN], new: [u8; TOKEN_SERIAL_LEN]) -> Rebind {
+    pub(super) fn rebind(
+        &self,
+        key_serial: [u8; TOKEN_SERIAL_LEN],
+        new: [u8; TOKEN_SERIAL_LEN],
+    ) -> Rebind {
         let key = SessionKey::TokenSerial(WarrenPubkey::from_bytes(key_serial));
         let (outcome, release) = {
             let live = self.live.lock();
@@ -516,6 +549,9 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
                 match (live.contains_key(&key), anchors.get_mut(&key_serial)) {
                     (true, Some(slot)) => {
                         let old = std::mem::replace(&mut slot.lease_serial, new);
+                        // A token the admitter spent is of the current epoch,
+                        // so the lease it names is fresh.
+                        slot.lease.refreshed();
                         (Rebind::Done, (old != new).then_some(old))
                     }
                     _ => (Rebind::Gone, Some(new)),
@@ -683,6 +719,9 @@ mod tests {
 
     impl ClosableConn for FakeConn {
         fn close_rejected(&self) {
+            self.closes.fetch_add(1, Ordering::AcqRel);
+        }
+        fn close_lease_expired(&self) {
             self.closes.fetch_add(1, Ordering::AcqRel);
         }
     }

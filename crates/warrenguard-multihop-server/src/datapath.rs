@@ -331,8 +331,12 @@ pub(crate) enum UplinkKind {
     /// version nibble.
     ControlFrame,
     /// A `RouteAnchorRequest`: never forwarded either, but handed to the
-    /// session's anchor handler. Every other control frame is dropped.
+    /// session's anchor handler.
     AnchorRequest(Box<AnchorRequestFrame>),
+    /// A `LeaseRefresh`: never forwarded, handed to the session's lease
+    /// handler with the token it carries, if any. Every other control frame
+    /// is dropped.
+    LeaseRefresh(Option<Box<warrenguard_wire::SessionToken>>),
     /// DAITA cover traffic. Dropped by design, before the TUN.
     DaitaDummy,
 }
@@ -354,6 +358,9 @@ pub(crate) fn classify_uplink(plaintext: &[u8]) -> UplinkKind {
                 sealed_anchor,
                 session_token,
             }));
+        }
+        Ok(Some(warrenguard_multihop::WarrenControlMessage::LeaseRefresh { session_token })) => {
+            return UplinkKind::LeaseRefresh(session_token);
         }
         Ok(Some(_)) => return UplinkKind::ControlFrame,
         Err(e) => {
@@ -1439,6 +1446,37 @@ pub(crate) mod tests {
         )
         .expect("encode");
         assert_eq!(classify_uplink(&ack), UplinkKind::ControlFrame);
+    }
+
+    #[test]
+    fn a_lease_refresh_is_handed_over_with_its_token_and_its_ack_dropped() {
+        let token = warrenguard_wire::SessionToken([0x3C; warrenguard_wire::SESSION_TOKEN_LEN]);
+        let refresh = warrenguard_multihop::encode_control(
+            &warrenguard_multihop::WarrenControlMessage::LeaseRefresh {
+                session_token: Some(Box::new(token)),
+            },
+        )
+        .expect("encode");
+        assert_eq!(
+            classify_uplink(&refresh),
+            UplinkKind::LeaseRefresh(Some(Box::new(token)))
+        );
+        let announce = warrenguard_multihop::encode_control(
+            &warrenguard_multihop::WarrenControlMessage::LeaseRefresh {
+                session_token: None,
+            },
+        )
+        .expect("encode");
+        assert_eq!(classify_uplink(&announce), UplinkKind::LeaseRefresh(None));
+        let ack = warrenguard_multihop::encode_control(
+            &warrenguard_multihop::WarrenControlMessage::LeaseRefreshAck { status: 5 },
+        )
+        .expect("encode");
+        assert_eq!(
+            classify_uplink(&ack),
+            UplinkKind::ControlFrame,
+            "an exit-to-client message arriving uplink is dropped"
+        );
     }
 
     #[test]

@@ -1,7 +1,9 @@
 //! Route admission by anchor through the real exit termination loop, over
 //! loopback QUIC with the real HPKE seals: a v7 main session anchors with an
 //! uplink datagram, a route session on another exit is admitted on its
-//! locator, refused with its sealed code, or ended when its anchor goes.
+//! locator, refused with its sealed code, or ended when its anchor goes; a
+//! main session refreshes its lease onto a token of a new epoch and its
+//! anchor follows, or is ended when it does not.
 //!
 //! The policy is a fake control plane holding a real route KEM key: it opens
 //! the blobs exactly as the API does, with the exit's own id as the locator's
@@ -17,10 +19,10 @@ use ed25519_dalek::SigningKey;
 use parking_lot::Mutex;
 use quinn::{Connection, Endpoint};
 use warrenguard_multihop::{
-    ClientSession, ExitId, RouteAnchorSecret, RouteAnchorStatus, RouteKemSecretKey,
-    RouteRejectCode, SealedToApi, WARREN_MH_REJECTED, WarrenControlMessage, WarrenKemPublicKey,
-    decode_frame, encode_control, encode_frame, seal_route_anchor, seal_route_locator,
-    try_decode_control,
+    ClientSession, ExitId, LeaseRefreshStatus, RouteAnchorSecret, RouteAnchorStatus,
+    RouteKemSecretKey, RouteRejectCode, SealedToApi, WARREN_MH_LEASE_EXPIRED, WARREN_MH_REJECTED,
+    WarrenControlMessage, WarrenKemPublicKey, decode_frame, encode_control, encode_frame,
+    seal_route_anchor, seal_route_locator, try_decode_control,
 };
 use warrenguard_multihop_server::ip_pool::IpAllocator;
 use warrenguard_multihop_server::multihop::{
@@ -595,4 +597,116 @@ async fn a_wallet_session_is_never_eligible_to_anchor() {
         "anchoring a wallet session would join a pubkey to its route exits"
     );
     assert!(anchors.0.lock().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_main_session_refreshes_its_lease_when_due_and_its_anchor_follows_the_new_serial() {
+    let (kem, anchors) = (kem(), Arc::new(Anchors::default()));
+    let main_exit = spawn_exit(0x30, &kem, &anchors, true);
+    let route_exit = spawn_exit(0x31, &kem, &anchors, true);
+    let secret = RouteAnchorSecret::generate();
+    let mut main = anchored_main(&main_exit, &kem, &secret, 0xB0).await;
+    let mut route = Client::dial(&route_exit).await;
+    let locator = seal_route_locator(kem.public_key(), &secret, &route_exit.exit_id).expect("seal");
+    route.setup(&route_request(locator)).await;
+
+    main.send_control(&WarrenControlMessage::LeaseRefresh {
+        session_token: None,
+    });
+    assert_eq!(
+        main.next_control().await,
+        Some(WarrenControlMessage::LeaseRefreshAck {
+            status: LeaseRefreshStatus::Registered.code()
+        }),
+        "the exit notes that this client refreshes"
+    );
+
+    // The deployer's renewal found the lease of a past epoch.
+    let stale = main_exit
+        .registry
+        .lease_refresh_due(&[0xB0; 32])
+        .expect("a live session holds that lease");
+    assert!(stale.capable);
+    assert_eq!(
+        main.next_control().await,
+        Some(WarrenControlMessage::LeaseRefreshAck {
+            status: LeaseRefreshStatus::Due.code()
+        })
+    );
+    main.send_control(&WarrenControlMessage::LeaseRefresh {
+        session_token: Some(Box::new(token(0xB1))),
+    });
+    assert_eq!(
+        main.next_control().await,
+        Some(WarrenControlMessage::LeaseRefreshAck {
+            status: LeaseRefreshStatus::Refreshed.code()
+        })
+    );
+    assert_eq!(main_exit.registry.live_token_serials(), vec![[0xB1; 32]]);
+
+    // The client re-homes its anchor on the new serial, with no token (past
+    // the exit's per-session interval between two anchor calls, which in
+    // production is hours).
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    let sealed = seal_route_anchor(kem.public_key(), &secret, &[0xB1; 32]).expect("seal");
+    main.send_control(&WarrenControlMessage::RouteAnchorRequest {
+        sealed_anchor: sealed,
+        session_token: None,
+    });
+    assert_eq!(
+        main.next_control().await,
+        Some(WarrenControlMessage::RouteAnchorAck {
+            status: RouteAnchorStatus::Bound.code(),
+            max_routes: MAX_ROUTES,
+        })
+    );
+    assert_eq!(
+        anchors.0.lock().get(secret.anchor_ref().as_bytes()),
+        Some(&[0xB1; 32]),
+        "the anchor hangs on the refreshed lease"
+    );
+    assert_eq!(main_exit.registry.live_anchor_serials(), vec![[0xB1; 32]]);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), route.conn.closed())
+            .await
+            .is_err(),
+        "the route was never touched"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_whose_lease_expired_is_told_then_closed_with_the_lease_code() {
+    let (kem, anchors) = (kem(), Arc::new(Anchors::default()));
+    // No route policy: refreshing a lease does not depend on route admission.
+    let exit = spawn_exit(0x32, &kem, &anchors, false);
+    let mut main = Client::dial(&exit).await;
+    main.setup(&v7_request(0xB2)).await;
+    main.send_control(&WarrenControlMessage::LeaseRefresh {
+        session_token: None,
+    });
+    assert_eq!(
+        main.next_control().await,
+        Some(WarrenControlMessage::LeaseRefreshAck {
+            status: LeaseRefreshStatus::Registered.code()
+        })
+    );
+
+    assert_eq!(exit.registry.end_expired_lease(&[0xB2; 32]), 1);
+    assert_eq!(
+        main.next_control().await,
+        Some(WarrenControlMessage::LeaseRefreshAck {
+            status: LeaseRefreshStatus::Expired.code()
+        }),
+        "the client learns why before the close"
+    );
+    match main.closed_with().await {
+        Some(quinn::ConnectionError::ApplicationClosed(close)) => {
+            assert_eq!(
+                close.error_code.into_inner(),
+                u64::from(WARREN_MH_LEASE_EXPIRED),
+                "an operational close the client redials after, never the policy close"
+            );
+        }
+        other => panic!("an expired session must be closed with the lease code, got {other:?}"),
+    }
 }

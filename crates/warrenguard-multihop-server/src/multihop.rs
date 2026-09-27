@@ -39,9 +39,9 @@ use tokio::sync::watch;
 use warrenguard_daita::daita::{DaitaEvent, DaitaState};
 use warrenguard_multihop::{
     EncapsulatedKeyBytes, ExitId, ExitSession, MULTIHOP_FRAME_MAX_OVERHEAD, MultihopError,
-    ReplayWindow, WARREN_MH_DRAINING, WARREN_MH_REJECTED, WarrenControlMessage,
-    WarrenKemPrivateKey, WarrenKemPublicKey, WarrenMultihopFrame, decode_frame, encode_control,
-    encode_frame, test_support::pubkey_to_bytes,
+    ReplayWindow, WARREN_MH_DRAINING, WARREN_MH_LEASE_EXPIRED, WARREN_MH_REJECTED,
+    WarrenControlMessage, WarrenKemPrivateKey, WarrenKemPublicKey, WarrenMultihopFrame,
+    decode_frame, encode_control, encode_frame, test_support::pubkey_to_bytes,
 };
 #[cfg(feature = "pq-hpke")]
 use warrenguard_multihop::{
@@ -66,8 +66,11 @@ use crate::datapath::{
 use crate::ip_pool::{ConnId, IpAllocator, IpAllocatorV6, SessionIntent, SessionIntentV6};
 use crate::metrics::{EvictReason, SetupAdmission};
 
+mod lease;
 mod route;
 mod wallet;
+
+pub use lease::StaleLease;
 
 /// Retain anti-replay windows for at most this many recent epochs. Rekeys are
 /// infrequent, so a handful covers every in-flight frame around an epoch
@@ -3160,6 +3163,10 @@ pub trait ClosableConn: Send + Sync + 'static {
     /// observing the close learns nothing about the client's status).
     fn close_rejected(&self);
 
+    /// Close the connection with the operational lease-expired code, which
+    /// the client treats as a loss and redials after (never a rejection).
+    fn close_lease_expired(&self);
+
     /// Live datapath counters for node telemetry, or `None` for a
     /// connection type that does not track them (test fakes). Default
     /// `None` so existing impls compile unchanged.
@@ -3180,6 +3187,10 @@ pub trait ClosableConn: Send + Sync + 'static {
 impl ClosableConn for Connection {
     fn close_rejected(&self) {
         self.close(quinn::VarInt::from_u32(WARREN_MH_REJECTED), &[]);
+    }
+
+    fn close_lease_expired(&self) {
+        self.close(quinn::VarInt::from_u32(WARREN_MH_LEASE_EXPIRED), &[]);
     }
 
     fn remote_address(&self) -> Option<std::net::SocketAddr> {
@@ -4906,6 +4917,11 @@ async fn serve_terminating_connection<T>(
                     anchor.submit(&plaintext, *frame);
                     continue;
                 }
+                UplinkKind::LeaseRefresh(token) => {
+                    report.control_frames += 1;
+                    anchor.submit_lease_refresh(&plaintext, token);
+                    continue;
+                }
                 UplinkKind::DaitaDummy => {
                     report.dummies += 1;
                     daita_rx.fire(&[DaitaEvent::PaddingRecv]);
@@ -5292,6 +5308,11 @@ async fn serve_pq_datagram_pump<T>(
                 UplinkKind::AnchorRequest(frame) => {
                     report.control_frames += 1;
                     anchor.submit(&plaintext, *frame);
+                    continue;
+                }
+                UplinkKind::LeaseRefresh(token) => {
+                    report.control_frames += 1;
+                    anchor.submit_lease_refresh(&plaintext, token);
                     continue;
                 }
                 UplinkKind::DaitaDummy => {
@@ -5748,6 +5769,9 @@ mod tests {
 
     impl ClosableConn for FakeConn {
         fn close_rejected(&self) {
+            self.closes.fetch_add(1, Ordering::AcqRel);
+        }
+        fn close_lease_expired(&self) {
             self.closes.fetch_add(1, Ordering::AcqRel);
         }
         fn datapath_stats(&self) -> Option<ConnDatapathStats> {
