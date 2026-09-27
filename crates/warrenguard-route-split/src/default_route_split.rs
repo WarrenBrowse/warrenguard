@@ -322,7 +322,7 @@ pub fn build_install_commands_scoped(
     // network reach the host's main table (and thus the original
     // default route via the physical interface) instead of the TUN.
     for cidr in bypass_cidrs {
-        cmds.push(bypass_rule("add", false, cidr));
+        cmds.push(bypass_rule("add", cidr));
     }
 
     // ip rule: all other traffic (or, include-only, the marked traffic) ->
@@ -359,7 +359,7 @@ pub fn build_uninstall_commands_scoped(
     // for symmetry, although `ip rule del` is order-insensitive when
     // the (to + pref) tuple is fully specified.
     for cidr in bypass_cidrs.iter().rev() {
-        cmds.push(bypass_rule("del", false, cidr));
+        cmds.push(bypass_rule("del", cidr));
     }
 
     // Flush table 100 (equivalent to deleting every route we
@@ -374,18 +374,16 @@ pub fn build_uninstall_commands_scoped(
     cmds
 }
 
-/// `ip [-6] rule <verb> to <network> lookup main pref 49`: the destination
-/// bypass shared by the CLI's `--bypass-cidr` and [`BypassNetworkRules`].
-fn bypass_rule(verb: &str, ipv6: bool, network: &dyn std::fmt::Display) -> Vec<String> {
-    let mut rule = Vec::with_capacity(9);
-    if ipv6 {
-        rule.push("-6".to_string());
-    }
+/// `ip rule <verb> to <cidr> lookup main pref 49`: the CLI's `--bypass-cidr`,
+/// which also sends a bypassed network out through the default route (the
+/// management network of an operator's server, reached through its gateway).
+fn bypass_rule(verb: &str, cidr: &BypassCidr) -> Vec<String> {
+    let mut rule = Vec::with_capacity(8);
     rule.extend([
         "rule".to_string(),
         verb.to_string(),
         "to".to_string(),
-        network.to_string(),
+        cidr.to_string(),
         "lookup".to_string(),
         "main".to_string(),
         "pref".to_string(),
@@ -394,15 +392,77 @@ fn bypass_rule(verb: &str, ipv6: bool, network: &dyn std::fmt::Display) -> Vec<S
     rule
 }
 
-/// The rule that sends traffic to `network` to the `main` table ahead of the
-/// tunnel lookup, in the rule database of the network's family. `verb` is
-/// `add`/`del`.
-#[must_use]
-pub fn build_bypass_network_rule(verb: &str, network: &BypassNetwork) -> Vec<String> {
-    bypass_rule(verb, network.is_ipv6(), network)
+/// Priority of the rules that keep the tunnel's own networks in the tunnel
+/// table, ahead of the shared networks at [`RULE_PREF_BYPASS_CIDR`].
+const RULE_PREF_KEEP_IN_TUNNEL: u32 = 48;
+
+/// One rule of [`BypassNetworkRules`] to add or remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BypassChange {
+    /// Send traffic to a shared network to `main`, where only a route more
+    /// specific than the default one (on the link, or a static route) takes
+    /// it: a shared network reached through the default gateway stays in the
+    /// tunnel, as it does with the plain split on macOS and Windows.
+    Add(BypassNetwork),
+    /// Undo [`Self::Add`].
+    Remove(BypassNetwork),
+    /// Keep a network of the tunnel itself (its address pool, its gateway, its
+    /// resolver) in the tunnel table, ahead of every shared network: a shared
+    /// `10.0.0.0/8` must not hand the tunnel's `10.66.0.0/16` to `main`, where
+    /// a route pushed by a hostile DHCP server (option 121) would take it off
+    /// the tunnel.
+    KeepInTunnel(BypassNetwork),
+    /// Undo [`Self::KeepInTunnel`].
+    StopKeeping(BypassNetwork),
 }
 
-/// The `ip` commands that take the installed bypass networks from
+impl BypassChange {
+    /// The `ip` arguments of this change, in the rule database of the
+    /// network's family.
+    #[must_use]
+    pub fn command(&self) -> Vec<String> {
+        let (verb, network, action, pref): (&str, &BypassNetwork, &[&str], u32) = match self {
+            Self::Add(network) => (
+                "add",
+                network,
+                &["lookup", "main", "suppress_prefixlength", "0"],
+                RULE_PREF_BYPASS_CIDR,
+            ),
+            Self::Remove(network) => (
+                "del",
+                network,
+                &["lookup", "main", "suppress_prefixlength", "0"],
+                RULE_PREF_BYPASS_CIDR,
+            ),
+            Self::KeepInTunnel(network) => (
+                "add",
+                network,
+                &["lookup", ROUTE_TABLE_STR],
+                RULE_PREF_KEEP_IN_TUNNEL,
+            ),
+            Self::StopKeeping(network) => (
+                "del",
+                network,
+                &["lookup", ROUTE_TABLE_STR],
+                RULE_PREF_KEEP_IN_TUNNEL,
+            ),
+        };
+        let mut rule = Vec::with_capacity(11);
+        if network.is_ipv6() {
+            rule.push("-6".to_owned());
+        }
+        rule.extend(["rule", verb, "to"].map(str::to_owned));
+        rule.push(network.to_string());
+        rule.extend(action.iter().map(|word| (*word).to_owned()));
+        rule.extend(["pref".to_owned(), pref.to_string()]);
+        rule
+    }
+}
+
+/// [`ROUTE_TABLE`] as `ip` spells it.
+const ROUTE_TABLE_STR: &str = "100";
+
+/// The shared-network changes that take the installed networks from
 /// `installed` to `wanted`: every new network is added before any old one is
 /// removed, and a network in both is left alone, so an update never opens a
 /// window in which a network kept by both lists is routed into the tunnel.
@@ -410,86 +470,171 @@ pub fn build_bypass_network_rule(verb: &str, network: &BypassNetwork) -> Vec<Str
 pub fn plan_bypass_update(
     installed: &[BypassNetwork],
     wanted: &[BypassNetwork],
-) -> Vec<Vec<String>> {
-    let mut adds: Vec<&BypassNetwork> = Vec::new();
+) -> Vec<BypassChange> {
+    let mut adds: Vec<BypassNetwork> = Vec::new();
     for network in wanted {
-        if !installed.contains(network) && !adds.contains(&network) {
-            adds.push(network);
+        if !installed.contains(network) && !adds.contains(network) {
+            adds.push(*network);
         }
     }
-    let adds = adds
-        .into_iter()
-        .map(|network| build_bypass_network_rule("add", network));
-    let dels = installed
+    let removes = installed
         .iter()
         .filter(|network| !wanted.contains(network))
-        .map(|network| build_bypass_network_rule("del", network));
-    adds.chain(dels).collect()
+        .map(|network| BypassChange::Remove(*network));
+    adds.into_iter()
+        .map(BypassChange::Add)
+        .chain(removes)
+        .collect()
+}
+
+/// `args` for a log line or an error, without the network: a custom network
+/// can tell as much about the user as an address.
+fn describe(args: &[String]) -> String {
+    let family = if args.first().is_some_and(|arg| arg == "-6") {
+        "ipv6"
+    } else {
+        "ipv4"
+    };
+    let verb = args
+        .iter()
+        .find(|arg| *arg == "add" || *arg == "del")
+        .map_or("?", String::as_str);
+    let pref = args.last().map_or("?", String::as_str);
+    format!("ip rule {verb} ({family}, pref {pref})")
+}
+
+/// Runs the `ip` rule commands of [`BypassNetworkRules`].
+pub trait IpRules: Send + Sync {
+    /// Runs `args`. An added rule that already exists, or a removed one
+    /// already gone, is a success.
+    fn run(&self, args: Vec<String>) -> impl std::future::Future<Output = Result<()>> + Send;
+
+    /// [`Self::run`] from a context that cannot await (`Drop`): bounded and
+    /// best effort.
+    fn run_blocking(&self, args: &[String]);
+}
+
+/// The system `ip`, reporting a failure without the network.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemIp;
+
+impl IpRules for SystemIp {
+    async fn run(&self, args: Vec<String>) -> Result<()> {
+        let outcome = if args.iter().any(|arg| arg == "del") {
+            run_ip_tolerant_no_such(&args).await
+        } else {
+            run_ip_tolerant_exists(&args).await
+        };
+        outcome.map_err(|_| anyhow!("{} failed", describe(&args)))
+    }
+
+    fn run_blocking(&self, args: &[String]) {
+        run_ip_quiet_sync_tolerant(args, &describe(args));
+    }
 }
 
 /// Destination bypasses that follow a list the consumer updates while the
 /// tunnel runs (the networks a "local network sharing" setting keeps off the
-/// tunnel, say). Each network is routed to `main` ahead of the tunnel lookup
-/// in its own family's rule database; the firewall still decides whether
-/// traffic to it may leave. Independent of the split-default guards, so the
-/// list can change without touching the tunnel's own routes.
+/// tunnel, say), each routed to `main` ahead of the tunnel lookup in its own
+/// family's rule database, with the tunnel's own networks kept in the tunnel
+/// ahead of them. The firewall still decides whether traffic to a shared
+/// network may leave. Independent of the split-default guards, so the list
+/// can change without touching the tunnel's own routes.
 ///
-/// A crashed predecessor's rules are not reclaimed: they only send the listed
-/// destinations to `main`, where the firewall still applies, and they cannot
-/// be told apart from another tool's `lookup main` rules.
-#[derive(Debug, Default)]
-pub struct BypassNetworkRules {
+/// A crashed predecessor's rules are reclaimed by [`force_cleanup_all`],
+/// which recognises them by their selector.
+#[derive(Debug)]
+pub struct BypassNetworkRules<R: IpRules = SystemIp> {
+    runner: R,
+    tunnel_networks: Vec<BypassNetwork>,
+    tunnel_networks_kept: Vec<BypassNetwork>,
     installed: Vec<BypassNetwork>,
 }
 
-impl BypassNetworkRules {
-    /// No network bypassed yet.
+impl BypassNetworkRules<SystemIp> {
+    /// No network shared yet; `tunnel_networks` (the tunnel's address pool,
+    /// in both families) are kept in the tunnel while any is.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(tunnel_networks: Vec<BypassNetwork>) -> Self {
+        Self::with_runner(tunnel_networks, SystemIp)
+    }
+}
+
+impl<R: IpRules> BypassNetworkRules<R> {
+    /// [`BypassNetworkRules::new`] over another runner.
+    #[must_use]
+    pub fn with_runner(tunnel_networks: Vec<BypassNetwork>, runner: R) -> Self {
+        Self {
+            runner,
+            tunnel_networks,
+            tunnel_networks_kept: Vec::new(),
+            installed: Vec::new(),
+        }
     }
 
-    /// The networks whose rules are in place.
+    /// The shared networks whose rules are in place.
     #[must_use]
     pub fn installed(&self) -> &[BypassNetwork] {
         &self.installed
     }
 
-    /// Makes the bypassed networks exactly `wanted` (see
-    /// [`plan_bypass_update`] for the order). A rule already present is
-    /// accepted, and one already gone counts as removed.
+    /// Makes the shared networks exactly `wanted` ([`plan_bypass_update`]
+    /// gives the order). The tunnel networks go in first, and a network is
+    /// shared only once all of them are in; they go out last, once nothing
+    /// is shared.
     ///
     /// # Errors
     ///
-    /// The first `ip` command that failed. The other commands still run,
-    /// and [`Self::installed`] names the networks whose rules are in place.
+    /// The first command that failed. The other commands still run, save the
+    /// shared networks when a tunnel network could not be kept in, and
+    /// [`Self::installed`] names the networks whose rules are in place.
     pub async fn apply(&mut self, wanted: &[BypassNetwork]) -> Result<()> {
         let mut first_error = None;
-        for network in wanted {
-            if self.installed.contains(network) {
-                continue;
-            }
-            let args = build_bypass_network_rule("add", network);
-            match run_ip_tolerant_exists(&args).await {
-                Ok(()) => self.installed.push(*network),
-                Err(error) => {
-                    first_error.get_or_insert(error.context(format!("ip {}", args.join(" "))));
+        if !wanted.is_empty() {
+            for network in self.tunnel_networks.clone() {
+                if self.tunnel_networks_kept.contains(&network) {
+                    continue;
+                }
+                match self
+                    .runner
+                    .run(BypassChange::KeepInTunnel(network).command())
+                    .await
+                {
+                    Ok(()) => self.tunnel_networks_kept.push(network),
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
                 }
             }
         }
-        let mut kept = Vec::with_capacity(self.installed.len());
-        for network in std::mem::take(&mut self.installed) {
-            if wanted.contains(&network) {
-                kept.push(network);
+        let tunnel_kept_in = self.tunnel_networks_kept.len() == self.tunnel_networks.len();
+        for change in plan_bypass_update(&self.installed, wanted) {
+            if matches!(change, BypassChange::Add(_)) && !tunnel_kept_in {
                 continue;
             }
-            let args = build_bypass_network_rule("del", &network);
-            if let Err(error) = run_ip_tolerant_no_such(&args).await {
-                kept.push(network);
-                first_error.get_or_insert(error.context(format!("ip {}", args.join(" "))));
+            match self.runner.run(change.command()).await {
+                Ok(()) => match change {
+                    BypassChange::Add(network) => self.installed.push(network),
+                    BypassChange::Remove(network) => self.installed.retain(|n| *n != network),
+                    BypassChange::KeepInTunnel(_) | BypassChange::StopKeeping(_) => {}
+                },
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
             }
         }
-        self.installed = kept;
+        if self.installed.is_empty() {
+            for network in std::mem::take(&mut self.tunnel_networks_kept) {
+                if let Err(error) = self
+                    .runner
+                    .run(BypassChange::StopKeeping(network).command())
+                    .await
+                {
+                    self.tunnel_networks_kept.push(network);
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
         tracing::info!(
             networks = self.installed.len(),
             "Warren bypass networks updated"
@@ -497,7 +642,7 @@ impl BypassNetworkRules {
         first_error.map_or(Ok(()), Err)
     }
 
-    /// Removes every bypass rule. Best effort: a failure is logged, and
+    /// Removes every rule. Best effort: a failure is logged, and
     /// [`Self::installed`] keeps the networks it could not remove.
     pub async fn clear(&mut self) {
         if let Err(error) = self.apply(&[]).await {
@@ -506,12 +651,17 @@ impl BypassNetworkRules {
     }
 }
 
-impl Drop for BypassNetworkRules {
+impl<R: IpRules> Drop for BypassNetworkRules<R> {
     fn drop(&mut self) {
-        // Drop cannot await: a brief blocking `ip` call per rule, bounded
-        // like every synchronous cleanup here.
+        // Drop cannot await: a brief bounded `ip` call per rule, shared
+        // networks first, as `clear` orders them.
         for network in std::mem::take(&mut self.installed) {
-            run_ip_sync_tolerant(&build_bypass_network_rule("del", &network));
+            self.runner
+                .run_blocking(&BypassChange::Remove(network).command());
+        }
+        for network in std::mem::take(&mut self.tunnel_networks_kept) {
+            self.runner
+                .run_blocking(&BypassChange::StopKeeping(network).command());
         }
     }
 }
@@ -593,7 +743,11 @@ pub fn build_split_tunnel_fwmark_uninstall_rule_v6(fwmark: &str) -> Vec<String> 
 #[must_use]
 pub fn plan_force_cleanup(ip_rule_show: &str) -> Vec<Vec<String>> {
     let table = ROUTE_TABLE.to_string();
-    let mut cmds = Vec::new();
+    let mut cmds = plan_shared_network_cleanup(ip_rule_show, false)
+        .into_iter()
+        .filter(|change| matches!(change, BypassChange::Remove(_)))
+        .map(|change| change.command())
+        .collect::<Vec<_>>();
     for line in ip_rule_show.lines() {
         if let Some(pref) = rule_pref_targeting_table(line, &table) {
             cmds.push(vec![
@@ -616,6 +770,63 @@ pub fn plan_force_cleanup(ip_rule_show: &str) -> Vec<Vec<String>> {
         ]);
     }
     cmds
+}
+
+/// The rules of [`BypassNetworkRules`] a crashed predecessor left in the v6
+/// rule database (`ip -6 rule show`), recognised by their selector: the
+/// shared networks at pref 49 with `suppress_prefixlength 0`, which a
+/// `--bypass-cidr` never carries, and the tunnel networks at pref 48 in the
+/// tunnel table.
+#[must_use]
+pub fn plan_force_cleanup_v6(ip_rule_show: &str) -> Vec<Vec<String>> {
+    plan_shared_network_cleanup(ip_rule_show, true)
+        .iter()
+        .map(BypassChange::command)
+        .collect()
+}
+
+/// The [`BypassChange`]s that undo the [`BypassNetworkRules`] rules listed in
+/// `ip_rule_show`, of the family `ipv6` names.
+fn plan_shared_network_cleanup(ip_rule_show: &str, ipv6: bool) -> Vec<BypassChange> {
+    let mut changes = Vec::new();
+    for line in ip_rule_show.lines() {
+        let Some((pref, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let tokens: Vec<&str> = rest.split_whitespace().collect();
+        let Some(network) = tokens
+            .windows(2)
+            .find(|pair| pair[0] == "to")
+            .and_then(|pair| parse_network(pair[1]))
+            .filter(|network| network.is_ipv6() == ipv6)
+        else {
+            continue;
+        };
+        let action = tokens
+            .iter()
+            .position(|token| *token == "lookup")
+            .map(|at| &tokens[at..]);
+        match (pref.trim(), action) {
+            (pref, Some(["lookup", "main", "suppress_prefixlength", "0"]))
+                if pref == RULE_PREF_BYPASS_CIDR.to_string() =>
+            {
+                changes.push(BypassChange::Remove(network));
+            }
+            (pref, Some(["lookup", table]))
+                if pref == RULE_PREF_KEEP_IN_TUNNEL.to_string() && *table == ROUTE_TABLE_STR =>
+            {
+                changes.push(BypassChange::StopKeeping(network));
+            }
+            _ => {}
+        }
+    }
+    changes
+}
+
+/// A network as `ip rule show` prints it (`10.0.0.0/8`, `fc00::/7`).
+fn parse_network(text: &str) -> Option<BypassNetwork> {
+    let (address, prefix) = text.split_once('/')?;
+    BypassNetwork::new(address.parse().ok()?, prefix.parse().ok()?).ok()
 }
 
 /// If `line` (one line of `ip rule show`) is a policy rule whose action is
@@ -1041,6 +1252,15 @@ const SYNC_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// `await`. Tolerates "already gone" stderr, bounds its own runtime, and never
 /// panics, so it is safe to call from `Drop` and during shutdown.
 fn run_ip_sync_tolerant(args: &[String]) {
+    run_ip_sync_tolerant_shown(args, &args.join(" "));
+}
+
+/// [`run_ip_sync_tolerant`], logging `shown` in place of the arguments.
+fn run_ip_quiet_sync_tolerant(args: &[String], shown: &str) {
+    run_ip_sync_tolerant_shown(args, shown);
+}
+
+fn run_ip_sync_tolerant_shown(args: &[String], shown: &str) {
     let spawned = SystemTool::Ip.command().and_then(|mut command| {
         command
             .args(args)
@@ -1052,7 +1272,7 @@ fn run_ip_sync_tolerant(args: &[String]) {
     let mut child = match spawned {
         Ok(child) => child,
         Err(e) => {
-            tracing::warn!(error = %e, cmd = %args.join(" "), "spawn ip sync cleanup failed (non-fatal)");
+            tracing::warn!(error = %e, cmd = %shown, "spawn ip sync cleanup failed (non-fatal)");
             return;
         }
     };
@@ -1061,7 +1281,7 @@ fn run_ip_sync_tolerant(args: &[String]) {
         let _ = child.kill();
         let _ = child.wait();
         tracing::warn!(
-            cmd = %args.join(" "),
+            cmd = %shown,
             timeout = ?SYNC_CLEANUP_TIMEOUT,
             "ip sync cleanup did not complete within timeout (killed)"
         );
@@ -1081,7 +1301,7 @@ fn run_ip_sync_tolerant(args: &[String]) {
         return;
     }
     tracing::warn!(
-        cmd = %args.join(" "),
+        cmd = %shown,
         stderr = %stderr.trim(),
         "ip sync cleanup failed (non-fatal)"
     );
@@ -1158,7 +1378,15 @@ fn run_ip_capture_sync(args: &[&str]) -> Option<String> {
 pub fn force_cleanup_all() {
     let ip_rule_show = run_ip_capture_sync(&["rule", "show"]).unwrap_or_default();
     for args in plan_force_cleanup(&ip_rule_show) {
-        run_ip_sync_tolerant(&args);
+        if args.iter().any(|arg| arg == "to") {
+            run_ip_quiet_sync_tolerant(&args, &describe(&args));
+        } else {
+            run_ip_sync_tolerant(&args);
+        }
+    }
+    let ip6_rule_show = run_ip_capture_sync(&["-6", "rule", "show"]).unwrap_or_default();
+    for args in plan_force_cleanup_v6(&ip6_rule_show) {
+        run_ip_quiet_sync_tolerant(&args, &describe(&args));
     }
 }
 
@@ -1856,52 +2084,272 @@ mod tests {
         BypassNetwork::new(address.parse().expect("ip"), prefix).expect("valid network")
     }
 
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_owned()).collect()
+    }
+
     #[test]
-    fn a_bypass_network_is_sent_to_main_ahead_of_the_tunnel_lookup_in_its_own_family() {
+    fn a_shared_network_leaves_through_main_only_by_a_route_more_specific_than_the_default() {
         assert_eq!(
-            build_bypass_network_rule("add", &network("192.168.0.0", 16)),
-            vec![
+            BypassChange::Add(network("192.168.0.0", 16)).command(),
+            strings(&[
                 "rule",
                 "add",
                 "to",
                 "192.168.0.0/16",
                 "lookup",
                 "main",
+                "suppress_prefixlength",
+                "0",
                 "pref",
                 "49"
-            ],
-            "the same rule a --bypass-cidr installs"
+            ])
         );
         assert_eq!(
-            build_bypass_network_rule("del", &network("fd00::", 8)),
-            vec![
-                "-6", "rule", "del", "to", "fd00::/8", "lookup", "main", "pref", "49"
-            ]
+            BypassChange::Remove(network("fd00::", 8)).command(),
+            strings(&[
+                "-6",
+                "rule",
+                "del",
+                "to",
+                "fd00::/8",
+                "lookup",
+                "main",
+                "suppress_prefixlength",
+                "0",
+                "pref",
+                "49"
+            ])
         );
     }
 
     #[test]
-    fn an_update_adds_the_new_networks_before_it_removes_the_old_ones() {
-        let kept = network("192.168.0.0", 16);
-        let gone = network("10.0.0.0", 8);
-        let new = network("fd00::", 8);
+    fn a_tunnel_network_stays_in_the_tunnel_table_ahead_of_every_shared_network() {
+        assert_eq!(
+            BypassChange::KeepInTunnel(network("10.66.0.0", 16)).command(),
+            strings(&[
+                "rule",
+                "add",
+                "to",
+                "10.66.0.0/16",
+                "lookup",
+                "100",
+                "pref",
+                "48"
+            ])
+        );
+        assert_eq!(
+            BypassChange::StopKeeping(network("fdcc:f:1::", 64)).command(),
+            strings(&[
+                "-6",
+                "rule",
+                "del",
+                "to",
+                "fdcc:f:1::/64",
+                "lookup",
+                "100",
+                "pref",
+                "48"
+            ])
+        );
+    }
 
-        let plan = plan_bypass_update(&[kept, gone], &[kept, new]);
+    /// Records every `ip` command, and fails the ones it is told to.
+    #[derive(Clone, Default)]
+    struct FakeIp {
+        ran: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+        failing: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl FakeIp {
+        fn ran(&self) -> Vec<Vec<String>> {
+            std::mem::take(&mut *self.ran.lock().expect("lock"))
+        }
+
+        fn fail(&self, change: BypassChange) {
+            self.failing.lock().expect("lock").push(change.command());
+        }
+    }
+
+    impl IpRules for FakeIp {
+        async fn run(&self, args: Vec<String>) -> Result<()> {
+            self.ran.lock().expect("lock").push(args.clone());
+            if self.failing.lock().expect("lock").contains(&args) {
+                return Err(anyhow!("refused"));
+            }
+            Ok(())
+        }
+
+        fn run_blocking(&self, args: &[String]) {
+            self.ran.lock().expect("lock").push(args.to_vec());
+        }
+    }
+
+    const POOL: &str = "10.66.0.0";
+
+    fn rules(ip: &FakeIp) -> BypassNetworkRules<FakeIp> {
+        BypassNetworkRules::with_runner(vec![network(POOL, 16)], ip.clone())
+    }
+
+    fn commands(changes: &[BypassChange]) -> Vec<Vec<String>> {
+        changes.iter().map(BypassChange::command).collect()
+    }
+
+    #[tokio::test]
+    async fn the_tunnel_networks_are_kept_in_before_any_network_is_shared() {
+        let ip = FakeIp::default();
+        let mut rules = rules(&ip);
+        let lan = network("10.0.0.0", 8);
+
+        rules.apply(&[lan]).await.expect("applied");
+
+        assert_eq!(
+            ip.ran(),
+            commands(&[
+                BypassChange::KeepInTunnel(network(POOL, 16)),
+                BypassChange::Add(lan)
+            ])
+        );
+        assert_eq!(rules.installed(), [lan]);
+    }
+
+    #[tokio::test]
+    async fn no_network_is_shared_when_the_tunnel_networks_could_not_be_kept_in() {
+        let ip = FakeIp::default();
+        ip.fail(BypassChange::KeepInTunnel(network(POOL, 16)));
+        let mut rules = rules(&ip);
+
+        assert!(rules.apply(&[network("10.0.0.0", 8)]).await.is_err());
+
+        assert_eq!(
+            ip.ran(),
+            commands(&[BypassChange::KeepInTunnel(network(POOL, 16))]),
+            "the pool would otherwise follow 10.0.0.0/8 out of the tunnel"
+        );
+        assert!(rules.installed().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_update_adds_the_new_networks_before_it_removes_the_old_ones() {
+        let ip = FakeIp::default();
+        let mut rules = rules(&ip);
+        let (kept, gone, new) = (
+            network("192.168.0.0", 16),
+            network("10.0.0.0", 8),
+            network("fd00::", 8),
+        );
+        rules.apply(&[kept, gone]).await.expect("applied");
+        let _ = ip.ran();
+
+        rules.apply(&[kept, new, new]).await.expect("applied");
+
+        assert_eq!(
+            ip.ran(),
+            commands(&[BypassChange::Add(new), BypassChange::Remove(gone)]),
+            "a kept network is left alone, and nothing goes before its replacement is in"
+        );
+        assert_eq!(rules.installed(), [kept, new]);
+    }
+
+    #[tokio::test]
+    async fn a_network_that_could_not_be_removed_is_still_reported_installed() {
+        let ip = FakeIp::default();
+        let mut rules = rules(&ip);
+        let lan = network("192.168.0.0", 16);
+        rules.apply(&[lan]).await.expect("applied");
+        ip.fail(BypassChange::Remove(lan));
+
+        assert!(rules.apply(&[]).await.is_err());
+
+        assert_eq!(rules.installed(), [lan]);
+        assert!(
+            !ip.ran()
+                .contains(&BypassChange::StopKeeping(network(POOL, 16)).command()),
+            "the tunnel networks stay in while a shared network is left"
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_removes_the_shared_networks_then_the_tunnel_networks() {
+        let ip = FakeIp::default();
+        let mut rules = rules(&ip);
+        let lan = network("192.168.0.0", 16);
+        rules.apply(&[lan]).await.expect("applied");
+        let _ = ip.ran();
+
+        rules.clear().await;
+
+        assert_eq!(
+            ip.ran(),
+            commands(&[
+                BypassChange::Remove(lan),
+                BypassChange::StopKeeping(network(POOL, 16))
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_rules_removes_what_is_installed_in_the_same_order() {
+        let ip = FakeIp::default();
+        let mut rules = rules(&ip);
+        let lan = network("192.168.0.0", 16);
+        rules.apply(&[lan]).await.expect("applied");
+        let _ = ip.ran();
+
+        drop(rules);
+
+        assert_eq!(
+            ip.ran(),
+            commands(&[
+                BypassChange::Remove(lan),
+                BypassChange::StopKeeping(network(POOL, 16))
+            ])
+        );
+    }
+
+    #[test]
+    fn a_failed_rule_is_described_without_its_network() {
+        let described = describe(&BypassChange::Add(network("172.20.0.0", 14)).command());
+
+        assert!(!described.contains("172.20"), "{described}");
+        assert!(described.contains("add"), "{described}");
+    }
+
+    #[test]
+    fn force_cleanup_reclaims_the_shared_network_rules_and_spares_a_bypass_cidr() {
+        let leaked = "0:\tfrom all lookup local\n\
+                      48:\tfrom all to 10.66.0.0/16 lookup 100\n\
+                      49:\tfrom all to 10.0.0.0/8 lookup main suppress_prefixlength 0\n\
+                      49:\tfrom all to 172.16.0.0/12 lookup main\n\
+                      32766:\tfrom all lookup main\n";
+
+        let plan = plan_force_cleanup(leaked);
+
+        assert!(plan.contains(&BypassChange::Remove(network("10.0.0.0", 8)).command()));
+        assert!(
+            !plan
+                .iter()
+                .any(|cmd| cmd.contains(&"172.16.0.0/12".to_owned())),
+            "a --bypass-cidr rule (no suppress_prefixlength) is not ours to reclaim"
+        );
+    }
+
+    #[test]
+    fn force_cleanup_reclaims_the_shared_network_rules_of_the_v6_database() {
+        let leaked = "0:\tfrom all lookup local\n\
+                      48:\tfrom all to fdcc:f:1::/64 lookup 100\n\
+                      49:\tfrom all to fc00::/7 lookup main suppress_prefixlength 0\n\
+                      32766:\tfrom all lookup main\n";
+
+        let plan = plan_force_cleanup_v6(leaked);
 
         assert_eq!(
             plan,
-            vec![
-                build_bypass_network_rule("add", &new),
-                build_bypass_network_rule("del", &gone),
-            ],
-            "a kept network is left alone, and nothing is torn down before its replacement is in"
+            commands(&[
+                BypassChange::StopKeeping(network("fdcc:f:1::", 64)),
+                BypassChange::Remove(network("fc00::", 7)),
+            ])
         );
-    }
-
-    #[test]
-    fn an_update_to_the_same_networks_changes_nothing() {
-        let lan = [network("192.168.0.0", 16), network("fe80::", 10)];
-        assert!(plan_bypass_update(&lan, &[lan[1], lan[0], lan[0]]).is_empty());
     }
 
     // --- --bypass-cidr tests ---
