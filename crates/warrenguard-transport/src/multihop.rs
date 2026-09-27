@@ -2911,10 +2911,6 @@ impl WarrenPumpHandle for MultiHopClient {
     }
 }
 
-/// Test-only accessor for the client's HPKE `encapsulated_key`, so a
-/// loopback test harness can build the matching exit-side
-/// [`warrenguard_multihop::ExitSession`] without going through the
-/// setup-stream wire exchange. `session` is private to this module;
 /// Which v7 request a token setup sends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
@@ -2925,9 +2921,11 @@ pub enum TokenRequestKind {
     Plain,
     /// `IpRequestV7Detailed`: a refused token is answered with
     /// `TokenRejected`, which says whether another session holds its serial.
-    /// An exit that predates it answers the plain `Rejected` to every such
-    /// request, valid token or not, so a client that meets that answer
-    /// presents the same token to that exit as [`Self::Plain`].
+    /// An exit that predates it and admits by allowlist, as every production
+    /// exit does, answers the plain `Rejected` to every such request, valid
+    /// token or not, so a client that meets that answer presents the same
+    /// token to that exit as [`Self::Plain`]. A permissive exit that predates
+    /// it admits the request unread, as it admits anything.
     Detailed,
 }
 
@@ -3592,7 +3590,11 @@ mod tests {
         // No token, or every token held elsewhere, says nothing about the
         // account: a later retry (a refilled store, a released serial) can
         // succeed, and a fatal verdict would show a subscription error.
-        for cause in [NoSessionTokenCause::Empty, NoSessionTokenCause::AllRefused] {
+        for cause in [
+            NoSessionTokenCause::Empty,
+            NoSessionTokenCause::AllRefused,
+            NoSessionTokenCause::AllInUse,
+        ] {
             assert_eq!(
                 MultiHopError::NoSessionToken(cause).retryability(),
                 warrenguard_wire::Retryability::RetrySameTarget,

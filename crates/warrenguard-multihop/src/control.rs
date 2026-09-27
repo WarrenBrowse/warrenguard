@@ -422,9 +422,10 @@ pub enum WarrenControlMessage {
     /// token again instead of the next one, so an exit sends it only to a
     /// client that asked for it.
     ///
-    /// A deployed exit that predates the variant decodes nothing and answers
-    /// the plain `Rejected`, which tells the client to present the same token
-    /// to that exit as an `IpRequestV7`.
+    /// A deployed exit that predates the variant and admits by allowlist (every
+    /// production exit) decodes nothing and answers the plain `Rejected`,
+    /// which tells the client to present the same token to that exit as an
+    /// `IpRequestV7`.
     IpRequestV7Detailed {
         /// As [`Self::IpRequestV7::prefer_ipv4`].
         prefer_ipv4: Option<[u8; 4]>,
@@ -438,7 +439,10 @@ pub enum WarrenControlMessage {
 
     /// Exit -> client, setup stream (discriminant 16). The answer to a
     /// refused [`Self::IpRequestV7Detailed`], sealed before the same single
-    /// opaque close as every policy refusal, so the relay learns nothing new.
+    /// opaque close as every policy refusal. Every reason code seals to the
+    /// same length, so the relay learns nothing of the reason; the reply is
+    /// one byte longer than the plain [`Self::Rejected`], which tells the
+    /// relay that the client asked for the reason.
     /// `reason_code` is a [`crate::TokenRejectCode`] as a plain `u8` so an
     /// unknown code still decodes.
     TokenRejected {

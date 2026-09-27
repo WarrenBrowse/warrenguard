@@ -5843,6 +5843,43 @@ mod run_tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_overlap_to_an_exit_that_predates_the_detailed_request_swaps_in_on_the_same_token() {
+        let (operational_key, exit) = exit_holding(0x95, &[]);
+        let mut config = config_with_fake_exit(&exit, &operational_key);
+        config.session_token_provider =
+            Some(provider_of(vec![vec![v7_token(1)], vec![v7_token(2), v7_token(3)]]).0);
+        let swaps = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        config.on_overlap_swapped = Some(Arc::new({
+            let swaps = swaps.clone();
+            move |_: &CircuitTarget| {
+                swaps.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+        let (supervisor, mut rx) = MultiHopSupervisor::new(config);
+        let handle = supervisor.handle();
+        let task = tokio::spawn(supervisor.run());
+        drop(first_session(&mut rx).await);
+        exit.predates_token_detail.store(true, Ordering::Relaxed);
+
+        handle.overlap_reconnect();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while swaps.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the overlap swaps in on the same token, asked plainly");
+
+        assert_eq!(
+            *exit.setup_requests.lock(),
+            vec![presented(&[1]), presented(&[2]), presented_plainly(&[2])]
+        );
+        drop(rx);
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
     #[tokio::test]
     async fn a_retrying_stack_survives_a_failed_setup_and_is_presented_again() {
         // The first token is refused, then the setup leading with the second
