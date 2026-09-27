@@ -466,7 +466,9 @@ where
                     // ordinary case at an epoch boundary, and the client
                     // answers a 407 with a fresh one.
                     TokenAdmission::Reject => Err(proxy_challenge_response()),
-                    TokenAdmission::Denied => Err(encode_response_headers(403, &[])),
+                    TokenAdmission::Denied | TokenAdmission::SerialInUse => {
+                        Err(encode_response_headers(403, &[]))
+                    }
                 }
             })
             .await

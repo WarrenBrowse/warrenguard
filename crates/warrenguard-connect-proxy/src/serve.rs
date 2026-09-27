@@ -160,7 +160,7 @@ where
             stream.flush().await?;
             return Ok(ProxyOutcome::Refused(ProxyRefusal::CredentialRejected));
         }
-        TokenAdmission::Denied => {
+        TokenAdmission::Denied | TokenAdmission::SerialInUse => {
             stream.write_all(refused_response()).await?;
             stream.flush().await?;
             return Ok(ProxyOutcome::Refused(ProxyRefusal::CredentialSpent));

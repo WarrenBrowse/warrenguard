@@ -53,10 +53,15 @@ pub enum TokenAdmission {
     /// No presented token verified for the current epoch (malformed,
     /// tampered, or all wrong-epoch). The caller closes the connection.
     Reject,
-    /// A token verified but its serial is already leased to a live session
-    /// elsewhere (cross-exit double-spend). The caller closes the connection
-    /// with the device-limit code.
+    /// A token verified but the control plane refused to lease its serial
+    /// for a reason other than [`Self::SerialInUse`] (a definitive server
+    /// verdict). The caller closes the connection.
     Denied,
+    /// A token verified but its serial is already leased to a live session
+    /// elsewhere (cross-exit double-spend), which is another device of the
+    /// same wallet. The caller closes the connection, and tells a client that
+    /// asked for the reason that the token's slot is taken.
+    SerialInUse,
 }
 
 /// Injected hook the exit calls to admit a v7 PRIMARY connection. Implemented
@@ -68,7 +73,8 @@ pub enum TokenAdmission {
 ///   It tries the presented `tokens` in order, verifying each offline against
 ///   the current epoch key; the first that verifies is spent and its serial
 ///   returned via [`TokenAdmission::Admit`]. All-invalid -> [`TokenAdmission::Reject`];
-///   a valid-but-already-spent serial -> [`TokenAdmission::Denied`]. A transport
+///   a valid-but-already-spent serial -> [`TokenAdmission::SerialInUse`]; any
+///   other refusal of the spend -> [`TokenAdmission::Denied`]. A transport
 ///   failure to the control plane is failed-open (Admit) so an API outage never
 ///   blacks out the tunnel, exactly like the v6 device cap.
 /// - [`Self::renew_live`] re-asserts the lease for every serial in `live` (called

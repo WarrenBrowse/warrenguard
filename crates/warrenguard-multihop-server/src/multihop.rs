@@ -398,6 +398,26 @@ async fn reply_sealed_detail_then_close(
     conn.close(quinn::VarInt::from_u32(WARREN_MH_REJECTED), &[]);
 }
 
+/// The sealed detail refusing the token of a v7 `request`: why, for a client
+/// that asked with `IpRequestV7Detailed`, and the plain `Rejected` for one
+/// that sent `IpRequestV7`, which predates `TokenRejected` and would read it as
+/// a failed setup, presenting the same token again instead of its next one.
+fn token_refusal_detail(request: &WarrenControlMessage, in_use: bool) -> WarrenControlMessage {
+    match request {
+        WarrenControlMessage::IpRequestV7Detailed { .. } => {
+            let code = if in_use {
+                warrenguard_multihop::TokenRejectCode::SerialInUse
+            } else {
+                warrenguard_multihop::TokenRejectCode::Unspecified
+            };
+            WarrenControlMessage::TokenRejected {
+                reason_code: code.code(),
+            }
+        }
+        _ => WarrenControlMessage::Rejected,
+    }
+}
+
 /// Per-connection state established during the reliable setup-stream
 /// phase and handed to the datagram pump. By the time the pump runs the
 /// HPKE context, the allocated IP, and the downlink route are all
@@ -914,13 +934,20 @@ async fn process_setup_frame(
                 }
             }
         }
-        Some(WarrenControlMessage::IpRequestV7 {
-            session_tokens,
-            wants_ipv6,
-            wants_daita,
-            prefer_ipv4,
-            ..
-        }) => {
+        Some(
+            request @ (WarrenControlMessage::IpRequestV7 {
+                session_tokens,
+                wants_ipv6,
+                wants_daita,
+                prefer_ipv4,
+            }
+            | WarrenControlMessage::IpRequestV7Detailed {
+                session_tokens,
+                wants_ipv6,
+                wants_daita,
+                prefer_ipv4,
+            }),
+        ) => {
             let admitted = match token_admitter {
                 Some(admitter) => admitter.admit(session_tokens).await,
                 // No admitter configured => this exit is not v7-capable.
@@ -937,9 +964,11 @@ async fn process_setup_frame(
                         *prefer_ipv4,
                     )
                 }
-                _ => {
+                refusal => {
                     crate::metrics::admission_metrics().record(SetupAdmission::TokenRefused);
+                    let in_use = refusal == warrenguard_server::TokenAdmission::SerialInUse;
                     tracing::warn!(
+                        in_use,
                         "multihop: v7 setup rejected - token invalid/denied; sealed detail + opaque close"
                     );
                     reply_sealed_detail_then_close(
@@ -948,7 +977,7 @@ async fn process_setup_frame(
                         epoch,
                         reverse_seq,
                         conn,
-                        &WarrenControlMessage::Rejected,
+                        &token_refusal_detail(request, in_use),
                     )
                     .await;
                     return None;
@@ -9278,6 +9307,123 @@ mod tests {
         assert!(
             matches!(detail, Some(WarrenControlMessage::Rejected)),
             "a denied v7 token must yield a sealed Rejected, got {detail:?}"
+        );
+    }
+
+    /// Admitter that answers every token with one fixed refusal.
+    struct RefusingMhAdmitter(warrenguard_server::TokenAdmission);
+
+    impl SessionTokenAdmitter for RefusingMhAdmitter {
+        fn admit<'a>(
+            &'a self,
+            _tokens: &'a [warrenguard_wire::SessionToken],
+        ) -> warrenguard_server::BoxFuture<'a, warrenguard_server::TokenAdmission> {
+            Box::pin(async move { self.0.clone() })
+        }
+
+        fn renew_live<'a>(
+            &'a self,
+            _live: &'a [[u8; 32]],
+        ) -> warrenguard_server::BoxFuture<'a, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    fn detailed_request(token: warrenguard_wire::SessionToken) -> WarrenControlMessage {
+        WarrenControlMessage::IpRequestV7Detailed {
+            prefer_ipv4: None,
+            wants_ipv6: false,
+            session_tokens: vec![token],
+            wants_daita: false,
+        }
+    }
+
+    fn assert_opaque_close(close: Option<quinn::ConnectionError>) {
+        match close {
+            Some(quinn::ConnectionError::ApplicationClosed(ac)) => assert_eq!(
+                u64::from(ac.error_code),
+                u64::from(WARREN_MH_REJECTED),
+                "ANTI-ORACLE: the relay sees the single opaque close"
+            ),
+            other => panic!("expected the opaque application close, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_detailed_request_whose_serial_is_in_use_learns_it_under_the_opaque_close() {
+        let admitter = Arc::new(RefusingMhAdmitter(
+            warrenguard_server::TokenAdmission::SerialInUse,
+        )) as Arc<dyn SessionTokenAdmitter>;
+        let exit = spawn_terminating_exit_v7(v4_alloc(), admitter);
+
+        let (detail, close) =
+            client_setup_roundtrip(&exit, |_| detailed_request(a_session_token(0x21))).await;
+
+        assert_eq!(
+            detail,
+            Some(WarrenControlMessage::TokenRejected {
+                reason_code: warrenguard_multihop::TokenRejectCode::SerialInUse.code()
+            }),
+            "a client that asked why must learn that another device holds the serial"
+        );
+        assert_opaque_close(close);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_detailed_request_whose_token_is_refused_otherwise_learns_an_unspecified_refusal() {
+        for verdict in [
+            warrenguard_server::TokenAdmission::Reject,
+            warrenguard_server::TokenAdmission::Denied,
+        ] {
+            let admitter =
+                Arc::new(RefusingMhAdmitter(verdict.clone())) as Arc<dyn SessionTokenAdmitter>;
+            let exit = spawn_terminating_exit_v7(v4_alloc(), admitter);
+
+            let (detail, close) =
+                client_setup_roundtrip(&exit, |_| detailed_request(a_session_token(0x22))).await;
+
+            assert_eq!(
+                detail,
+                Some(WarrenControlMessage::TokenRejected {
+                    reason_code: warrenguard_multihop::TokenRejectCode::Unspecified.code()
+                }),
+                "{verdict:?} is no serial in use"
+            );
+            assert_opaque_close(close);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_plain_v7_request_whose_serial_is_in_use_keeps_the_rejected_deployed_clients_read() {
+        let admitter = Arc::new(RefusingMhAdmitter(
+            warrenguard_server::TokenAdmission::SerialInUse,
+        )) as Arc<dyn SessionTokenAdmitter>;
+        let exit = spawn_terminating_exit_v7(v4_alloc(), admitter);
+
+        let (detail, close) = client_setup_roundtrip(&exit, |s| {
+            s.build_ip_request_v7(vec![a_session_token(0x23)], None, false, false)
+        })
+        .await;
+
+        assert_eq!(
+            detail,
+            Some(WarrenControlMessage::Rejected),
+            "a deployed client cannot decode TokenRejected and would present the same token again"
+        );
+        assert_opaque_close(close);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_detailed_request_with_a_valid_token_is_admitted_like_a_plain_one() {
+        let admitter = Arc::new(FakeMhAdmitter { deny: false }) as Arc<dyn SessionTokenAdmitter>;
+        let exit = spawn_terminating_exit_v7(v4_alloc(), admitter);
+
+        let (detail, _close) =
+            client_setup_roundtrip(&exit, |_| detailed_request(a_session_token(0x24))).await;
+
+        assert!(
+            matches!(detail, Some(WarrenControlMessage::IpAssign { .. })),
+            "expected an IpAssign, got {detail:?}"
         );
     }
 

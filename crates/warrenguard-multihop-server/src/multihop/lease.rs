@@ -222,7 +222,9 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
                 Rebind::Done => LeaseRefreshStatus::Refreshed,
                 Rebind::HeldElsewhere | Rebind::Gone => LeaseRefreshStatus::Refused,
             },
-            TokenAdmission::Denied | TokenAdmission::Reject => LeaseRefreshStatus::Refused,
+            TokenAdmission::Denied | TokenAdmission::SerialInUse | TokenAdmission::Reject => {
+                LeaseRefreshStatus::Refused
+            }
         }
     }
 
