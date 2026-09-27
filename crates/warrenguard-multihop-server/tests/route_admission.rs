@@ -622,9 +622,7 @@ async fn a_main_session_refreshes_its_lease_when_due_and_its_anchor_follows_the_
     );
 
     // The deployer's renewal found the lease of a past epoch.
-    let stale = main_exit
-        .registry
-        .lease_refresh_due(&[0xB0; 32])
+    let stale = main_exit.registry.lease_refresh_due(&[[0xB0; 32]], 1)[0]
         .expect("a live session holds that lease");
     assert!(stale.capable);
     assert_eq!(
@@ -691,7 +689,7 @@ async fn a_session_whose_lease_expired_is_told_then_closed_with_the_lease_code()
         })
     );
 
-    assert_eq!(exit.registry.end_expired_lease(&[0xB2; 32]), 1);
+    assert_eq!(exit.registry.end_expired_leases(&[[0xB2; 32]]), vec![1]);
     assert_eq!(
         main.next_control().await,
         Some(WarrenControlMessage::LeaseRefreshAck {

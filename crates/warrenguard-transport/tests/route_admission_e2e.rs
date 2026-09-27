@@ -453,9 +453,7 @@ async fn a_stale_lease_is_refreshed_in_place_and_an_expired_one_redials_with_the
     // The deployer's renewal finds the main's lease of a past epoch, once the
     // client has announced that it refreshes.
     wait_for("the refresh announcement", || {
-        main_exit
-            .registry
-            .lease_refresh_due(&serial(0x15))
+        main_exit.registry.lease_refresh_due(&[serial(0x15)], 1)[0]
             .is_some_and(|stale| stale.capable)
     })
     .await;
@@ -479,7 +477,10 @@ async fn a_stale_lease_is_refreshed_in_place_and_an_expired_one_redials_with_the
 
     // A session that does not refresh in time is ended; the client redials on
     // a fresh token and re-homes the anchor, and the route is still untouched.
-    assert_eq!(main_exit.registry.end_expired_lease(&serial(0x16)), 1);
+    assert_eq!(
+        main_exit.registry.end_expired_leases(&[serial(0x16)]),
+        vec![1]
+    );
     wait_for("the redialled main session", || {
         main_exit.registry.live_token_serials() == vec![serial(0x17)]
     })

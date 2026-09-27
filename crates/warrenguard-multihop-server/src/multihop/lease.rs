@@ -10,14 +10,19 @@
 //! [`SessionTokenAdmitter`] and moves the session's lease onto its serial
 //! (the rebind an anchor request with a token also makes). Whether and when
 //! a session that does not refresh is ended is the deployer's call
-//! ([`MultihopSessionRegistry::end_expired_lease`]); the registry says how
+//! ([`MultihopSessionRegistry::end_expired_leases`]); the registry says how
 //! long the lease has been stale and whether the client announced it
 //! refreshes.
 //!
 //! No-log: nothing here logs a serial, a token or a digest.
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// The tokio clock, so the throttle and the staleness follow a paused test
+// clock; it is the system's monotonic clock otherwise.
+use tokio::time::Instant;
 
 use sha2::{Digest, Sha256};
 use warrenguard_multihop::{LeaseRefreshStatus, WarrenControlMessage};
@@ -51,8 +56,12 @@ pub(super) struct LeaseSlot {
     /// When the last spend started.
     last_call: Option<Instant>,
     /// Digest of the last request that reached the admitter, and its verdict:
-    /// a byte-identical repeat is answered from it.
+    /// a byte-identical repeat is answered from it. Never an `unavailable`
+    /// verdict, which the client answers by presenting the same token again.
     last: Option<([u8; 32], LeaseRefreshStatus)>,
+    /// The deployer's period (its epoch) in which this lease was last counted
+    /// stale.
+    counted_period: Option<u64>,
 }
 
 impl LeaseSlot {
@@ -62,6 +71,9 @@ impl LeaseSlot {
     }
 }
 
+/// A session to end, with its connections.
+type ExpiringSession<C> = (SessionKey, Vec<(ConnId, C)>);
+
 /// What the registry knows of a session whose lease the deployer reported
 /// stale, for the deployer to decide whether to end it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +82,9 @@ pub struct StaleLease {
     pub stale_for: Duration,
     /// Whether the session's client announced it refreshes its lease.
     pub capable: bool,
+    /// Whether this report is the first to find the lease stale in the
+    /// deployer's current period, the one the stale counters count.
+    pub first_in_period: bool,
 }
 
 fn send_ack(reply: &ControlTx, status: LeaseRefreshStatus) {
@@ -179,7 +194,11 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
                     .unwrap_or(LeaseRefreshStatus::Unavailable);
                     if let Some(slot) = registry.route.anchors.lock().get_mut(&key_serial) {
                         slot.lease.in_flight = false;
-                        slot.lease.last = Some((digest, status));
+                        // An `unavailable` is never replayed: the client's retry of
+                        // the same token must reach the admitter again, or one slow
+                        // spend would leave the session stale for its whole grace.
+                        slot.lease.last =
+                            (status != LeaseRefreshStatus::Unavailable).then_some((digest, status));
                         // A client that refreshes is one that will again.
                         slot.lease.capable |= status == LeaseRefreshStatus::Refreshed;
                     }
@@ -207,102 +226,144 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
         }
     }
 
-    /// The registry key of the live token session holding the lease of
-    /// `lease_serial`. Called with `live` and `anchors` held.
-    fn key_of_lease(
-        live: &std::collections::HashMap<SessionKey, std::collections::HashMap<ConnId, C>>,
-        anchors: &std::collections::HashMap<[u8; TOKEN_SERIAL_LEN], AnchorSlot>,
-        lease_serial: &[u8; TOKEN_SERIAL_LEN],
-    ) -> Option<[u8; TOKEN_SERIAL_LEN]> {
-        live.keys().find_map(|key| match key {
-            SessionKey::TokenSerial(serial) => {
-                let key = *serial.as_bytes();
-                let lease = anchors.get(&key).map_or(key, |slot| slot.lease_serial);
-                (&lease == lease_serial).then_some(key)
-            }
-            SessionKey::Wallet(_) | SessionKey::Route(_) => None,
-        })
+    /// Map every live token session's current lease serial to its registry
+    /// key, once per call, so a round over every stale lease of the exit
+    /// costs one pass over the sessions rather than one per lease. Called
+    /// with `live` and `anchors` held. Two sessions share a lease only while
+    /// an overlap swap drains the old one on the serial the new one was
+    /// admitted on, both the same client's: either key then serves.
+    fn keys_by_lease(
+        live: &HashMap<SessionKey, HashMap<ConnId, C>>,
+        anchors: &HashMap<[u8; TOKEN_SERIAL_LEN], AnchorSlot>,
+    ) -> HashMap<[u8; TOKEN_SERIAL_LEN], [u8; TOKEN_SERIAL_LEN]> {
+        live.keys()
+            .filter_map(|key| match key {
+                SessionKey::TokenSerial(serial) => {
+                    let key = *serial.as_bytes();
+                    Some((anchors.get(&key).map_or(key, |slot| slot.lease_serial), key))
+                }
+                SessionKey::Wallet(_) | SessionKey::Route(_) => None,
+            })
+            .collect()
     }
 
-    /// The deployer found the lease of `lease_serial` to belong to a past
-    /// epoch. Records when it first did, asks a client that announced the
-    /// capability for a token of the current epoch (`LeaseRefreshAck{due}`
-    /// on one connection), and says how long the lease has been stale and
-    /// whether the client refreshes. `None` when no live session holds that
-    /// lease. Call it at each renewal while the lease stays stale: the ask
-    /// is repeated, so a lost datagram costs one renewal interval.
-    pub fn lease_refresh_due(&self, lease_serial: &[u8; TOKEN_SERIAL_LEN]) -> Option<StaleLease> {
+    /// The deployer found the leases in `lease_serials` to belong to a past
+    /// epoch, `period` being the deployer's current one. For each, records
+    /// when it first did, asks a client that announced the capability for a
+    /// token of the current epoch (`LeaseRefreshAck{due}` on one connection),
+    /// and says how long the lease has been stale and whether the client
+    /// refreshes; `None` where no live session holds that lease. Call it at
+    /// each renewal round while leases stay stale: the ask is repeated, so a
+    /// lost datagram costs one round. A stale lease counts once per `period`
+    /// in `stale_capable` or `stale_incapable`, so a session that never
+    /// refreshes counts in every epoch it lives through, as a refreshing one
+    /// does.
+    pub fn lease_refresh_due(
+        &self,
+        lease_serials: &[[u8; TOKEN_SERIAL_LEN]],
+        period: u64,
+    ) -> Vec<Option<StaleLease>> {
         let now = Instant::now();
-        let (key_serial, since, first, capable) = {
+        let mut ask = Vec::new();
+        let (mut capable_count, mut incapable_count) = (0u64, 0u64);
+        let verdicts: Vec<Option<StaleLease>> = {
             let live = self.live.lock();
             let mut anchors = self.route.anchors.lock();
-            let key_serial = Self::key_of_lease(&live, &anchors, lease_serial)?;
-            let slot = &mut anchors
-                .entry(key_serial)
-                .or_insert_with(|| AnchorSlot::new(key_serial))
-                .lease;
-            let first = slot.stale_since.is_none();
-            let since = *slot.stale_since.get_or_insert(now);
-            (key_serial, since, first, slot.capable)
+            let keys = Self::keys_by_lease(&live, &anchors);
+            lease_serials
+                .iter()
+                .map(|lease| {
+                    let key = *keys.get(lease)?;
+                    let slot = &mut anchors
+                        .entry(key)
+                        .or_insert_with(|| AnchorSlot::new(key))
+                        .lease;
+                    let since = *slot.stale_since.get_or_insert(now);
+                    let first_in_period = slot.counted_period != Some(period);
+                    if first_in_period {
+                        slot.counted_period = Some(period);
+                        if slot.capable {
+                            capable_count += 1;
+                        } else {
+                            incapable_count += 1;
+                        }
+                    }
+                    if slot.capable {
+                        ask.push(SessionKey::TokenSerial(WarrenPubkey::from_bytes(key)));
+                    }
+                    Some(StaleLease {
+                        stale_for: now.duration_since(since),
+                        capable: slot.capable,
+                        first_in_period,
+                    })
+                })
+                .collect()
         };
-        if first {
-            lease_refresh_metrics().record(if capable {
-                LeaseRefreshResult::StaleCapable
-            } else {
-                LeaseRefreshResult::StaleIncapable
-            });
+        let metrics = lease_refresh_metrics();
+        for _ in 0..capable_count {
+            metrics.record(LeaseRefreshResult::StaleCapable);
         }
-        if capable {
-            let key = SessionKey::TokenSerial(WarrenPubkey::from_bytes(key_serial));
-            // One connection is enough: the ack carries no correlation, and
-            // one per bonded leg would start one refresh per leg.
-            if let Some((_, tx)) = self.route.controls_of(key).into_iter().next() {
-                send_ack(&tx, LeaseRefreshStatus::Due);
-                lease_refresh_metrics().record(LeaseRefreshResult::DueSent);
+        for _ in 0..incapable_count {
+            metrics.record(LeaseRefreshResult::StaleIncapable);
+        }
+        // One connection per session is enough: the ack carries no
+        // correlation, and one per bonded leg would start one refresh per leg.
+        let controls = self.route.first_controls_of(&ask);
+        for key in &ask {
+            if let Some(tx) = controls.get(key) {
+                send_ack(tx, LeaseRefreshStatus::Due);
+                metrics.record(LeaseRefreshResult::DueSent);
             }
         }
-        Some(StaleLease {
-            stale_for: now.duration_since(since),
-            capable,
-        })
+        verdicts
     }
 
-    /// End the session holding the lease of `lease_serial` because its lease
-    /// was not refreshed in time: every connection gets
+    /// End the sessions holding the leases in `lease_serials` because they
+    /// were not refreshed in time: every connection gets
     /// `LeaseRefreshAck{expired}` and is then closed with the operational
     /// lease-expired code, which its client redials after on a token of the
-    /// current epoch. Returns how many connections were ended.
-    pub fn end_expired_lease(&self, lease_serial: &[u8; TOKEN_SERIAL_LEN]) -> usize
+    /// current epoch. Returns, per lease, how many connections were ended.
+    pub fn end_expired_leases(&self, lease_serials: &[[u8; TOKEN_SERIAL_LEN]]) -> Vec<usize>
     where
         C: Clone,
     {
-        let (key, conns): (SessionKey, Vec<(ConnId, C)>) = {
+        let sessions: Vec<Option<ExpiringSession<C>>> = {
             let live = self.live.lock();
             let anchors = self.route.anchors.lock();
-            let Some(key_serial) = Self::key_of_lease(&live, &anchors, lease_serial) else {
-                return 0;
-            };
-            let key = SessionKey::TokenSerial(WarrenPubkey::from_bytes(key_serial));
-            let conns = live
-                .get(&key)
-                .map(|conns| conns.iter().map(|(id, c)| (*id, c.clone())).collect())
-                .unwrap_or_default();
-            (key, conns)
+            let keys = Self::keys_by_lease(&live, &anchors);
+            lease_serials
+                .iter()
+                .map(|lease| {
+                    let key = SessionKey::TokenSerial(WarrenPubkey::from_bytes(*keys.get(lease)?));
+                    let conns = live
+                        .get(&key)
+                        .map(|conns| conns.iter().map(|(id, c)| (*id, c.clone())).collect())
+                        .unwrap_or_default();
+                    Some((key, conns))
+                })
+                .collect()
         };
-        let controls: std::collections::HashMap<ConnId, ControlTx> =
-            self.route.controls_of(key).into_iter().collect();
-        for (id, conn) in &conns {
-            let told = controls
-                .get(id)
-                .is_some_and(|tx| tx.try_send(Outbound::EndLease).is_ok());
-            if !told {
-                conn.close_lease_expired();
-            }
-        }
-        if !conns.is_empty() {
-            lease_refresh_metrics().record(LeaseRefreshResult::Expired);
-        }
-        conns.len()
+        let controls = self.route.controls_by_conn();
+        sessions
+            .into_iter()
+            .map(|session| {
+                let Some((key, conns)) = session else {
+                    return 0;
+                };
+                for (id, conn) in &conns {
+                    let told = controls
+                        .get(&(key, *id))
+                        .is_some_and(|tx| tx.try_send(Outbound::EndLease).is_ok());
+                    if !told {
+                        conn.close_lease_expired();
+                    }
+                }
+                if !conns.is_empty() {
+                    lease_refresh_metrics().record(LeaseRefreshResult::Expired);
+                }
+                conns.len()
+            })
+            .collect()
     }
 }
 
@@ -335,6 +396,8 @@ mod tests {
     /// never answers; counts spends.
     struct FakeTokens {
         verdict: Option<bool>,
+        /// The first spend never answers, the later ones follow `verdict`.
+        hang_first: bool,
         spends: AtomicUsize,
     }
 
@@ -342,6 +405,7 @@ mod tests {
         fn new(verdict: Option<bool>) -> Arc<Self> {
             Arc::new(Self {
                 verdict,
+                hang_first: false,
                 spends: AtomicUsize::new(0),
             })
         }
@@ -349,8 +413,11 @@ mod tests {
 
     impl SessionTokenAdmitter for FakeTokens {
         fn admit<'a>(&'a self, tokens: &'a [SessionToken]) -> BoxFuture<'a, TokenAdmission> {
-            self.spends.fetch_add(1, Ordering::AcqRel);
+            let first = self.spends.fetch_add(1, Ordering::AcqRel) == 0;
             Box::pin(async move {
+                if first && self.hang_first {
+                    std::future::pending::<()>().await;
+                }
                 match self.verdict {
                     None => std::future::pending().await,
                     Some(false) => TokenAdmission::Denied,
@@ -403,6 +470,15 @@ mod tests {
         (registry, ctx, rx, conn)
     }
 
+    /// One lease reported stale in period 1, as a renewal round does.
+    fn due(registry: &MultihopSessionRegistry<FakeConn>, lease: [u8; 32]) -> Option<StaleLease> {
+        registry.lease_refresh_due(&[lease], 1).pop().flatten()
+    }
+
+    fn end(registry: &MultihopSessionRegistry<FakeConn>, lease: [u8; 32]) -> usize {
+        registry.end_expired_leases(&[lease]).iter().sum()
+    }
+
     fn submit(
         registry: &Arc<MultihopSessionRegistry<FakeConn>>,
         ctx: &AnchorContext,
@@ -438,13 +514,13 @@ mod tests {
     #[tokio::test]
     async fn an_announcement_marks_the_session_capable_and_is_acked_registered() {
         let (registry, ctx, mut rx, _) = main_session(Some(FakeTokens::new(Some(true))));
-        let stale = registry.lease_refresh_due(&MAIN).expect("live");
+        let stale = due(&registry, MAIN).expect("live");
         assert!(!stale.capable, "nothing announced yet");
         nothing_sent(&mut rx).await;
 
         submit(&registry, &ctx, None);
         assert_eq!(next_status(&mut rx).await, LeaseRefreshStatus::Registered);
-        assert!(registry.lease_refresh_due(&MAIN).expect("live").capable);
+        assert!(due(&registry, MAIN).expect("live").capable);
         assert_eq!(
             next_status(&mut rx).await,
             LeaseRefreshStatus::Due,
@@ -461,7 +537,7 @@ mod tests {
         registry.set_token_session_end_observer(Box::new(move |s| sink.lock().push(s)));
         submit(&registry, &ctx, None);
         next_status(&mut rx).await;
-        registry.lease_refresh_due(&MAIN).expect("live");
+        due(&registry, MAIN).expect("live");
         next_status(&mut rx).await;
         tokio::time::sleep(Duration::from_millis(80)).await;
 
@@ -475,11 +551,11 @@ mod tests {
             "the lease left behind is released"
         );
         assert_eq!(
-            registry.lease_refresh_due(&MAIN),
+            due(&registry, MAIN),
             None,
             "no session holds the old lease any more"
         );
-        let again = registry.lease_refresh_due(&fresh).expect("live");
+        let again = due(&registry, fresh).expect("live");
         assert!(
             again.stale_for < Duration::from_millis(50),
             "a refresh clears the staleness: a later report starts a new one"
@@ -489,7 +565,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_token_is_acked_refused_and_keeps_the_lease() {
         let (registry, ctx, mut rx, _) = main_session(Some(FakeTokens::new(Some(false))));
-        registry.lease_refresh_due(&MAIN).expect("live");
+        due(&registry, MAIN).expect("live");
         submit(&registry, &ctx, Some(token(0x77)));
         assert_eq!(next_status(&mut rx).await, LeaseRefreshStatus::Refused);
         assert_eq!(registry.live_token_serials(), vec![MAIN]);
@@ -537,6 +613,54 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_token_presented_again_after_unavailable_reaches_the_admitter_again() {
+        let tokens = Arc::new(FakeTokens {
+            verdict: Some(true),
+            hang_first: true,
+            spends: AtomicUsize::new(0),
+        });
+        let (registry, ctx, mut rx, _) = main_session(Some(Arc::clone(&tokens)));
+        submit(&registry, &ctx, Some(token(0x77)));
+        match tokio::time::timeout(REFRESH_CALL_TIMEOUT * 3, rx.recv()).await {
+            Ok(Some(Outbound::Control(WarrenControlMessage::LeaseRefreshAck { status }))) => {
+                assert_eq!(
+                    LeaseRefreshStatus::from_code(status),
+                    LeaseRefreshStatus::Unavailable
+                );
+            }
+            other => panic!("expected an unavailable ack, got {other:?}"),
+        }
+        tokio::time::sleep(REFRESH_MIN_INTERVAL).await;
+
+        // The client presents the same token again, byte for byte.
+        submit(&registry, &ctx, Some(token(0x77)));
+
+        assert_eq!(
+            next_status(&mut rx).await,
+            LeaseRefreshStatus::Refreshed,
+            "an unavailable verdict is never replayed from the cache"
+        );
+        assert_eq!(tokens.spends.load(Ordering::Acquire), 2);
+        assert_eq!(registry.live_token_serials(), vec![[0x77; 32]]);
+    }
+
+    #[tokio::test]
+    async fn a_session_that_never_refreshes_counts_stale_once_in_every_period() {
+        let (registry, _ctx, _rx, _) = main_session(Some(FakeTokens::new(Some(true))));
+        let report = |period| {
+            registry.lease_refresh_due(&[MAIN], period)[0]
+                .expect("live")
+                .first_in_period
+        };
+        assert!(report(7), "the first round of a period counts it");
+        assert!(!report(7), "later rounds of the same period do not");
+        assert!(
+            report(8),
+            "the next epoch counts it again, as it counts a session that refreshed"
+        );
+    }
+
     #[tokio::test]
     async fn only_a_session_admitted_on_a_token_is_eligible() {
         let wallet = SessionKey::Wallet(WarrenPubkey::from_bytes([0x33; 32]));
@@ -570,16 +694,16 @@ mod tests {
         submit(&registry, &ctx, None);
         next_status(&mut rx).await;
 
-        let first = registry.lease_refresh_due(&MAIN).expect("live");
+        let first = due(&registry, MAIN).expect("live");
         tokio::time::sleep(Duration::from_millis(30)).await;
-        let second = registry.lease_refresh_due(&MAIN).expect("live");
+        let second = due(&registry, MAIN).expect("live");
         assert!(second.stale_for >= first.stale_for + Duration::from_millis(30));
         let asked = [&mut rx, &mut rx2]
             .into_iter()
             .map(|rx| std::iter::from_fn(|| rx.try_recv().ok()).count())
             .sum::<usize>();
         assert_eq!(asked, 2, "one due per report, on a single leg");
-        assert_eq!(registry.lease_refresh_due(&[0x99; 32]), None);
+        assert_eq!(due(&registry, [0x99; 32]), None);
     }
 
     #[tokio::test]
@@ -588,7 +712,7 @@ mod tests {
         let untold = FakeConn::default();
         registry.register_key(main_key(), 2, untold.clone());
 
-        assert_eq!(registry.end_expired_lease(&MAIN), 2);
+        assert_eq!(end(&registry, MAIN), 2);
         assert!(matches!(rx.try_recv(), Ok(Outbound::EndLease)));
         assert_eq!(
             told.expired.load(Ordering::Acquire),
@@ -605,6 +729,6 @@ mod tests {
             0,
             "never the policy close, which a client reads as fatal"
         );
-        assert_eq!(registry.end_expired_lease(&[0x99; 32]), 0);
+        assert_eq!(end(&registry, [0x99; 32]), 0);
     }
 }

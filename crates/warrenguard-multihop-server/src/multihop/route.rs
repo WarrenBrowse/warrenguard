@@ -277,6 +277,24 @@ impl RegistryRouteState {
             .collect()
     }
 
+    /// One control sender per session in `keys`, in a single pass over the
+    /// connections.
+    pub(super) fn first_controls_of(&self, keys: &[SessionKey]) -> HashMap<SessionKey, ControlTx> {
+        let wanted: HashSet<SessionKey> = keys.iter().copied().collect();
+        let mut out = HashMap::new();
+        for ((key, _), tx) in self.control.lock().iter() {
+            if wanted.contains(key) {
+                out.entry(*key).or_insert_with(|| tx.clone());
+            }
+        }
+        out
+    }
+
+    /// Every connection's control sender.
+    pub(super) fn controls_by_conn(&self) -> HashMap<(SessionKey, ConnId), ControlTx> {
+        self.control.lock().clone()
+    }
+
     pub(super) fn retain_locator(&self, route_serial: [u8; 32], locator: &SealedToApi) {
         self.locators
             .lock()
