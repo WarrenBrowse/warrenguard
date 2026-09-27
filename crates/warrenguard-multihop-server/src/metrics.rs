@@ -791,7 +791,9 @@ impl LeaseRefreshMetrics {
         }
     }
 
-    pub(crate) fn record(&self, result: LeaseRefreshResult) {
+    /// Counts one event. Public so a deployer's exposition can be tested
+    /// against a block it filled itself.
+    pub fn record(&self, result: LeaseRefreshResult) {
         self.counts[result.index()].fetch_add(1, Ordering::Relaxed);
     }
 
