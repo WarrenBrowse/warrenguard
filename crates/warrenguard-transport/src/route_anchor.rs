@@ -331,7 +331,9 @@ pub(crate) async fn run_anchoring(
         // the session needs no token for that. Compared with the last value
         // seen rather than with `serial`, which a token this task presented
         // moved on its own.
-        let current = *lease_serial.borrow();
+        // Marked seen, so the bound wait below does not wake for a move
+        // this cycle already follows.
+        let current = *lease_serial.borrow_and_update();
         if current != refreshed {
             refreshed = current;
             serial = current;

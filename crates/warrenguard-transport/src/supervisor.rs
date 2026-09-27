@@ -96,8 +96,11 @@ pub type DialRefusedObserver =
 /// client-measured half of the shared path-aware selection signal).
 pub type PathRttObserver = Arc<dyn Fn([u8; 32], u32) + Send + Sync>;
 
-/// Source of anonymous v7 session tokens (Privacy Pass). Called ONCE
-/// per session establishment to obtain the session's token stack. Each setup
+/// Source of anonymous v7 session tokens (Privacy Pass). Called once per
+/// session establishment to obtain the session's token stack, once more when
+/// the exit asks the session to refresh its lease at an epoch change (at most
+/// once per ask, which the exit repeats every renewal round while the lease
+/// stays stale), and once when an anchor registration needs a token. Each setup
 /// request presents ONE token of it, under either [`SessionAdmission`]: an exit
 /// shown several serials of one holder could link every other session
 /// presenting one of them. The primary and all its bonded secondaries present
@@ -111,10 +114,13 @@ pub type PathRttObserver = Arc<dyn Fn([u8; 32], u32) + Send + Sync>;
 /// current-epoch tokens lets a session get past a serial another device
 /// already holds.
 ///
-/// The app wires this to a closure that pops a token from its `TokenStore` for
-/// the current epoch (plus an optional next-epoch lookahead for clock skew) and
-/// converts it to the wire [`SessionToken`]. The supervisor is deliberately
-/// ignorant of epochs and the store: it only asks for a per-session stack.
+/// The provider must not consume what it hands out: an exit decides how often
+/// a refresh asks, so a provider that popped tokens could be drained by one.
+/// The app's providers hand out the current epoch's batch, the same on every
+/// call within an epoch, and a refresh walks it one token per request, which
+/// shows an exit nothing a refused setup does not already show it. The
+/// supervisor is deliberately ignorant of epochs and the store: it only asks
+/// for a stack.
 pub type SessionTokenProvider = Arc<dyn Fn() -> Vec<SessionToken> + Send + Sync>;
 
 /// How the supervisor's sessions are admitted at the exit. Set with
@@ -6469,6 +6475,7 @@ mod route_run_tests {
     const REGISTERED: u8 = 0;
     const REFRESHED: u8 = 1;
     const REFUSED: u8 = 2;
+    const UNAVAILABLE: u8 = 3;
     const DUE: u8 = 5;
 
     /// A token session supervisor (no anchor) on the fast lease schedule.
@@ -6538,6 +6545,71 @@ mod route_run_tests {
             vec![None, Some(token(0x21).0), Some(token(0x22).0)],
             "the refused token is followed by the next, one per request, and nothing after the refresh"
         );
+        task.abort();
+        reader.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unavailable_answer_presents_the_same_token_again() {
+        let operational_key = SigningKey::from_bytes(&[0xB7; 32]);
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0xC7; 16]));
+        exit.lease_script
+            .lock()
+            .extend([Some(REGISTERED), Some(UNAVAILABLE), Some(REFRESHED)]);
+        let (tokens, _) = provider(vec![vec![token(0x17)], vec![token(0x71), token(0x72)]]);
+        let (supervisor, rx) = token_supervisor(&exit, &operational_key, tokens);
+        let reader = spawn_reader(rx);
+        let task = tokio::spawn(supervisor.run());
+        wait_for("the announcement", || exit.lease_requests.lock().len() == 1).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        ask_for_a_token(&exit);
+
+        wait_for("the refresh", || exit.lease_requests.lock().len() == 3).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            *exit.lease_requests.lock(),
+            vec![None, Some(token(0x71).0), Some(token(0x71).0)],
+            "unavailable is no refusal: the same token is presented again"
+        );
+        task.abort();
+        reader.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refresh_during_an_anchor_retry_moves_the_next_registration_onto_the_new_serial() {
+        let (operational_key, kem) = (SigningKey::from_bytes(&[0xB8; 32]), kem());
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0xC8; 16]));
+        // The control plane is unavailable at first: the anchoring task waits
+        // before its next registration.
+        exit.anchor_script.lock().extend([Some(4), Some(0)]);
+        exit.lease_script
+            .lock()
+            .extend([Some(REGISTERED), Some(REFRESHED)]);
+        let anchor = anchor(&kem);
+        let (tokens, _) = provider(vec![vec![token(0x18)], vec![token(0x81)]]);
+        let (supervisor, rx) = main_supervisor(&exit, &operational_key, Some(tokens), &anchor);
+        let supervisor = supervisor
+            .with_lease_schedule(FAST_LEASE)
+            .with_anchor_schedule(crate::route_anchor::AnchorSchedule {
+                unavailable_retry: Duration::from_millis(800),
+                ..FAST
+            });
+        let reader = spawn_reader(rx);
+        let task = tokio::spawn(supervisor.run());
+        wait_state(&anchor, AnchorState::Unavailable).await;
+        wait_for("the announcement", || exit.lease_requests.lock().len() == 1).await;
+
+        ask_for_a_token(&exit);
+
+        wait_state(&anchor, AnchorState::Anchored { max_routes: 32 }).await;
+        let seen = exit.anchor_requests.lock().clone();
+        assert_eq!(seen.len(), 2);
+        assert!(
+            opens_for_serial(&kem, &seen[1].sealed, &session_token_serial(&token(0x81))),
+            "the registration after the wait is sealed to the refreshed serial"
+        );
+        assert!(seen[1].token.is_none());
         task.abort();
         reader.abort();
     }

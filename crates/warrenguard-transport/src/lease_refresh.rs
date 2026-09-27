@@ -115,7 +115,14 @@ pub(crate) async fn run_lease_refresh(
         }
         match refresh_once(&primary, tokens.as_ref(), &mut acks, &schedule).await {
             Some(Some(token)) => {
-                serial.send_replace(session_token_serial(&token));
+                // A late `due` answered `refreshed` for the lease the session
+                // already holds moves nothing, and must not re-home the anchor.
+                let fresh = session_token_serial(&token);
+                serial.send_if_modified(|current| {
+                    let moved = *current != fresh;
+                    *current = fresh;
+                    moved
+                });
                 tracing::info!("session lease refreshed onto a token of the current epoch");
             }
             // Nothing refreshed: the exit asks again at its next renewal.
