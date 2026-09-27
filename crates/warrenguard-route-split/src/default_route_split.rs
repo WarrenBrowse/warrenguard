@@ -67,7 +67,7 @@ use warrenguard_killswitch_os::validate_tun_name as ks_validate_tun_name;
 use warrenguard_systool::SystemTool;
 use warrenguard_tun_core::WARREN_TUNNEL_FWMARK;
 
-pub use crate::bypass_cidr::BypassCidr;
+pub use crate::bypass_cidr::{BypassCidr, BypassNetwork};
 
 /// Dedicated Linux routing table number for split-default.
 /// Distinct from `policy_routing` (which uses table 42) to avoid
@@ -322,16 +322,7 @@ pub fn build_install_commands_scoped(
     // network reach the host's main table (and thus the original
     // default route via the physical interface) instead of the TUN.
     for cidr in bypass_cidrs {
-        cmds.push(vec![
-            "rule".into(),
-            "add".into(),
-            "to".into(),
-            cidr.to_string(),
-            "lookup".into(),
-            "main".into(),
-            "pref".into(),
-            RULE_PREF_BYPASS_CIDR.to_string(),
-        ]);
+        cmds.push(bypass_rule("add", false, cidr));
     }
 
     // ip rule: all other traffic (or, include-only, the marked traffic) ->
@@ -368,16 +359,7 @@ pub fn build_uninstall_commands_scoped(
     // for symmetry, although `ip rule del` is order-insensitive when
     // the (to + pref) tuple is fully specified.
     for cidr in bypass_cidrs.iter().rev() {
-        cmds.push(vec![
-            "rule".into(),
-            "del".into(),
-            "to".into(),
-            cidr.to_string(),
-            "lookup".into(),
-            "main".into(),
-            "pref".into(),
-            RULE_PREF_BYPASS_CIDR.to_string(),
-        ]);
+        cmds.push(bypass_rule("del", false, cidr));
     }
 
     // Flush table 100 (equivalent to deleting every route we
@@ -390,6 +372,148 @@ pub fn build_uninstall_commands_scoped(
     ]);
 
     cmds
+}
+
+/// `ip [-6] rule <verb> to <network> lookup main pref 49`: the destination
+/// bypass shared by the CLI's `--bypass-cidr` and [`BypassNetworkRules`].
+fn bypass_rule(verb: &str, ipv6: bool, network: &dyn std::fmt::Display) -> Vec<String> {
+    let mut rule = Vec::with_capacity(9);
+    if ipv6 {
+        rule.push("-6".to_string());
+    }
+    rule.extend([
+        "rule".to_string(),
+        verb.to_string(),
+        "to".to_string(),
+        network.to_string(),
+        "lookup".to_string(),
+        "main".to_string(),
+        "pref".to_string(),
+        RULE_PREF_BYPASS_CIDR.to_string(),
+    ]);
+    rule
+}
+
+/// The rule that sends traffic to `network` to the `main` table ahead of the
+/// tunnel lookup, in the rule database of the network's family. `verb` is
+/// `add`/`del`.
+#[must_use]
+pub fn build_bypass_network_rule(verb: &str, network: &BypassNetwork) -> Vec<String> {
+    bypass_rule(verb, network.is_ipv6(), network)
+}
+
+/// The `ip` commands that take the installed bypass networks from
+/// `installed` to `wanted`: every new network is added before any old one is
+/// removed, and a network in both is left alone, so an update never opens a
+/// window in which a network kept by both lists is routed into the tunnel.
+#[must_use]
+pub fn plan_bypass_update(
+    installed: &[BypassNetwork],
+    wanted: &[BypassNetwork],
+) -> Vec<Vec<String>> {
+    let mut adds: Vec<&BypassNetwork> = Vec::new();
+    for network in wanted {
+        if !installed.contains(network) && !adds.contains(&network) {
+            adds.push(network);
+        }
+    }
+    let adds = adds
+        .into_iter()
+        .map(|network| build_bypass_network_rule("add", network));
+    let dels = installed
+        .iter()
+        .filter(|network| !wanted.contains(network))
+        .map(|network| build_bypass_network_rule("del", network));
+    adds.chain(dels).collect()
+}
+
+/// Destination bypasses that follow a list the consumer updates while the
+/// tunnel runs (the networks a "local network sharing" setting keeps off the
+/// tunnel, say). Each network is routed to `main` ahead of the tunnel lookup
+/// in its own family's rule database; the firewall still decides whether
+/// traffic to it may leave. Independent of the split-default guards, so the
+/// list can change without touching the tunnel's own routes.
+///
+/// A crashed predecessor's rules are not reclaimed: they only send the listed
+/// destinations to `main`, where the firewall still applies, and they cannot
+/// be told apart from another tool's `lookup main` rules.
+#[derive(Debug, Default)]
+pub struct BypassNetworkRules {
+    installed: Vec<BypassNetwork>,
+}
+
+impl BypassNetworkRules {
+    /// No network bypassed yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The networks whose rules are in place.
+    #[must_use]
+    pub fn installed(&self) -> &[BypassNetwork] {
+        &self.installed
+    }
+
+    /// Makes the bypassed networks exactly `wanted` (see
+    /// [`plan_bypass_update`] for the order). A rule already present is
+    /// accepted, and one already gone counts as removed.
+    ///
+    /// # Errors
+    ///
+    /// The first `ip` command that failed. The other commands still run,
+    /// and [`Self::installed`] names the networks whose rules are in place.
+    pub async fn apply(&mut self, wanted: &[BypassNetwork]) -> Result<()> {
+        let mut first_error = None;
+        for network in wanted {
+            if self.installed.contains(network) {
+                continue;
+            }
+            let args = build_bypass_network_rule("add", network);
+            match run_ip_tolerant_exists(&args).await {
+                Ok(()) => self.installed.push(*network),
+                Err(error) => {
+                    first_error.get_or_insert(error.context(format!("ip {}", args.join(" "))));
+                }
+            }
+        }
+        let mut kept = Vec::with_capacity(self.installed.len());
+        for network in std::mem::take(&mut self.installed) {
+            if wanted.contains(&network) {
+                kept.push(network);
+                continue;
+            }
+            let args = build_bypass_network_rule("del", &network);
+            if let Err(error) = run_ip_tolerant_no_such(&args).await {
+                kept.push(network);
+                first_error.get_or_insert(error.context(format!("ip {}", args.join(" "))));
+            }
+        }
+        self.installed = kept;
+        tracing::info!(
+            networks = self.installed.len(),
+            "Warren bypass networks updated"
+        );
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Removes every bypass rule. Best effort: a failure is logged, and
+    /// [`Self::installed`] keeps the networks it could not remove.
+    pub async fn clear(&mut self) {
+        if let Err(error) = self.apply(&[]).await {
+            tracing::warn!(error = %error, "removing the bypass networks failed (non-fatal)");
+        }
+    }
+}
+
+impl Drop for BypassNetworkRules {
+    fn drop(&mut self) {
+        // Drop cannot await: a brief blocking `ip` call per rule, bounded
+        // like every synchronous cleanup here.
+        for network in std::mem::take(&mut self.installed) {
+            run_ip_sync_tolerant(&build_bypass_network_rule("del", &network));
+        }
+    }
 }
 
 /// Build the single `ip rule add` that routes split-tunnel "excluded" traffic
@@ -1724,6 +1848,60 @@ mod tests {
         let cmds = build_install_commands("myown-tun", &[]);
         assert!(cmds[0].contains(&"myown-tun".to_string()));
         assert!(cmds[1].contains(&"myown-tun".to_string()));
+    }
+
+    // --- live bypass networks ---
+
+    fn network(address: &str, prefix: u8) -> BypassNetwork {
+        BypassNetwork::new(address.parse().expect("ip"), prefix).expect("valid network")
+    }
+
+    #[test]
+    fn a_bypass_network_is_sent_to_main_ahead_of_the_tunnel_lookup_in_its_own_family() {
+        assert_eq!(
+            build_bypass_network_rule("add", &network("192.168.0.0", 16)),
+            vec![
+                "rule",
+                "add",
+                "to",
+                "192.168.0.0/16",
+                "lookup",
+                "main",
+                "pref",
+                "49"
+            ],
+            "the same rule a --bypass-cidr installs"
+        );
+        assert_eq!(
+            build_bypass_network_rule("del", &network("fd00::", 8)),
+            vec![
+                "-6", "rule", "del", "to", "fd00::/8", "lookup", "main", "pref", "49"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_update_adds_the_new_networks_before_it_removes_the_old_ones() {
+        let kept = network("192.168.0.0", 16);
+        let gone = network("10.0.0.0", 8);
+        let new = network("fd00::", 8);
+
+        let plan = plan_bypass_update(&[kept, gone], &[kept, new]);
+
+        assert_eq!(
+            plan,
+            vec![
+                build_bypass_network_rule("add", &new),
+                build_bypass_network_rule("del", &gone),
+            ],
+            "a kept network is left alone, and nothing is torn down before its replacement is in"
+        );
+    }
+
+    #[test]
+    fn an_update_to_the_same_networks_changes_nothing() {
+        let lan = [network("192.168.0.0", 16), network("fe80::", 10)];
+        assert!(plan_bypass_update(&lan, &[lan[1], lan[0], lan[0]]).is_empty());
     }
 
     // --- --bypass-cidr tests ---

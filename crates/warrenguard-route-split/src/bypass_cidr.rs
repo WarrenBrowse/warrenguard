@@ -9,7 +9,7 @@
 //! macOS/Windows that may want to log or persist the value even
 //! before the platform-specific runtime support lands).
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use thiserror::Error;
 
@@ -78,6 +78,71 @@ impl std::str::FromStr for BypassCidr {
     }
 }
 
+/// A network of either family kept off the tunnel: traffic to it uses the
+/// host's main routing table. Host bits are cleared, so two spellings of one
+/// network are one value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BypassNetwork {
+    address: IpAddr,
+    prefix: u8,
+}
+
+/// Why a network cannot be kept off the tunnel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum BypassNetworkError {
+    /// A `/0` would take a whole address family off the tunnel.
+    #[error("a /0 network would take a whole address family off the tunnel")]
+    WholeFamily,
+    /// The prefix is longer than the address (33+ for IPv4, 129+ for IPv6).
+    #[error("the prefix is longer than the address")]
+    PrefixTooLong,
+}
+
+impl BypassNetwork {
+    /// The network `address/prefix`, with the host bits of `address` cleared.
+    ///
+    /// # Errors
+    ///
+    /// - [`BypassNetworkError::WholeFamily`] for a `/0`.
+    /// - [`BypassNetworkError::PrefixTooLong`] for a prefix longer than the
+    ///   address.
+    pub fn new(address: IpAddr, prefix: u8) -> Result<Self, BypassNetworkError> {
+        if prefix == 0 {
+            return Err(BypassNetworkError::WholeFamily);
+        }
+        // `prefix` is at least 1 here, so neither shift reaches the width.
+        let address = match address {
+            IpAddr::V4(_) | IpAddr::V6(_) if prefix > max_prefix(address) => {
+                return Err(BypassNetworkError::PrefixTooLong);
+            }
+            IpAddr::V4(v4) => {
+                IpAddr::V4(Ipv4Addr::from(u32::from(v4) & (u32::MAX << (32 - prefix))))
+            }
+            IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(
+                u128::from(v6) & (u128::MAX << (128 - prefix)),
+            )),
+        };
+        Ok(Self { address, prefix })
+    }
+
+    /// Whether the network is an IPv6 one.
+    #[must_use]
+    pub fn is_ipv6(&self) -> bool {
+        self.address.is_ipv6()
+    }
+}
+
+fn max_prefix(address: IpAddr) -> u8 {
+    if address.is_ipv4() { 32 } else { 128 }
+}
+
+impl std::fmt::Display for BypassNetwork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.address, self.prefix)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,6 +186,36 @@ mod tests {
     fn rejects_non_ipv4_network() {
         let err = "::1/128".parse::<BypassCidr>().unwrap_err();
         assert!(matches!(err, ParseBypassCidrError::BadNetwork(_)));
+    }
+
+    #[test]
+    fn a_bypass_network_clears_its_host_bits_in_either_family() {
+        let v4 = BypassNetwork::new("192.168.1.42".parse().expect("ip"), 24).expect("valid");
+        let v6 = BypassNetwork::new("fd00::1".parse().expect("ip"), 8).expect("valid");
+        assert_eq!(v4.to_string(), "192.168.1.0/24");
+        assert_eq!(v6.to_string(), "fd00::/8");
+        assert!(v6.is_ipv6() && !v4.is_ipv6());
+    }
+
+    #[test]
+    fn a_bypass_network_never_takes_a_whole_family_off_the_tunnel() {
+        assert_eq!(
+            BypassNetwork::new("::".parse().expect("ip"), 0),
+            Err(BypassNetworkError::WholeFamily)
+        );
+        assert_eq!(
+            BypassNetwork::new("10.0.0.0".parse().expect("ip"), 0),
+            Err(BypassNetworkError::WholeFamily)
+        );
+    }
+
+    #[test]
+    fn a_bypass_network_refuses_a_prefix_longer_than_its_address() {
+        assert_eq!(
+            BypassNetwork::new("10.0.0.0".parse().expect("ip"), 33),
+            Err(BypassNetworkError::PrefixTooLong)
+        );
+        assert!(BypassNetwork::new("fe80::".parse().expect("ip"), 128).is_ok());
     }
 
     #[test]
