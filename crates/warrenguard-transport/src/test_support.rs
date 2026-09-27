@@ -464,9 +464,18 @@ pub(crate) struct FakeMultihopExit {
     /// Every setup request this exit opened, in arrival order.
     pub(crate) setup_requests: Arc<parking_lot::Mutex<Vec<SeenSetupRequest>>>,
     /// Tokens whose serial is leased elsewhere. A v7 request whose FIRST token
-    /// is listed is refused with the sealed `Rejected` detail, the way a real
-    /// exit spends the first token that verifies and stops at the refusal.
+    /// is listed is refused, the way a real exit spends the first token that
+    /// verifies and stops at the refusal: with the sealed `TokenRejected`
+    /// (serial in use) for an `IpRequestV7Detailed`, the plain `Rejected` for
+    /// an `IpRequestV7`.
     pub(crate) tokens_in_use: Arc<parking_lot::Mutex<Vec<[u8; SESSION_TOKEN_LEN]>>>,
+    /// Tokens that do not verify. A v7 request whose FIRST token is listed is
+    /// refused with the sealed `TokenRejected` (unspecified) for an
+    /// `IpRequestV7Detailed`, the plain `Rejected` for an `IpRequestV7`.
+    pub(crate) tokens_invalid: Arc<parking_lot::Mutex<Vec<[u8; SESSION_TOKEN_LEN]>>>,
+    /// When set, the exit predates `IpRequestV7Detailed`: it decodes nothing
+    /// of one and answers the plain `Rejected`, whatever the token.
+    pub(crate) predates_token_detail: Arc<AtomicBool>,
     /// Every `RouteAnchorRequest` datagram this exit read, in arrival order.
     pub(crate) anchor_requests: Arc<parking_lot::Mutex<Vec<SeenAnchorRequest>>>,
     /// Answers to the next anchor requests, one per request, in order: an
@@ -506,6 +515,8 @@ pub(crate) enum SeenSetupRequest {
     },
     /// A v7 `IpRequestV7` with its tokens in presentation order.
     Tokens(Vec<[u8; SESSION_TOKEN_LEN]>),
+    /// A v7 `IpRequestV7Detailed` with its tokens in presentation order.
+    DetailedTokens(Vec<[u8; SESSION_TOKEN_LEN]>),
     /// A route `IpRequestRoute` with its locator, raw.
     Route([u8; warrenguard_multihop::SEALED_TO_API_LEN]),
     /// Anything else, or a plaintext that is no control message.
@@ -593,6 +604,8 @@ struct FakeExitBehaviour {
     lose_reply: ReplyLoss,
     setup_requests: Arc<parking_lot::Mutex<Vec<SeenSetupRequest>>>,
     tokens_in_use: Arc<parking_lot::Mutex<Vec<[u8; SESSION_TOKEN_LEN]>>>,
+    tokens_invalid: Arc<parking_lot::Mutex<Vec<[u8; SESSION_TOKEN_LEN]>>>,
+    predates_token_detail: Arc<AtomicBool>,
     anchor_requests: Arc<parking_lot::Mutex<Vec<SeenAnchorRequest>>>,
     anchor_script: Arc<parking_lot::Mutex<std::collections::VecDeque<Option<u8>>>>,
     route_reply: Arc<parking_lot::Mutex<Option<WarrenControlMessage>>>,
@@ -663,6 +676,9 @@ async fn serve_one_fake_exit_connection(
         Ok(Some(WarrenControlMessage::IpRequestV7 { session_tokens, .. })) => {
             SeenSetupRequest::Tokens(session_tokens.iter().map(|t| t.0).collect())
         }
+        Ok(Some(WarrenControlMessage::IpRequestV7Detailed { session_tokens, .. })) => {
+            SeenSetupRequest::DetailedTokens(session_tokens.iter().map(|t| t.0).collect())
+        }
         Ok(Some(WarrenControlMessage::IpRequestRoute { route_locator, .. })) => {
             SeenSetupRequest::Route(route_locator.to_bytes())
         }
@@ -672,22 +688,37 @@ async fn serve_one_fake_exit_connection(
         SeenSetupRequest::Route(_) => behaviour.route_reply.lock().clone(),
         _ => None,
     };
-    let lead_token_in_use = match &seen {
-        SeenSetupRequest::Tokens(tokens) => tokens
-            .first()
-            .is_some_and(|lead| behaviour.tokens_in_use.lock().contains(lead)),
-        _ => false,
+    let (lead, detailed) = match &seen {
+        SeenSetupRequest::Tokens(tokens) => (tokens.first().copied(), false),
+        SeenSetupRequest::DetailedTokens(tokens) => (tokens.first().copied(), true),
+        _ => (None, false),
     };
+    let lead_token_refusal = lead.and_then(|lead| {
+        if behaviour.tokens_in_use.lock().contains(&lead) {
+            Some(warrenguard_multihop::TokenRejectCode::SerialInUse)
+        } else if behaviour.tokens_invalid.lock().contains(&lead) {
+            Some(warrenguard_multihop::TokenRejectCode::Unspecified)
+        } else {
+            None
+        }
+    });
+    let predates_detail = detailed && behaviour.predates_token_detail.load(Ordering::Relaxed);
     behaviour.setup_requests.lock().push(seen);
     let reply_msg = if let Some(refusal) = route_refusal {
         refusal
+    } else if predates_detail {
+        WarrenControlMessage::Rejected
     } else if behaviour.reject_banned.load(Ordering::Relaxed) {
         WarrenControlMessage::RejectedBanned {
             reason_code: behaviour.ban_reason_code.load(Ordering::Relaxed),
         }
     } else if behaviour.reject_device_limit.load(Ordering::Relaxed) {
         WarrenControlMessage::RejectedDeviceLimit
-    } else if behaviour.reject.load(Ordering::Relaxed) || lead_token_in_use {
+    } else if let (Some(code), true) = (lead_token_refusal, detailed) {
+        WarrenControlMessage::TokenRejected {
+            reason_code: code.code(),
+        }
+    } else if behaviour.reject.load(Ordering::Relaxed) || lead_token_refusal.is_some() {
         WarrenControlMessage::Rejected
     } else {
         WarrenControlMessage::IpAssign {
@@ -924,6 +955,8 @@ pub(crate) fn spawn_fake_multihop_exit_on(
         lose_reply: Arc::new(parking_lot::Mutex::new(None)),
         setup_requests: Arc::new(parking_lot::Mutex::new(Vec::new())),
         tokens_in_use: Arc::new(parking_lot::Mutex::new(Vec::new())),
+        tokens_invalid: Arc::new(parking_lot::Mutex::new(Vec::new())),
+        predates_token_detail: Arc::new(AtomicBool::new(false)),
         anchor_requests: Arc::new(parking_lot::Mutex::new(Vec::new())),
         anchor_script: Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
         route_reply: Arc::new(parking_lot::Mutex::new(None)),
@@ -993,6 +1026,8 @@ pub(crate) fn spawn_fake_multihop_exit_on(
         lose_reply: behaviour.lose_reply,
         setup_requests: behaviour.setup_requests,
         tokens_in_use: behaviour.tokens_in_use,
+        tokens_invalid: behaviour.tokens_invalid,
+        predates_token_detail: behaviour.predates_token_detail,
         anchor_requests: behaviour.anchor_requests,
         anchor_script: behaviour.anchor_script,
         route_reply: behaviour.route_reply,

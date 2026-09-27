@@ -220,10 +220,13 @@ pub enum NoSessionTokenCause {
     /// The token provider had no token to hand out (none configured, or its
     /// store is empty for the current epoch).
     Empty,
-    /// The exit refused every token of the stack, one attempt each. The wire
-    /// does not say why; with a wallet's tokens shared across its devices the
-    /// usual cause is that each serial already holds a live session elsewhere.
+    /// The exit refused every token of the stack, one attempt each, and at
+    /// least one of them for a reason other than [`Self::AllInUse`], or
+    /// without saying why (an exit that predates the typed refusal).
     AllRefused,
+    /// The exit refused every token of the stack because its serial holds a
+    /// live session elsewhere: other devices of the wallet hold every slot.
+    AllInUse,
 }
 
 impl core::fmt::Display for NoSessionTokenCause {
@@ -231,6 +234,7 @@ impl core::fmt::Display for NoSessionTokenCause {
         f.write_str(match self {
             Self::Empty => "no token available",
             Self::AllRefused => "every token was refused",
+            Self::AllInUse => "every token is in use by another session",
         })
     }
 }
@@ -2429,11 +2433,38 @@ impl MultiHopClient {
         session_tokens: Option<&[SessionToken]>,
         prefer_ipv4: Option<std::net::Ipv4Addr>,
     ) -> Result<Vec<u8>, MultiHopError> {
+        self.setup_over_stream_with_token_request(
+            identity,
+            wants_ipv6,
+            wants_daita,
+            session_tokens,
+            prefer_ipv4,
+            TokenRequestKind::Plain,
+        )
+        .await
+    }
+
+    /// Variant of [`Self::setup_over_stream_with_options`] that picks which
+    /// v7 request carries `session_tokens` (see [`TokenRequestKind`]). No
+    /// effect on a request without tokens.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::setup_over_stream`].
+    pub async fn setup_over_stream_with_token_request(
+        &self,
+        identity: Option<&SigningKey>,
+        wants_ipv6: bool,
+        wants_daita: bool,
+        session_tokens: Option<&[SessionToken]>,
+        prefer_ipv4: Option<std::net::Ipv4Addr>,
+        kind: TokenRequestKind,
+    ) -> Result<Vec<u8>, MultiHopError> {
         // Sign over the session's CURRENT encapsulated_key. Setup runs
         // before any traffic, so no rekey can race the seal below; if one
         // ever did, the exit would reject the stale PoP and the supervisor
         // would redial cleanly.
-        let request_msg = compose_setup_request(
+        let request_msg = kind.shape(compose_setup_request(
             identity,
             &self.exit_id,
             &self.session.encapsulated_key(),
@@ -2441,7 +2472,7 @@ impl MultiHopClient {
             wants_daita,
             session_tokens,
             prefer_ipv4,
-        );
+        ));
         self.setup_over_stream_request(&request_msg).await
     }
 
@@ -2884,6 +2915,48 @@ impl WarrenPumpHandle for MultiHopClient {
 /// loopback test harness can build the matching exit-side
 /// [`warrenguard_multihop::ExitSession`] without going through the
 /// setup-stream wire exchange. `session` is private to this module;
+/// Which v7 request a token setup sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum TokenRequestKind {
+    /// `IpRequestV7`, which every v7 exit decodes. A refused token is
+    /// answered with the plain `Rejected`, whatever the reason.
+    #[default]
+    Plain,
+    /// `IpRequestV7Detailed`: a refused token is answered with
+    /// `TokenRejected`, which says whether another session holds its serial.
+    /// An exit that predates it answers the plain `Rejected` to every such
+    /// request, valid token or not, so a client that meets that answer
+    /// presents the same token to that exit as [`Self::Plain`].
+    Detailed,
+}
+
+impl TokenRequestKind {
+    /// `request` as this kind sends it: an `IpRequestV7` becomes an
+    /// `IpRequestV7Detailed` under [`Self::Detailed`], and every other
+    /// request is left as it is.
+    #[must_use]
+    pub fn shape(self, request: WarrenControlMessage) -> WarrenControlMessage {
+        match (self, request) {
+            (
+                Self::Detailed,
+                WarrenControlMessage::IpRequestV7 {
+                    prefer_ipv4,
+                    wants_ipv6,
+                    session_tokens,
+                    wants_daita,
+                },
+            ) => WarrenControlMessage::IpRequestV7Detailed {
+                prefer_ipv4,
+                wants_ipv6,
+                session_tokens,
+                wants_daita,
+            },
+            (_, request) => request,
+        }
+    }
+}
+
 /// Builds the setup-stream control request. Pure so the request shape,
 /// notably the session-placement `prefer_ipv4` hint pass-through, is
 /// testable without a live session.
@@ -2996,6 +3069,40 @@ mod tests {
             got: 0,
             expected: 1,
         })
+    }
+
+    #[test]
+    fn a_detailed_token_request_keeps_every_field_and_leaves_other_requests_alone() {
+        let tokens = vec![SessionToken([0xAB; warrenguard_wire::SESSION_TOKEN_LEN])];
+        let plain = WarrenControlMessage::IpRequestV7 {
+            prefer_ipv4: Some([10, 66, 0, 7]),
+            wants_ipv6: true,
+            session_tokens: tokens.clone(),
+            wants_daita: true,
+        };
+
+        assert_eq!(
+            TokenRequestKind::Detailed.shape(plain.clone()),
+            WarrenControlMessage::IpRequestV7Detailed {
+                prefer_ipv4: Some([10, 66, 0, 7]),
+                wants_ipv6: true,
+                session_tokens: tokens,
+                wants_daita: true,
+            }
+        );
+        assert_eq!(TokenRequestKind::Plain.shape(plain.clone()), plain);
+        let wallet = WarrenControlMessage::IpRequest {
+            prefer_ipv4: None,
+            client_pubkey: None,
+            wants_ipv6: false,
+            pop_sig: None,
+            wants_daita: false,
+        };
+        assert_eq!(
+            TokenRequestKind::Detailed.shape(wallet.clone()),
+            wallet,
+            "a request without a token never becomes a token request"
+        );
     }
 
     #[test]

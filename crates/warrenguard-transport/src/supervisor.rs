@@ -46,7 +46,7 @@ use warrenguard_transport_core::{
     warren_transport_config_client_with_idle_cover,
 };
 
-use crate::multihop::{self, MultiHopClient, MultiHopError, NoSessionTokenCause};
+use crate::multihop::{self, MultiHopClient, MultiHopError, NoSessionTokenCause, TokenRequestKind};
 
 /// Observer invoked whenever the supervisor successfully publishes a
 /// fresh session that follows a previous disconnect (i.e. the initial
@@ -167,16 +167,32 @@ impl SessionAdmission {
     }
 }
 
-/// Whether a setup rejection can be the exit refusing the presented token. The
-/// exit answers every v7 refusal (no token verified, or the token's serial is
-/// already leased to a live session elsewhere, `SerialInUse`) with the same
-/// sealed `Rejected` detail, or with the bare opaque close when the detail is
-/// lost, so the client cannot tell an in-use serial from an invalid token.
+/// Whether a setup rejection can be the exit refusing the presented token. An
+/// exit answers a refused `IpRequestV7Detailed` with the sealed
+/// `TokenRejected`, read as [`RejectionReason::SerialInUse`] when another
+/// session holds the token's serial and as the plain refusal otherwise. An
+/// exit that predates it, or a refusal whose detail was lost, says only
+/// `Rejected` or closes, so an in-use serial reads like an invalid token.
 fn is_token_refusal(reason: RejectionReason) -> bool {
     matches!(
         reason,
-        RejectionReason::NotAllowlisted | RejectionReason::PolicyRefused
+        RejectionReason::NotAllowlisted
+            | RejectionReason::PolicyRefused
+            | RejectionReason::SerialInUse
     )
+}
+
+/// The reason a session ends with once the exit refused every token of its
+/// stack, the last refusal being `last`: the device limit when every refusal
+/// said another session holds the token's serial, and otherwise the plain
+/// refusal, since a stack holding a token that did not verify says nothing
+/// about the wallet's other devices.
+fn walked_stack_verdict(last: RejectionReason, every_slot_taken: bool) -> RejectionReason {
+    match last {
+        _ if every_slot_taken => RejectionReason::DeviceLimit,
+        RejectionReason::SerialInUse => RejectionReason::NotAllowlisted,
+        other => other,
+    }
 }
 
 /// One session's v7 token stack, as the provider handed it out, plus how many
@@ -191,6 +207,9 @@ fn is_token_refusal(reason: RejectionReason) -> bool {
 struct TokenStack {
     tokens: Vec<SessionToken>,
     refused: usize,
+    /// How many of the `refused` were refused because another session holds
+    /// the token's serial.
+    in_use: usize,
     /// When the provider handed the stack out, to stop re-presenting it once
     /// it may belong to a past epoch.
     popped_at: Instant,
@@ -210,6 +229,7 @@ impl TokenStack {
         (!tokens.is_empty()).then(|| Self {
             tokens,
             refused: 0,
+            in_use: 0,
             popped_at: Instant::now(),
         })
     }
@@ -234,15 +254,26 @@ impl TokenStack {
         self.popped_at.elapsed() < RETRYING_STACK_MAX_AGE
     }
 
-    /// Record that the exit refused the lead token and move it to the back.
+    /// Record that the exit refused the lead token, `in_use` when it said
+    /// another session holds the token's serial, and move it to the back.
     /// `false` once every token has led an attempt: nothing untried remains.
-    fn rotate(&mut self) -> bool {
+    fn refuse(&mut self, in_use: bool) -> bool {
         self.refused += 1;
+        if in_use {
+            self.in_use += 1;
+        }
         if self.refused >= self.tokens.len() {
             return false;
         }
         self.tokens.rotate_left(1);
         true
+    }
+
+    /// Whether every refusal so far said another session holds the token's
+    /// serial. Once every token was refused, that is the wallet's devices
+    /// holding every slot: the device limit.
+    fn every_slot_taken(&self) -> bool {
+        self.refused > 0 && self.in_use == self.refused
     }
 
     /// Whether this stack is part-way through its refusal retries, so an
@@ -702,6 +733,9 @@ pub struct MultiHopSupervisor {
     anchor_schedule: crate::route_anchor::AnchorSchedule,
     /// When lease refresh requests are sent. Shortened by tests only.
     lease_schedule: crate::lease_refresh::LeaseSchedule,
+    /// Exits that answered an `IpRequestV7Detailed` with the plain
+    /// `Rejected`: they predate it, so their token setups send `IpRequestV7`.
+    exits_predating_token_detail: parking_lot::Mutex<std::collections::HashSet<ExitId>>,
 }
 
 /// Consecutive watchdog-forced redials, each of a session whose ENTIRE life
@@ -760,6 +794,8 @@ enum Established {
     SetupFailed,
     /// A route setup refused (see [`SetupOutcome::RouteRefused`]).
     RouteRefused,
+    /// See [`SetupOutcome::ExitPredatesTokenDetail`].
+    ExitPredatesTokenDetail,
 }
 
 /// Ceiling on the setup round-trip, measured from a completed handshake.
@@ -790,6 +826,11 @@ enum SetupOutcome {
     /// A route setup the exit refused (only under
     /// [`SessionAdmission::Route`]).
     RouteRefused(crate::route_anchor::RouteRefusal),
+    /// The exit answered an `IpRequestV7Detailed` with the plain `Rejected`:
+    /// it predates the request, refused it unread and spent nothing. The
+    /// exit is remembered, and a redial presents the same token to it as an
+    /// `IpRequestV7`.
+    ExitPredatesTokenDetail,
 }
 
 impl MultiHopSupervisor {
@@ -819,6 +860,7 @@ impl MultiHopSupervisor {
             route_anchor: None,
             anchor_schedule: crate::route_anchor::AnchorSchedule::DEFAULT,
             lease_schedule: crate::lease_refresh::LeaseSchedule::DEFAULT,
+            exits_predating_token_detail: parking_lot::Mutex::new(std::collections::HashSet::new()),
         };
         (supervisor, rx)
     }
@@ -1116,14 +1158,15 @@ impl MultiHopSupervisor {
                 .await
             {
                 SetupOutcome::Assigned(assign) => assign,
-                SetupOutcome::Rejected(reason) => {
+                SetupOutcome::Rejected(mut reason) => {
                     if is_token_refusal(reason)
                         && let Some(mut stack) = session_tokens
                     {
-                        if stack.rotate() {
+                        if stack.refuse(reason == RejectionReason::SerialInUse) {
                             // No-log: counts only, never a token or its serial.
                             tracing::info!(
                                 refused = stack.refused,
+                                in_use = stack.in_use,
                                 stack = stack.tokens.len(),
                                 "exit refused the session token; redialling with the next token"
                             );
@@ -1131,20 +1174,30 @@ impl MultiHopSupervisor {
                             retrying_tokens = Some(stack);
                             continue;
                         }
+                        let every_slot_taken = stack.every_slot_taken();
                         if self.admission == SessionAdmission::TokensOnly {
                             tracing::warn!(
                                 stack = stack.tokens.len(),
+                                every_slot_taken,
                                 "exit refused every token of a tokens-only session"
                             );
                             drop(primary);
-                            return Err(MultiHopError::NoSessionToken(
-                                NoSessionTokenCause::AllRefused,
-                            ));
+                            return Err(MultiHopError::NoSessionToken(if every_slot_taken {
+                                NoSessionTokenCause::AllInUse
+                            } else {
+                                NoSessionTokenCause::AllRefused
+                            }));
                         }
+                        reason = walked_stack_verdict(reason, every_slot_taken);
                     }
                     let _ = self.fatal_tx.send(Some(reason));
                     tracing::warn!(%reason, "multi-hop session rejected by exit at setup; surfacing fatal");
                     return Err(MultiHopError::Rejected(reason));
+                }
+                SetupOutcome::ExitPredatesTokenDetail => {
+                    drop(primary);
+                    retrying_tokens = session_tokens;
+                    continue;
                 }
                 SetupOutcome::TimedOut => {
                     retrying_tokens = session_tokens.filter(TokenStack::is_retrying);
@@ -1772,12 +1825,14 @@ impl MultiHopSupervisor {
         // sentinel so it can never be co-housed with another live session
         // of the same identity. Exits predating the hint ignore it.
         let placement = self.session_placement_hint(primary.exit_id());
+        let kind = self.token_request_kind(primary.exit_id());
         let setup_result = Self::setup_request(
             primary,
             &self.config,
             &self.admission,
             session_token,
             placement,
+            kind,
         )
         .await;
 
@@ -1785,6 +1840,18 @@ impl MultiHopSupervisor {
             && let Some(refusal) = Self::route_refusal(primary, &setup_result)
         {
             return SetupOutcome::RouteRefused(refusal);
+        }
+        if session_token.is_some()
+            && kind == TokenRequestKind::Detailed
+            && Self::answered_plain_rejected(&setup_result)
+        {
+            tracing::info!(
+                "exit predates the detailed token request; presenting the token plainly"
+            );
+            self.exits_predating_token_detail
+                .lock()
+                .insert(primary.exit_id());
+            return SetupOutcome::ExitPredatesTokenDetail;
         }
 
         let sealed_detail = setup_result
@@ -1821,15 +1888,37 @@ impl MultiHopSupervisor {
         SetupOutcome::Assigned(spec)
     }
 
+    /// Which request a token setup at `exit_id` sends: the detailed one,
+    /// unless that exit answered it with the plain `Rejected` before.
+    fn token_request_kind(&self, exit_id: ExitId) -> TokenRequestKind {
+        if self.exits_predating_token_detail.lock().contains(&exit_id) {
+            TokenRequestKind::Plain
+        } else {
+            TokenRequestKind::Detailed
+        }
+    }
+
+    /// Whether the setup reply is the plain sealed `Rejected`, which an exit
+    /// that decodes `IpRequestV7Detailed` never sends in answer to one.
+    fn answered_plain_rejected(setup_result: &Result<Vec<u8>, MultiHopError>) -> bool {
+        setup_result.as_ref().is_ok_and(|reply| {
+            matches!(
+                warrenguard_multihop::try_decode_control(reply),
+                Ok(Some(warrenguard_multihop::WarrenControlMessage::Rejected))
+            )
+        })
+    }
+
     /// One setup round trip for `client` under `admission`: a route request
-    /// with a fresh locator for a route session, else the token or wallet
-    /// request.
+    /// with a fresh locator for a route session, else the token request of
+    /// `kind` or the wallet request.
     async fn setup_request(
         client: &MultiHopClient,
         config: &SupervisorConfig,
         admission: &SessionAdmission,
         session_token: Option<SessionToken>,
         prefer_ipv4: Option<std::net::Ipv4Addr>,
+        kind: TokenRequestKind,
     ) -> Result<Vec<u8>, MultiHopError> {
         if let Some(route) = admission.route() {
             let request = crate::route_anchor::route_request(
@@ -1845,12 +1934,13 @@ impl MultiHopSupervisor {
             return client.setup_over_stream_request(&request).await;
         }
         client
-            .setup_over_stream_with_options(
+            .setup_over_stream_with_token_request(
                 admission.wallet_identity(&config.client_signing),
                 config.wants_ipv6,
                 config.enable_daita,
                 session_token.as_ref().map(std::slice::from_ref),
                 prefer_ipv4,
+                kind,
             )
             .await
     }
@@ -2083,6 +2173,7 @@ impl MultiHopSupervisor {
                 primary.force_close_for_reconnect();
                 return Established::RouteRefused;
             }
+            SetupOutcome::ExitPredatesTokenDetail => return Established::ExitPredatesTokenDetail,
         };
 
         // Bonded secondaries: best-effort extra connections under the same
@@ -2161,10 +2252,14 @@ impl MultiHopSupervisor {
                     let lead = session_tokens.as_ref().map(TokenStack::lead);
                     return Some((bundle, primary, target, lead));
                 }
+                Established::ExitPredatesTokenDetail => {
+                    retrying_tokens = session_tokens;
+                    continue;
+                }
                 Established::Rejected(reason) => {
                     if is_token_refusal(reason)
                         && let Some(mut stack) = session_tokens
-                        && stack.rotate()
+                        && stack.refuse(reason == RejectionReason::SerialInUse)
                     {
                         tracing::info!(
                             refused = stack.refused,
@@ -2343,12 +2438,15 @@ impl MultiHopSupervisor {
             // a per-session exit lands it on the primary's IP even when
             // another live session of the same identity holds the sticky
             // binding.
+            // A secondary joins the session its primary's token was admitted
+            // on, so it is never walked and needs no reason for a refusal.
             let setup = Self::setup_request(
                 &client,
                 config,
                 &admission,
                 session_token,
                 Some(primary_spec.assigned),
+                TokenRequestKind::Plain,
             )
             .await;
             if let Some(reason) = client.rejection_reason() {
@@ -3218,11 +3316,14 @@ mod tests {
         // The refused token stays in the stack (another session may release its
         // serial), and the redials stop once every token led one attempt.
         let mut stack = TokenStack::new(vec![token(1), token(2), token(3)]).expect("non-empty");
-        assert!(stack.rotate());
+        assert!(stack.refuse(false));
         assert_eq!(leads(&stack), [2, 3, 1]);
-        assert!(stack.rotate());
+        assert!(stack.refuse(false));
         assert_eq!(leads(&stack), [3, 1, 2]);
-        assert!(!stack.rotate(), "a third refusal has no untried token left");
+        assert!(
+            !stack.refuse(false),
+            "a third refusal has no untried token left"
+        );
         assert_eq!(
             leads(&stack),
             [3, 1, 2],
@@ -3249,7 +3350,7 @@ mod tests {
         config.session_token_provider = Some(provider);
         let (supervisor, _rx) = MultiHopSupervisor::new(config);
         let mut carried = TokenStack::new(vec![token(1), token(2)]).expect("non-empty");
-        assert!(carried.rotate());
+        assert!(carried.refuse(false));
 
         let stack = supervisor
             .tokens_for_attempt(Some(carried))
@@ -3270,7 +3371,7 @@ mod tests {
         config.session_token_provider = Some(provider);
         let (supervisor, _rx) = MultiHopSupervisor::new(config);
         let mut carried = TokenStack::new(vec![token(1), token(2)]).expect("non-empty");
-        assert!(carried.rotate());
+        assert!(carried.refuse(false));
         carried.popped_at = Instant::now()
             .checked_sub(RETRYING_STACK_MAX_AGE + Duration::from_secs(1))
             .expect("the monotonic clock is past the max age");
@@ -3287,7 +3388,45 @@ mod tests {
     #[test]
     fn a_single_token_stack_has_no_next_token() {
         let mut stack = TokenStack::new(vec![token(1)]).expect("non-empty");
-        assert!(!stack.rotate());
+        assert!(!stack.refuse(false));
+    }
+
+    #[test]
+    fn a_walked_stack_ends_with_the_device_limit_only_when_every_slot_is_taken() {
+        assert_eq!(
+            walked_stack_verdict(RejectionReason::SerialInUse, true),
+            RejectionReason::DeviceLimit
+        );
+        assert_eq!(
+            walked_stack_verdict(RejectionReason::SerialInUse, false),
+            RejectionReason::NotAllowlisted,
+            "a serial in use is no fatal reason of its own"
+        );
+        for last in [
+            RejectionReason::NotAllowlisted,
+            RejectionReason::PolicyRefused,
+        ] {
+            assert_eq!(walked_stack_verdict(last, false), last);
+        }
+    }
+
+    #[test]
+    fn only_a_stack_refused_as_in_use_for_every_token_has_every_slot_taken() {
+        let mut in_use = TokenStack::new(vec![token(1), token(2)]).expect("non-empty");
+        assert!(in_use.refuse(true));
+        assert!(!in_use.refuse(true));
+        assert!(in_use.every_slot_taken());
+
+        let mut mixed = TokenStack::new(vec![token(1), token(2)]).expect("non-empty");
+        assert!(mixed.refuse(true));
+        assert!(!mixed.refuse(false));
+        assert!(
+            !mixed.every_slot_taken(),
+            "a token that did not verify says nothing about the other devices"
+        );
+
+        let untried = TokenStack::new(vec![token(1)]).expect("non-empty");
+        assert!(!untried.every_slot_taken(), "no refusal, no verdict");
     }
 
     #[test]
@@ -3302,6 +3441,7 @@ mod tests {
         // are not about the token: another token cannot change them.
         assert!(is_token_refusal(RejectionReason::NotAllowlisted));
         assert!(is_token_refusal(RejectionReason::PolicyRefused));
+        assert!(is_token_refusal(RejectionReason::SerialInUse));
         assert!(!is_token_refusal(RejectionReason::IpExhausted));
         assert!(!is_token_refusal(RejectionReason::Banned(0)));
     }
@@ -5324,7 +5464,18 @@ mod run_tests {
         SessionToken([fill; warrenguard_wire::SESSION_TOKEN_LEN])
     }
 
+    /// The request a token setup sends an exit that decodes the detailed one.
     fn presented(fills: &[u8]) -> SeenSetupRequest {
+        SeenSetupRequest::DetailedTokens(
+            fills
+                .iter()
+                .map(|f| [*f; warrenguard_wire::SESSION_TOKEN_LEN])
+                .collect(),
+        )
+    }
+
+    /// The request a token setup sends an exit that predates the detailed one.
+    fn presented_plainly(fills: &[u8]) -> SeenSetupRequest {
         SeenSetupRequest::Tokens(
             fills
                 .iter()
@@ -5441,12 +5592,16 @@ mod run_tests {
 
     #[tokio::test]
     async fn every_token_refused_ends_after_one_attempt_per_token_and_stays_fatal_by_default() {
+        // One token in use and one that does not verify: no device limit, the
+        // stack itself is wrong.
         let operational_key = SigningKey::from_bytes(&[0x64; 32]);
         let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x74; 16]));
-        exit.tokens_in_use.lock().extend([
-            [1; warrenguard_wire::SESSION_TOKEN_LEN],
-            [2; warrenguard_wire::SESSION_TOKEN_LEN],
-        ]);
+        exit.tokens_in_use
+            .lock()
+            .push([1; warrenguard_wire::SESSION_TOKEN_LEN]);
+        exit.tokens_invalid
+            .lock()
+            .push([2; warrenguard_wire::SESSION_TOKEN_LEN]);
         let mut config = config_with_fake_exit(&exit, &operational_key);
         config.session_token_provider = Some(provider_of(vec![vec![v7_token(1), v7_token(2)]]).0);
         let (supervisor, _rx) = MultiHopSupervisor::new(config);
@@ -5478,10 +5633,12 @@ mod run_tests {
     async fn tokens_only_with_every_token_refused_fails_typed_without_a_wallet_request() {
         let operational_key = SigningKey::from_bytes(&[0x65; 32]);
         let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x75; 16]));
-        exit.tokens_in_use.lock().extend([
-            [1; warrenguard_wire::SESSION_TOKEN_LEN],
-            [2; warrenguard_wire::SESSION_TOKEN_LEN],
-        ]);
+        exit.tokens_in_use
+            .lock()
+            .push([1; warrenguard_wire::SESSION_TOKEN_LEN]);
+        exit.tokens_invalid
+            .lock()
+            .push([2; warrenguard_wire::SESSION_TOKEN_LEN]);
         let mut config = config_with_fake_exit(&exit, &operational_key);
         config.session_token_provider = Some(provider_of(vec![vec![v7_token(1), v7_token(2)]]).0);
         let (supervisor, _rx) = MultiHopSupervisor::new(config);
@@ -5507,6 +5664,135 @@ mod run_tests {
             "only token requests, one token each"
         );
         assert_eq!(*fatal_rx.borrow_and_update(), None);
+    }
+
+    fn exit_holding(seed: u8, in_use: &[u8]) -> (SigningKey, FakeMultihopExit) {
+        let operational_key = SigningKey::from_bytes(&[seed; 32]);
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([seed; 16]));
+        exit.tokens_in_use.lock().extend(
+            in_use
+                .iter()
+                .map(|f| [*f; warrenguard_wire::SESSION_TOKEN_LEN]),
+        );
+        (operational_key, exit)
+    }
+
+    #[tokio::test]
+    async fn every_token_refused_as_in_use_ends_with_the_device_limit() {
+        let (operational_key, exit) = exit_holding(0x91, &[1, 2]);
+        let mut config = config_with_fake_exit(&exit, &operational_key);
+        config.session_token_provider = Some(provider_of(vec![vec![v7_token(1), v7_token(2)]]).0);
+        let (supervisor, _rx) = MultiHopSupervisor::new(config);
+        let mut fatal_rx = supervisor.fatal_rx();
+
+        let result = tokio::time::timeout(Duration::from_secs(10), supervisor.run())
+            .await
+            .expect("the retries are bounded by the stack");
+
+        assert!(
+            matches!(
+                result,
+                Err(MultiHopError::Rejected(RejectionReason::DeviceLimit))
+            ),
+            "other devices hold every slot of the wallet: got {result:?}"
+        );
+        assert_eq!(
+            *fatal_rx.borrow_and_update(),
+            Some(RejectionReason::DeviceLimit),
+            "the deployer shows the device limit, not an expired subscription"
+        );
+        assert_eq!(
+            *exit.setup_requests.lock(),
+            vec![presented(&[1]), presented(&[2])],
+            "one detailed request per token, and no wallet request"
+        );
+    }
+
+    #[tokio::test]
+    async fn tokens_only_with_every_token_in_use_says_so() {
+        let (operational_key, exit) = exit_holding(0x92, &[1, 2]);
+        let mut config = config_with_fake_exit(&exit, &operational_key);
+        config.session_token_provider = Some(provider_of(vec![vec![v7_token(1), v7_token(2)]]).0);
+        let (supervisor, _rx) = MultiHopSupervisor::new(config);
+        let supervisor = supervisor.with_session_admission(SessionAdmission::TokensOnly);
+
+        let result = tokio::time::timeout(Duration::from_secs(10), supervisor.run())
+            .await
+            .expect("the retries are bounded by the stack");
+
+        assert!(
+            matches!(
+                result,
+                Err(MultiHopError::NoSessionToken(NoSessionTokenCause::AllInUse))
+            ),
+            "got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exit_that_predates_the_detailed_request_gets_the_same_token_plainly() {
+        let (operational_key, exit) = exit_holding(0x93, &[]);
+        exit.predates_token_detail.store(true, Ordering::Relaxed);
+        let mut config = config_with_fake_exit(&exit, &operational_key);
+        let (provider, calls) = provider_of(vec![vec![v7_token(1), v7_token(2)]]);
+        config.session_token_provider = Some(provider);
+        let (supervisor, mut rx) = MultiHopSupervisor::new(config);
+        let fatal_rx = supervisor.fatal_rx();
+        let task = tokio::spawn(supervisor.run());
+
+        let bundle = first_session(&mut rx).await;
+
+        assert_eq!(
+            *exit.setup_requests.lock(),
+            vec![presented(&[1]), presented_plainly(&[1])],
+            "the plain Rejected of an exit that cannot read the request spends no token"
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "the retry reuses the stack"
+        );
+        assert!(fatal_rx.borrow().is_none());
+        drop(bundle);
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    #[tokio::test]
+    async fn an_exit_that_predates_the_detailed_request_cannot_report_the_device_limit() {
+        // The old exit's refusals do not say why: the walk ends as it always
+        // did, and the deployer, which knows the subscription, decides.
+        let (operational_key, exit) = exit_holding(0x94, &[1, 2]);
+        exit.predates_token_detail.store(true, Ordering::Relaxed);
+        let mut config = config_with_fake_exit(&exit, &operational_key);
+        config.session_token_provider = Some(provider_of(vec![vec![v7_token(1), v7_token(2)]]).0);
+        let (supervisor, _rx) = MultiHopSupervisor::new(config);
+        let mut fatal_rx = supervisor.fatal_rx();
+
+        let result = tokio::time::timeout(Duration::from_secs(10), supervisor.run())
+            .await
+            .expect("the retries are bounded by the stack");
+
+        assert!(
+            matches!(
+                result,
+                Err(MultiHopError::Rejected(RejectionReason::NotAllowlisted))
+            ),
+            "got {result:?}"
+        );
+        assert_eq!(
+            *fatal_rx.borrow_and_update(),
+            Some(RejectionReason::NotAllowlisted)
+        );
+        assert_eq!(
+            *exit.setup_requests.lock(),
+            vec![
+                presented(&[1]),
+                presented_plainly(&[1]),
+                presented_plainly(&[2])
+            ],
+            "the exit is asked plainly once it answered the detailed request with Rejected"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -5652,8 +5938,9 @@ mod run_tests {
 
             assert_eq!(
                 *exit.setup_requests.lock(),
-                vec![presented(&[1]), presented(&[2]), presented(&[2])],
-                "{admission:?}: the secondary joins on the token the primary was admitted with"
+                vec![presented(&[1]), presented(&[2]), presented_plainly(&[2])],
+                "{admission:?}: the secondary joins on the token the primary was admitted with, \
+                 plainly since it is never walked"
             );
             drop(rx);
             let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
@@ -6724,7 +7011,7 @@ mod route_run_tests {
         wait_for("the redial", || exit.setup_requests.lock().len() == 2).await;
         assert_eq!(
             exit.setup_requests.lock()[1],
-            SeenSetupRequest::Tokens(vec![token(0x61).0]),
+            SeenSetupRequest::DetailedTokens(vec![token(0x61).0]),
             "the redial presents a fresh stack"
         );
         assert!(
