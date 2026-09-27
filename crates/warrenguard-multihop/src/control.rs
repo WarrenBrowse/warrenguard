@@ -387,6 +387,30 @@ pub enum WarrenControlMessage {
     /// A client that predates the variant fails to decode it and falls back
     /// to the opaque close, which it reads as a fatal policy refusal.
     RejectedDeviceLimit,
+
+    /// Client -> exit, **uplink datagram** on a session admitted on a token
+    /// (discriminant 13). With no token: the client announces that it will
+    /// refresh its lease at each epoch change, sent after every setup. With a
+    /// token: a token of the current epoch, which the exit spends before
+    /// moving the session's lease onto its serial (after a `due` ack). A
+    /// deployed exit drops every uplink control datagram, so an old exit
+    /// never answers and never asks.
+    LeaseRefresh {
+        /// A token of the current epoch, or `None` for the announcement.
+        /// Boxed so the enum stays small; serde encodes a box as its
+        /// content, so the wire is the raw token.
+        session_token: Option<Box<SessionToken>>,
+    },
+
+    /// Exit -> client, **downlink datagram** on a session admitted on a token
+    /// (discriminant 14): the answer to a [`Self::LeaseRefresh`], `due` when
+    /// the session's lease belongs to a past epoch, or `expired` before the
+    /// exit ends the session. `status` is a
+    /// [`crate::LeaseRefreshStatus`] as a plain `u8`.
+    LeaseRefreshAck {
+        /// See [`crate::LeaseRefreshStatus`].
+        status: u8,
+    },
 }
 
 impl WarrenControlMessage {
@@ -408,6 +432,8 @@ impl WarrenControlMessage {
             Self::RouteAnchorAck { .. } => "RouteAnchorAck",
             Self::RouteEnded { .. } => "RouteEnded",
             Self::RejectedDeviceLimit => "RejectedDeviceLimit",
+            Self::LeaseRefresh { .. } => "LeaseRefresh",
+            Self::LeaseRefreshAck { .. } => "LeaseRefreshAck",
         }
     }
 }
@@ -942,6 +968,38 @@ mod tests {
     }
 
     #[test]
+    fn lease_refresh_wire_layout_is_frozen() {
+        assert_eq!(
+            encode_control(&WarrenControlMessage::LeaseRefresh {
+                session_token: None
+            })
+            .unwrap(),
+            vec![0xC0, 0x03, 0x0D, 0x00],
+            "LeaseRefresh is tag 13, then None: the capability announcement"
+        );
+        let len = warrenguard_wire::SESSION_TOKEN_LEN;
+        let with_token = encode_control(&WarrenControlMessage::LeaseRefresh {
+            session_token: Some(Box::new(SessionToken(
+                [0xCD; warrenguard_wire::SESSION_TOKEN_LEN],
+            ))),
+        })
+        .unwrap();
+        let mut expected = vec![0xC0, 0x03, 0x0D, 0x01];
+        expected.extend_from_slice(&vec![0xCD; len]); // raw token, no length prefix
+        assert_eq!(with_token, expected, "LeaseRefresh wire layout drifted");
+        assert_eq!(with_token.len(), 358);
+    }
+
+    #[test]
+    fn lease_refresh_ack_wire_layout_is_frozen() {
+        assert_eq!(
+            encode_control(&WarrenControlMessage::LeaseRefreshAck { status: 5 }).unwrap(),
+            vec![0xC0, 0x03, 0x0E, 0x05],
+            "LeaseRefreshAck is tag 14 then one status byte"
+        );
+    }
+
+    #[test]
     fn route_variants_round_trip() {
         for msg in [
             WarrenControlMessage::IpRequestRoute {
@@ -962,6 +1020,15 @@ mod tests {
                 max_routes: u16::MAX,
             },
             WarrenControlMessage::RouteEnded { reason_code: 200 },
+            WarrenControlMessage::LeaseRefresh {
+                session_token: Some(Box::new(SessionToken(
+                    [0x44; warrenguard_wire::SESSION_TOKEN_LEN],
+                ))),
+            },
+            WarrenControlMessage::LeaseRefresh {
+                session_token: None,
+            },
+            WarrenControlMessage::LeaseRefreshAck { status: 250 },
         ] {
             let decoded = try_decode_control(&encode_control(&msg).unwrap())
                 .unwrap()
@@ -1030,6 +1097,10 @@ mod tests {
             },
             WarrenControlMessage::RouteEnded { reason_code: 1 },
             WarrenControlMessage::RejectedDeviceLimit,
+            WarrenControlMessage::LeaseRefresh {
+                session_token: None,
+            },
+            WarrenControlMessage::LeaseRefreshAck { status: 1 },
         ];
         for msg in new_variants {
             let bytes = encode_control(&msg).unwrap();
@@ -1066,6 +1137,17 @@ mod tests {
         assert!(
             !rendered.contains("119, 119"),
             "Debug must not render the sealed blob or the token: {rendered}"
+        );
+        let refresh = WarrenControlMessage::LeaseRefresh {
+            session_token: Some(Box::new(SessionToken(
+                [0x77; warrenguard_wire::SESSION_TOKEN_LEN],
+            ))),
+        };
+        assert_eq!(refresh.variant_name(), "LeaseRefresh");
+        let rendered = format!("{refresh:?}");
+        assert!(
+            !rendered.contains("119, 119"),
+            "Debug must not render the token: {rendered}"
         );
     }
 

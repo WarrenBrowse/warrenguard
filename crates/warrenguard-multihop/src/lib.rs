@@ -42,6 +42,7 @@ mod control;
 pub mod dial;
 mod errors;
 mod exit_descriptor;
+mod lease_refresh;
 mod node_attestation;
 mod operational_cert;
 mod pop;
@@ -64,7 +65,8 @@ mod pq_session;
 mod xwing;
 
 pub use close_codes::{
-    RejectionReason, WARREN_MH_DRAINING, WARREN_MH_FORCED_RECONNECT, WARREN_MH_REJECTED,
+    RejectionReason, WARREN_MH_DRAINING, WARREN_MH_FORCED_RECONNECT, WARREN_MH_LEASE_EXPIRED,
+    WARREN_MH_REJECTED,
 };
 pub use control::{
     CONTROL_FIRST_BYTE, CONTROL_VERSION_V3, ControlError, PopSignature, WarrenControlMessage,
@@ -78,6 +80,7 @@ pub use exit_descriptor::{
     verify_exit_descriptor_pq, verify_exit_descriptor_v2,
     verify_exit_descriptor_with_dns_attestation,
 };
+pub use lease_refresh::LeaseRefreshStatus;
 pub use node_attestation::{
     NodeAttestationError, node_attestation_signing_payload, sign_node_attestation,
     verify_node_attestation,

@@ -246,6 +246,20 @@ fn message_for(v: &ControlVec) -> WarrenControlMessage {
             reason_code: v.reason_code.expect("reason_code"),
         },
         "rejected_device_limit" => WarrenControlMessage::RejectedDeviceLimit,
+        "lease_refresh_announce" | "lease_refresh_with_token" => {
+            WarrenControlMessage::LeaseRefresh {
+                session_token: v.session_token_hex.as_ref().map(|h| {
+                    Box::new(warrenguard_wire::SessionToken(
+                        hex::decode(h).expect("hex").try_into().expect("354 bytes"),
+                    ))
+                }),
+            }
+        }
+        "lease_refresh_ack_refreshed" | "lease_refresh_ack_due" | "lease_refresh_ack_expired" => {
+            WarrenControlMessage::LeaseRefreshAck {
+                status: v.status.expect("status"),
+            }
+        }
         other => panic!("unknown control vector name: {other}"),
     }
 }

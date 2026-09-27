@@ -203,7 +203,9 @@ pub fn ip_assignment_from_setup_plaintext(plaintext: &[u8]) -> Result<IpAssignme
             | WarrenControlMessage::IpRequestRoute { .. }
             | WarrenControlMessage::RouteAnchorRequest { .. }
             | WarrenControlMessage::RouteAnchorAck { .. }
-            | WarrenControlMessage::RouteEnded { .. },
+            | WarrenControlMessage::RouteEnded { .. }
+            | WarrenControlMessage::LeaseRefresh { .. }
+            | WarrenControlMessage::LeaseRefreshAck { .. },
         )
         | None => Err(SetupError::UnexpectedReply),
     }

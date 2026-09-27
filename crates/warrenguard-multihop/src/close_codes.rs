@@ -58,6 +58,18 @@ pub const WARREN_MH_FORCED_RECONNECT: u32 = 0x57_4D_46_31;
 /// exit instead of redialing the one that is draining. ASCII `"WMD1"`.
 pub const WARREN_MH_DRAINING: u32 = 0x57_4D_44_31;
 
+/// The exit ended a session admitted on an anonymous token because its
+/// fleet-wide lease belongs to a past epoch and the client did not present a
+/// token of the current one within the exit's grace window. Sent after the
+/// sealed `LeaseRefreshAck{expired}`. Operational like
+/// [`WARREN_MH_FORCED_RECONNECT`], NOT a policy rejection: it never maps to a
+/// [`RejectionReason`], so a client redials the same exit with a token of the
+/// current epoch, and a client that predates it reads an unknown code, which
+/// it treats the same way. The relay learns that the exit ended the session
+/// near an epoch boundary, which the timing of the close already shows.
+/// ASCII `"WML1"`.
+pub const WARREN_MH_LEASE_EXPIRED: u32 = 0x57_4D_4C_31;
+
 /// A definitive, policy-level reason an exit refused a multi-hop
 /// session. Distinct from a transient network loss: a rejection will
 /// recur on an immediate redial, so the supervisor surfaces it upward
@@ -143,7 +155,11 @@ impl RejectionReason {
             | crate::WarrenControlMessage::IpRequestRoute { .. }
             | crate::WarrenControlMessage::RouteAnchorRequest { .. }
             | crate::WarrenControlMessage::RouteAnchorAck { .. }
-            | crate::WarrenControlMessage::RouteEnded { .. } => None,
+            | crate::WarrenControlMessage::RouteEnded { .. }
+            // A lease refresh is session upkeep; its `expired` status
+            // precedes an operational close the client redials after.
+            | crate::WarrenControlMessage::LeaseRefresh { .. }
+            | crate::WarrenControlMessage::LeaseRefreshAck { .. } => None,
         }
     }
 
@@ -253,6 +269,30 @@ mod tests {
         // RejectionReason would trip the supervisor's fatal path and turn a
         // routine maintenance migration into a terminal tunnel error.
         assert_eq!(RejectionReason::from_close_code(WARREN_MH_DRAINING), None);
+    }
+
+    #[test]
+    fn an_expired_lease_is_never_a_rejection_and_keeps_its_own_code() {
+        // Mapping it to a RejectionReason would turn an hourly lease upkeep
+        // into a terminal tunnel error instead of a redial on a fresh token.
+        assert_eq!(
+            RejectionReason::from_close_code(WARREN_MH_LEASE_EXPIRED),
+            None
+        );
+        assert_eq!(WARREN_MH_LEASE_EXPIRED, 0x57_4D_4C_31, "\"WML1\" is frozen");
+        for other in [
+            WARREN_MH_REJECTED,
+            WARREN_MH_FORCED_RECONNECT,
+            WARREN_MH_DRAINING,
+        ] {
+            assert_ne!(WARREN_MH_LEASE_EXPIRED, other);
+        }
+        assert_eq!(
+            RejectionReason::from_sealed_detail(&WarrenControlMessage::LeaseRefreshAck {
+                status: 6
+            }),
+            None
+        );
     }
 
     #[test]
