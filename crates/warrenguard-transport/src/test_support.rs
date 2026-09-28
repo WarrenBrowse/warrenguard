@@ -493,10 +493,7 @@ pub(crate) struct FakeMultihopExit {
     /// followed by a close with the given code.
     pub(crate) downlink: tokio::sync::broadcast::Sender<(WarrenControlMessage, Option<u32>)>,
     on_next_dial: NextDialHook,
-    /// The listening endpoint; `None` while the exit is down in a restart.
-    server: Arc<parking_lot::Mutex<Option<Endpoint>>>,
-    server_cfg: quinn::ServerConfig,
-    accept_loop: FakeExitAcceptLoop,
+    _server_ep: Endpoint,
 }
 
 /// What the fake exit read from one `RouteAnchorRequest`.
@@ -546,29 +543,6 @@ pub(crate) struct FakeLeg {
 type NextDialHook = Arc<parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>>;
 
 impl FakeMultihopExit {
-    /// Restarts the exit the way a stopping exit process and its supervisor
-    /// do: every connection is closed with application code 0, new ones are
-    /// refused while those closes drain, the port is released, and the exit
-    /// listens again on the same address `down_for` after the close, which
-    /// is returned. Returns once it listens again.
-    pub(crate) async fn restart(&self, down_for: Duration) -> Instant {
-        let endpoint = self
-            .server
-            .lock()
-            .take()
-            .expect("the fake exit is listening before a restart");
-        let closed_at = Instant::now();
-        endpoint.close(quinn::VarInt::from_u32(0), &[]);
-        let _ = tokio::time::timeout(Duration::from_secs(2), endpoint.wait_idle()).await;
-        drop(endpoint);
-        tokio::time::sleep_until((closed_at + down_for).into()).await;
-        let endpoint = Endpoint::server(self.server_cfg.clone(), self.relay.endpoint)
-            .expect("the restarted fake exit binds its address again");
-        self.accept_loop.spawn(endpoint.clone());
-        *self.server.lock() = Some(endpoint);
-        closed_at
-    }
-
     /// Runs `hook` once, when the next connection attempt reaches this exit
     /// and before its handshake completes: lets a test land a retarget while
     /// a dial to this exit is in flight.
@@ -947,7 +921,7 @@ pub(crate) fn spawn_fake_multihop_exit_on(
         &[warrenguard_config::ALPN_H3],
     )
     .expect("server cfg");
-    let server_ep = Endpoint::server(server_cfg.clone(), bind).ok()?;
+    let server_ep = Endpoint::server(server_cfg, bind).ok()?;
     let addr = server_ep.local_addr().expect("local addr");
 
     let relay = Arc::new(RelayDescriptorSigned {
@@ -993,15 +967,42 @@ pub(crate) fn spawn_fake_multihop_exit_on(
 
     let refuse_handshake = Arc::new(AtomicBool::new(false));
     let on_next_dial: NextDialHook = Arc::new(parking_lot::Mutex::new(None));
-    let accept_loop = FakeExitAcceptLoop {
-        exit_id,
-        accepted: accepted.clone(),
-        accepted_at: accepted_at.clone(),
-        behaviour: behaviour.clone(),
-        refuse_handshake: refuse_handshake.clone(),
-        on_next_dial: on_next_dial.clone(),
-    };
-    accept_loop.spawn(server_ep.clone());
+
+    let accept_loop_ep = server_ep.clone();
+    let accept_loop_accepted = accepted.clone();
+    let accept_loop_accepted_at = accepted_at.clone();
+    let accept_loop_behaviour = behaviour.clone();
+    let accept_loop_refuse_handshake = refuse_handshake.clone();
+    let accept_loop_on_next_dial = on_next_dial.clone();
+    tokio::spawn(async move {
+        loop {
+            let Some(incoming) = accept_loop_ep.accept().await else {
+                return;
+            };
+            let hook = accept_loop_on_next_dial.lock().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+            if accept_loop_refuse_handshake.load(Ordering::Relaxed) {
+                incoming.refuse();
+                continue;
+            }
+            let Ok(conn) = incoming.await else {
+                continue;
+            };
+            accept_loop_accepted_at.lock().push(Instant::now());
+            let ordinal = accept_loop_accepted.fetch_add(1, Ordering::Relaxed) + 1;
+            // Served off the accept loop, so a connection the exit holds open
+            // (a live session, a swallowed setup) never stalls the client's
+            // next dial, a make-before-break one included.
+            tokio::spawn(serve_one_fake_exit_connection(
+                conn,
+                exit_id,
+                ordinal,
+                accept_loop_behaviour.clone(),
+            ));
+        }
+    });
 
     Some(FakeMultihopExit {
         relay,
@@ -1034,55 +1035,6 @@ pub(crate) fn spawn_fake_multihop_exit_on(
         lease_script: behaviour.lease_script,
         downlink: behaviour.downlink,
         on_next_dial,
-        server: Arc::new(parking_lot::Mutex::new(Some(server_ep))),
-        server_cfg,
-        accept_loop,
+        _server_ep: server_ep,
     })
-}
-
-/// The fake exit's accept side, kept so a restart can serve the endpoint it
-/// binds again with the same behaviour and counters.
-#[derive(Clone)]
-struct FakeExitAcceptLoop {
-    exit_id: ExitId,
-    accepted: Arc<AtomicUsize>,
-    accepted_at: Arc<parking_lot::Mutex<Vec<Instant>>>,
-    behaviour: FakeExitBehaviour,
-    refuse_handshake: Arc<AtomicBool>,
-    on_next_dial: NextDialHook,
-}
-
-impl FakeExitAcceptLoop {
-    fn spawn(&self, endpoint: Endpoint) {
-        let this = self.clone();
-        tokio::spawn(async move {
-            loop {
-                let Some(incoming) = endpoint.accept().await else {
-                    return;
-                };
-                let hook = this.on_next_dial.lock().take();
-                if let Some(hook) = hook {
-                    hook();
-                }
-                if this.refuse_handshake.load(Ordering::Relaxed) {
-                    incoming.refuse();
-                    continue;
-                }
-                let Ok(conn) = incoming.await else {
-                    continue;
-                };
-                this.accepted_at.lock().push(Instant::now());
-                let ordinal = this.accepted.fetch_add(1, Ordering::Relaxed) + 1;
-                // Served off the accept loop, so a connection the exit holds open
-                // (a live session, a swallowed setup) never stalls the client's
-                // next dial, a make-before-break one included.
-                tokio::spawn(serve_one_fake_exit_connection(
-                    conn,
-                    this.exit_id,
-                    ordinal,
-                    this.behaviour.clone(),
-                ));
-            }
-        });
-    }
 }

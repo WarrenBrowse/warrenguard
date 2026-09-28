@@ -1103,9 +1103,6 @@ impl MultiHopSupervisor {
         // Consecutive `anchor unknown` refusals of a route session, reset by
         // every published session.
         let mut anchor_unknown_refusals = 0u32;
-        // The fast schedule an operational close starts, kept across a failed
-        // setup until its window is spent; every session end replaces it.
-        let mut operational: Option<crate::redial_policy::OperationalRedial> = None;
         loop {
             // Non-racy shutdown check: if every pump receiver is already
             // gone (the tunnel monitor tore down and aborted the pumps),
@@ -1143,7 +1140,7 @@ impl MultiHopSupervisor {
                     );
                     return Ok(());
                 }
-                result = self.connect_with_unbounded_retry(&mut redial, &mut operational) => result?,
+                result = self.connect_with_unbounded_retry(&mut redial) => result?,
             };
             let primary = Arc::new(client);
 
@@ -1550,23 +1547,6 @@ impl MultiHopSupervisor {
                 // setup is not answered with back-to-back handshakes.
                 if crate::redial_policy::is_healthy_uptime(session_established.elapsed()) {
                     redial.reset();
-                }
-                // A peer that closed with the operational code is restarting:
-                // redial on the fast schedule so the client is back within a
-                // cadence of the new listener, not a QUIC retransmission later.
-                operational = crate::redial_policy::OperationalRedial::after_session(
-                    session_established.elapsed(),
-                    &close_err,
-                    Instant::now(),
-                    bundle.quinn_stats().path.rtt,
-                    bundle
-                        .is_over_carrier()
-                        .then(warrenguard_config::knobs::tcp_fallback_race_delay),
-                );
-                if operational.is_some() {
-                    tracing::info!(
-                        "peer closed the session to restart; redialling on the fast schedule"
-                    );
                 }
 
                 // Feed the carrier-first verdict: a UDP session that a watchdog
@@ -2608,67 +2588,27 @@ impl MultiHopSupervisor {
     /// operator misconfiguration (rotated operational pubkey, broken
     /// TLS provider) is visible instead of burning the user's battery
     /// in a retry loop.
-    ///
-    /// While `operational` holds a fast schedule, attempts follow it instead,
-    /// each dial abandoned after its bound; once it is spent it is cleared
-    /// and `redial` takes over.
     async fn connect_with_unbounded_retry(
         &self,
         redial: &mut JitterBackoff,
-        operational: &mut Option<crate::redial_policy::OperationalRedial>,
     ) -> Result<(MultiHopClient, CircuitTarget), MultiHopError> {
         let mut attempt_count = 0u64;
         loop {
-            let fast = operational
-                .as_mut()
-                .and_then(|schedule| schedule.next_attempt(Instant::now()));
-            let dial_bound = match fast {
-                Some(attempt) => {
-                    tokio::time::sleep_until(attempt.start_at.into()).await;
-                    Some(attempt.dial_bound)
-                }
-                None => {
-                    *operational = None;
-                    let delay = redial.next_delay();
-                    if !delay.is_zero() {
-                        tokio::time::sleep(delay).await;
-                    }
-                    None
-                }
-            };
+            let delay = redial.next_delay();
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             attempt_count = attempt_count.saturating_add(1);
             let target = self.current_target();
-            let dialled = match dial_bound {
-                Some(bound) => {
-                    let Ok(dialled) = tokio::time::timeout(bound, self.connect_once(&target)).await
-                    else {
-                        tracing::debug!(
-                            attempt = attempt_count,
-                            "fast redial attempt abandoned after its dial bound"
-                        );
-                        continue;
-                    };
-                    dialled
-                }
-                None => self.connect_once(&target).await,
-            };
-            match dialled {
+            match self.connect_once(&target).await {
                 Ok(client) => return Ok((client, target)),
                 Err(e) if e.is_retriable() => {
                     self.notify_dial_refused(&e, &target);
-                    if dial_bound.is_some() {
-                        tracing::debug!(
-                            error = %e,
-                            attempt = attempt_count,
-                            "fast redial attempt failed"
-                        );
-                    } else {
-                        tracing::warn!(
-                            error = %e,
-                            attempt = attempt_count,
-                            "supervisor reconnect attempt failed, retrying after backoff"
-                        );
-                    }
+                    tracing::warn!(
+                        error = %e,
+                        attempt = attempt_count,
+                        "supervisor reconnect attempt failed, retrying after backoff"
+                    );
                 }
                 Err(e) => return Err(e),
             }
@@ -4277,74 +4217,6 @@ mod run_tests {
                 .expect("reports lock")
                 .push((hop, relay_id, exit_id));
         })
-    }
-
-    /// Waits until the supervisor publishes a live session.
-    async fn wait_for_session(rx: &mut watch::Receiver<Option<Arc<MultiHopBundle>>>) {
-        loop {
-            if rx.borrow_and_update().is_some() {
-                return;
-            }
-            rx.changed().await.expect("watch sender alive");
-        }
-    }
-
-    /// Runs a healthy session against a fake exit, restarts the exit so that
-    /// its successor listens `down_for` after the close, and returns how long
-    /// after the close the client dialled it again.
-    async fn back_after_a_restart(key_fill: u8, down_for: Duration) -> Duration {
-        let operational_key = SigningKey::from_bytes(&[key_fill; 32]);
-        let exit_id = ExitId::from_bytes([key_fill; 16]);
-        let exit = spawn_fake_multihop_exit(&operational_key, exit_id);
-        let config = config_with_fake_exit(&exit, &operational_key);
-        let (supervisor, mut rx) = MultiHopSupervisor::new(config);
-        let task = tokio::spawn(supervisor.run());
-        tokio::time::timeout(Duration::from_secs(5), wait_for_session(&mut rx))
-            .await
-            .expect("the first session is published");
-        // A healthy session: only one that served this long is redialled at once.
-        tokio::time::sleep(crate::redial_policy::MIN_HEALTHY_UPTIME).await;
-
-        let closed_at = exit.restart(down_for).await;
-        wait_for_accepts(&exit, 2, Duration::from_secs(10)).await;
-        let back_after = exit.accepted_at.lock()[1] - closed_at;
-        drop(rx);
-        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-        back_after
-    }
-
-    /// An exit that stops closes its clients with the operational code, keeps
-    /// refusing while its closes drain, and listens again once its successor
-    /// has bound the port. A client told of the stop must be back within about
-    /// one redial cadence of the new listener: with the ordinary schedule, a
-    /// redial drawn into the gap before the bind waited a whole QUIC Initial
-    /// retransmission.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_exit_restart_is_redialled_within_a_cadence_of_its_new_listener() {
-        let back_after = back_after_a_restart(0x4E, Duration::from_secs(1)).await;
-
-        assert!(
-            back_after <= Duration::from_millis(1200),
-            "a client told of an exit restart must be back within 1.2 s of the close \
-             when the new listener binds at 1 s, got {back_after:?}"
-        );
-    }
-
-    /// A fast attempt whose Initial was lost before the successor bound is
-    /// abandoned at its dial bound for a fresh one, rather than left to wait
-    /// for the Initial's retransmission, which comes a second later and then
-    /// two seconds after that.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_fast_redial_whose_initial_was_lost_does_not_wait_for_its_retransmission() {
-        let down_for = Duration::from_millis(1600);
-        let back_after = back_after_a_restart(0x4F, down_for).await;
-
-        let within = down_for + crate::redial_policy::OPERATIONAL_REDIAL_CADENCE * 2;
-        assert!(
-            back_after <= within,
-            "a client must be back within two cadences of a listener that binds at \
-             {down_for:?}, got {back_after:?}"
-        );
     }
 
     /// A setup the exit refuses after the QUIC handshake (here the drain close
