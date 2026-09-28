@@ -542,18 +542,32 @@ impl MultiHopBundle {
     /// 2026-08-10. Quarantined legs are probed too: the probe is how a
     /// quarantined leg proves it deserves to come back.
     ///
+    /// Synchronous, so the prober never holds the bundle across a wait (see
+    /// [`Self::lifetime`]).
+    ///
     /// # Errors
     ///
-    /// Propagates [`MultiHopClient::send`] errors of that leg. Returns
+    /// Propagates [`MultiHopClient::send_packet`] errors of that leg. Returns
     /// [`MultiHopError::NoSession`] when `leg` is out of range.
-    pub async fn send_probe_on(&self, leg: usize, payload: &[u8]) -> Result<(), MultiHopError> {
+    pub fn send_probe_on(&self, leg: usize, payload: &[u8]) -> Result<(), MultiHopError> {
         let client = self
             .clients
             .read()
             .get(leg)
             .cloned()
             .ok_or(MultiHopError::NoSession)?;
-        client.send(payload).await
+        client.send_packet(payload)
+    }
+
+    /// A handle on this bundle's life that does not keep it alive, for an
+    /// observer that holds only a `Weak` on it and must wait: an observer
+    /// that upgrades to wait keeps a torn-down tunnel's sessions open until
+    /// its wait ends, because the bundle closes them on its drop.
+    pub(crate) fn lifetime(&self) -> BundleLifetime {
+        BundleLifetime {
+            closed: self.closed_tx.subscribe(),
+            sealed: self.sealed_tx.subscribe(),
+        }
     }
 
     /// Per-leg inner budgets, indexed like [`Self::clients`]: what the
@@ -915,6 +929,26 @@ impl MultiHopBundle {
     #[must_use]
     pub fn is_over_carrier(&self) -> bool {
         self.primary().is_over_carrier()
+    }
+}
+
+/// See [`MultiHopBundle::lifetime`].
+#[derive(Clone)]
+pub(crate) struct BundleLifetime {
+    closed: watch::Receiver<Option<quinn::ConnectionError>>,
+    sealed: watch::Receiver<bool>,
+}
+
+impl BundleLifetime {
+    /// Resolves once a session of the bundle died or the bundle was dropped.
+    pub(crate) async fn ended(&mut self) {
+        // An `Err` is the bundle's drop, which ends it too.
+        let _ = self.closed.wait_for(Option::is_some).await;
+    }
+
+    /// Resolves once the bundle is sealed, `false` when it was dropped first.
+    pub(crate) async fn sealed(&mut self) -> bool {
+        self.sealed.wait_for(|sealed| *sealed).await.is_ok()
     }
 }
 
@@ -1502,7 +1536,6 @@ mod live_tests {
         for _ in 0..PROBES {
             bundle
                 .send_probe_on(1, &[0x45; 200])
-                .await
                 .expect("leg 1 accepts the probe");
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1518,7 +1551,7 @@ mod live_tests {
             "leg 1 must have carried every one of them"
         );
         assert!(
-            bundle.send_probe_on(9, &[0x45; 200]).await.is_err(),
+            bundle.send_probe_on(9, &[0x45; 200]).is_err(),
             "an out-of-range leg is an error, never a silent send elsewhere"
         );
     }

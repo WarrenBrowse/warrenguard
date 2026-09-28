@@ -614,10 +614,13 @@ impl RoundKind {
 }
 
 /// Spawns the prober for one published bundle. The task holds only a
-/// `Weak` on the bundle (a strong reference here would keep the session
-/// alive past the supervisor's teardown) and exits when the bundle dies
-/// or is dropped; the supervisor spawns a fresh prober on the next
-/// publish. A no-op task when `WARREN_PATH_HEALTH_SECS=0`.
+/// `Weak` on the bundle and upgrades it for synchronous steps alone, never
+/// across a wait: the bundle closes its sessions on its drop, so a strong
+/// reference held through the cadence or the reply timeout kept a torn-down
+/// tunnel's sessions open, and their probes running, up to a cadence after
+/// its owner let go. The task exits as soon as the bundle dies or is dropped; the
+/// supervisor spawns a fresh prober on the next publish. A no-op task when
+/// `WARREN_PATH_HEALTH_SECS=0`.
 ///
 /// The published [`LegHealth`] is reset here: the legs of the new bundle
 /// have not been measured yet.
@@ -641,12 +644,12 @@ pub fn spawn_path_health(
         let Some(steady) = steady_cadence() else {
             return;
         };
+        let Some(mut lifetime) = bundle.upgrade().map(|strong| strong.lifetime()) else {
+            return;
+        };
         let mut first = true;
         let mut verdicts = LegVerdicts::default();
         loop {
-            let Some(strong) = bundle.upgrade() else {
-                return;
-            };
             let kind = RoundKind::next(
                 first,
                 verdicts.awaiting_confirmation(),
@@ -657,11 +660,11 @@ pub fn spawn_path_health(
                 generation,
                 steady,
             };
+            let mut sealed = lifetime.clone();
             let done = tokio::select! {
-                _ = strong.closed() => true,
-                () = probe_round(&strong, &shared, &overlap, round, &mut verdicts) => false,
+                () = lifetime.ended() => true,
+                () = probe_round(&bundle, &mut sealed, &shared, &overlap, round, &mut verdicts) => false,
             };
-            drop(strong);
             if done {
                 return;
             }
@@ -681,17 +684,18 @@ struct Round {
 }
 
 /// One paced probe round against a live bundle: sleep the cadence, send
-/// the pair, collect replies, feed the tracker, act on transitions.
+/// the pair, collect replies, feed the tracker, act on transitions. The
+/// bundle is upgraded only around the synchronous steps (see
+/// [`spawn_path_health`]), and a round whose bundle is gone ends there.
 async fn probe_round(
-    bundle: &Arc<crate::bundle::MultiHopBundle>,
+    bundle: &std::sync::Weak<crate::bundle::MultiHopBundle>,
+    lifetime: &mut crate::bundle::BundleLifetime,
     shared: &Arc<ProberShared>,
     overlap: &Arc<Notify>,
     round: Round,
     verdicts: &mut LegVerdicts,
 ) {
     {
-        // Single round; the caller's loop re-upgrades the bundle
-        // between rounds so this task never pins the session alive.
         let cadence = if shared.tracker.lock().wants_fast() {
             FAST_CADENCE
         } else {
@@ -703,7 +707,7 @@ async fn probe_round(
             // seconds of the connect.
             RoundKind::Seal => tokio::select! {
                 () = tokio::time::sleep(cadence) => false,
-                () = bundle.sealed() => true,
+                sealed = lifetime.sealed() => sealed,
             },
             RoundKind::Confirm => {
                 tokio::time::sleep(FAST_CADENCE).await;
@@ -722,7 +726,9 @@ async fn probe_round(
         // budget: a leg that has quietly stopped carrying full-size frames
         // is only visible when the packet it is asked to carry is the one it
         // claims to support.
-        let budgets = bundle.leg_inner_payloads();
+        let Some(budgets) = bundle.upgrade().map(|strong| strong.leg_inner_payloads()) else {
+            return;
+        };
         let legs = budgets.len();
         if legs == 0 {
             return;
@@ -733,6 +739,9 @@ async fn probe_round(
 
         let sweep = {
             let mut replies = shared.replies.lock().await;
+            let Some(strong) = bundle.upgrade() else {
+                return;
+            };
             // Stale replies of older rounds must not credit this one.
             while replies.try_recv().is_ok() {}
             // A fresh order every round: an exit that returns echoes round
@@ -762,14 +771,15 @@ async fn probe_round(
                 ) else {
                     return;
                 };
-                if bundle.send_probe_on(leg, &small).await.is_err()
-                    || bundle.send_probe_on(leg, &large).await.is_err()
+                if strong.send_probe_on(leg, &small).is_err()
+                    || strong.send_probe_on(leg, &large).is_err()
                 {
                     // Dying connection: the supervisor is already on it; a
                     // send failure is not path evidence.
                     return;
                 }
             }
+            drop(strong);
             let mut sweep = Sweep::new(legs);
             let deadline = tokio::time::Instant::now() + REPLY_TIMEOUT;
             while !sweep.complete() {
@@ -796,6 +806,9 @@ async fn probe_round(
         // hang" on a tunnel that reports Connected. Logged on the transitions
         // only, in both directions, so it dates the episode instead of
         // repeating every round.
+        let Some(bundle) = bundle.upgrade() else {
+            return;
+        };
         let published = bundle.max_inner_payload();
         let under_floor = published < warrenguard_transport_core::QUIC_SAFE_INNER_MTU;
         if under_floor
@@ -1432,5 +1445,77 @@ mod tests {
         let request = build_echo_request(SRC, GW, 0xC0DE, 9, 84).expect("builds");
         assert!(!tap.try_intercept(&request), "request, not reply");
         assert!(rx.try_recv().is_err(), "nothing was fed");
+    }
+
+    /// A tunnel torn down by its owner: the prober of its bundle is spawned,
+    /// the bundle is sealed and published, and then every owner lets go of
+    /// it. Answers whether the exit side saw its session close `within` the
+    /// teardown, or `None` when the environment disables or shortens the
+    /// prober's cadence, which skips the test.
+    async fn close_seen_by_the_exit_after_teardown(
+        endpoints: bool,
+        within: Duration,
+    ) -> Option<bool> {
+        match steady_cadence() {
+            Some(cadence) if cadence > Duration::from_secs(4) => {}
+            _ => return None,
+        }
+        let pair = crate::test_support::spawn_loopback_multihop(
+            warrenguard_multihop::ExitId::from_bytes([0x5A; 16]),
+        )
+        .await;
+        let bundle = crate::bundle::MultiHopBundle::new(vec![pair.client.clone()]);
+        let shared = ProberShared::new(0xC0DE);
+        if endpoints {
+            shared.set_endpoints(SRC, GW);
+        }
+        drop(spawn_path_health(
+            Arc::downgrade(&bundle),
+            shared,
+            Arc::new(Notify::new()),
+        ));
+        // The loopback exit answers no echo, so the prober is now either
+        // waiting out its cadence (no endpoints yet) or its replies.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            pair.exit_conn.close_reason().is_none(),
+            "the session is live before the teardown"
+        );
+
+        drop(bundle);
+
+        Some(
+            tokio::time::timeout(within, pair.exit_conn.closed())
+                .await
+                .is_ok(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_torn_down_bundle_closes_at_once_while_its_prober_waits_out_the_cadence() {
+        let Some(closed) =
+            close_seen_by_the_exit_after_teardown(false, Duration::from_secs(2)).await
+        else {
+            eprintln!("skipped: the environment disables or shortens the prober cadence");
+            return;
+        };
+        assert!(
+            closed,
+            "the prober kept the session of a torn-down tunnel open through its cadence"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_torn_down_bundle_closes_at_once_while_its_prober_waits_for_replies() {
+        let Some(closed) =
+            close_seen_by_the_exit_after_teardown(true, Duration::from_secs(1)).await
+        else {
+            eprintln!("skipped: the environment disables or shortens the prober cadence");
+            return;
+        };
+        assert!(
+            closed,
+            "the prober kept the session of a torn-down tunnel open until its reply timeout"
+        );
     }
 }
