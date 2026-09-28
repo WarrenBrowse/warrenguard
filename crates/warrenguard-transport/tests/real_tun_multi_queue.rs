@@ -62,3 +62,30 @@ async fn single_queue_request_returns_exactly_one() {
 
     assert_eq!(queues.len(), 1, "a single-queue request yields one handle");
 }
+
+#[tokio::test]
+#[ignore = "needs root + a real Linux TUN with IFF_MULTI_QUEUE"]
+async fn set_tx_queue_len_resizes_the_ring_of_the_interface() {
+    // The kernel's 500-packet default tail-drops downlink bursts on an exit;
+    // the size set through the primary queue is the interface's, so it holds
+    // for every queue attached to it.
+    let queues = RealTun::create_multi_queue_named(
+        "wgmq2",
+        Ipv4Addr::new(10, 66, 0, 1),
+        16,
+        None,
+        0,
+        1280,
+        true,
+        2,
+    )
+    .await
+    .expect("create 2 multi-queue TUN queues (needs root)");
+
+    queues[0]
+        .set_tx_queue_len(4000)
+        .expect("resize the TUN ring (needs root)");
+    let len = std::fs::read_to_string("/sys/class/net/wgmq2/tx_queue_len")
+        .expect("read the interface's tx_queue_len");
+    assert_eq!(len.trim(), "4000", "the ring must take the size asked for");
+}

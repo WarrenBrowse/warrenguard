@@ -246,6 +246,14 @@ pub const REGISTRY: &[KnobMeta] = &[
         home: "warrenguard-config/src/knobs.rs (resolver only; deployer-wired, see docs/35-ENV-KNOBS.md)",
     },
     KnobMeta {
+        name: "WARREN_EXIT_TUN_TXQUEUELEN",
+        kind: "usize",
+        default: "4000",
+        clamp: "unset/garbage/under 100 -> 4000; clamped to [100, 100000]",
+        effect: "ring of the exit's TUN device in packets (txqueuelen, per queue, Linux only): the kernel tail-drops a downlink packet routed into a full ring, and its default of 500 dropped hundreds to thousands of packets per bulk transfer at distance",
+        home: "warrenguard-config/src/knobs.rs (resolver only; deployer-wired, see docs/35-ENV-KNOBS.md)",
+    },
+    KnobMeta {
         name: "WARREN_EXIT_V2_DRAIN_SIGNAL",
         kind: "bool",
         default: "off",
@@ -1106,6 +1114,45 @@ pub fn exit_tun_queues() -> usize {
     })
 }
 
+/// Default ring of an exit's TUN device, in packets (`txqueuelen`).
+///
+/// A TUN device keeps no qdisc backlog of its own: the kernel hands each
+/// packet routed into it to a per-queue ring the exit's reader drains, and
+/// drops it (`tx_dropped`) when the ring is full. On a Hetzner A/B at 150 ms
+/// the kernel default of 500 dropped 800 to 2 100 downlink packets per 30 s
+/// transfer, forwarded traffic included, and 4000 dropped none with the same
+/// ping p50/p99 through the tunnel
+/// (`warren-core/bench/results/2026-09-28_quinn-path-change_hetzner_migration-ab.md`).
+pub const DEFAULT_EXIT_TUN_TX_QUEUE_LEN: usize = 4000;
+const MIN_TUN_TX_QUEUE_LEN: usize = 100;
+const MAX_TUN_TX_QUEUE_LEN: usize = 100_000;
+
+/// Pure seam of [`exit_tun_tx_queue_len`].
+fn resolve_exit_tun_tx_queue_len(raw: Option<&str>) -> usize {
+    parse_usize_clamped(
+        raw,
+        MIN_TUN_TX_QUEUE_LEN,
+        MAX_TUN_TX_QUEUE_LEN,
+        DEFAULT_EXIT_TUN_TX_QUEUE_LEN,
+    )
+}
+
+/// `WARREN_EXIT_TUN_TXQUEUELEN`: the ring of the exit's TUN device, in packets.
+/// Unset, unparsable or under 100 yields [`DEFAULT_EXIT_TUN_TX_QUEUE_LEN`];
+/// above 100 000 is clamped. Linux only; every queue of a multi-queue TUN gets
+/// a ring of this size.
+///
+/// This resolver has no in-repo caller: the TUN is opened by the deployer's
+/// binary, which applies the value with `RealTun::set_tx_queue_len`. See the
+/// "Deployer-wired knobs" section of `docs/35-ENV-KNOBS.md`.
+#[must_use]
+pub fn exit_tun_tx_queue_len() -> usize {
+    static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        resolve_exit_tun_tx_queue_len(std::env::var("WARREN_EXIT_TUN_TXQUEUELEN").ok().as_deref())
+    })
+}
+
 /// `WARREN_EXIT_V2_DRAIN_SIGNAL`: give `/v2` sessions the drain signal (the
 /// `ExitDraining` advisory, then the drain close at the deadline). OFF by
 /// default; `"1"`/`"true"` enables it. Read once.
@@ -1235,6 +1282,20 @@ pub fn log_effective_overrides() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_exit_tun_ring_defaults_to_4000_packets_and_refuses_a_starved_ring() {
+        // 500 is the kernel default the fleet ran with, and it tail-drops
+        // downlink packets in bursts (the 2026-09-28 Hetzner ring A/B): the
+        // default must be the benched 4000, and a value under the floor falls
+        // back to it rather than starving the reader.
+        assert_eq!(resolve_exit_tun_tx_queue_len(None), 4000);
+        assert_eq!(resolve_exit_tun_tx_queue_len(Some("nope")), 4000);
+        assert_eq!(resolve_exit_tun_tx_queue_len(Some("10")), 4000);
+        assert_eq!(resolve_exit_tun_tx_queue_len(Some("500")), 500);
+        assert_eq!(resolve_exit_tun_tx_queue_len(Some("10000")), 10_000);
+        assert_eq!(resolve_exit_tun_tx_queue_len(Some("10000000")), 100_000);
+    }
 
     #[test]
     fn an_absent_or_rejected_bdp_floor_leaves_the_side_to_choose() {

@@ -437,6 +437,34 @@ impl RealTun {
         Self::create_internal(None, addr, prefix, None, 0, DEFAULT_TUN_MTU, false, false).await
     }
 
+    /// Sets the ring of the TUN interface to `len` packets (`txqueuelen`).
+    ///
+    /// A TUN keeps no qdisc backlog of its own: the kernel drops a packet
+    /// routed into it (`tx_dropped`) when the ring the reader drains is full,
+    /// and the kernel default of 500 does so in bursts on a busy exit (see
+    /// `warrenguard_config::knobs::DEFAULT_EXIT_TUN_TX_QUEUE_LEN`). The size
+    /// is the interface's, so on a multi-queue TUN one call sizes every
+    /// queue's ring. A no-op off Linux, where the platform TUN has no such
+    /// ring to size.
+    ///
+    /// # Errors
+    ///
+    /// EPERM without `CAP_NET_ADMIN`, or `InvalidInput` for a length that
+    /// does not fit the kernel's `u32`.
+    pub fn set_tx_queue_len(&self, len: usize) -> std::io::Result<()> {
+        let len = u32::try_from(len)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "txqueuelen"))?;
+        #[cfg(target_os = "linux")]
+        {
+            self.device.set_tx_queue_len(len)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = len;
+            Ok(())
+        }
+    }
+
     /// Name of the TUN interface as seen by the OS (e.g. `utun7`, `tun0`).
     #[must_use]
     pub fn name(&self) -> &str {
