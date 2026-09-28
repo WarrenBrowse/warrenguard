@@ -254,6 +254,14 @@ pub const REGISTRY: &[KnobMeta] = &[
         home: "warrenguard-config/src/knobs.rs (resolver only; deployer-wired, see docs/35-ENV-KNOBS.md)",
     },
     KnobMeta {
+        name: "WARREN_EXIT_HANDSHAKE_DEADLINE_SECS",
+        kind: "u64 (seconds)",
+        default: "5",
+        clamp: "1 to 60; 0/unparsable -> default, above 60 -> 60",
+        effect: "longest an exit waits for a client's QUIC handshake to complete before it drops the half-open connection and frees its in-flight slot",
+        home: "warrenguard-config/src/knobs.rs (resolver only; deployer-wired, see docs/35-ENV-KNOBS.md)",
+    },
+    KnobMeta {
         name: "WARREN_CLIENT_TUN_QUEUES",
         kind: "usize",
         default: "auto (min(cores, num_conns))",
@@ -1117,6 +1125,50 @@ pub fn exit_v2_drain_signal() -> bool {
     })
 }
 
+/// Default of [`exit_handshake_deadline`]: the engine client abandons a UDP
+/// handshake after 5 s and falls back to its TCP carrier, so an exit that
+/// waits longer only holds a slot for a dial nobody is still making.
+const EXIT_HANDSHAKE_DEADLINE_SECS_DEFAULT: u64 = 5;
+/// Ceiling of [`exit_handshake_deadline`]: past it the bound stops doing its
+/// job, which is to free a half-open handshake long before QUIC's idle timeout.
+const EXIT_HANDSHAKE_DEADLINE_SECS_MAX: u64 = 60;
+
+/// Parses a raw `WARREN_EXIT_HANDSHAKE_DEADLINE_SECS`. Zero would refuse every
+/// handshake, so it falls back to the default like an unparsable value; above
+/// the ceiling is clamped down. Pure for testability.
+fn parse_exit_handshake_deadline_secs(raw: Option<&str>) -> u64 {
+    match parse_u64_or_default(
+        "WARREN_EXIT_HANDSHAKE_DEADLINE_SECS",
+        raw,
+        EXIT_HANDSHAKE_DEADLINE_SECS_DEFAULT,
+    ) {
+        0 => EXIT_HANDSHAKE_DEADLINE_SECS_DEFAULT,
+        secs => secs.min(EXIT_HANDSHAKE_DEADLINE_SECS_MAX),
+    }
+}
+
+/// `WARREN_EXIT_HANDSHAKE_DEADLINE_SECS`: how long an exit's accept path waits
+/// for a client's QUIC handshake to complete. A client that sent its Initial and
+/// vanished (an abandoned dial, a dial queued in the socket while the exit
+/// restarted) otherwise leaves a half-open connection until QUIC's idle
+/// timeout, holding an in-flight slot and making the next clean stop wait its
+/// whole close drain. Default 5 s, clamped to `[1, 60]`. Read once.
+///
+/// Has no in-repo caller: the engine does not own the exit's accept loop. A
+/// deployer's exit binary bounds its `Incoming` await with this value. See the
+/// "Deployer-wired knobs" section of `docs/35-ENV-KNOBS.md`.
+#[must_use]
+pub fn exit_handshake_deadline() -> std::time::Duration {
+    static CACHE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    std::time::Duration::from_secs(*CACHE.get_or_init(|| {
+        parse_exit_handshake_deadline_secs(
+            std::env::var("WARREN_EXIT_HANDSHAKE_DEADLINE_SECS")
+                .ok()
+                .as_deref(),
+        )
+    }))
+}
+
 /// Resolves the raw `WARREN_CLIENT_TUN_QUEUES` value against the host core count
 /// and the session's connection count: `0` (unset/auto) opens
 /// `min(cores, num_conns)` queues (one per core up to one per connection, so a
@@ -1542,6 +1594,27 @@ mod tests {
         // Absent / garbage -> default.
         assert_eq!(parse_positive_usize_clamped(None, max, 4096), 4096);
         assert_eq!(parse_positive_usize_clamped(Some("x"), max, 4096), 4096);
+    }
+
+    #[test]
+    fn exit_handshake_deadline_defaults_to_five_seconds_and_stays_bounded() {
+        assert_eq!(
+            parse_exit_handshake_deadline_secs(None),
+            5,
+            "unset keeps the documented default"
+        );
+        assert_eq!(parse_exit_handshake_deadline_secs(Some("nope")), 5);
+        assert_eq!(
+            parse_exit_handshake_deadline_secs(Some("0")),
+            5,
+            "zero would refuse every handshake, so it is a typo, not an instruction"
+        );
+        assert_eq!(parse_exit_handshake_deadline_secs(Some("12")), 12);
+        assert_eq!(
+            parse_exit_handshake_deadline_secs(Some("3600")),
+            60,
+            "an hour would bring back the unbounded half-open handshake"
+        );
     }
 
     #[test]
