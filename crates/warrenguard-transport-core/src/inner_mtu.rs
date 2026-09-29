@@ -314,7 +314,7 @@ pub fn uplink_frag_needed(dropped: &[u8], budget: u16) -> Option<Vec<u8>> {
 
 /// True when the packet is an ICMP/ICMPv6 *error* message, about which no
 /// further ICMP error may be generated (RFC 1122 / RFC 4443 loop guard).
-fn is_icmp_error(pkt: &[u8]) -> bool {
+pub(crate) fn is_icmp_error(pkt: &[u8]) -> bool {
     match pkt.first().map(|b| b >> 4) {
         Some(4) => {
             let ihl = usize::from(pkt[0] & 0x0f) * 4;
@@ -340,6 +340,29 @@ fn is_icmp_error(pkt: &[u8]) -> bool {
 pub fn build_frag_needed(
     dropped: &[u8],
     effective_mtu: u16,
+    gw_v4: std::net::Ipv4Addr,
+    gw_v6: std::net::Ipv6Addr,
+) -> Option<Vec<u8>> {
+    let mtu = effective_mtu.to_be_bytes();
+    build_icmp_error(
+        dropped,
+        (3, 4),
+        (2, 0),
+        [0, 0, mtu[0], mtu[1]],
+        gw_v4,
+        gw_v6,
+    )
+}
+
+/// An ICMP error about `dropped`, sent from the tunnel gateway of its family
+/// to its source: `v4` or `v6` names the (type, code) and `rest` fills the
+/// four header bytes after the checksum. Returns `None` for non-IP input, an
+/// ICMP error (loop guard) or a non-unicast sender.
+pub(crate) fn build_icmp_error(
+    dropped: &[u8],
+    v4: (u8, u8),
+    v6: (u8, u8),
+    rest: [u8; 4],
     gw_v4: std::net::Ipv4Addr,
     gw_v6: std::net::Ipv6Addr,
 ) -> Option<Vec<u8>> {
@@ -374,9 +397,9 @@ pub fn build_frag_needed(
             let ip_ck = internet_checksum(0, &pkt[..IPV4_MIN_HEADER]);
             pkt[10..12].copy_from_slice(&ip_ck.to_be_bytes());
             let icmp = IPV4_MIN_HEADER;
-            pkt[icmp] = 3;
-            pkt[icmp + 1] = 4;
-            pkt[icmp + 6..icmp + 8].copy_from_slice(&effective_mtu.to_be_bytes());
+            pkt[icmp] = v4.0;
+            pkt[icmp + 1] = v4.1;
+            pkt[icmp + 4..icmp + 8].copy_from_slice(&rest);
             pkt[icmp + 8..icmp + 8 + quote_len].copy_from_slice(&dropped[..quote_len]);
             let icmp_ck = internet_checksum(0, &pkt[icmp..]);
             pkt[icmp + 2..icmp + 4].copy_from_slice(&icmp_ck.to_be_bytes());
@@ -403,8 +426,9 @@ pub fn build_frag_needed(
             pkt[8..24].copy_from_slice(&gw_v6.octets());
             pkt[24..40].copy_from_slice(&src);
             let icmp = IPV6_HEADER;
-            pkt[icmp] = 2;
-            pkt[icmp + 4..icmp + 8].copy_from_slice(&u32::from(effective_mtu).to_be_bytes());
+            pkt[icmp] = v6.0;
+            pkt[icmp + 1] = v6.1;
+            pkt[icmp + 4..icmp + 8].copy_from_slice(&rest);
             pkt[icmp + 8..icmp + 8 + quote_len].copy_from_slice(&dropped[..quote_len]);
             let seed = icmpv6_pseudo_sum(gw_v6, src_ip, icmp_len as u32);
             let icmp_ck = internet_checksum(seed, &pkt[icmp..]);
@@ -413,6 +437,29 @@ pub fn build_frag_needed(
         }
         _ => None,
     }
+}
+
+/// Unfolded ones-complement sum of the pseudo-header an upper-layer checksum
+/// covers, for either family: both addresses, the protocol and the length.
+/// The IPv4 (RFC 9293) and IPv6 (RFC 8200) layouts differ only in field
+/// widths, which the folding in [`internet_checksum`] makes irrelevant.
+pub(crate) fn l4_pseudo_sum(
+    src: std::net::IpAddr,
+    dst: std::net::IpAddr,
+    proto: u8,
+    len: u32,
+) -> u32 {
+    fn words(ip: std::net::IpAddr) -> u32 {
+        let octets = match ip {
+            std::net::IpAddr::V4(a) => a.octets().to_vec(),
+            std::net::IpAddr::V6(a) => a.octets().to_vec(),
+        };
+        octets
+            .chunks_exact(2)
+            .map(|w| u32::from(u16::from_be_bytes([w[0], w[1]])))
+            .sum()
+    }
+    words(src) + words(dst) + u32::from(proto) + len
 }
 
 #[cfg(test)]

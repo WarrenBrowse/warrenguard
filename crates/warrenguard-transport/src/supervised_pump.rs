@@ -440,6 +440,25 @@ async fn reflect_frag_needed<T: PacketDevice>(tun: &T, client: &MultiHopBundle, 
     }
 }
 
+/// Answers a packet whose source the exit refuses (a socket connected before
+/// the tunnel came up) with the reset or ICMP unreachable a router would send,
+/// instead of sealing it for an exit that drops it: the application sees the
+/// error now and reconnects through the tunnel, rather than waiting on a
+/// silent path until its own timeout. Returns whether the packet was answered.
+async fn answer_stale_source<T: PacketDevice>(
+    tun: &T,
+    client: &MultiHopBundle,
+    packet: &[u8],
+) -> bool {
+    let Some(answer) = client.stale_source_answer(packet) else {
+        return false;
+    };
+    if let Err(e) = tun.send(&answer).await {
+        tracing::trace!(error = %e, "stale-source answer tun write failed");
+    }
+    true
+}
+
 /// Uplink pump: read IP packets from `tun` and seal them as multi-hop
 /// frames using the latest [`crate::multihop::MultiHopClient`] the
 /// supervisor publishes on `rx`. Drops packets during reconnect windows
@@ -473,6 +492,9 @@ pub async fn run_uplink<T: PacketDevice>(rx: ClientWatch, tun: T) -> Result<()> 
             );
             continue;
         };
+        if answer_stale_source(&tun, &client, &packet).await {
+            continue;
+        }
         clamp_uplink_to_budget(&client, &mut packet);
         match client.send(&packet).await {
             Ok(()) => {}
@@ -528,6 +550,7 @@ pub async fn run_uplink_with_daita<T: PacketDevice>(
     let mut sent_padding = 0u64;
     let mut padding_failed = 0u64;
     let mut too_large = 0u64;
+    let mut stale_source = 0u64;
     let mut dying = 0u64;
     let mut last_report = Instant::now();
     let mut tun_io = TunIoTolerance::new("uplink tun recv");
@@ -566,6 +589,10 @@ pub async fn run_uplink_with_daita<T: PacketDevice>(
                     );
                     continue;
                 };
+                if answer_stale_source(&tun, &client, &packet).await {
+                    stale_source += 1;
+                    continue;
+                }
                 let mut packet = packet;
                 clamp_uplink_to_budget(&client, &mut packet);
                 match client.send(&packet).await {
@@ -628,6 +655,7 @@ pub async fn run_uplink_with_daita<T: PacketDevice>(
                 sent_padding,
                 padding_failed,
                 too_large,
+                stale_source,
                 dying,
                 "uplink_with_daita report"
             );
@@ -1576,6 +1604,92 @@ mod live_pump_tests {
             !resumed.is_empty(),
             "forwarding must resume once live again"
         );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+    }
+
+    // ------------------------------------------------------------------
+    // run_uplink: a stale source is answered, never sent
+    // ------------------------------------------------------------------
+
+    /// A UDP datagram from `src`, the shape of a QUIC packet a browser
+    /// session keeps sending on the socket it opened before the connect.
+    fn stale_udp_from(src: [u8; 4]) -> Vec<u8> {
+        let mut pkt = vec![0u8; 32];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&32u16.to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 17;
+        pkt[12..16].copy_from_slice(&src);
+        pkt[16..20].copy_from_slice(&[93, 184, 216, 34]);
+        pkt[20..22].copy_from_slice(&60_005u16.to_be_bytes());
+        pkt[22..24].copy_from_slice(&443u16.to_be_bytes());
+        pkt[24..26].copy_from_slice(&12u16.to_be_bytes());
+        pkt
+    }
+
+    /// Checks that `pump`, fed a packet from the host's physical address,
+    /// answers it with an ICMP unreachable into the TUN and seals nothing,
+    /// while a packet from the session's own address still reaches the exit.
+    async fn assert_stale_source_answered_not_sent(
+        pair: &crate::test_support::LoopbackMultiHop,
+        bundle: &MultiHopBundle,
+        tun: &warrenguard_transport_core::FakeTun,
+    ) {
+        tun.inject_inbound(stale_udp_from([192, 168, 1, 12]));
+        let answers = wait_for_outbound(tun).await;
+        assert_eq!(answers.len(), 1, "one answer per stale packet");
+        let icmp = &answers[0];
+        assert_eq!(icmp[9], 1, "the answer is ICMP");
+        assert_eq!((icmp[20], icmp[21]), (3, 1), "host unreachable");
+        assert_eq!(
+            &icmp[16..20],
+            &[192, 168, 1, 12],
+            "back to the stale socket"
+        );
+        let got = tokio::time::timeout(ABSENCE_WINDOW, pair.exit_conn.read_datagram()).await;
+        assert!(
+            got.is_err(),
+            "a packet the exit refuses is never sealed and sent"
+        );
+        assert_eq!(bundle.real_traffic_totals().0, 0);
+
+        tun.inject_inbound(stale_udp_from([10, 66, 0, 7]));
+        let forwarded = tokio::time::timeout(RECV_TIMEOUT, pair.exit_conn.read_datagram())
+            .await
+            .expect("the session's own traffic still flows")
+            .expect("datagram");
+        assert!(!forwarded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_uplink_answers_a_stale_source_instead_of_sending_it() {
+        let pair = spawn_loopback_multihop(ExitId::from_bytes([0x13; 16])).await;
+        let bundle = MultiHopBundle::new(vec![pair.client.clone()]);
+        bundle.set_source_addresses(std::net::Ipv4Addr::new(10, 66, 0, 7), None);
+        let (tx, rx) = tokio::sync::watch::channel(Some(bundle.clone()));
+        let tun = warrenguard_transport_core::FakeTun::new();
+        let task = tokio::spawn(run_uplink(rx, tun.clone()));
+
+        assert_stale_source_answered_not_sent(&pair, &bundle, &tun).await;
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+    }
+
+    #[tokio::test]
+    async fn run_uplink_with_daita_answers_a_stale_source_instead_of_sending_it() {
+        let pair = spawn_loopback_multihop(ExitId::from_bytes([0x14; 16])).await;
+        let bundle = MultiHopBundle::new(vec![pair.client.clone()]);
+        bundle.set_source_addresses(std::net::Ipv4Addr::new(10, 66, 0, 7), None);
+        let (tx, rx) = tokio::sync::watch::channel(Some(bundle.clone()));
+        let tun = warrenguard_transport_core::FakeTun::new();
+        let daita: DaitaShared = Arc::new(PlMutex::new(DaitaState::disabled()));
+        let state_changed = Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn(run_uplink_with_daita(rx, tun.clone(), daita, state_changed));
+
+        assert_stale_source_answered_not_sent(&pair, &bundle, &tun).await;
 
         drop(tx);
         let _ = tokio::time::timeout(Duration::from_secs(2), task).await;

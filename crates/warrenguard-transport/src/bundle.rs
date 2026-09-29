@@ -530,6 +530,17 @@ impl MultiHopBundle {
         })
     }
 
+    /// The packet to write back into the TUN instead of sending `packet`,
+    /// when the exit's anti-spoof gate would refuse its source: see
+    /// [`warrenguard_transport_core::reject_stale_source`]. `None` until the
+    /// session's addresses are named, and for every packet the exit admits.
+    #[must_use]
+    pub fn stale_source_answer(&self, packet: &[u8]) -> Option<Vec<u8>> {
+        let &(v4, v6) = self.source_addresses.get()?;
+        let refusal = warrenguard_transport_core::classify_source(packet, v4, v6)?;
+        warrenguard_transport_core::uplink_reject_stale_source(packet, refusal)
+    }
+
     /// Seals and sends one path-health probe on the leg at `leg`, WITHOUT
     /// feeding the real-traffic liveness counters: engine-generated probes
     /// must never satisfy (or trip) the app-traffic dead-path watches.
@@ -1237,6 +1248,42 @@ mod live_tests {
             .expect("the session takes the packet");
 
         assert_eq!(session.answerable_uplink_total(), 1);
+    }
+
+    /// Only a packet the exit refuses, from a source an application could
+    /// have opened a flow on, gets an answer, and only once the session's
+    /// addresses are named.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_source_answer_covers_only_what_the_exit_refuses() {
+        let pair = spawn_loopback_multihop(ExitId::from_bytes([0x8B; 16])).await;
+        let session = MultiHopBundle::new(vec![pair.client.clone()]);
+        let stale = udp_from([192, 168, 1, 12]);
+        assert!(
+            session.stale_source_answer(&stale).is_none(),
+            "nothing to judge against before the addresses are named"
+        );
+
+        session.set_source_addresses(Ipv4Addr::new(10, 66, 0, 7), None);
+
+        let answer = session
+            .stale_source_answer(&stale)
+            .expect("a stale source is answered");
+        assert_eq!(
+            &answer[16..20],
+            &[192, 168, 1, 12],
+            "addressed to the stale socket"
+        );
+        assert!(
+            session
+                .stale_source_answer(&udp_from([10, 66, 0, 7]))
+                .is_none()
+        );
+        assert!(
+            session
+                .stale_source_answer(&icmpv6_from("fe80::1".parse().expect("literal")))
+                .is_none(),
+            "link-local chatter stays unanswered"
+        );
     }
 
     #[tokio::test]

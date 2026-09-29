@@ -14,6 +14,7 @@ pub mod inner_mtu;
 pub mod ip_parse;
 pub mod packet_device;
 pub mod path_probe;
+pub mod stale_source;
 pub mod transport_config;
 
 pub use client_metrics::{ClientMetrics, ClientMetricsSnapshot, MetricsRegistry};
@@ -31,6 +32,7 @@ pub use ip_parse::{
 };
 pub use packet_device::{FakeTun, PacketDevice};
 pub use path_probe::{PATH_PROBE_INTERVAL, PathProbeDelta, spawn_path_probe};
+pub use stale_source::{reject_stale_source, uplink_reject_stale_source};
 pub use transport_config::{
     CLIENT_MAX_IDLE_TIMEOUT_SECS, DATAGRAM_MAX_REORDER, warren_transport_config_client,
     warren_transport_config_client_full, warren_transport_config_client_multihop_with_gso,
