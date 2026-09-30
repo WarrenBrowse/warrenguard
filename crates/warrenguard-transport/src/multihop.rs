@@ -111,6 +111,14 @@ pub enum MultiHopError {
     /// instead of dialing forever. Carries no address (no-log discipline).
     #[error("no route to the relay on any published address family")]
     NoRouteToRelay,
+    /// Every entry relay the deployer offered is unreachable on this host's
+    /// address families: the dialed entry answered [`Self::NoRouteToRelay`]
+    /// and no retarget moved the session to an entry it had not already
+    /// found unroutable (see [`crate::supervisor::SupervisorConfig::on_dial_refused`]),
+    /// or [`crate::reachable_entries`] found none. Terminal until the host
+    /// changes network. Carries no address (no-log discipline).
+    #[error("no entry relay reachable on this network's address families")]
+    NoReachableEntry,
     /// `Endpoint::connect` rejected the dial parameters (bad endpoint
     /// shape, missing default client config, etc.).
     #[error("QUIC connect setup failed: {0}")]
@@ -247,6 +255,10 @@ impl MultiHopError {
     /// Configuration errors (PKI mismatch, TLS provider setup,
     /// wire-format decode of a poisoned descriptor) are never retried:
     /// they would burn every attempt and surface the same error.
+    ///
+    /// [`MultiHopError::NoRouteToRelay`] is retriable through another entry
+    /// only (see [`Self::dial_refusal`]); the supervisor ends in
+    /// [`MultiHopError::NoReachableEntry`] once no retarget offers one.
     #[must_use]
     pub fn is_retriable(&self) -> bool {
         matches!(
@@ -254,7 +266,8 @@ impl MultiHopError {
             MultiHopError::Bind { .. }
                 | MultiHopError::Connect(_)
                 | MultiHopError::Handshake(_)
-                | MultiHopError::TcpFallback(_),
+                | MultiHopError::TcpFallback(_)
+                | MultiHopError::NoRouteToRelay,
         )
     }
 
@@ -271,6 +284,11 @@ impl MultiHopError {
     ///   ([`WARREN_MH_DRAINING`]), which by design never maps to a
     ///   [`RejectionReason`] (a drain is maintenance, not policy).
     ///
+    /// [`MultiHopError::NoRouteToRelay`] names the entry too: this host
+    /// holds no route to any address family it publishes, which a redial of
+    /// the same entry repeats and another entry may not share. It is the
+    /// local kernel's verdict, so no peer can forge it.
+    ///
     /// Either close counts whether it ends the handshake, a live session
     /// ([`MultiHopError::Recv`]) or the setup round-trip that follows a
     /// successful handshake ([`MultiHopError::SetupClosed`]), which is
@@ -285,6 +303,9 @@ impl MultiHopError {
     /// one-hop circuit both are the same node.
     #[must_use]
     pub fn dial_refusal(&self) -> Option<DialRefusedHop> {
+        if let MultiHopError::NoRouteToRelay = self {
+            return Some(DialRefusedHop::Entry);
+        }
         let (MultiHopError::Handshake(err)
         | MultiHopError::Recv(err)
         | MultiHopError::SetupClosed(err)) = self
@@ -315,7 +336,9 @@ impl MultiHopError {
     /// A policy rejection carries its own verdict (fatal for an unauthorized
     /// account, reselect for exhaustion). A dial refusal by the entry relay or
     /// the exit's drain reselects (redialing the same circuit re-hits the closed
-    /// admission gate). Everything else retries the same target under backoff.
+    /// admission gate), and so does an entry this host cannot route. Running
+    /// out of routable entries is fatal with its own cause. Everything else
+    /// retries the same target under backoff.
     #[must_use]
     pub fn retryability(&self) -> warrenguard_wire::Retryability {
         if let MultiHopError::Rejected(reason) = self {
@@ -326,6 +349,11 @@ impl MultiHopError {
         // subscription failure.
         if let MultiHopError::NoSessionToken(_) = self {
             return warrenguard_wire::Retryability::RetrySameTarget;
+        }
+        if let MultiHopError::NoReachableEntry = self {
+            return warrenguard_wire::Retryability::Fatal(
+                warrenguard_wire::FatalCause::NoReachableEntry,
+            );
         }
         // The same route request meets the same refusal: the consumer moves
         // to another admission (a token route), never a fatal account state.
@@ -3601,6 +3629,32 @@ mod tests {
                 "{cause}"
             );
         }
+    }
+
+    #[test]
+    fn an_entry_without_a_route_is_left_for_another_entry() {
+        // Forum topic 210: an IPv6-only phone dialed a v4-only entry, and the
+        // supervisor stopped instead of moving to a dual-stack one.
+        let err = MultiHopError::NoRouteToRelay;
+        assert_eq!(err.dial_refusal(), Some(DialRefusedHop::Entry));
+        assert_eq!(
+            err.retryability(),
+            warrenguard_wire::Retryability::RetryReselect
+        );
+        assert!(
+            err.is_retriable(),
+            "the supervisor keeps dialing, through the entry a retarget names"
+        );
+    }
+
+    #[test]
+    fn no_reachable_entry_stops_with_its_own_cause() {
+        let err = MultiHopError::NoReachableEntry;
+        assert!(!err.is_retriable());
+        assert_eq!(
+            err.retryability(),
+            warrenguard_wire::Retryability::Fatal(warrenguard_wire::FatalCause::NoReachableEntry)
+        );
     }
 
     #[test]

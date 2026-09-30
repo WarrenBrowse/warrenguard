@@ -121,6 +121,35 @@ pub fn select(
     select_from(&candidates(relay), requested_bind, probe)
 }
 
+/// The entry relays this host can dial, as indices into `candidates`, in the
+/// caller's order; empty when it can reach none of them.
+///
+/// Choosing an entry by directory order alone ignores address families: on an
+/// IPv6-only network a v4-only node listed first is picked as the entry for
+/// every exit and fails before its first packet (forum topic 210). Each client
+/// filters `candidates` by its own policy first (distinct from the exit, the
+/// entry country the user pinned, drained nodes) and orders them by its own
+/// preference; this keeps that order and drops only what the network cannot
+/// route. It never adds an entry the caller left out, so a pinned entry the
+/// network cannot reach yields an empty list for the caller to report, rather
+/// than a silent move to another country.
+///
+/// `probe` is injected for the same reason as in [`select_from`]; the engine's
+/// own probe is `warrenguard_transport::reachable_entries`.
+#[must_use]
+pub fn reachable_entries<'a>(
+    candidates: impl IntoIterator<Item = &'a RelayDescriptorSigned>,
+    requested_bind: SocketAddr,
+    probe: impl Fn(SocketAddr) -> Reachability,
+) -> Vec<usize> {
+    candidates
+        .into_iter()
+        .enumerate()
+        .filter(|(_, relay)| select(relay, requested_bind, &probe).is_some())
+        .map(|(index, _)| index)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,6 +289,58 @@ mod tests {
             }
         });
         assert_eq!(chosen, None, "a v4-pinned bind cannot dial a v6 endpoint");
+    }
+
+    /// A probe for a network carrying `v4` and `v6` as given.
+    fn network(v4: bool, v6: bool) -> impl Fn(SocketAddr) -> Reachability {
+        move |target| {
+            if (target.is_ipv6() && v6) || (target.is_ipv4() && v4) {
+                Reachability::Routed
+            } else {
+                Reachability::Refused
+            }
+        }
+    }
+
+    #[test]
+    fn an_ipv6_only_network_skips_a_v4_only_entry_listed_first() {
+        // Forum topic 210: the directory lists a v4-only node first, and a
+        // phone on an IPv6-only network picked it as the entry for every exit.
+        let v4_only = relay(V4, None);
+        let dual_stack = relay("192.0.2.20:443", Some("[2001:db8::20]:443"));
+        let chosen = reachable_entries(
+            [&v4_only, &dual_stack],
+            addr(WILDCARD_V4),
+            network(false, true),
+        );
+        assert_eq!(chosen, vec![1]);
+    }
+
+    #[test]
+    fn an_ipv4_network_keeps_the_callers_order() {
+        let v4_only = relay(V4, None);
+        let dual_stack = relay("192.0.2.20:443", Some("[2001:db8::20]:443"));
+        let chosen = reachable_entries(
+            [&v4_only, &dual_stack],
+            addr(WILDCARD_V4),
+            network(true, false),
+        );
+        assert_eq!(
+            chosen,
+            vec![0, 1],
+            "a network that reaches every entry must see the order it asked for"
+        );
+    }
+
+    #[test]
+    fn an_ipv6_only_network_reaches_no_v4_only_entry() {
+        let first = relay(V4, None);
+        let second = relay("192.0.2.20:443", None);
+        let chosen = reachable_entries([&first, &second], addr(WILDCARD_V4), network(false, true));
+        assert!(
+            chosen.is_empty(),
+            "no entry is reachable, so none may be offered, got {chosen:?}"
+        );
     }
 
     #[test]

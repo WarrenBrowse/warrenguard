@@ -424,13 +424,18 @@ pub struct SupervisorConfig {
     /// [`OverlapSwapObserver`]). `None` = not observed.
     pub on_overlap_swapped: Option<OverlapSwapObserver>,
     /// Optional observer fired on each deliberately refused dial
-    /// attempt (drained entry or exit, see
-    /// [`MultiHopError::dial_refusal`]), with the refused circuit's
+    /// attempt (drained entry or exit, or an entry this host cannot route,
+    /// see [`MultiHopError::dial_refusal`]), with the refused circuit's
     /// identity. A deployer excludes the refusing node from its own
     /// selection and retargets via [`SupervisorHandle::migrate_to`];
     /// the retry loop keeps running either way and picks a retarget up
     /// on its next attempt. `None` = refusals retry like any other
     /// transient error.
+    ///
+    /// An unroutable entry is the exception to "keeps running": unless the
+    /// observer retargets, from inside the call, to an entry the current dial
+    /// cycle has not found unroutable, the supervisor ends with
+    /// [`MultiHopError::NoReachableEntry`].
     pub on_dial_refused: Option<DialRefusedObserver>,
     /// Optional observer of the measured client->entry path RTT
     /// ([`PathRttObserver`]): fired on each session publish and once
@@ -2588,20 +2593,53 @@ impl MultiHopSupervisor {
     /// operator misconfiguration (rotated operational pubkey, broken
     /// TLS provider) is visible instead of burning the user's battery
     /// in a retry loop.
+    ///
+    /// An entry this host cannot route ([`MultiHopError::NoRouteToRelay`]) is
+    /// reported to [`SupervisorConfig::on_dial_refused`] and the entry its
+    /// retarget names is dialed at once, since the failure cost no packet.
+    /// When the retarget names no entry this cycle has not already found
+    /// unroutable (no observer, no other entry, or a retarget going round in
+    /// circles), the cycle ends in [`MultiHopError::NoReachableEntry`]: the
+    /// fleet bounds the loop, and the user learns the network is the cause.
     async fn connect_with_unbounded_retry(
         &self,
         redial: &mut JitterBackoff,
     ) -> Result<(MultiHopClient, CircuitTarget), MultiHopError> {
         let mut attempt_count = 0u64;
+        let mut unroutable: Vec<[u8; 16]> = Vec::new();
+        let mut redial_at_once = false;
         loop {
-            let delay = redial.next_delay();
-            if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
+            if std::mem::take(&mut redial_at_once) {
+                // An unroutable dial completes without ever pending, so
+                // yield: a teardown racing this loop must still be observed.
+                tokio::task::yield_now().await;
+            } else {
+                let delay = redial.next_delay();
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
             }
             attempt_count = attempt_count.saturating_add(1);
             let target = self.current_target();
             match self.connect_once(&target).await {
                 Ok(client) => return Ok((client, target)),
+                Err(e @ MultiHopError::NoRouteToRelay) => {
+                    unroutable.push(target.relay.relay_id);
+                    self.notify_dial_refused(&e, &target);
+                    if unroutable.contains(&self.current_target().relay.relay_id) {
+                        tracing::warn!(
+                            attempt = attempt_count,
+                            "no entry relay reachable on this network's address families; stopping"
+                        );
+                        return Err(MultiHopError::NoReachableEntry);
+                    }
+                    tracing::info!(
+                        attempt = attempt_count,
+                        "entry relay unreachable on this network's address families; \
+                         dialing the entry the retarget named"
+                    );
+                    redial_at_once = true;
+                }
                 Err(e) if e.is_retriable() => {
                     self.notify_dial_refused(&e, &target);
                     tracing::warn!(
@@ -4436,6 +4474,143 @@ mod run_tests {
             refuse_setups,
         )
         .await;
+    }
+
+    /// `circuit` entered through a relay that publishes one IPv6 address
+    /// only. The run tests bind `127.0.0.1:0`, a pinned IPv4 bind, so this
+    /// host holds no route to it: the dial ends in `NoRouteToRelay` before a
+    /// packet, on any machine.
+    fn unroutable(circuit: CircuitTarget) -> CircuitTarget {
+        CircuitTarget {
+            relay: Arc::new(RelayDescriptorSigned {
+                endpoint: "[2001:db8::1]:443".parse().expect("static addr parses"),
+                endpoint_v6: None,
+                ..(*circuit.relay).clone()
+            }),
+            ..circuit
+        }
+    }
+
+    /// An `on_dial_refused` observer that records every report and then moves
+    /// the session to whatever `next` names for the refused relay id, the way
+    /// a deployer's directory retarget does.
+    fn record_and_retarget(
+        reports: &RefusalReports,
+        migrate: &Arc<std::sync::OnceLock<MigrateHandle>>,
+        next: impl Fn([u8; 16]) -> Option<CircuitTarget> + Send + Sync + 'static,
+    ) -> DialRefusedObserver {
+        let record = record_refusals(reports);
+        let migrate = migrate.clone();
+        Arc::new(move |hop, relay_id, exit_id| {
+            record(hop, relay_id, exit_id);
+            if let (Some(handle), Some(target)) = (migrate.get(), next(relay_id)) {
+                handle.migrate_to(target);
+            }
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_entry_this_network_cannot_route_is_left_for_the_next_entry() {
+        let operational_key = SigningKey::from_bytes(&[0x61; 32]);
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x62; 16]));
+        let v4_only = unroutable(circuit_to(&exit, [0xE1; 16], &operational_key));
+        let reachable = circuit_to(&exit, [0xE2; 16], &operational_key);
+        let reports = RefusalReports::default();
+        let migrate = Arc::new(std::sync::OnceLock::new());
+        let mut config = SupervisorConfig {
+            relay: v4_only.relay.clone(),
+            ..config_with_fake_exit(&exit, &operational_key)
+        };
+        config.backoff = TEST_BACKOFF;
+        config.on_dial_refused = Some(record_and_retarget(&reports, &migrate, move |_| {
+            Some(reachable.clone())
+        }));
+        let (supervisor, mut rx) = MultiHopSupervisor::new(config);
+        let _ = migrate.set(supervisor.migrate_handle());
+        let task = tokio::spawn(supervisor.run());
+
+        tokio::time::timeout(Duration::from_secs(5), rx.changed())
+            .await
+            .expect("the session comes up through the next entry")
+            .expect("watch sender alive");
+        assert_eq!(
+            *reports.lock().expect("reports lock"),
+            vec![(
+                multihop::DialRefusedHop::Entry,
+                v4_only.relay.relay_id,
+                *exit.exit_id.as_bytes()
+            )],
+            "the unroutable entry is reported once, as the entry of the dialed circuit"
+        );
+
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_fleet_this_network_cannot_route_ends_in_no_reachable_entry() {
+        // Two unroutable entries and a retarget that keeps alternating
+        // between them: the supervisor stops at the first entry it would
+        // dial twice, instead of looping over the fleet forever.
+        let operational_key = SigningKey::from_bytes(&[0x63; 32]);
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x64; 16]));
+        let first = unroutable(circuit_to(&exit, [0xE3; 16], &operational_key));
+        let second = unroutable(circuit_to(&exit, [0xE4; 16], &operational_key));
+        let reports = RefusalReports::default();
+        let migrate = Arc::new(std::sync::OnceLock::new());
+        let mut config = SupervisorConfig {
+            relay: first.relay.clone(),
+            ..config_with_fake_exit(&exit, &operational_key)
+        };
+        config.backoff = TEST_BACKOFF;
+        let (a, b) = (first.clone(), second.clone());
+        config.on_dial_refused = Some(record_and_retarget(&reports, &migrate, move |refused| {
+            Some(if refused == a.relay.relay_id {
+                b.clone()
+            } else {
+                a.clone()
+            })
+        }));
+        let (supervisor, _rx) = MultiHopSupervisor::new(config);
+        let _ = migrate.set(supervisor.migrate_handle());
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), supervisor.run())
+            .await
+            .expect("the supervisor stops instead of looping");
+        assert!(
+            matches!(ended, Err(MultiHopError::NoReachableEntry)),
+            "got {ended:?}"
+        );
+        let refused: Vec<[u8; 16]> = reports
+            .lock()
+            .expect("reports lock")
+            .iter()
+            .map(|(_, relay_id, _)| *relay_id)
+            .collect();
+        assert_eq!(refused, vec![first.relay.relay_id, second.relay.relay_id]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unroutable_entry_with_no_retarget_ends_in_no_reachable_entry() {
+        // A deployment with no directory to retarget from has nowhere else
+        // to go: it stops at once with the typed cause.
+        let operational_key = SigningKey::from_bytes(&[0x65; 32]);
+        let exit = spawn_fake_multihop_exit(&operational_key, ExitId::from_bytes([0x66; 16]));
+        let only = unroutable(circuit_to(&exit, [0xE5; 16], &operational_key));
+        let mut config = SupervisorConfig {
+            relay: only.relay.clone(),
+            ..config_with_fake_exit(&exit, &operational_key)
+        };
+        config.backoff = TEST_BACKOFF;
+        let (supervisor, _rx) = MultiHopSupervisor::new(config);
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), supervisor.run())
+            .await
+            .expect("the supervisor stops instead of looping");
+        assert!(
+            matches!(ended, Err(MultiHopError::NoReachableEntry)),
+            "got {ended:?}"
+        );
     }
 
     /// The exit each connection of `bundle` terminates at, primary first.

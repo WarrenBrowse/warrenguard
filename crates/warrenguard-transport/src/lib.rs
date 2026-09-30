@@ -71,4 +71,5 @@ pub use ip_assign::{IpAssignChannel, IpAssignSpec};
 pub use real_tun::RealTun;
 // The engine's supervisor-facing reconnect verdict, re-exported so a consumer
 // naming it through the transport crate does not reach into `warrenguard-wire`.
+pub use dial_target::reachable_entries;
 pub use warrenguard_wire::{FatalCause, Retryability};

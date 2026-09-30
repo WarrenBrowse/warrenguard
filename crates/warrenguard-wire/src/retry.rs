@@ -9,9 +9,9 @@
 //!
 //! Three actions, keeping every distinction the exit expresses:
 //! - [`Retryability::Fatal`] stops the supervisor and surfaces a
-//!   [`FatalCause`] to the user (the account/identity is the problem, or the
-//!   refusal is opaque and definitive): an immediate redial reproduces it and
-//!   no other exit helps.
+//!   [`FatalCause`] to the user (the account/identity is the problem, the
+//!   refusal is opaque and definitive, or the host's network routes no
+//!   entry): an immediate redial reproduces it and no other exit helps.
 //! - [`Retryability::RetrySameTarget`] is a transient failure (bind contention,
 //!   handshake stall, a network blip): retry the SAME target after a backoff.
 //! - [`Retryability::RetryReselect`] is a refusal that is not the client's fault
@@ -27,9 +27,10 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Retryability {
-    /// Definitive refusal tied to the account/identity or an opaque policy
-    /// close: stop and surface the [`FatalCause`]. Retrying reproduces it, and
-    /// no other exit resolves it (only the user provisioning/renewing does).
+    /// Definitive refusal tied to the account/identity, an opaque policy
+    /// close, or a network that routes no entry: stop and surface the
+    /// [`FatalCause`]. Retrying reproduces it, and no other exit resolves it
+    /// (only the user renewing, or changing network, does).
     Fatal(FatalCause),
     /// Transient failure: retry the SAME target after a backoff.
     RetrySameTarget,
@@ -57,6 +58,12 @@ pub enum FatalCause {
     /// The exit closed with the opaque policy-rejection code and the sealed
     /// cause did not arrive: definitive, but the specific reason is unknown.
     PolicyRefused,
+    /// The host's network routes none of the address families the candidate
+    /// entry relays publish (an IPv6-only network against v4-only entries).
+    /// Neither the account nor the fleet is at fault, and no redial on this
+    /// network helps: the user changes network, or unpins an entry country
+    /// the network cannot reach.
+    NoReachableEntry,
 }
 
 impl Retryability {

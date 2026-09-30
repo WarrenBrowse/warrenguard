@@ -56,9 +56,93 @@ pub(crate) fn local_route(target: SocketAddr, bypass: Option<SocketBypass>) -> R
     }
 }
 
+/// The entry relays this host can dial now, as indices into `candidates` in
+/// the caller's order: [`warrenguard_multihop::dial::reachable_entries`] with
+/// the same kernel probe, tunnel escape included, as the dial itself uses.
+///
+/// Pass the entries the client's own policy allows (not the exit, not a
+/// drained node, only the pinned entry country when the user pinned one), in
+/// its order of preference, with the `bind_addr` and `socket_bypass` the
+/// supervisor will dial with; then dial the first index returned. The order
+/// is kept, so on a network that routes every family nothing changes.
+///
+/// # Errors
+///
+/// [`crate::multihop::MultiHopError::NoReachableEntry`] when the host routes
+/// none of them. A pinned entry country is never widened here: the client
+/// surfaces this error (and may offer to unpin) instead of moving the user
+/// to a country they did not choose.
+pub fn reachable_entries<'a>(
+    candidates: impl IntoIterator<Item = &'a warrenguard_multihop::RelayDescriptorSigned>,
+    bind_addr: SocketAddr,
+    socket_bypass: Option<SocketBypass>,
+) -> Result<Vec<usize>, crate::multihop::MultiHopError> {
+    let chosen = warrenguard_multihop::dial::reachable_entries(candidates, bind_addr, |target| {
+        local_route(target, socket_bypass)
+    });
+    if chosen.is_empty() {
+        return Err(crate::multihop::MultiHopError::NoReachableEntry);
+    }
+    Ok(chosen)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn relay(endpoint: &str) -> warrenguard_multihop::RelayDescriptorSigned {
+        warrenguard_multihop::RelayDescriptorSigned {
+            relay_id: [0x11; 16],
+            relay_ed25519_pubkey: [0x22; 32],
+            endpoint: endpoint.parse().expect("static addr parses"),
+            endpoint_v6: None,
+            cover_domain: None,
+            tcp_fallback: false,
+            signature: [0x33; 64],
+        }
+    }
+
+    /// A pinned IPv4 bind reaches no IPv6 address, which stands in for an
+    /// IPv4-only network on any test host without touching its routes.
+    const PINNED_V4: &str = "127.0.0.1:0";
+
+    #[tokio::test]
+    async fn the_engine_probe_offers_only_the_entries_this_host_can_route() {
+        #[cfg(unix)]
+        let _serial = crate::socket_protect::TEST_PROTECT_LOCK.lock().await;
+        let v6_only = relay("[2001:db8::1]:443");
+        let loopback = relay("127.0.0.1:9");
+
+        let chosen = reachable_entries(
+            [&v6_only, &loopback],
+            PINNED_V4.parse().expect("static addr parses"),
+            None,
+        )
+        .expect("the loopback entry is reachable");
+
+        assert_eq!(chosen, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn no_routable_candidate_is_the_typed_no_reachable_entry() {
+        #[cfg(unix)]
+        let _serial = crate::socket_protect::TEST_PROTECT_LOCK.lock().await;
+        let v6_only = relay("[2001:db8::1]:443");
+
+        let chosen = reachable_entries(
+            [&v6_only],
+            PINNED_V4.parse().expect("static addr parses"),
+            None,
+        );
+
+        assert!(
+            matches!(
+                chosen,
+                Err(crate::multihop::MultiHopError::NoReachableEntry)
+            ),
+            "got {chosen:?}"
+        );
+    }
 
     #[tokio::test]
     async fn the_loopback_route_reads_as_routed() {
