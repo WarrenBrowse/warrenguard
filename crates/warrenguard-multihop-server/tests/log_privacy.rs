@@ -164,3 +164,58 @@ fn the_only_exempted_line_is_the_port_fail_guard() {
         exempt.len()
     );
 }
+
+/// Per-session timing fields: a session's lifetime with the event timestamp is
+/// a connection log (when a subscriber connected and for how long). Ops may
+/// keep it at `debug`, never at `info` and above, which production retains.
+const FORBIDDEN_SESSION_TIMING_FIELDS: &[&str] = &[
+    "conn_secs",
+    "duration_secs",
+    "session_secs",
+    "conn_start.elapsed()",
+];
+
+/// The `tracing` macros whose events a production exit retains (its filter
+/// is `info`).
+const RETAINED_LEVEL_MACROS: &[&str] = &["info!(", "warn!(", "error!("];
+
+/// The bodies of every `info!`/`warn!`/`error!` invocation, with the 1-based
+/// line where each starts. A body runs from the macro line to the first line
+/// that closes it with `);`, which is how rustfmt lays out a multi-line event.
+fn retained_events(body: &str) -> Vec<(usize, String)> {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut events = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if RETAINED_LEVEL_MACROS.iter().any(|m| lines[i].contains(m)) {
+            let start = i;
+            let mut text = String::new();
+            while i < lines.len() {
+                text.push_str(lines[i]);
+                text.push('\n');
+                if lines[i].trim_end().ends_with(");") {
+                    break;
+                }
+                i += 1;
+            }
+            events.push((start + 1, text));
+        }
+        i += 1;
+    }
+    events
+}
+
+#[test]
+fn multihop_server_keeps_session_timing_out_of_retained_levels() {
+    let body = read_multihop();
+    for (line, event) in retained_events(&body) {
+        for field in FORBIDDEN_SESSION_TIMING_FIELDS {
+            assert!(
+                !event.contains(field),
+                "{MULTIHOP_SRC}:{line} logs {field:?} at info or above. A per-session \
+                 duration next to the event timestamp records when a subscriber was \
+                 connected and for how long; production keeps info, so log it at debug."
+            );
+        }
+    }
+}

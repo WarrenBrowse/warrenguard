@@ -5154,9 +5154,11 @@ async fn serve_terminating_connection<T>(
     // Read the LIVE state, not the pre-setup pick: a client that never
     // negotiated DAITA closes with `machines_count=0`, not the sampled pool's
     // count.
+    // At debug: the lifetime next to the event timestamp is a connection log,
+    // which production (filter `info`) must not retain.
     if daita_offered {
         let (metrics, machines_count) = daita.snapshot();
-        tracing::info!(
+        tracing::debug!(
             machine = %daita_machine_name.as_deref().unwrap_or("<none>"),
             machines_count,
             padding_fired = metrics.padding_fired,
