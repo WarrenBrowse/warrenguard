@@ -286,6 +286,13 @@ impl<A: Copy + Eq + std::hash::Hash> Holdings<A> {
     fn len(&self) -> usize {
         self.by_conn.len()
     }
+
+    /// Re-attributes every connection `from` authenticated to `to`.
+    fn transfer_owner(&mut self, from: &[u8; 32], to: [u8; 32]) {
+        for owner in self.owners.values_mut().filter(|owner| *owner == from) {
+            *owner = to;
+        }
+    }
 }
 
 /// Errors returned by [`IpAllocator::new`].
@@ -790,6 +797,32 @@ impl IpAllocator {
         }
     }
 
+    /// Make `to` the key that owns everything `from` owns: the live
+    /// connections it authenticated, its sticky binding (replacing any binding
+    /// `to` had, which only a session that already ended can have left), and
+    /// its claim on an address something still routes to.
+    ///
+    /// A token session's lease moves to a fresh serial at every epoch, and a
+    /// client that reconnects presents the current serial, not the one its
+    /// session was admitted on. Without this, the reconnect is a stranger to
+    /// the pool and loses its address, and with it the port forwards its
+    /// departed address still holds until the deployer's reaper runs.
+    pub fn transfer_owner(&mut self, from: [u8; 32], to: [u8; 32]) {
+        if from == to {
+            return;
+        }
+        self.used.transfer_owner(&from, to);
+        if let Some(addr) = self.sticky.remove(&from) {
+            self.sticky.retain(|_, bound| *bound != addr);
+            self.sticky.insert(to, addr);
+        }
+        for holder in self.last_holder.values_mut() {
+            if *holder == Some(from) {
+                *holder = Some(to);
+            }
+        }
+    }
+
     /// Release a previously-allocated address. Idempotent on unknown
     /// `conn`. Released IPs go back to the free set; the next allocate
     /// draws a random host, so a freshly-reconnected client does not
@@ -1049,6 +1082,18 @@ impl IpAllocatorV6 {
     /// authenticated owner is `pubkey`.
     fn held_by_pubkey(&self, offset: u64, pubkey: &[u8; 32]) -> bool {
         self.used.held_by(offset, pubkey)
+    }
+
+    /// See [`IpAllocator::transfer_owner`].
+    pub fn transfer_owner(&mut self, from: [u8; 32], to: [u8; 32]) {
+        if from == to {
+            return;
+        }
+        self.used.transfer_owner(&from, to);
+        if let Some(offset) = self.sticky.remove(&from) {
+            self.sticky.retain(|_, bound| *bound != offset);
+            self.sticky.insert(to, offset);
+        }
     }
 
     /// Release a previously-allocated address. Idempotent on unknown
@@ -2434,5 +2479,159 @@ mod tests {
             capacity,
             "an address whose forward ended must not be lost to the pool"
         );
+    }
+
+    // A token session's lease moves to a fresh serial every epoch (the lease
+    // refresh), and a reconnecting client presents the current epoch's serial,
+    // never the one it was first admitted on. On 2026-10-12 a client that
+    // reconnected seven seconds after a clean disconnect was therefore a
+    // stranger to the pool: it was drawn another address, and its forwarded
+    // port and entitlement stayed held by its own departed address until the
+    // orphan reaper ran, 47 s later.
+
+    #[test]
+    fn a_session_whose_lease_moved_gets_its_forwarded_address_back_under_the_new_serial() {
+        let mut pool = IpAllocator::with_seed(NET, 24, GW, 0x3A).expect("/24 pool builds");
+        let forwards = Forwards::naming([]);
+        pool.set_address_claims(forwards.clone());
+        let admitted_on = [0x15; 32];
+        let refreshed_onto = [0x17; 32];
+        let owned = pool
+            .allocate_for_pubkey_reclaiming(1, admitted_on, SessionIntent::Fresh)
+            .expect("the session");
+        forwards.name(owned);
+        pool.transfer_owner(admitted_on, refreshed_onto);
+        pool.release(1);
+
+        let back = pool
+            .allocate_for_pubkey_reclaiming(2, refreshed_onto, SessionIntent::Join(owned))
+            .expect("the client reconnects");
+        assert_eq!(
+            back, owned,
+            "the reconnect must keep its address and its forwards"
+        );
+    }
+
+    #[test]
+    fn the_serial_a_session_left_behind_no_longer_claims_its_address() {
+        let mut pool = IpAllocator::with_seed(NET, 24, GW, 0x3B).expect("/24 pool builds");
+        let forwards = Forwards::naming([]);
+        pool.set_address_claims(forwards.clone());
+        let owned = pool
+            .allocate_for_pubkey_reclaiming(1, [0x15; 32], SessionIntent::Fresh)
+            .expect("the session");
+        forwards.name(owned);
+        pool.transfer_owner([0x15; 32], [0x17; 32]);
+        pool.release(1);
+
+        let other = pool
+            .allocate_for_pubkey_reclaiming(2, [0x15; 32], SessionIntent::Join(owned))
+            .expect("a session on the old serial");
+        assert_ne!(other, owned, "a spent serial must not take the forwards");
+    }
+
+    #[test]
+    fn a_leg_presenting_the_new_serial_joins_the_live_session_it_refreshed() {
+        let mut pool = IpAllocator::with_seed(NET, 24, GW, 0x3C).expect("/24 pool builds");
+        let owned = pool
+            .allocate_for_pubkey_reclaiming(1, [0x15; 32], SessionIntent::Fresh)
+            .expect("the primary");
+        pool.transfer_owner([0x15; 32], [0x17; 32]);
+
+        let leg = pool
+            .allocate_for_pubkey_reclaiming(2, [0x17; 32], SessionIntent::Join(owned))
+            .expect("a redialed leg");
+        assert_eq!(
+            leg, owned,
+            "a bonded leg must land on its session's address"
+        );
+    }
+
+    #[test]
+    fn a_hintless_reconnect_under_the_new_serial_lands_on_its_sticky_address() {
+        let mut pool = IpAllocator::with_seed(NET, 24, GW, 0x3D).expect("/24 pool builds");
+        let owned = pool
+            .allocate_for_pubkey(1, [0x15; 32])
+            .expect("the session");
+        pool.transfer_owner([0x15; 32], [0x17; 32]);
+        pool.release(1);
+
+        assert_eq!(pool.allocate_for_pubkey(2, [0x17; 32]), Some(owned));
+    }
+
+    #[test]
+    fn transferring_a_key_the_pool_never_saw_changes_nothing() {
+        let mut pool = IpAllocator::with_seed(NET, 24, GW, 0x3E).expect("/24 pool builds");
+        let owned = pool
+            .allocate_for_pubkey(1, [0x15; 32])
+            .expect("the session");
+        pool.transfer_owner([0x99; 32], [0x98; 32]);
+        pool.release(1);
+
+        assert_eq!(pool.allocate_for_pubkey(2, [0x15; 32]), Some(owned));
+        assert_eq!(pool.sticky_count(), 1);
+    }
+
+    #[test]
+    fn a_v6_session_whose_lease_moved_is_joined_under_the_new_serial() {
+        // The session stays live: a released offset would come back from the
+        // recycle set whatever the key, which would prove nothing.
+        let mut pool = IpAllocatorV6::with_seed(NET6, 0x3F);
+        let owned = pool
+            .allocate_for_pubkey(1, [0x15; 32])
+            .expect("the session");
+        pool.transfer_owner([0x15; 32], [0x17; 32]);
+
+        assert_eq!(
+            pool.allocate_for_pubkey(2, [0x17; 32]),
+            Some(owned),
+            "a leg under the new serial shares the session's interface ID"
+        );
+        assert_ne!(
+            pool.allocate_for_pubkey(3, [0x15; 32]),
+            Some(owned),
+            "the serial the lease left no longer owns it"
+        );
+    }
+
+    #[test]
+    fn a_second_sessions_forwarded_address_follows_its_lease_too() {
+        // The claim on an address that is not the key's sticky one rides
+        // `last_holder`, not the sticky map.
+        let mut pool = IpAllocator::with_seed(NET, 24, GW, 0x40).expect("/24 pool builds");
+        let forwards = Forwards::naming([]);
+        pool.set_address_claims(forwards.clone());
+        let key = [0x15; 32];
+        pool.allocate_for_pubkey(1, key).expect("the first session");
+        let second = pool
+            .allocate_for_pubkey_with_intent(2, key, SessionIntent::Fresh)
+            .expect("the second session");
+        forwards.name(second);
+        pool.release(2);
+        pool.transfer_owner(key, [0x17; 32]);
+
+        let back = pool
+            .allocate_for_pubkey_with_intent(3, [0x17; 32], SessionIntent::Join(second))
+            .expect("the second session reconnects");
+        assert_eq!(back, second);
+    }
+
+    #[test]
+    fn a_new_serial_that_was_bound_elsewhere_is_rebound_to_the_live_session() {
+        // `to` is the serial a live session's lease just moved onto, so its
+        // own stale binding (from a session that ended earlier) gives way.
+        let mut pool = IpAllocator::with_seed(NET, 24, GW, 0x41).expect("/24 pool builds");
+        let stale = pool
+            .allocate_for_pubkey(1, [0x17; 32])
+            .expect("an earlier session");
+        pool.release(1);
+        let live = pool
+            .allocate_for_pubkey(2, [0x15; 32])
+            .expect("the live session");
+        assert_ne!(stale, live);
+        pool.transfer_owner([0x15; 32], [0x17; 32]);
+        pool.release(2);
+
+        assert_eq!(pool.allocate_for_pubkey(3, [0x17; 32]), Some(live));
     }
 }

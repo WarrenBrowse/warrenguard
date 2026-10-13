@@ -3361,6 +3361,15 @@ pub struct MultihopSessionRegistry<C: ClosableConn = Connection> {
     /// Told the serial of a token session whose last connection just ended,
     /// see [`Self::set_token_session_end_observer`].
     token_end_observer: std::sync::OnceLock<TokenSessionEndObserver>,
+    /// Moves a token session's address ownership in the pool onto each
+    /// serial its lease moves to; wired by
+    /// [`ExitTerminateCtx::with_session_registry`].
+    lease_owner_sink: std::sync::OnceLock<LeaseOwnerSink>,
+    /// Held across a whole rebind, the pool move included: the anchor path
+    /// and the lease refresh can rebind one session at the same time, and
+    /// pool moves applied out of order would leave the pool on a serial the
+    /// lease already left.
+    lease_moves: Mutex<()>,
     /// Route admission state (control senders, anchors, retained locators),
     /// see the `route` submodule.
     route: route::RegistryRouteState,
@@ -3382,6 +3391,12 @@ pub type WalletSessionEndObserver = Box<dyn Fn(WalletSession) + Send + Sync>;
 /// connection teardown path, synchronously, so it must hand the serial off
 /// (a `try_send`, a spawn) and never block or await.
 pub type TokenSessionEndObserver = Box<dyn Fn([u8; TOKEN_SERIAL_LEN]) + Send + Sync>;
+
+/// Told `(from, to)` each time a live token session's lease moves from one
+/// serial to another, so the address pool keys the session on the serial a
+/// reconnect will present.
+pub(crate) type LeaseOwnerSink =
+    Box<dyn Fn([u8; TOKEN_SERIAL_LEN], [u8; TOKEN_SERIAL_LEN]) + Send + Sync>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum SessionKey {
@@ -3414,6 +3429,8 @@ impl<C: ClosableConn> Default for MultihopSessionRegistry<C> {
             live: Mutex::new(HashMap::new()),
             ipv4_to_pubkey: Mutex::new(HashMap::new()),
             token_end_observer: std::sync::OnceLock::new(),
+            lease_owner_sink: std::sync::OnceLock::new(),
+            lease_moves: Mutex::new(()),
             route: route::RegistryRouteState::default(),
             wallet: wallet::RegistryWalletState::default(),
             wallet_end_observer: std::sync::OnceLock::new(),
@@ -3577,6 +3594,12 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
     /// Set once. Returns `false`, keeping the first, when one is already wired.
     pub fn set_token_session_end_observer(&self, observer: TokenSessionEndObserver) -> bool {
         self.token_end_observer.set(observer).is_ok()
+    }
+
+    /// Wire the pool side of a lease move (see [`LeaseOwnerSink`]). Set once;
+    /// `false`, keeping the first, when one is already wired.
+    pub(crate) fn set_lease_owner_sink(&self, sink: LeaseOwnerSink) -> bool {
+        self.lease_owner_sink.set(sink).is_ok()
     }
 
     /// The wallet-signed sessions the gate admitted that hold at least one
@@ -4363,6 +4386,24 @@ impl<T: PacketDevice + Clone> ExitTerminateCtx<T> {
     pub fn with_session_registry(mut self, registry: Arc<MultihopSessionRegistry>) -> Self {
         if let Some(allowlist) = self.allowlist.clone() {
             spawn_allowlist_expiry_sweep(registry.clone(), allowlist);
+        }
+        // Wired here, unconditionally, rather than left to the deployer: a
+        // pool that keeps a refreshed session under its admission serial
+        // turns every reconnect after an epoch boundary into a stranger,
+        // which loses the client its address and its port forwards.
+        let v4 = Arc::clone(&self.ip_allocator);
+        let v6 = self.ip_allocator_v6.clone();
+        let wired = registry.set_lease_owner_sink(Box::new(move |from, to| {
+            v4.lock().transfer_owner(from, to);
+            if let Some(v6) = &v6 {
+                v6.lock().transfer_owner(from, to);
+            }
+        }));
+        if !wired {
+            tracing::warn!(
+                "session registry already wired to another exit context's address pools; \
+                 its lease moves keep updating those"
+            );
         }
         self.session_registry = Some(registry);
         self
@@ -5547,6 +5588,41 @@ mod tests {
     // ---- Downlink over-read backpressure gate ----
 
     // ---- Multi-queue exit TUN wiring ----
+
+    /// The exit context wires the registry's lease moves into its own pools,
+    /// so no deployer can leave a refreshed session keyed on its admission
+    /// serial (the registry side of the move is proven in `route`).
+    #[tokio::test]
+    async fn the_exit_context_moves_a_refreshed_sessions_address_onto_its_new_serial() {
+        let (priv_key, _pub) = derive_x25519_keypair(&[3u8; 32]).expect("32-byte ikm");
+        let (pool, pool6) = (v4_alloc(), v6_alloc().expect("v6 pool"));
+        let registry = MultihopSessionRegistry::new();
+        let _ctx = ExitTerminateCtx::new(
+            priv_key,
+            ExitId::from_bytes([1u8; 16]),
+            warrenguard_transport_core::FakeTun::new(),
+            None,
+            None,
+            Arc::clone(&pool),
+            Some(Arc::clone(&pool6)),
+            None,
+        )
+        .with_session_registry(Arc::clone(&registry));
+        let (admitted, refreshed) = ([0x15; 32], [0x17; 32]);
+        let v4 = pool.lock().allocate_for_pubkey(1, admitted).expect("v4");
+        let v6 = pool6.lock().allocate_for_pubkey(1, admitted).expect("v6");
+
+        let sink = registry
+            .lease_owner_sink
+            .get()
+            .expect("the context wires the registry's lease moves");
+        sink(admitted, refreshed);
+
+        // The session stays live, so only ownership can put a leg of the new
+        // serial on its addresses.
+        assert_eq!(pool.lock().allocate_for_pubkey(2, refreshed), Some(v4));
+        assert_eq!(pool6.lock().allocate_for_pubkey(2, refreshed), Some(v6));
+    }
 
     /// The single-queue default (no extra queues) must be exactly today's
     /// behaviour: one queue, and `pick_uplink_tun` hands out the primary

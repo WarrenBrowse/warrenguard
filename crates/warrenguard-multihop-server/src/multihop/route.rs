@@ -540,17 +540,24 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
 
     /// Make the session keyed by `key_serial` hold the lease of `new`, the
     /// serial of a token its anchor request just spent. The serial it leaves
-    /// behind is reported ended so the deployer releases it; the sticky
-    /// allocation keeps its key. Refused when another live session of this
-    /// exit holds `new` (the control plane re-admits a same-exit duplicate,
-    /// so only this registry can tell), and when the session ended
-    /// meanwhile, in which case `new` is released since nobody holds it.
+    /// behind is reported ended so the deployer releases it, and the address
+    /// pool moves the session's ownership onto `new`: a client reconnecting
+    /// presents the current serial, never the one it was admitted on.
+    /// Refused when another live session of this exit holds `new` (the
+    /// control plane re-admits a same-exit duplicate, so only this registry
+    /// can tell), and when the session ended meanwhile, in which case `new`
+    /// is released since nobody holds it.
+    ///
+    /// Ownership moves per serial, not per session: during an overlap swap
+    /// the draining and the new session share their admission serial, so a
+    /// drain that outlives an epoch boundary carries both to its new lease.
     pub(super) fn rebind(
         &self,
         key_serial: [u8; TOKEN_SERIAL_LEN],
         new: [u8; TOKEN_SERIAL_LEN],
     ) -> Rebind {
         let key = SessionKey::TokenSerial(WarrenPubkey::from_bytes(key_serial));
+        let _serialized = self.lease_moves.lock();
         let (outcome, release) = {
             let live = self.live.lock();
             let mut anchors = self.route.anchors.lock();
@@ -576,6 +583,11 @@ impl<C: ClosableConn> MultihopSessionRegistry<C> {
                 }
             }
         };
+        if let (Rebind::Done, Some(from), Some(sink)) =
+            (&outcome, release, self.lease_owner_sink.get())
+        {
+            sink(from, new);
+        }
         if let (Some(serial), Some(observer)) = (release, self.token_end_observer.get()) {
             observer(serial);
         }
@@ -1297,5 +1309,120 @@ mod tests {
         for task in pending {
             task.abort();
         }
+    }
+
+    type LeaseMoves = Arc<Mutex<Vec<([u8; 32], [u8; 32])>>>;
+
+    /// Records every `(from, to)` lease move the registry hands the pool.
+    fn recording_owner_sink(registry: &MultihopSessionRegistry<FakeConn>) -> LeaseMoves {
+        let moves = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&moves);
+        assert!(registry.set_lease_owner_sink(Box::new(move |from, to| {
+            sink.lock().push((from, to));
+        })));
+        moves
+    }
+
+    fn with_slot(registry: &MultihopSessionRegistry<FakeConn>) {
+        registry
+            .route
+            .anchors
+            .lock()
+            .entry(MAIN)
+            .or_insert_with(|| AnchorSlot::new(MAIN));
+    }
+
+    #[test]
+    fn a_rebind_hands_each_lease_move_to_the_pool_in_order() {
+        // The pool keys a session's address on the serial a reconnect will
+        // present, which is the lease's latest serial: every move chains
+        // from the previous one, not from the admission serial.
+        let registry = registry_with_main();
+        with_slot(&registry);
+        let moves = recording_owner_sink(&registry);
+
+        assert!(matches!(registry.rebind(MAIN, [0x16; 32]), Rebind::Done));
+        assert!(matches!(registry.rebind(MAIN, [0x17; 32]), Rebind::Done));
+
+        assert_eq!(
+            *moves.lock(),
+            vec![(MAIN, [0x16; 32]), ([0x16; 32], [0x17; 32])]
+        );
+    }
+
+    #[test]
+    fn a_rebind_onto_the_serial_already_held_moves_nothing() {
+        let registry = registry_with_main();
+        with_slot(&registry);
+        let moves = recording_owner_sink(&registry);
+
+        assert!(matches!(registry.rebind(MAIN, MAIN), Rebind::Done));
+        assert!(moves.lock().is_empty());
+    }
+
+    #[test]
+    fn a_refused_or_late_rebind_moves_nothing_in_the_pool() {
+        let registry = registry_with_main();
+        with_slot(&registry);
+        registry.register_key(
+            SessionKey::TokenSerial(WarrenPubkey::from_bytes([0x77; 32])),
+            2,
+            FakeConn::default(),
+        );
+        let moves = recording_owner_sink(&registry);
+
+        assert!(matches!(
+            registry.rebind(MAIN, [0x77; 32]),
+            Rebind::HeldElsewhere
+        ));
+        registry.unregister_key(main_key(), 1);
+        assert!(matches!(registry.rebind(MAIN, [0x18; 32]), Rebind::Gone));
+
+        assert!(moves.lock().is_empty());
+    }
+
+    #[test]
+    fn concurrent_rebinds_reach_the_pool_in_the_order_they_moved_the_lease() {
+        // The anchor path and the lease refresh can rebind one session at
+        // once. If the second rebind could move the registry and the pool
+        // while the first is still on its way to the pool, the pool would end
+        // keyed on the serial the lease already left.
+        let registry = registry_with_main();
+        with_slot(&registry);
+        let moves: LeaseMoves = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let go_rx = Mutex::new(Some(go_rx));
+        let sink = Arc::clone(&moves);
+        assert!(registry.set_lease_owner_sink(Box::new(move |from, to| {
+            // Taken in its own statement: a guard held while waiting would
+            // serialize the two sinks by itself and hide the race.
+            let first_call = go_rx.lock().take();
+            if let Some(go) = first_call {
+                entered_tx.send(()).unwrap();
+                go.recv().unwrap();
+            }
+            sink.lock().push((from, to));
+        })));
+
+        let first = {
+            let registry = Arc::clone(&registry);
+            std::thread::spawn(move || registry.rebind(MAIN, [0x16; 32]))
+        };
+        entered_rx.recv().unwrap();
+        let second = {
+            let registry = Arc::clone(&registry);
+            std::thread::spawn(move || registry.rebind(MAIN, [0x17; 32]))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        go_tx.send(()).unwrap();
+        assert!(matches!(first.join().unwrap(), Rebind::Done));
+        assert!(matches!(second.join().unwrap(), Rebind::Done));
+
+        assert_eq!(
+            *moves.lock(),
+            vec![(MAIN, [0x16; 32]), ([0x16; 32], [0x17; 32])],
+            "the pool must see the moves in the order the lease made them"
+        );
     }
 }
