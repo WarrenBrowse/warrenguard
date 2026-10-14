@@ -27,8 +27,8 @@ webpki-roots = "1"
 # Initial-fragmentation knobs (`initial_datagram_min_size` /
 # `initial_crypto_first_fragment_size`), socket buffer sizing, and the Apple
 # fast datapath. Inherited transitively, no `[patch.crates-io]` needed.
-quinn = { git = "https://github.com/WarrenBrowse/warren-quinn.git", tag = "v0.11.17-fork.15", package = "warren-quinn" }
-quinn-udp = { git = "https://github.com/WarrenBrowse/warren-quinn.git", tag = "v0.11.17-fork.15", package = "warren-quinn-udp" }
+quinn = { git = "https://github.com/WarrenBrowse/warren-quinn.git", tag = "v0.11.19-fork.16", package = "warren-quinn" }
+quinn-udp = { git = "https://github.com/WarrenBrowse/warren-quinn.git", tag = "v0.11.19-fork.16", package = "warren-quinn-udp" }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "logging"] }
 # Async TLS 1.3 for the TCP-over-TLS fallback carrier (client dials the cover
 # domain on :443/tcp, exit terminates it). Wraps the rustls configs built in
@@ -72,6 +72,11 @@ blind-rsa-signatures = "0.17"
 # moving it (or a blind-rsa-signatures release that needs another one) is a
 # deliberate step that revisits that analysis.
 rsa = { version = "=0.10.0-rc.18", default-features = false, features = ["hazmat"] }
+# rsa 0.10.0-rc.18 accepts any pkcs1 0.8 pre-release, and pkcs1 0.8.0-rc.5
+# (2026-10-05) breaks its encoding module. A consumer that resolves without
+# this lock would pick rc.5 and stop compiling; pin the release rc.18 builds
+# against until rsa is moved deliberately (see the note above).
+pkcs1 = { version = "=0.8.0-rc.4", default-features = false }
 # AES for QUIC Initial packet protection (RFC 9001): AES-128-GCM payload +
 # AES-128 (single-block ECB) header-protection mask. Used by warrenguard-ja4.
 aes = "0.8"
