@@ -15,8 +15,6 @@
 //!
 //! [`ParcelFileDescriptor`]: https://developer.android.com/reference/android/os/ParcelFileDescriptor
 
-#![cfg(target_os = "android")]
-
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::Arc;
@@ -66,9 +64,14 @@ impl AndroidTun {
         let mut flags = OFlag::from_bits_truncate(current);
         flags.insert(OFlag::O_NONBLOCK);
         fcntl(fd.as_fd(), FcntlArg::F_SETFL(flags)).map_err(errno_to_io)?;
-        Ok(Self {
-            fd: Arc::new(AsyncFd::new(fd)?),
-        })
+        // tokio 1.53 deprecated the safe constructors in favour of `unsafe`
+        // ones (tokio#8587), and this crate forbids `unsafe`. The I/O safety
+        // they ask for holds here: the `AsyncFd` takes the `OwnedFd` by value,
+        // so nothing else can close or reuse the descriptor while it is
+        // registered.
+        #[allow(deprecated)]
+        let fd = AsyncFd::new(fd)?;
+        Ok(Self { fd: Arc::new(fd) })
     }
 }
 
