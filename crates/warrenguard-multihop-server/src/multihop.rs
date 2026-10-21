@@ -418,6 +418,35 @@ fn token_refusal_detail(request: &WarrenControlMessage, in_use: bool) -> WarrenC
     }
 }
 
+/// Whether a v7 setup on `serial` would join a live session it is not part of.
+///
+/// Every client of a wallet holds the same token batch, so two devices can
+/// lead with one serial. The control plane renews a serial re-presented at the
+/// exit that holds it, so this exit is the only place that can tell a second
+/// device from the session's own bonded leg or redial: those name an address
+/// the session holds, and a second device starts fresh or names an address of
+/// its own. Refused as in use, it walks to its next token, which keeps one
+/// serial to one session, one rate budget and one lease. A hint-less request
+/// keeps the historical sharing.
+fn serial_held_by_another_session(
+    registry: Option<&Arc<MultihopSessionRegistry>>,
+    ip_allocator: &Mutex<IpAllocator>,
+    serial: &[u8; TOKEN_SERIAL_LEN],
+    prefer_ipv4: Option<[u8; 4]>,
+) -> bool {
+    let Some(registry) = registry else {
+        return false;
+    };
+    if !registry.is_token_serial_live(serial) {
+        return false;
+    }
+    match SessionIntent::from_prefer_ipv4(prefer_ipv4) {
+        SessionIntent::Legacy => false,
+        SessionIntent::Fresh => true,
+        SessionIntent::Join(addr) => !ip_allocator.lock().held_by_pubkey(addr, serial),
+    }
+}
+
 /// Per-connection state established during the reliable setup-stream
 /// phase and handed to the datagram pump. By the time the pump runs the
 /// HPKE context, the allocated IP, and the downlink route are all
@@ -954,6 +983,30 @@ async fn process_setup_frame(
                 None => warrenguard_server::TokenAdmission::Reject,
             };
             match admitted {
+                warrenguard_server::TokenAdmission::Admit { serial }
+                    if serial_held_by_another_session(
+                        session_registry,
+                        ip_allocator,
+                        &serial,
+                        *prefer_ipv4,
+                    ) =>
+                {
+                    crate::metrics::admission_metrics().record(SetupAdmission::TokenRefused);
+                    tracing::warn!(
+                        "multihop: v7 setup rejected - its serial holds a live session it does \
+                         not belong to; sealed detail + opaque close"
+                    );
+                    reply_sealed_detail_then_close(
+                        &mut send,
+                        &term,
+                        epoch,
+                        reverse_seq,
+                        conn,
+                        &token_refusal_detail(request, true),
+                    )
+                    .await;
+                    return None;
+                }
                 warrenguard_server::TokenAdmission::Admit { serial } => {
                     crate::metrics::admission_metrics().record(SetupAdmission::TokenAdmitted);
                     (
@@ -9040,6 +9093,123 @@ mod tests {
 
     fn a_session_token(fill: u8) -> warrenguard_wire::SessionToken {
         warrenguard_wire::SessionToken([fill; warrenguard_wire::SESSION_TOKEN_LEN])
+    }
+
+    fn spawn_terminating_exit_v7_with_registry() -> (TerminatingExit, Arc<MultihopSessionRegistry>)
+    {
+        let exit_key = SigningKey::from_bytes(&[0x42; 32]);
+        let (privkey, exit_pub) =
+            derive_x25519_keypair(&ANTI_ORACLE_EXIT_IKM).expect("x25519 keypair derives");
+        let registry = MultihopSessionRegistry::new();
+        let admitter = Arc::new(FakeMhAdmitter { deny: false }) as Arc<dyn SessionTokenAdmitter>;
+        let ctx = ExitTerminateCtx::new(
+            privkey,
+            ExitId::from_bytes(ANTI_ORACLE_EXIT_ID),
+            warrenguard_transport_core::FakeTun::new(),
+            None,
+            None,
+            v4_alloc(),
+            None,
+            None,
+        )
+        .with_session_registry(registry.clone())
+        .with_token_admitter(Some(admitter));
+        let ExitHarness {
+            addr,
+            sni,
+            endpoint,
+            accept_task,
+        } = spawn_exit_accept_loop(&exit_key, ctx);
+        (
+            TerminatingExit {
+                addr,
+                sni,
+                exit_pub,
+                _endpoint: endpoint,
+                accept_task,
+            },
+            registry,
+        )
+    }
+
+    fn v7_request(fill: u8, prefer_ipv4: Option<[u8; 4]>) -> WarrenControlMessage {
+        WarrenControlMessage::IpRequestV7Detailed {
+            prefer_ipv4,
+            wants_ipv6: false,
+            session_tokens: vec![a_session_token(fill)],
+            wants_daita: false,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_second_session_on_a_live_serial_is_refused_so_it_moves_to_its_next_token() {
+        // Two devices of one wallet hold the same batch, and the same exit
+        // merged the second into the first's session: one rate budget, one
+        // lease, and a lease refresh asked of one device only.
+        let (exit, _registry) = spawn_terminating_exit_v7_with_registry();
+        let fresh = Some([0, 0, 0, 0]);
+        let (_first, _) = client_setup_admitted(&exit, v7_request(0x31, fresh)).await;
+
+        let (detail, close) = client_setup_roundtrip(&exit, |_| v7_request(0x31, fresh)).await;
+
+        assert_eq!(
+            detail,
+            Some(WarrenControlMessage::TokenRejected {
+                reason_code: warrenguard_multihop::TokenRejectCode::SerialInUse.code()
+            })
+        );
+        assert_opaque_close(close);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_connection_naming_its_sessions_address_joins_the_live_serial() {
+        let (exit, _registry) = spawn_terminating_exit_v7_with_registry();
+        let (_first, ip) = client_setup_admitted(&exit, v7_request(0x32, Some([0, 0, 0, 0]))).await;
+
+        let (_leg, joined) = client_setup_admitted(&exit, v7_request(0x32, Some(ip))).await;
+
+        assert_eq!(
+            joined, ip,
+            "a bonded leg or a redial shares its session's address"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_connection_naming_another_address_on_a_live_serial_is_refused() {
+        let (exit, _registry) = spawn_terminating_exit_v7_with_registry();
+        let (_first, _) = client_setup_admitted(&exit, v7_request(0x33, Some([0, 0, 0, 0]))).await;
+
+        let (detail, _close) =
+            client_setup_roundtrip(&exit, |_| v7_request(0x33, Some([10, 66, 0, 250]))).await;
+
+        assert_eq!(
+            detail,
+            Some(WarrenControlMessage::TokenRejected {
+                reason_code: warrenguard_multihop::TokenRejectCode::SerialInUse.code()
+            }),
+            "an address this session does not hold names another session"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_fresh_session_on_a_serial_nobody_holds_is_admitted() {
+        let (exit, registry) = spawn_terminating_exit_v7_with_registry();
+        let (first, _) = client_setup_admitted(&exit, v7_request(0x34, Some([0, 0, 0, 0]))).await;
+        drop(first);
+        let mut serial = [0u8; 32];
+        serial.copy_from_slice(&a_session_token(0x34).0[..32]);
+        for _ in 0..200 {
+            if !registry.is_token_serial_live(&serial) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !registry.is_token_serial_live(&serial),
+            "the first session ended"
+        );
+
+        let (_next, _) = client_setup_admitted(&exit, v7_request(0x34, Some([0, 0, 0, 0]))).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

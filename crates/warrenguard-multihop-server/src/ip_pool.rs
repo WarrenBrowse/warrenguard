@@ -641,7 +641,7 @@ impl IpAllocator {
 
     /// True when `ip` is live-held by at least one connection whose
     /// authenticated owner is `pubkey`.
-    fn held_by_pubkey(&self, ip: Ipv4Addr, pubkey: &[u8; 32]) -> bool {
+    pub(crate) fn held_by_pubkey(&self, ip: Ipv4Addr, pubkey: &[u8; 32]) -> bool {
         self.used.held_by(ip, pubkey)
     }
 
