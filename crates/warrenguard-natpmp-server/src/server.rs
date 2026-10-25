@@ -152,6 +152,20 @@ pub trait CredentialAuthority: Send + Sync {
     fn on_granted(&self, credential: &[u8], allocation: &Allocation) {
         let _ = (credential, allocation);
     }
+
+    /// `client_ip` deleted one of its mappings (lifetime 0) and the delete
+    /// removed something. Awaited before the delete is acknowledged, so a
+    /// deployer that hands back what a credential bought (a lease held
+    /// elsewhere) has done it by the time the client sends its next request,
+    /// on this server or another one. Bounded by the request timeout like the
+    /// release itself. Defaults to nothing.
+    fn on_released_by_client<'a>(
+        &'a self,
+        client_ip: Ipv4Addr,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        let _ = client_ip;
+        Box::pin(async {})
+    }
 }
 
 /// RFC 6886 NAT-PMP server - UDP listening loop.
@@ -396,16 +410,27 @@ impl<B: PortForwardingBackend + 'static> Server<B> {
                     let _ = tx.send(released);
                 });
                 match tokio::time::timeout(self.request_timeout, rx).await {
-                    Ok(Ok(Ok(_released))) => Response::Map {
-                        proto,
-                        result_code: ResultCode::Success,
-                        epoch_secs,
-                        internal_port,
-                        external_port: internal_port,
-                        lifetime_secs: 0,
-                        // Release ack: no budget hint needed.
-                        rate_limit: None,
-                    },
+                    Ok(Ok(Ok(released))) => {
+                        if released && let Some(authority) = self.credential_authority.as_ref() {
+                            // A hook that overruns costs the client nothing it
+                            // asked for: the mapping is already gone.
+                            let _ = tokio::time::timeout(
+                                self.request_timeout,
+                                authority.on_released_by_client(src_v4),
+                            )
+                            .await;
+                        }
+                        Response::Map {
+                            proto,
+                            result_code: ResultCode::Success,
+                            epoch_secs,
+                            internal_port,
+                            external_port: internal_port,
+                            lifetime_secs: 0,
+                            // Release ack: no budget hint needed.
+                            rate_limit: None,
+                        }
+                    }
                     Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => {
                         // No-log: never log the client's tunnel-inner address.
                         tracing::warn!("natpmp release failed or timed out");

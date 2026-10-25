@@ -35,6 +35,7 @@ struct Authority {
     verdict: CredentialVerdict,
     required: bool,
     bound: Mutex<Vec<(Vec<u8>, Allocation)>>,
+    released_by: Mutex<Vec<Ipv4Addr>>,
 }
 
 impl Authority {
@@ -43,7 +44,12 @@ impl Authority {
             verdict,
             required,
             bound: Mutex::new(Vec::new()),
+            released_by: Mutex::new(Vec::new()),
         })
+    }
+
+    fn released_by(&self) -> Vec<Ipv4Addr> {
+        self.released_by.lock().expect("authority lock").clone()
     }
 
     fn bound(&self) -> Vec<(Vec<u8>, Allocation)> {
@@ -70,6 +76,20 @@ impl CredentialAuthority for Authority {
             .lock()
             .expect("authority lock")
             .push((credential.to_vec(), allocation.clone()));
+    }
+
+    fn on_released_by_client<'a>(
+        &'a self,
+        client_ip: Ipv4Addr,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            // Slow on purpose: the acknowledgement must wait for it.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            self.released_by
+                .lock()
+                .expect("authority lock")
+                .push(client_ip);
+        })
     }
 }
 
@@ -300,4 +320,46 @@ async fn an_abuse_quarantine_keeps_the_former_tenant_off_its_port_until_it_lifts
     tokio::time::sleep(Duration::from_millis(400)).await;
     let (code, after) = round_trip(&client, server, &pinned).await;
     assert_eq!((code, after), (SUCCESS, 50000), "the quarantine lifts");
+}
+
+// A client deleting its forward is the one moment a deployer can hand back
+// what the credential bought, and it must be done before the client hears the
+// delete went through: the client's next request, on this exit or another one,
+// presents the same credential and must find it free (forum topic 226, a
+// change of country refused because the exit just left still held it).
+#[tokio::test]
+async fn a_delete_tells_the_authority_before_it_is_acknowledged() {
+    let allocator = Arc::new(Allocator::new());
+    let authority = Authority::new(CredentialVerdict::Grant, true);
+    let server = spawn_server(Arc::clone(&authority), Arc::clone(&allocator)).await;
+    let client = client().await;
+    let (granted, _) = round_trip(
+        &client,
+        server,
+        &map_request(MapProto::Tcp, 0, 600, Some(CREDENTIAL)),
+    )
+    .await;
+    assert_eq!(granted, SUCCESS);
+
+    let (code, _) = round_trip(&client, server, &map_request(MapProto::Tcp, 0, 0, None)).await;
+
+    assert_eq!(code, SUCCESS);
+    assert_eq!(authority.released_by(), vec![Ipv4Addr::LOCALHOST]);
+}
+
+#[tokio::test]
+async fn a_delete_that_released_nothing_tells_the_authority_nothing() {
+    let allocator = Arc::new(Allocator::new());
+    let authority = Authority::new(CredentialVerdict::Grant, true);
+    let server = spawn_server(Arc::clone(&authority), Arc::clone(&allocator)).await;
+
+    let (code, _) = round_trip(
+        &client().await,
+        server,
+        &map_request(MapProto::Tcp, 0, 0, None),
+    )
+    .await;
+
+    assert_eq!(code, SUCCESS);
+    assert!(authority.released_by().is_empty());
 }
