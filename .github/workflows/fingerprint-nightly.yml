@@ -84,8 +84,10 @@ jobs:
             sudo apt-get update -qq && sudo apt-get install -y -qq python3-pip
           fi
           python3 -m pip install --user --quiet tomli
-      - name: Check the quinn fork base versions against the RustSec advisory DB
+      - name: Check the quinn fork base versions against the RustSec DB and the quinn-rs GitHub advisories
         # cargo-audit/deny cannot match the renamed fork crates; this maps them
         # back to upstream quinn/quinn-proto/quinn-udp and evaluates every
         # advisory against the fork's base versions.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./scripts/check-quinn-advisories.sh

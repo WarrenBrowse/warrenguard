@@ -12,8 +12,18 @@
 # inside an affected range, or when an advisory cannot be parsed (conservative:
 # unparseable is a failure, never a silent skip).
 #
+# Two sources are evaluated. The RustSec DB, and the GitHub repository
+# advisories of quinn-rs/quinn: upstream files some advisories there only, and
+# GHSA-6pp4-4cxf-xf88 (quinn-udp < 0.6.3) sat 25 days unseen by this watch
+# because RustSec never imported it. A repository advisory's vulnerable range is
+# maintainer free text (`< 0.5.16, >= 0.6.0 < 0.6.3`, `> 0.7.0` with no upper
+# bound), so it is not trusted: a base version is covered only when it reaches
+# the patched version listed for its own release line, or every listed one.
+#
 # Reviewed-and-accepted advisories can be ignored via the ignore file (one
-# RUSTSEC id per line, rationale mandatory as a comment).
+# RUSTSEC or GHSA id per line, rationale mandatory as a comment). A RustSec
+# advisory whose aliases name an ignored GHSA id is accepted with it, so a
+# GitHub-only advisory accepted today stays accepted once RustSec imports it.
 #
 # Environment overrides (they let scripts/ci/test-check-quinn-advisories.sh drive
 # this script hermetically, without network access):
@@ -25,6 +35,12 @@
 #                               file does not exist).
 #   QUINN_ADVISORY_IGNORE_FILE  ignore file (default:
 #                               scripts/quinn-advisories-ignore.txt).
+#   QUINN_GHSA_JSON             file holding the GitHub repository advisories
+#                               as the REST API returns them; the fetch is
+#                               skipped (exit 2 when the file does not exist).
+#                               Otherwise they are fetched from api.github.com,
+#                               authenticated with GITHUB_TOKEN or GH_TOKEN when
+#                               set.
 #
 # An expected upstream crate with NO `crates/<name>` directory in the DB is a
 # FAILURE (exit 1), never a skip: a crate silently dropped from the evaluation is
@@ -35,13 +51,15 @@
 # directory, which is then evaluated like any other, so the exception cannot hide
 # one. See FORK_UPSTREAM_WITHOUT_ADVISORIES below.
 #
-# Requirements: git (only when QUINN_ADVISORY_DB_DIR is unset), python3 with
-# tomllib (3.11+) or the `tomli` backport.
+# Requirements: git (only when QUINN_ADVISORY_DB_DIR is unset), curl (only when
+# QUINN_GHSA_JSON is unset), python3 with tomllib (3.11+) or the `tomli`
+# backport.
 #
 # Exit codes:
 #   0  every advisory against the fork crates is covered (or explicitly ignored)
 #   1  at least one advisory is NOT covered (or could not be parsed)
-#   2  invocation error (no Cargo.lock, no git, no TOML parser, ...)
+#   2  invocation error (no Cargo.lock, no git, no TOML parser, the GitHub
+#      advisories unreachable or not an advisory list, ...)
 
 set -euo pipefail
 
@@ -50,6 +68,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 LOCK="${QUINN_ADVISORY_LOCK:-$REPO_ROOT/Cargo.lock}"
 IGNORE_FILE="${QUINN_ADVISORY_IGNORE_FILE:-$SCRIPT_DIR/quinn-advisories-ignore.txt}"
 ADVISORY_DB_URL="https://github.com/rustsec/advisory-db.git"
+GHSA_URL="https://api.github.com/repos/quinn-rs/quinn/security-advisories?per_page=100"
 
 if [[ ! -f "$LOCK" ]]; then
     echo "ERROR: $LOCK not found (run from a resolved warrenguard workspace, or set QUINN_ADVISORY_LOCK)" >&2
@@ -69,13 +88,38 @@ else
     CLEANUP_DB_DIR="$DB_DIR"
     echo "==> Cloning rustsec/advisory-db (shallow) into $DB_DIR"
 fi
-trap 'if [[ -n "$CLEANUP_DB_DIR" ]]; then rm -rf "$CLEANUP_DB_DIR"; fi' EXIT INT TERM
+CLEANUP_GHSA=""
+trap 'if [[ -n "$CLEANUP_DB_DIR" ]]; then rm -rf "$CLEANUP_DB_DIR"; fi; if [[ -n "$CLEANUP_GHSA" ]]; then rm -f "$CLEANUP_GHSA"; fi' EXIT INT TERM
 
 if [[ -n "$CLEANUP_DB_DIR" ]]; then
     git clone --quiet --depth 1 "$ADVISORY_DB_URL" "$DB_DIR"
 fi
 
-DB_DIR="$DB_DIR" LOCK="$LOCK" IGNORE_FILE="$IGNORE_FILE" python3 - <<'PYEOF'
+if [[ -n "${QUINN_GHSA_JSON:-}" ]]; then
+    GHSA_JSON="$QUINN_GHSA_JSON"
+    if [[ ! -f "$GHSA_JSON" ]]; then
+        echo "ERROR: QUINN_GHSA_JSON=$GHSA_JSON does not exist" >&2
+        exit 2
+    fi
+    echo "==> Using GitHub repository advisories from $GHSA_JSON (QUINN_GHSA_JSON)"
+else
+    GHSA_JSON="$(mktemp -t quinn-ghsa.XXXXXX)"
+    CLEANUP_GHSA="$GHSA_JSON"
+    echo "==> Fetching the GitHub repository advisories of quinn-rs/quinn"
+    auth=()
+    token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+    if [[ -n "$token" ]]; then
+        auth=(-H "Authorization: Bearer $token")
+    fi
+    if ! curl -fsSL --retry 3 --max-time 60 -H "Accept: application/vnd.github+json" \
+        "${auth[@]}" -o "$GHSA_JSON" "$GHSA_URL"; then
+        echo "ERROR: could not fetch $GHSA_URL" >&2
+        exit 2
+    fi
+fi
+
+DB_DIR="$DB_DIR" LOCK="$LOCK" IGNORE_FILE="$IGNORE_FILE" GHSA_JSON="$GHSA_JSON" python3 - <<'PYEOF'
+import json
 import os
 import re
 import sys
@@ -96,6 +140,9 @@ except ModuleNotFoundError:
 LOCK = Path(os.environ["LOCK"])
 DB = Path(os.environ["DB_DIR"])
 IGNORE_FILE = Path(os.environ["IGNORE_FILE"])
+GHSA_JSON = Path(os.environ["GHSA_JSON"])
+# The REST endpoint pages at 100; a full page means advisories may be missing.
+GHSA_PAGE_SIZE = 100
 
 # Fork package name in Cargo.lock -> upstream crate name in the advisory DB.
 FORK_TO_UPSTREAM = {
@@ -153,6 +200,36 @@ def satisfies(version, requirement):
     return True
 
 
+def release_line(version):
+    """The semver compatibility line: 0.y for 0.y.z, x for x.y.z."""
+    return version[:2] if version[0] == 0 else version[:1]
+
+
+def ghsa_patched_versions(text):
+    """Parse a repository advisory's `patched_versions` free text.
+
+    GitHub accepts `0.11.19`, `>= 0.11.19` and comma lists of one fix per
+    release line (`>= 0.5.16, >= 0.6.3`, `0.9.5, 0.10.5`). Any other operator
+    cannot be read as "fixed from" and is refused.
+    """
+    fixes = []
+    for item in text.split(","):
+        item = item.strip()
+        if item.startswith(">="):
+            item = item[2:].strip()
+        if not item or not item[0].isdigit():
+            raise ValueError(f"unsupported patched version: {item!r}")
+        fixes.append(parse_version(item))
+    return fixes
+
+
+def ghsa_covered(base, fixes):
+    """Covered at the fix of its own release line, or above every fix."""
+    if base >= max(fixes):
+        return True
+    return any(release_line(fix) == release_line(base) and base >= fix for fix in fixes)
+
+
 def front_matter(text):
     """Extract the ```toml fenced front matter of an advisory file."""
     m = re.search(r"```toml\n(.*?)```", text, re.DOTALL)
@@ -178,7 +255,24 @@ print("==> Fork base versions: " + " ".join(f"{u}={v}" for u, v in crates.items(
 
 IGNORED = set()
 if IGNORE_FILE.is_file():
-    IGNORED = set(re.findall(r"RUSTSEC-\d{4}-\d{4}", IGNORE_FILE.read_text()))
+    IGNORED = set(
+        re.findall(
+            r"RUSTSEC-\d{4}-\d{4}|GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}",
+            IGNORE_FILE.read_text(),
+        )
+    )
+
+try:
+    ghsa_advisories = json.loads(GHSA_JSON.read_text())
+except ValueError as exc:
+    print(f"ERROR: {GHSA_JSON} is not JSON ({exc})", file=sys.stderr)
+    sys.exit(2)
+if not isinstance(ghsa_advisories, list):
+    print(
+        f"ERROR: {GHSA_JSON} is not a GitHub advisory list: {str(ghsa_advisories)[:200]}",
+        file=sys.stderr,
+    )
+    sys.exit(2)
 
 failures = []
 checked = 0
@@ -189,7 +283,7 @@ for crate, base_str in crates.items():
         if crate in FORK_UPSTREAM_WITHOUT_ADVISORIES:
             print(
                 f"NO-ADVISORIES {crate}: no crates/{crate} in the advisory DB "
-                "(upstream has filed none), nothing to evaluate"
+                "(RustSec has filed none), nothing to evaluate"
             )
             continue
         failures.append(
@@ -205,6 +299,13 @@ for crate, base_str in crates.items():
             continue
         try:
             meta = front_matter(adv_path.read_text())
+            aliases = IGNORED.intersection(meta.get("advisory", {}).get("aliases", []))
+            if aliases:
+                print(
+                    f"IGNORED {adv_id} ({crate}) as alias of {', '.join(sorted(aliases))} "
+                    "per quinn-advisories-ignore.txt"
+                )
+                continue
             versions = meta.get("versions", {})
             patched = versions.get("patched", [])
             unaffected = versions.get("unaffected", [])
@@ -222,6 +323,39 @@ for crate, base_str in crates.items():
         except Exception as exc:  # conservative: unparseable = failure
             failures.append(f"{adv_id} ({crate}): cannot evaluate ({exc})")
 
+if len(ghsa_advisories) >= GHSA_PAGE_SIZE:
+    failures.append(
+        f"GitHub returned a full page of {len(ghsa_advisories)} advisories; "
+        "pagination is not implemented, so some were not evaluated"
+    )
+for adv in ghsa_advisories:
+    adv_id = adv.get("ghsa_id", "<no ghsa_id>")
+    if adv.get("state") != "published" or adv.get("withdrawn_at"):
+        continue
+    for vuln in adv.get("vulnerabilities") or []:
+        crate = (vuln.get("package") or {}).get("name")
+        if crate not in crates:
+            continue
+        checked += 1
+        base_str = crates[crate]
+        if adv_id in IGNORED:
+            print(f"IGNORED {adv_id} ({crate}) per quinn-advisories-ignore.txt")
+            continue
+        patched = vuln.get("patched_versions")
+        if not patched:
+            failures.append(f"{adv_id} ({crate} {base_str}): no patched version exists")
+            continue
+        try:
+            if ghsa_covered(parse_version(base_str), ghsa_patched_versions(patched)):
+                print(f"OK {adv_id} ({crate}): base {base_str} is patched ({patched})")
+            else:
+                failures.append(
+                    f"{adv_id} ({crate} {base_str}): base version is AFFECTED "
+                    f"(patched={patched!r})"
+                )
+        except Exception as exc:  # conservative: unparseable = failure
+            failures.append(f"{adv_id} ({crate}): cannot evaluate ({exc})")
+
 print(f"==> {checked} advisories checked across {', '.join(crates)}")
 if failures:
     print("", file=sys.stderr)
@@ -231,7 +365,7 @@ if failures:
     print(
         "\nAction: rebase the fork on a patched upstream base and push a new "
         "warren-quinn tag (bump the tag in the root Cargo.toml), or document an "
-        "accepted risk in scripts/quinn-advisories-ignore.txt.",
+        "accepted risk or a backported fix in scripts/quinn-advisories-ignore.txt.",
         file=sys.stderr,
     )
     sys.exit(1)

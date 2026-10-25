@@ -190,5 +190,9 @@ jobs:
       # unparseable advisory, so a green real run below means something.
       - name: Hermetic fixture test for the advisory watch
         run: bash scripts/ci/test-check-quinn-advisories.sh
-      - name: Check the quinn fork base versions against the RustSec advisory DB
+      - name: Check the quinn fork base versions against the RustSec DB and the quinn-rs GitHub advisories
+        # The token only lifts the unauthenticated API rate limit, which the
+        # shared runner IPs exhaust.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./scripts/check-quinn-advisories.sh
