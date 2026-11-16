@@ -46,6 +46,10 @@ jobs:
 
   clippy:
     name: cargo clippy (${{ matrix.name }})
+    # Pull-request code must never run on the self-hosted macOS runners: they
+    # run as the operator account of the Mac that holds the fleet keys. A fork
+    # PR skips this job; a same-repo PR comes from someone with write access.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
@@ -83,6 +87,10 @@ jobs:
     # and its FFI) get compiled and linted at all. The crates listed are the
     # ones carrying Windows code that need no C toolchain for the target.
     name: cargo clippy (windows target)
+    # Pull-request code must never run on the self-hosted macOS runners: they
+    # run as the operator account of the Mac that holds the fleet keys. A fork
+    # PR skips this job; a same-repo PR comes from someone with write access.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 30
     steps:
