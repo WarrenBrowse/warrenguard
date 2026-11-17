@@ -756,6 +756,10 @@ pub struct MultiHopSupervisor {
     /// Exits that answered an `IpRequestV7Detailed` with the plain
     /// `Rejected`: they predate it, so their token setups send `IpRequestV7`.
     exits_predating_token_detail: parking_lot::Mutex<std::collections::HashSet<ExitId>>,
+    /// Exits that answered a dated setup request with the plain `Rejected`:
+    /// they predate session binding (warren-core doc 116), so their setups
+    /// send the legacy request.
+    exits_predating_dated_setup: parking_lot::Mutex<std::collections::HashSet<ExitId>>,
 }
 
 /// Consecutive watchdog-forced redials, each of a session whose ENTIRE life
@@ -817,8 +821,8 @@ enum Established {
     SetupFailed,
     /// A route setup refused (see [`SetupOutcome::RouteRefused`]).
     RouteRefused,
-    /// See [`SetupOutcome::ExitPredatesTokenDetail`].
-    ExitPredatesTokenDetail,
+    /// See [`SetupOutcome::ExitPredatesRequest`].
+    ExitPredatesRequest,
 }
 
 /// Ceiling on the setup round-trip, measured from a completed handshake.
@@ -853,11 +857,12 @@ enum SetupOutcome {
     /// A route setup the exit refused (only under
     /// [`SessionAdmission::Route`]).
     RouteRefused(crate::route_anchor::RouteRefusal),
-    /// The exit answered an `IpRequestV7Detailed` with the plain `Rejected`:
-    /// it predates the request, refused it unread and spent nothing. The
-    /// exit is remembered, and a redial presents the same token to it as an
-    /// `IpRequestV7`.
-    ExitPredatesTokenDetail,
+    /// The exit answered a dated request or an `IpRequestV7Detailed` with
+    /// the plain `Rejected`: it predates the request, refused it unread and
+    /// spent nothing. The exit is remembered, and a redial presents the same
+    /// token to it in the request it decodes (the legacy one, then
+    /// `IpRequestV7`).
+    ExitPredatesRequest,
 }
 
 impl MultiHopSupervisor {
@@ -888,6 +893,7 @@ impl MultiHopSupervisor {
             anchor_schedule: crate::route_anchor::AnchorSchedule::DEFAULT,
             lease_schedule: crate::lease_refresh::LeaseSchedule::DEFAULT,
             exits_predating_token_detail: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            exits_predating_dated_setup: parking_lot::Mutex::new(std::collections::HashSet::new()),
         };
         (supervisor, rx)
     }
@@ -1224,7 +1230,7 @@ impl MultiHopSupervisor {
                     tracing::warn!(%reason, "multi-hop session rejected by exit at setup; surfacing fatal");
                     return Err(MultiHopError::Rejected(reason));
                 }
-                SetupOutcome::ExitPredatesTokenDetail => {
+                SetupOutcome::ExitPredatesRequest => {
                     drop(primary);
                     retrying_tokens = session_tokens;
                     continue;
@@ -1312,6 +1318,7 @@ impl MultiHopSupervisor {
                 &session_target,
                 assign,
                 session_tokens.as_ref().map(TokenStack::lead),
+                self.sends_dated_setup(primary.exit_id()),
             );
             let mut route_control = self.start_route_control(
                 &bundle,
@@ -1856,6 +1863,7 @@ impl MultiHopSupervisor {
         // of the same identity. Exits predating the hint ignore it.
         let placement = self.session_placement_hint(primary.exit_id());
         let kind = self.token_request_kind(primary.exit_id());
+        let dated = self.sends_dated_setup(primary.exit_id());
         let setup_result = Self::setup_request(
             primary,
             &self.config,
@@ -1863,8 +1871,19 @@ impl MultiHopSupervisor {
             session_token,
             placement,
             kind,
+            dated,
         )
         .await;
+
+        // First: an exit that predates the dated request also predates every
+        // refusal a dated request can get, and reads it as nothing at all.
+        if dated && Self::answered_plain_rejected(&setup_result) {
+            tracing::info!("exit predates the dated setup request; sending it the legacy request");
+            self.exits_predating_dated_setup
+                .lock()
+                .insert(primary.exit_id());
+            return SetupOutcome::ExitPredatesRequest;
+        }
 
         if self.admission.route().is_some()
             && let Some(refusal) = Self::route_refusal(primary, &setup_result)
@@ -1881,7 +1900,7 @@ impl MultiHopSupervisor {
             self.exits_predating_token_detail
                 .lock()
                 .insert(primary.exit_id());
-            return SetupOutcome::ExitPredatesTokenDetail;
+            return SetupOutcome::ExitPredatesRequest;
         }
 
         let sealed_detail = setup_result
@@ -1921,6 +1940,12 @@ impl MultiHopSupervisor {
         SetupOutcome::Assigned(spec)
     }
 
+    /// Whether a setup at `exit_id` sends the dated request: always, unless
+    /// that exit answered one with the plain `Rejected` before.
+    fn sends_dated_setup(&self, exit_id: ExitId) -> bool {
+        !self.exits_predating_dated_setup.lock().contains(&exit_id)
+    }
+
     /// Which request a token setup at `exit_id` sends: the detailed one,
     /// unless that exit answered it with the plain `Rejected` before.
     fn token_request_kind(&self, exit_id: ExitId) -> TokenRequestKind {
@@ -1957,7 +1982,8 @@ impl MultiHopSupervisor {
 
     /// One setup round trip for `client` under `admission`: a route request
     /// with a fresh locator for a route session, else the token request of
-    /// `kind` or the wallet request.
+    /// `kind` or the wallet request; each in its dated variant when `dated`.
+    #[allow(clippy::too_many_arguments)]
     async fn setup_request(
         client: &MultiHopClient,
         config: &SupervisorConfig,
@@ -1965,6 +1991,7 @@ impl MultiHopSupervisor {
         session_token: Option<SessionToken>,
         prefer_ipv4: Option<std::net::Ipv4Addr>,
         kind: TokenRequestKind,
+        dated: bool,
     ) -> Result<Vec<u8>, MultiHopError> {
         if let Some(route) = admission.route() {
             let request = crate::route_anchor::route_request(
@@ -1977,7 +2004,23 @@ impl MultiHopSupervisor {
             .map_err(|_| {
                 MultiHopError::RouteRefused(crate::route_anchor::RouteRefusal::AnchorUnavailable)
             })?;
+            let request = if dated {
+                crate::multihop::dated_route_request(request, warrenguard_config::unix_now())
+            } else {
+                request
+            };
             return client.setup_over_stream_request(&request).await;
+        }
+        if dated {
+            return client
+                .setup_over_stream_dated(
+                    admission.wallet_identity(&config.client_signing),
+                    config.wants_ipv6,
+                    config.enable_daita,
+                    session_token.as_ref().map(std::slice::from_ref),
+                    prefer_ipv4,
+                )
+                .await;
         }
         client
             .setup_over_stream_with_token_request(
@@ -2074,6 +2117,7 @@ impl MultiHopSupervisor {
         primary_spec: IpAssignSpec,
         want: usize,
         session_token: Option<SessionToken>,
+        dated: bool,
     ) -> Vec<Arc<MultiHopClient>> {
         let mut dials = tokio::task::JoinSet::new();
         for index in 1..want {
@@ -2091,6 +2135,7 @@ impl MultiHopSupervisor {
                     index,
                     primary_spec,
                     session_token,
+                    dated,
                 )
                 .await;
                 (index, secondary)
@@ -2133,6 +2178,7 @@ impl MultiHopSupervisor {
         dialled: &CircuitTarget,
         primary_spec: IpAssignSpec,
         session_token: Option<SessionToken>,
+        dated: bool,
     ) {
         let want = resolve_bonded_want(
             self.config.n_connections,
@@ -2161,6 +2207,7 @@ impl MultiHopSupervisor {
                         index,
                         primary_spec,
                         session_token,
+                        dated,
                     )
                     .await
                 });
@@ -2221,7 +2268,7 @@ impl MultiHopSupervisor {
                 primary.force_close_for_reconnect();
                 return Established::RouteRefused;
             }
-            SetupOutcome::ExitPredatesTokenDetail => return Established::ExitPredatesTokenDetail,
+            SetupOutcome::ExitPredatesRequest => return Established::ExitPredatesRequest,
         };
 
         // Bonded secondaries: best-effort extra connections under the same
@@ -2241,6 +2288,7 @@ impl MultiHopSupervisor {
                     primary_spec,
                     want,
                     session_token,
+                    self.sends_dated_setup(primary.exit_id()),
                 )
                 .await,
             );
@@ -2300,7 +2348,7 @@ impl MultiHopSupervisor {
                     let lead = session_tokens.as_ref().map(TokenStack::lead);
                     return Some((bundle, primary, target, lead));
                 }
-                Established::ExitPredatesTokenDetail => {
+                Established::ExitPredatesRequest => {
                     retrying_tokens = session_tokens;
                     continue;
                 }
@@ -2459,6 +2507,7 @@ impl MultiHopSupervisor {
         index: usize,
         primary_spec: IpAssignSpec,
         session_token: Option<SessionToken>,
+        dated: bool,
     ) -> Option<Arc<MultiHopClient>> {
         // A tokens-only primary never sets up without a token, so this only
         // guards a future caller against building a wallet request here.
@@ -2495,6 +2544,7 @@ impl MultiHopSupervisor {
                 session_token,
                 Some(primary_spec.assigned),
                 TokenRequestKind::Plain,
+                dated,
             )
             .await;
             if let Some(reason) = client.rejection_reason() {
@@ -5979,6 +6029,91 @@ mod run_tests {
     }
 
     #[tokio::test]
+    async fn every_setup_is_dated_by_default_and_a_token_refusal_still_says_why() {
+        let (operational_key, exit) = exit_holding(0x95, &[1]);
+        let mut config = config_with_fake_exit(&exit, &operational_key);
+        config.session_token_provider = Some(provider_of(vec![vec![v7_token(1), v7_token(2)]]).0);
+        let (supervisor, mut rx) = MultiHopSupervisor::new(config);
+        let task = tokio::spawn(supervisor.run());
+
+        let bundle = first_session(&mut rx).await;
+
+        assert_eq!(
+            *exit.dated_setups.lock(),
+            vec![true, true],
+            "an exit that decodes the dated request gets nothing else"
+        );
+        assert_eq!(
+            *exit.setup_requests.lock(),
+            vec![presented(&[1]), presented(&[2])],
+            "a dated token request is refused with the reason, and the walk goes on"
+        );
+        drop(bundle);
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    #[tokio::test]
+    async fn an_exit_that_predates_the_dated_request_is_sent_the_legacy_one_from_then_on() {
+        let (operational_key, exit) = exit_holding(0x96, &[]);
+        exit.predates_dated_setup.store(true, Ordering::Relaxed);
+        let config = config_with_fake_exit(&exit, &operational_key);
+        let (supervisor, mut rx) = MultiHopSupervisor::new(config);
+        let fatal_rx = supervisor.fatal_rx();
+        let task = tokio::spawn(supervisor.run());
+
+        let bundle = first_session(&mut rx).await;
+
+        assert_eq!(
+            *exit.dated_setups.lock(),
+            vec![true, false],
+            "one dated attempt, answered with the plain Rejected, then the legacy request"
+        );
+        assert_eq!(
+            exit.setup_requests.lock().last(),
+            Some(&SeenSetupRequest::Wallet { names_pubkey: true }),
+            "the legacy request is admitted"
+        );
+        assert!(
+            fatal_rx.borrow().is_none(),
+            "an exit that predates the request is not a refusal of the account"
+        );
+
+        // The next session to the same exit goes straight to the legacy
+        // request.
+        bundle.primary().force_close_for_reconnect();
+        let bundle = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                rx.changed().await.expect("watch sender alive");
+                if let Some(next) = rx.borrow_and_update().clone()
+                    && !Arc::ptr_eq(&next, &bundle)
+                {
+                    return next;
+                }
+            }
+        })
+        .await
+        .expect("the redial publishes a new session");
+        assert_eq!(
+            exit.dated_setups.lock().last(),
+            Some(&false),
+            "the exit is remembered"
+        );
+        assert_eq!(
+            exit.dated_setups
+                .lock()
+                .iter()
+                .filter(|dated| **dated)
+                .count(),
+            1,
+            "never asked the dated request twice"
+        );
+        drop(bundle);
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    #[tokio::test]
     async fn an_exit_that_predates_the_detailed_request_gets_the_same_token_plainly() {
         let (operational_key, exit) = exit_holding(0x93, &[]);
         exit.predates_token_detail.store(true, Ordering::Relaxed);
@@ -5993,8 +6128,13 @@ mod run_tests {
 
         assert_eq!(
             *exit.setup_requests.lock(),
-            vec![presented(&[1]), presented_plainly(&[1])],
-            "the plain Rejected of an exit that cannot read the request spends no token"
+            vec![
+                SeenSetupRequest::Other,
+                presented(&[1]),
+                presented_plainly(&[1])
+            ],
+            "the plain Rejected of an exit that cannot read the request spends no token: \
+             the dated request, then the detailed one, then the plain one"
         );
         assert_eq!(
             calls.load(Ordering::Relaxed),
@@ -6040,11 +6180,13 @@ mod run_tests {
         assert_eq!(
             *exit.setup_requests.lock(),
             vec![
+                SeenSetupRequest::Other,
                 presented(&[1]),
                 presented_plainly(&[1]),
                 presented_plainly(&[2])
             ],
-            "the exit is asked plainly once it answered the detailed request with Rejected"
+            "the exit is asked plainly once it answered the dated and the detailed requests \
+             with Rejected"
         );
     }
 
@@ -6126,7 +6268,13 @@ mod run_tests {
 
         assert_eq!(
             *exit.setup_requests.lock(),
-            vec![presented(&[1]), presented(&[2]), presented_plainly(&[2])]
+            vec![
+                presented(&[1]),
+                SeenSetupRequest::Other,
+                presented(&[2]),
+                presented_plainly(&[2])
+            ],
+            "the overlap meets the exit's new answer with the dated request first"
         );
         drop(rx);
         drop(handle);
@@ -6185,6 +6333,7 @@ mod run_tests {
             1,
             spec,
             None,
+            true,
         )
         .await;
 
@@ -6228,9 +6377,9 @@ mod run_tests {
 
             assert_eq!(
                 *exit.setup_requests.lock(),
-                vec![presented(&[1]), presented(&[2]), presented_plainly(&[2])],
+                vec![presented(&[1]), presented(&[2]), presented(&[2])],
                 "{admission:?}: the secondary joins on the token the primary was admitted with, \
-                 plainly since it is never walked"
+                 in the dated request, which an exit answers as the detailed one"
             );
             drop(rx);
             let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
@@ -6800,10 +6949,14 @@ mod route_run_tests {
                 MultiHopError::RouteRefused(refusal) => assert_eq!(refusal, want),
                 other => panic!("expected a route refusal, got {other:?}"),
             }
+            // A plain `Rejected` to the dated route request can be an exit
+            // that predates the dated requests but admits routes: the legacy
+            // route request settles it on a second dial.
+            let dials = if want == RouteRefusal::Legacy { 2 } else { 1 };
             assert_eq!(
                 exit.accepted.load(AtomicOrdering::Relaxed),
-                1,
-                "{want:?}: one dial"
+                dials,
+                "{want:?}: {dials} dial(s)"
             );
             assert_eq!(
                 calls.load(AtomicOrdering::Relaxed),

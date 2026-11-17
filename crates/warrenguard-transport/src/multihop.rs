@@ -26,7 +26,6 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-#[cfg(feature = "pq-hpke")]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -477,13 +476,11 @@ pub const MAX_MULTIHOP_SETUP_FRAME_BYTES: usize = 64 * 1024;
 /// upper bound of the 2-5 s envelope.
 const PENDING_OLD_EPOCH_TTL: Duration = Duration::from_secs(5);
 
-/// `/v2` only: minimum spacing between resent PQ epoch-bootstrap pings while
-/// the current epoch stays unacked. Frequent relative to the 5 s doctrine
-/// overlap window above: a handful of retries at this cadence lands the new
-/// epoch at the exit well before the overlap prunes, even against moderate
-/// datagram loss, without spamming the exit on every `send_packet` call.
-#[cfg(feature = "pq-hpke")]
-const PQ_SETUP_PING_RESEND_INTERVAL: Duration = Duration::from_millis(200);
+/// Minimum spacing between resent epoch bootstraps (the rekey announcement
+/// and the new epoch's bootstrap frame) while the current epoch stays
+/// unacked. Frequent enough that a few lost datagrams cost a fraction of a
+/// second, without spamming the exit on every `send_packet` call.
+const REKEY_BOOTSTRAP_RESEND_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Per-epoch anti-replay tracker. The receive path picks the matching
 /// instance for `frame.epoch` so a straggler from the just-closed
@@ -639,6 +636,14 @@ impl ClientSessionKind {
         }
     }
 
+    fn has_pending_old_epoch(&self) -> bool {
+        match self {
+            Self::V1(s) => s.read().has_pending_old_epoch(),
+            #[cfg(feature = "pq-hpke")]
+            Self::V2 { session, .. } => session.read().has_pending_old_epoch(),
+        }
+    }
+
     fn prune_pending_old_epoch(&self) {
         match self {
             Self::V1(s) => s.write().prune_pending_old_epoch(),
@@ -758,26 +763,25 @@ pub struct MultiHopClient {
     /// [`WarrenControlMessage::IpAssign`]. `None` before setup, or if the
     /// reply was a policy refusal (`Rejected` / `IpExhausted`) instead.
     assignment: Mutex<Option<IpAssignment>>,
-    /// `/v2` only: whether the exit has proven (by a reverse frame observed
-    /// on the current epoch) that it established this epoch's PQ session.
-    /// While `false`, DATA frames seal under the RETAINED previous epoch
-    /// (see [`PqClientSession::seal_pending_old_epoch`]), never the new one:
-    /// the new epoch's `pq_ct` only ever rides its own dedicated small setup
-    /// ping ([`Self::send_pq_setup_ping`]), so a rekey's ML-KEM ciphertext
-    /// can never oversize a caller's full-size DATA frame. Reset to `false`
-    /// on every rekey; explicitly set `true` right after a successful
-    /// [`Self::setup_over_stream`] (epoch 0's setup rides the reliable
-    /// stream, so it counts as acked immediately) and by
-    /// [`Self::decode_and_open_reply`] once a reverse frame proves the exit
-    /// decapsulated the current epoch.
-    #[cfg(feature = "pq-hpke")]
-    pq_setup_acked: AtomicBool,
-    /// `/v2` only: when [`Self::send_pq_setup_ping`] last fired, so
-    /// [`Self::maybe_resend_pq_setup_ping`] can rate-limit the resend to
-    /// [`PQ_SETUP_PING_RESEND_INTERVAL`] instead of re-pinging on every
+    /// Whether the exit has proven (by a reverse frame observed on the
+    /// current epoch) that it switched to this epoch. While `false` after a
+    /// rekey, DATA frames seal under the RETAINED previous epoch, which the
+    /// exit already holds, never the new one: an exit that binds the
+    /// connection to the keys the client announced drops a new-epoch frame
+    /// until the announcement reached it, and on `/v2` the new epoch's
+    /// `pq_ct` only ever rides its own small bootstrap frame, so a rekey's
+    /// ML-KEM ciphertext can never oversize a caller's full-size DATA frame.
+    /// Reset to `false` on every rekey; set `true` right after a successful
+    /// [`Self::setup_over_stream`] (the setup rides the reliable stream) and
+    /// by [`Self::decode_and_open_reply`] once a reverse frame proves the exit
+    /// moved to the current epoch. A `/v1` session starts acked: its epoch 0
+    /// needs no bootstrap.
+    epoch_acked: AtomicBool,
+    /// When [`Self::send_rekey_bootstrap`] last fired, so
+    /// [`Self::maybe_resend_rekey_bootstrap`] can rate-limit the resend to
+    /// [`REKEY_BOOTSTRAP_RESEND_INTERVAL`] instead of resending on every
     /// `send_packet` call while unacked.
-    #[cfg(feature = "pq-hpke")]
-    pq_setup_ping_last_sent: Mutex<Option<Instant>>,
+    rekey_bootstrap_last_sent: Mutex<Option<Instant>>,
 }
 
 /// Atomic counters that aggregate per-session activity. Mutation paths
@@ -1557,10 +1561,8 @@ impl MultiHopClient {
             metrics: MultiHopMetrics::default(),
             relay_auth_pubkey,
             assignment: Mutex::new(None),
-            #[cfg(feature = "pq-hpke")]
-            pq_setup_acked: AtomicBool::new(false),
-            #[cfg(feature = "pq-hpke")]
-            pq_setup_ping_last_sent: Mutex::new(None),
+            epoch_acked: AtomicBool::new(true),
+            rekey_bootstrap_last_sent: Mutex::new(None),
         })
     }
 
@@ -1659,8 +1661,8 @@ impl MultiHopClient {
             metrics: MultiHopMetrics::default(),
             relay_auth_pubkey,
             assignment: Mutex::new(None),
-            pq_setup_acked: AtomicBool::new(false),
-            pq_setup_ping_last_sent: Mutex::new(None),
+            epoch_acked: AtomicBool::new(false),
+            rekey_bootstrap_last_sent: Mutex::new(None),
         })
     }
 
@@ -2115,11 +2117,10 @@ impl MultiHopClient {
             self.rekey()?;
         }
 
-        // Piggyback the PQ epoch-bootstrap retry on ordinary traffic, the
-        // same lazy-on-traffic style as `prune_pending_overlap_if_expired`
-        // above: no dedicated timer task, no-op once acked or rate-limited.
-        #[cfg(feature = "pq-hpke")]
-        self.maybe_resend_pq_setup_ping();
+        // Piggyback the epoch-bootstrap retry on ordinary traffic, the same
+        // lazy-on-traffic style as `prune_pending_overlap_if_expired` above:
+        // no dedicated timer task, no-op once acked or rate-limited.
+        self.maybe_resend_rekey_bootstrap();
 
         // Classify while the plaintext is still readable: the sealed frame
         // is opaque to quinn, so the inner ECN/flow key must travel with
@@ -2219,7 +2220,7 @@ impl MultiHopClient {
     /// is unacked, they instead seal under the RETAINED previous epoch
     /// ([`PqClientSession::seal_pending_old_epoch`]), which the exit already
     /// established; the new epoch's `pq_ct` rides only its own dedicated
-    /// small setup ping ([`Self::send_pq_setup_ping`]), decoupled from
+    /// small bootstrap frame ([`Self::send_rekey_bootstrap`]), decoupled from
     /// whatever size the caller's payload happens to be. Reattaching `pq_ct`
     /// to a caller's DATA frame here was the historical bug: an unacked full
     /// MTU DATA frame plus the 1088-byte ML-KEM ciphertext oversizes past
@@ -2233,8 +2234,15 @@ impl MultiHopClient {
             ClientSessionKind::V1(session) => {
                 let frame = {
                     let sess = session.read();
-                    let epoch = sess.epoch();
-                    sess.seal(payload, epoch, seq)?
+                    if !self.epoch_acked.load(Ordering::Acquire) && sess.has_pending_old_epoch() {
+                        // The exit has not moved to the new epoch yet (it may
+                        // not even have the announcement): keep the data on
+                        // the epoch it already holds.
+                        sess.seal_pending_old_epoch(payload, seq)?
+                    } else {
+                        let epoch = sess.epoch();
+                        sess.seal(payload, epoch, seq)?
+                    }
                 };
                 encode_frame(&frame).map_err(map_multihop_encode_err)
             }
@@ -2242,7 +2250,7 @@ impl MultiHopClient {
             ClientSessionKind::V2 { session, .. } => {
                 let frame = {
                     let sess = session.read();
-                    if self.pq_setup_acked.load(Ordering::Acquire) {
+                    if self.epoch_acked.load(Ordering::Acquire) {
                         sess.seal(payload, sess.epoch(), seq)?
                     } else if sess.has_pending_old_epoch() {
                         // (b) preferred: the exit already established the
@@ -2257,7 +2265,7 @@ impl MultiHopClient {
                         // (a) fallback: the overlap window elapsed with no
                         // ack yet (should not happen at normal RTTs; a
                         // resent ping is still in flight, see
-                        // `maybe_resend_pq_setup_ping`). Seal under the new
+                        // `maybe_resend_rekey_bootstrap`). Seal under the new
                         // epoch with NO pq_ct: the exit cannot open this
                         // without a setup frame it kept, so it is dropped
                         // until a ping lands and flips the epoch to acked.
@@ -2305,7 +2313,10 @@ impl MultiHopClient {
                     // reverse-direction datapath.
                     Ok(sess.open_response_owned(frame)?)
                 });
-                let (plaintext, _frame_epoch_is_pending) = self.record_reply_metrics(gated)?;
+                let (plaintext, frame_epoch_is_pending) = self.record_reply_metrics(gated)?;
+                if !frame_epoch_is_pending {
+                    self.epoch_acked.store(true, Ordering::Release);
+                }
                 Ok(plaintext)
             }
             #[cfg(feature = "pq-hpke")]
@@ -2330,7 +2341,7 @@ impl MultiHopClient {
                 // the exit has decapsulated this epoch's pq_ct, so the
                 // forward path can stop re-carrying it.
                 if !frame_epoch_is_pending {
-                    self.pq_setup_acked.store(true, Ordering::Release);
+                    self.epoch_acked.store(true, Ordering::Release);
                 }
                 Ok(plaintext)
             }
@@ -2500,7 +2511,40 @@ impl MultiHopClient {
             wants_daita,
             session_tokens,
             prefer_ipv4,
+            None,
         ));
+        self.setup_over_stream_request(&request_msg).await
+    }
+
+    /// The dated counterpart of [`Self::setup_over_stream_with_options`]
+    /// (warren-core doc 116): the request carries this device's wall clock
+    /// (`IpRequestDated` with the `/v3` proof of possession, or
+    /// `IpRequestV7Dated`). An exit that decodes it binds the connection to
+    /// the keys this client announces and refuses a frame captured on the
+    /// way; it never answers it with the plain `Rejected`, which therefore
+    /// means an exit that predates it: send that exit the legacy request.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::setup_over_stream`].
+    pub async fn setup_over_stream_dated(
+        &self,
+        identity: Option<&SigningKey>,
+        wants_ipv6: bool,
+        wants_daita: bool,
+        session_tokens: Option<&[SessionToken]>,
+        prefer_ipv4: Option<std::net::Ipv4Addr>,
+    ) -> Result<Vec<u8>, MultiHopError> {
+        let request_msg = compose_setup_request(
+            identity,
+            &self.exit_id,
+            &self.session.encapsulated_key(),
+            wants_ipv6,
+            wants_daita,
+            session_tokens,
+            prefer_ipv4,
+            Some(warrenguard_config::unix_now()),
+        );
         self.setup_over_stream_request(&request_msg).await
     }
 
@@ -2566,10 +2610,7 @@ impl MultiHopClient {
         // proves the exit decapsulated this epoch's pq_ct. The datagram data
         // path can therefore start acked immediately, without waiting to
         // observe a separate reverse datagram first.
-        #[cfg(feature = "pq-hpke")]
-        if matches!(self.session, ClientSessionKind::V2 { .. }) {
-            self.pq_setup_acked.store(true, Ordering::Release);
-        }
+        self.epoch_acked.store(true, Ordering::Release);
         // Opportunistically capture the typed IP allocation for
         // `Self::assignment` and friends. Best-effort: a `Rejected` /
         // `IpExhausted` reply (or any other non-IpAssign control message)
@@ -2705,9 +2746,12 @@ impl MultiHopClient {
     }
 
     /// Force an immediate rekey. Allocates a fresh HPKE setup against
-    /// the same destination exit, bumps the epoch, and resets the
-    /// forward-direction seq counter and the reverse-direction
-    /// replay window.
+    /// the same destination exit, bumps the epoch, installs a fresh
+    /// reverse-direction replay window, and announces the new key to the
+    /// exit under the previous epoch. The forward sequence counter keeps
+    /// running: data stays on the previous epoch until the exit acknowledges
+    /// the new one, and restarting the counter would reuse its (key, nonce)
+    /// pairs.
     ///
     /// Returns the new epoch number on success.
     ///
@@ -2729,15 +2773,18 @@ impl MultiHopClient {
             ClientSessionKind::V2 { session, recipient } => {
                 let mut sess = session.write();
                 sess.rekey(recipient, &mut rand_core::UnwrapErr(rand_core::OsRng))?;
-                // A rekey's pq_ct rides lossy datagrams (unlike epoch 0's,
-                // which rides the reliable setup stream): the new epoch
-                // needs its own bootstrap ping until the exit acks it (see
-                // `send_pq_setup_ping` below and `decode_and_open_reply`).
-                self.pq_setup_acked.store(false, Ordering::Release);
                 sess.epoch()
             }
         };
-        self.seq_send.store(0, Ordering::Release);
+        // The new epoch is announced and bootstrapped on lossy datagrams
+        // (unlike epoch 0, which rides the reliable setup stream), so it
+        // stays unacked until a reverse frame of it arrives (see
+        // `send_rekey_bootstrap` below and `decode_and_open_reply`).
+        self.epoch_acked.store(false, Ordering::Release);
+        // The send counter is NOT reset: until the acknowledgement the
+        // client keeps sealing under the previous epoch, and a counter
+        // restarted at 0 would reuse that epoch's (key, nonce) pairs. A fresh
+        // epoch window on the exit accepts a first sequence number above 0.
         self.frames_in_epoch.store(0, Ordering::Release);
         *self.last_rekey.lock() = Instant::now();
         // Move the current replay window into the pending slot so
@@ -2759,82 +2806,126 @@ impl MultiHopClient {
         self.metrics.rekey_count.fetch_add(1, Ordering::Relaxed);
         tracing::info!("multi-hop session rekey applied");
 
-        // Bootstrap the new epoch on its own small datagram immediately,
-        // decoupled from the data path (see the module docs on the
-        // historical oversized-DATA-frame bug). Best-effort: a lost or
-        // momentarily oversized ping is retried by `send_packet` via
-        // `maybe_resend_pq_setup_ping`, so a failure here must never fail
-        // the rekey call itself. Sent after the seq/replay bookkeeping
-        // above so the ping consumes seq 0 of the fresh epoch's counter,
-        // exactly like any other first frame of an epoch.
-        #[cfg(feature = "pq-hpke")]
-        if let ClientSessionKind::V2 { session, .. } = &self.session {
-            let _ = self.send_pq_setup_ping(session);
-        }
+        // Announce and bootstrap the new epoch on their own small datagrams
+        // immediately, decoupled from the data path (see the module docs on
+        // the historical oversized-DATA-frame bug). Best-effort: a lost one
+        // is resent by `send_packet` via `maybe_resend_rekey_bootstrap`, so a
+        // failure here must never fail the rekey call itself.
+        let _ = self.send_rekey_bootstrap();
 
         Ok(new_epoch)
     }
 
-    /// Seal and send a dedicated small PQ epoch-bootstrap datagram: an
-    /// empty-payload `/v2` SETUP frame carrying `pq_ct`, sized at
-    /// [`warrenguard_multihop::MULTIHOP_FRAME_V2_MAX_OVERHEAD`] alone
-    /// (well under any real path datagram cap) so it always fits
-    /// regardless of whatever size the caller's own DATA payloads are.
-    /// Called immediately from [`Self::rekey`] and re-called
-    /// (rate-limited) from [`Self::maybe_resend_pq_setup_ping`] while the
-    /// epoch stays unacked.
+    /// Announce and bootstrap the current epoch on two small datagrams of
+    /// their own:
+    ///
+    /// 1. after a rekey, a `SessionRekey` naming the new epoch's key, sealed
+    ///    under the PREVIOUS epoch: an exit that binds the connection accepts
+    ///    a new key only from the client's own session, which a relay cannot
+    ///    seal under;
+    /// 2. an empty-payload frame under the new epoch (`/v2`: the setup frame
+    ///    carrying `pq_ct`, sized at
+    ///    [`warrenguard_multihop::MULTIHOP_FRAME_V2_MAX_OVERHEAD`] alone), on
+    ///    which the exit establishes and switches to the epoch.
+    ///
+    /// An exit that predates session binding drops the announcement as an
+    /// unknown control frame and switches on the bootstrap frame. Called
+    /// from [`Self::rekey`] and re-called (rate-limited) from
+    /// [`Self::maybe_resend_rekey_bootstrap`] while the epoch stays unacked;
+    /// at an unacked `/v2` epoch 0 there is no previous epoch and only the
+    /// bootstrap frame goes.
     ///
     /// # Errors
     ///
     /// Propagates a seal, encode, or Quinn send failure. Every caller
-    /// treats this as best-effort (a lost or momentarily oversized ping is
-    /// retried on the next [`Self::send_packet`] call), so a failure here
+    /// treats this as best-effort (a lost or momentarily oversized datagram
+    /// is retried on the next [`Self::send_packet`] call), so a failure here
     /// must never fail the caller's own send or the rekey that triggered it.
-    #[cfg(feature = "pq-hpke")]
-    fn send_pq_setup_ping(&self, session: &RwLock<PqClientSession>) -> Result<(), MultiHopError> {
-        let seq = self.seq_send.fetch_add(1, Ordering::AcqRel);
-        let frame = {
-            let sess = session.read();
-            let epoch = sess.epoch();
-            sess.seal_setup(&[], epoch, seq)?
+    fn send_rekey_bootstrap(&self) -> Result<(), MultiHopError> {
+        let announcement = encode_control(&WarrenControlMessage::SessionRekey {
+            new_encapsulated_key: self.session.encapsulated_key(),
+            new_epoch: self.session.epoch(),
+        })
+        .map_err(|e| match e {
+            warrenguard_multihop::ControlError::Decode(p) => MultiHopError::Encode(p),
+            _ => MultiHopError::Encode(postcard::Error::SerializeBufferFull),
+        })?;
+        let (announce, bootstrap) = match &self.session {
+            ClientSessionKind::V1(session) => {
+                let sess = session.read();
+                let announce = if sess.has_pending_old_epoch() {
+                    let seq = self.seq_send.fetch_add(1, Ordering::AcqRel);
+                    let frame = sess.seal_pending_old_epoch(&announcement, seq)?;
+                    Some(encode_frame(&frame).map_err(map_multihop_encode_err)?)
+                } else {
+                    None
+                };
+                let seq = self.seq_send.fetch_add(1, Ordering::AcqRel);
+                let frame = sess.seal(&[], sess.epoch(), seq)?;
+                (
+                    announce,
+                    encode_frame(&frame).map_err(map_multihop_encode_err)?,
+                )
+            }
+            #[cfg(feature = "pq-hpke")]
+            ClientSessionKind::V2 { session, .. } => {
+                let sess = session.read();
+                let announce = if sess.has_pending_old_epoch() {
+                    let seq = self.seq_send.fetch_add(1, Ordering::AcqRel);
+                    let frame = sess.seal_pending_old_epoch(&announcement, seq)?;
+                    Some(encode_frame_v2(&frame).map_err(map_multihop_encode_err)?)
+                } else {
+                    None
+                };
+                let seq = self.seq_send.fetch_add(1, Ordering::AcqRel);
+                let frame = sess.seal_setup(&[], sess.epoch(), seq)?;
+                (
+                    announce,
+                    encode_frame_v2(&frame).map_err(map_multihop_encode_err)?,
+                )
+            }
         };
-        let bytes = encode_frame_v2(&frame).map_err(map_multihop_encode_err)?;
-        self.conn.send_datagram(Bytes::from(bytes))?;
-        self.metrics
-            .pq_setup_resends
-            .fetch_add(1, Ordering::Relaxed);
+        // The announcement first: an exit that binds the connection drops the
+        // bootstrap frame of a key it was not told about.
+        if let Some(announce) = announce {
+            self.conn.send_datagram(Bytes::from(announce))?;
+            self.metrics.frames_sent.fetch_add(1, Ordering::Relaxed);
+        }
+        self.conn.send_datagram(Bytes::from(bootstrap))?;
+        #[cfg(feature = "pq-hpke")]
+        if matches!(self.session, ClientSessionKind::V2 { .. }) {
+            self.metrics
+                .pq_setup_resends
+                .fetch_add(1, Ordering::Relaxed);
+        }
         self.metrics.frames_sent.fetch_add(1, Ordering::Relaxed);
-        *self.pq_setup_ping_last_sent.lock() = Some(Instant::now());
+        *self.rekey_bootstrap_last_sent.lock() = Some(Instant::now());
         Ok(())
     }
 
-    /// Opportunistically resend [`Self::send_pq_setup_ping`] from the data
-    /// path: called on every [`Self::send_packet`] so a lost ping (the
-    /// datagram path is lossy by design) gets retried without a dedicated
-    /// timer task, the same lazy-on-traffic style as
+    /// Opportunistically resend [`Self::send_rekey_bootstrap`] from the data
+    /// path: called on every [`Self::send_packet`] so a lost announcement or
+    /// bootstrap frame (the datagram path is lossy by design) gets retried
+    /// without a dedicated timer task, the same lazy-on-traffic style as
     /// [`Self::prune_pending_overlap_if_expired`]. No-op once acked, and
-    /// rate-limited to [`PQ_SETUP_PING_RESEND_INTERVAL`] so steady traffic
-    /// does not re-ping on every packet.
-    #[cfg(feature = "pq-hpke")]
-    fn maybe_resend_pq_setup_ping(&self) {
-        let ClientSessionKind::V2 { session, .. } = &self.session else {
-            return;
-        };
-        if self.pq_setup_acked.load(Ordering::Acquire) {
+    /// rate-limited to [`REKEY_BOOTSTRAP_RESEND_INTERVAL`] so steady traffic
+    /// does not resend on every packet.
+    fn maybe_resend_rekey_bootstrap(&self) {
+        if self.epoch_acked.load(Ordering::Acquire) {
             return;
         }
         let due = {
-            let last = self.pq_setup_ping_last_sent.lock();
+            let last = self.rekey_bootstrap_last_sent.lock();
             match *last {
                 None => true,
-                Some(t) => t.elapsed() >= PQ_SETUP_PING_RESEND_INTERVAL,
+                Some(t) => t.elapsed() >= REKEY_BOOTSTRAP_RESEND_INTERVAL,
             }
         };
         if !due {
             return;
         }
-        // Best-effort: see `Self::send_pq_setup_ping`'s doc.
-        let _ = self.send_pq_setup_ping(session);
+        // Best-effort: see `Self::send_rekey_bootstrap`'s doc.
+        let _ = self.send_rekey_bootstrap();
     }
 
     /// If a previous rekey is still in its overlap window and the
@@ -2844,6 +2935,12 @@ impl MultiHopClient {
     /// the cleanup happens lazily on the next traffic event after
     /// expiry, without needing a dedicated background task.
     fn prune_pending_overlap_if_expired(&self) {
+        // While a rekey is unacked the previous epoch is the one carrying
+        // the data and the only one that can announce the new key: it stays
+        // until the exit moves.
+        if self.rekey_unacked() {
+            return;
+        }
         let should_prune = {
             let at = self.pending_old_epoch_at.lock();
             match *at {
@@ -2859,7 +2956,17 @@ impl MultiHopClient {
         *self.pending_old_epoch_at.lock() = None;
     }
 
+    /// Whether a rekey is waiting for the exit's acknowledgement. Another
+    /// rekey would replace the only epoch the exit holds with one it was
+    /// never told about.
+    fn rekey_unacked(&self) -> bool {
+        !self.epoch_acked.load(Ordering::Acquire) && self.session.has_pending_old_epoch()
+    }
+
     fn should_rekey(&self, frames_sent: u64) -> bool {
+        if self.rekey_unacked() {
+            return false;
+        }
         if frames_sent >= self.rekey_policy.max_frames {
             return true;
         }
@@ -2983,6 +3090,33 @@ impl TokenRequestKind {
     }
 }
 
+/// `request` as a dated setup sends it: an `IpRequestRoute` becomes an
+/// `IpRequestRouteDated` carrying `client_unix_secs`, and every other message
+/// is left as it is (the wallet and token requests are dated by
+/// [`MultiHopClient::setup_over_stream_dated`], which needs the key to sign
+/// the time).
+#[must_use]
+pub fn dated_route_request(
+    request: WarrenControlMessage,
+    client_unix_secs: u64,
+) -> WarrenControlMessage {
+    match request {
+        WarrenControlMessage::IpRequestRoute {
+            prefer_ipv4,
+            wants_ipv6,
+            route_locator,
+            wants_daita,
+        } => WarrenControlMessage::IpRequestRouteDated {
+            prefer_ipv4,
+            wants_ipv6,
+            route_locator,
+            wants_daita,
+            client_unix_secs,
+        },
+        other => other,
+    }
+}
+
 /// Builds the setup-stream control request. Pure so the request shape,
 /// notably the session-placement `prefer_ipv4` hint pass-through, is
 /// testable without a live session.
@@ -2997,6 +3131,7 @@ impl TokenRequestKind {
 /// (domain-separated, exit-bound) so a strict exit can verify possession
 /// instead of trusting a bare assertion. The production binary always
 /// passes the key; `None` is for permissive/bench exits only.
+#[allow(clippy::too_many_arguments)]
 fn compose_setup_request(
     identity: Option<&SigningKey>,
     exit_id: &ExitId,
@@ -3005,15 +3140,47 @@ fn compose_setup_request(
     wants_daita: bool,
     session_tokens: Option<&[SessionToken]>,
     prefer_ipv4: Option<std::net::Ipv4Addr>,
+    dated_at: Option<u64>,
 ) -> WarrenControlMessage {
     let prefer_ipv4 = prefer_ipv4.map(|ip| ip.octets());
-    match session_tokens {
-        Some(tokens) if !tokens.is_empty() => WarrenControlMessage::IpRequestV7 {
+    match (session_tokens, dated_at) {
+        (Some(tokens), Some(client_unix_secs)) if !tokens.is_empty() => {
+            WarrenControlMessage::IpRequestV7Dated {
+                prefer_ipv4,
+                wants_ipv6,
+                session_tokens: tokens.to_vec(),
+                wants_daita,
+                client_unix_secs,
+            }
+        }
+        (Some(tokens), None) if !tokens.is_empty() => WarrenControlMessage::IpRequestV7 {
             prefer_ipv4,
             wants_ipv6,
             session_tokens: tokens.to_vec(),
             wants_daita,
         },
+        (_, Some(client_unix_secs)) => {
+            let (client_pubkey, pop_sig) = match identity {
+                Some(key) => (
+                    Some(key.verifying_key().to_bytes()),
+                    Some(warrenguard_multihop::sign_pop_v3(
+                        key,
+                        exit_id,
+                        encapsulated_key,
+                        client_unix_secs,
+                    )),
+                ),
+                None => (None, None),
+            };
+            WarrenControlMessage::IpRequestDated {
+                prefer_ipv4,
+                client_pubkey,
+                wants_ipv6,
+                pop_sig,
+                wants_daita,
+                client_unix_secs,
+            }
+        }
         _ => {
             let (client_pubkey, pop_sig) = match identity {
                 Some(key) => (
@@ -3098,6 +3265,83 @@ mod tests {
     }
 
     #[test]
+    fn a_dated_wallet_request_signs_its_time_under_the_v3_proof() {
+        let key = SigningKey::from_bytes(&[0x21; 32]);
+        let exit_id = ExitId::from_bytes([0x31; 16]);
+        let encap = [0x41; 32];
+        let t = 1_800_000_000;
+        let request = compose_setup_request(
+            Some(&key),
+            &exit_id,
+            &encap,
+            true,
+            false,
+            None,
+            None,
+            Some(t),
+        );
+        let WarrenControlMessage::IpRequestDated {
+            client_pubkey: Some(pubkey),
+            pop_sig: Some(sig),
+            client_unix_secs,
+            wants_ipv6: true,
+            ..
+        } = request
+        else {
+            panic!("a dated wallet request, got {}", request.variant_name());
+        };
+        assert_eq!(client_unix_secs, t);
+        assert!(warrenguard_multihop::verify_pop_v3(
+            &pubkey, &exit_id, &encap, t, &sig
+        ));
+        assert!(
+            !warrenguard_multihop::verify_pop(&pubkey, &exit_id, &encap, &sig),
+            "the dated request carries the /v3 proof, not the /v2 one"
+        );
+    }
+
+    #[test]
+    fn a_dated_token_request_is_the_dated_variant_and_routes_are_dated_apart() {
+        let tokens = [SessionToken([0x17; warrenguard_wire::SESSION_TOKEN_LEN])];
+        let request = compose_setup_request(
+            None,
+            &ExitId::from_bytes([0x31; 16]),
+            &[0x41; 32],
+            false,
+            true,
+            Some(&tokens),
+            None,
+            Some(7),
+        );
+        assert!(matches!(
+            request,
+            WarrenControlMessage::IpRequestV7Dated {
+                client_unix_secs: 7,
+                wants_daita: true,
+                ..
+            }
+        ));
+        let route = WarrenControlMessage::IpRequestRoute {
+            prefer_ipv4: None,
+            wants_ipv6: false,
+            route_locator: warrenguard_multihop::SealedToApi::from_bytes(
+                &[0x3C; warrenguard_multihop::SEALED_TO_API_LEN],
+            ),
+            wants_daita: false,
+        };
+        assert_eq!(
+            dated_route_request(route, 9).setup_unix_secs(),
+            Some(9),
+            "a route request is dated"
+        );
+        assert_eq!(
+            dated_route_request(WarrenControlMessage::Rejected, 9),
+            WarrenControlMessage::Rejected,
+            "any other message is left alone"
+        );
+    }
+
+    #[test]
     fn a_detailed_token_request_keeps_every_field_and_leaves_other_requests_alone() {
         let tokens = vec![SessionToken([0xAB; warrenguard_wire::SESSION_TOKEN_LEN])];
         let plain = WarrenControlMessage::IpRequestV7 {
@@ -3141,7 +3385,16 @@ mod tests {
         let key = SigningKey::from_bytes(&[0x11; 32]);
         let hint = std::net::Ipv4Addr::new(10, 66, 0, 42);
 
-        match compose_setup_request(Some(&key), &exit_id, &encap, true, false, None, Some(hint)) {
+        match compose_setup_request(
+            Some(&key),
+            &exit_id,
+            &encap,
+            true,
+            false,
+            None,
+            Some(hint),
+            None,
+        ) {
             WarrenControlMessage::IpRequest {
                 prefer_ipv4,
                 client_pubkey,
@@ -3173,6 +3426,7 @@ mod tests {
             true,
             Some(&tokens),
             Some(std::net::Ipv4Addr::UNSPECIFIED),
+            None,
         ) {
             WarrenControlMessage::IpRequestV7 { prefer_ipv4, .. } => {
                 assert_eq!(
@@ -3184,7 +3438,7 @@ mod tests {
             other => panic!("expected a v7 IpRequestV7, got {other:?}"),
         }
 
-        match compose_setup_request(Some(&key), &exit_id, &encap, false, false, None, None) {
+        match compose_setup_request(Some(&key), &exit_id, &encap, false, false, None, None, None) {
             WarrenControlMessage::IpRequest { prefer_ipv4, .. } => {
                 assert_eq!(prefer_ipv4, None, "no hint stays a legacy request");
             }
@@ -4297,43 +4551,74 @@ mod tests {
     async fn rekey_round_trip_new_epoch_frame_decrypts_in_both_directions() {
         let mut pair =
             crate::test_support::spawn_loopback_multihop(ExitId::from_bytes([0x63; 16])).await;
+        let old_key = client_encapsulated_key_for_test(&pair.client);
 
         // Uplink before the rekey: epoch 0.
         pair.client
             .send(b"\x45pre-rekey")
             .await
             .expect("send epoch 0");
-        let wire0 = tokio::time::timeout(Duration::from_secs(2), pair.exit_conn.read_datagram())
-            .await
-            .expect("must not time out")
-            .expect("datagram");
-        let frame0 = decode_frame(&wire0).expect("decode epoch-0 frame");
+        let frame0 = recv_v1_frame(&pair.exit_conn).await;
         assert_eq!(frame0.epoch, 0);
 
         let new_epoch = pair.client.rekey().expect("rekey must succeed");
         assert_eq!(new_epoch, 1, "the first rekey must move epoch 0 -> 1");
+        let new_key = client_encapsulated_key_for_test(&pair.client);
 
-        // Uplink after the rekey: epoch 1, seq counter reset to 0.
+        // The announcement, sealed under the epoch the exit already holds.
+        let announce = recv_v1_frame(&pair.exit_conn).await;
+        assert_eq!(
+            announce.epoch, 0,
+            "the announcement rides the previous epoch"
+        );
+        assert_eq!(announce.encapsulated_key, old_key);
+        assert_eq!(
+            warrenguard_multihop::try_decode_control(
+                &pair
+                    .exit_session
+                    .open(&announce)
+                    .expect("the epoch 0 session opens the announcement")
+            )
+            .expect("a control message"),
+            Some(WarrenControlMessage::SessionRekey {
+                new_encapsulated_key: new_key,
+                new_epoch,
+            })
+        );
+        // Then the bootstrap frame under the new epoch.
+        let boot_frame = recv_v1_frame(&pair.exit_conn).await;
+        assert_eq!(boot_frame.epoch, new_epoch);
+        assert_eq!(boot_frame.encapsulated_key, new_key);
+
+        // Unacked: data stays on epoch 0, and the counter keeps running.
         pair.client
             .send(b"\x45post-rekey")
             .await
-            .expect("send epoch 1");
-        let wire1 = tokio::time::timeout(Duration::from_secs(2), pair.exit_conn.read_datagram())
-            .await
-            .expect("must not time out")
-            .expect("datagram");
-        let frame1 = decode_frame(&wire1).expect("decode epoch-1 frame");
+            .expect("send while unacked");
+        let unacked = recv_v1_frame(&pair.exit_conn).await;
         assert_eq!(
-            frame1.epoch, 1,
-            "post-rekey frames must carry the new epoch"
+            unacked.epoch, 0,
+            "until the exit moves, data rides the epoch it holds"
         );
-        assert_eq!(frame1.seq, 0, "the forward seq counter must reset on rekey");
+        assert!(
+            unacked.seq > boot_frame.seq
+                && boot_frame.seq > announce.seq
+                && announce.seq > frame0.seq,
+            "the forward counter never restarts"
+        );
+        assert_eq!(
+            pair.exit_session.open(&unacked).expect("epoch 0 opens it"),
+            b"\x45post-rekey"
+        );
 
-        // Downlink round-trip: a real exit re-derives its receiver context
-        // from the new epoch's encapsulated_key on seeing this first
-        // post-rekey frame; mirror that, then confirm the client's own
-        // `recv()` (which gates on the SAME new epoch) opens it correctly.
+        // The exit moves on the bootstrap frame and answers on epoch 1: ack.
         pair.rebuild_exit_session_for_current_epoch();
+        assert!(
+            pair.exit_session
+                .open(&boot_frame)
+                .expect("the new session opens the bootstrap frame")
+                .is_empty()
+        );
         let reply = pair
             .exit_session
             .seal_response(b"\x45reply-epoch-1", new_epoch, 0)
@@ -4347,6 +4632,97 @@ mod tests {
             .expect("must not time out")
             .expect("recv must decrypt the new-epoch reply");
         assert_eq!(recovered, b"\x45reply-epoch-1");
+
+        pair.client
+            .send(b"\x45steady")
+            .await
+            .expect("send after the ack");
+        let steady = recv_v1_frame(&pair.exit_conn).await;
+        assert_eq!(
+            steady.epoch, new_epoch,
+            "acked: data moves to the new epoch"
+        );
+        assert!(steady.seq > unacked.seq);
+        assert_eq!(
+            pair.exit_session.open(&steady).expect("epoch 1 opens it"),
+            b"\x45steady"
+        );
+    }
+
+    /// Reads and decodes the next raw `/v1` datagram the client sent.
+    async fn recv_v1_frame(exit_conn: &Connection) -> warrenguard_multihop::WarrenMultihopFrame {
+        let wire = tokio::time::timeout(Duration::from_secs(2), exit_conn.read_datagram())
+            .await
+            .expect("must not time out")
+            .expect("datagram");
+        decode_frame(&wire).expect("decode v1 frame")
+    }
+
+    #[tokio::test]
+    async fn no_epoch_and_sequence_pair_is_sealed_twice_across_a_rekey() {
+        // Every datagram's per-packet key comes from (epoch, seq) under a
+        // zero nonce: a repeated pair is a repeated (key, nonce), visible to
+        // the relay. Restarting the counter at a rekey repeated the first
+        // pairs of the previous epoch, which the client keeps sealing under
+        // until the exit acknowledges the new one.
+        let pair =
+            crate::test_support::spawn_loopback_multihop(ExitId::from_bytes([0x64; 16])).await;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..4 {
+            pair.client.send(b"\x45a").await.expect("send");
+            let f = recv_v1_frame(&pair.exit_conn).await;
+            assert!(seen.insert((f.epoch, f.seq)));
+        }
+        pair.client.rekey().expect("rekey");
+        for _ in 0..2 {
+            let f = recv_v1_frame(&pair.exit_conn).await;
+            assert!(seen.insert((f.epoch, f.seq)), "announcement and bootstrap");
+        }
+        for _ in 0..4 {
+            pair.client.send(b"\x45b").await.expect("send");
+            let f = recv_v1_frame(&pair.exit_conn).await;
+            assert!(
+                seen.insert((f.epoch, f.seq)),
+                "SECURITY: (epoch {}, seq {}) sealed twice",
+                f.epoch,
+                f.seq
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn no_second_rekey_starts_while_the_first_is_unacked() {
+        // A second rekey would replace the only epoch the exit holds with
+        // one it was never told about, and drop the epoch that can announce.
+        let mut pair =
+            crate::test_support::spawn_loopback_multihop(ExitId::from_bytes([0x65; 16])).await;
+        assert!(
+            pair.client.should_rekey(u64::MAX),
+            "acked: the policy rules"
+        );
+        let new_epoch = pair.client.rekey().expect("rekey");
+        assert!(
+            !pair.client.should_rekey(u64::MAX),
+            "unacked: no automatic rekey, whatever the count"
+        );
+        pair.client.prune_pending_overlap_if_expired();
+        assert!(
+            pair.client.session.has_pending_old_epoch(),
+            "nor does the previous epoch go"
+        );
+        pair.rebuild_exit_session_for_current_epoch();
+        let reply = pair
+            .exit_session
+            .seal_response(b"\x45ack", new_epoch, 0)
+            .expect("seal_response");
+        pair.exit_conn
+            .send_datagram(bytes::Bytes::from(encode_frame(&reply).expect("encode")))
+            .expect("send_datagram");
+        tokio::time::timeout(Duration::from_secs(2), pair.client.recv())
+            .await
+            .expect("must not time out")
+            .expect("the ack opens");
+        assert!(pair.client.should_rekey(u64::MAX), "acked again");
     }
 
     #[tokio::test]
@@ -4555,6 +4931,36 @@ mod tests {
             decode_frame_v2(&wire).expect("decode v2 frame")
         }
 
+        /// Reads the rekey announcement the client sends ahead of the new
+        /// epoch's bootstrap ping: a DATA frame sealed under the previous
+        /// epoch, which `pair.exit_session` still holds, naming the client's
+        /// new key and epoch.
+        async fn expect_announcement_v2(
+            pair: &crate::test_support::LoopbackMultiHopPq,
+            new_epoch: u32,
+        ) -> WarrenMultihopFrameV2 {
+            let frame = recv_v2_frame(&pair.exit_conn).await;
+            assert_eq!(
+                frame.epoch,
+                new_epoch - 1,
+                "sealed under the previous epoch"
+            );
+            assert!(frame.pq_ct.is_empty(), "the announcement is a DATA frame");
+            let plaintext = pair
+                .exit_session
+                .open(&frame)
+                .expect("the previous epoch's session opens it");
+            let (new_key, _) = client_pq_setup_material_for_test(&pair.client);
+            assert_eq!(
+                warrenguard_multihop::try_decode_control(&plaintext).expect("a control message"),
+                Some(WarrenControlMessage::SessionRekey {
+                    new_encapsulated_key: new_key,
+                    new_epoch,
+                })
+            );
+            frame
+        }
+
         #[tokio::test]
         async fn rekey_round_trip_new_epoch_frame_decrypts_in_both_directions_pq() {
             let mut pair =
@@ -4599,9 +5005,12 @@ mod tests {
             let new_epoch = pair.client.rekey().expect("rekey must succeed");
             assert_eq!(new_epoch, 1, "the first rekey must move epoch 0 -> 1");
 
-            // `rekey()` immediately emits the new epoch's own bootstrap ping,
-            // decoupled from any caller send.
+            // `rekey()` immediately announces the new key under epoch 0, then
+            // emits the new epoch's own bootstrap ping, decoupled from any
+            // caller send.
+            let announce = expect_announcement_v2(&pair, new_epoch).await;
             let ping1 = recv_v2_frame(&pair.exit_conn).await;
+            assert!(ping1.seq > announce.seq && announce.seq > frame0.seq);
             assert_eq!(ping1.epoch, new_epoch);
             assert!(
                 !ping1.pq_ct.is_empty(),
@@ -4673,6 +5082,45 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn no_epoch_and_sequence_pair_is_sealed_twice_across_a_rekey_pq() {
+            // The deployed defect: the counter restarted at the rekey while
+            // the data kept riding the previous epoch until the ack, so the
+            // first frames repeated (epoch, seq), a (key, nonce) pair, of the
+            // start of that epoch, and the exit dropped them as replays.
+            let pair =
+                crate::test_support::spawn_loopback_multihop_pq(ExitId::from_bytes([0x7A; 16]))
+                    .await;
+            let mut seen = std::collections::HashSet::new();
+            let mut note = |f: WarrenMultihopFrameV2| {
+                assert!(
+                    seen.insert((f.epoch, f.seq)),
+                    "SECURITY: (epoch {}, seq {}) sealed twice",
+                    f.epoch,
+                    f.seq
+                );
+            };
+            pair.client.send(b"\x45a").await.expect("send");
+            note(recv_v2_frame(&pair.exit_conn).await); // epoch 0 bootstrap ping
+            note(recv_v2_frame(&pair.exit_conn).await);
+            for _ in 0..3 {
+                pair.client.send(b"\x45a").await.expect("send");
+                note(recv_v2_frame(&pair.exit_conn).await);
+            }
+            let new_epoch = pair.client.rekey().expect("rekey");
+            note(expect_announcement_v2(&pair, new_epoch).await);
+            note(recv_v2_frame(&pair.exit_conn).await);
+            for _ in 0..4 {
+                pair.client.send(b"\x45b").await.expect("send");
+                let frame = recv_v2_frame(&pair.exit_conn).await;
+                assert_eq!(
+                    frame.epoch, 0,
+                    "unacked: the previous epoch carries the data"
+                );
+                note(frame);
+            }
+        }
+
+        #[tokio::test]
         async fn resend_until_ack_state_machine_stops_pinging_after_ack() {
             // Focused unit test for the resend-until-ack policy, decoupled
             // from the full rekey round trip above: after `rekey()`, DATA
@@ -4685,6 +5133,7 @@ mod tests {
                     .await;
             let new_epoch = pair.client.rekey().expect("rekey must succeed");
 
+            expect_announcement_v2(&pair, new_epoch).await;
             let ping = recv_v2_frame(&pair.exit_conn).await;
             assert_eq!(ping.epoch, new_epoch);
             assert!(
@@ -4750,15 +5199,23 @@ mod tests {
                     .await;
             let new_epoch = pair.client.rekey().expect("rekey must succeed");
 
+            expect_announcement_v2(&pair, new_epoch).await;
             let first_ping = recv_v2_frame(&pair.exit_conn).await;
             assert_eq!(first_ping.epoch, new_epoch);
 
-            tokio::time::sleep(PQ_SETUP_PING_RESEND_INTERVAL + Duration::from_millis(50)).await;
+            tokio::time::sleep(REKEY_BOOTSTRAP_RESEND_INTERVAL + Duration::from_millis(50)).await;
             pair.client
                 .send(b"\x45after-the-interval")
                 .await
                 .expect("send after the resend interval");
 
+            // The announcement goes again with the ping: either could be the
+            // one the path lost.
+            let resent_announce = expect_announcement_v2(&pair, new_epoch).await;
+            assert!(
+                resent_announce.seq > first_ping.seq,
+                "a fresh sequence number"
+            );
             let resent_ping = recv_v2_frame(&pair.exit_conn).await;
             assert_eq!(resent_ping.epoch, new_epoch);
             assert!(

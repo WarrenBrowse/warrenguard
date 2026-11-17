@@ -474,8 +474,15 @@ pub(crate) struct FakeMultihopExit {
     /// `IpRequestV7Detailed`, the plain `Rejected` for an `IpRequestV7`.
     pub(crate) tokens_invalid: Arc<parking_lot::Mutex<Vec<[u8; SESSION_TOKEN_LEN]>>>,
     /// When set, the exit predates `IpRequestV7Detailed`: it decodes nothing
-    /// of one and answers the plain `Rejected`, whatever the token.
+    /// of one and answers the plain `Rejected`, whatever the token. Such an
+    /// exit predates the dated requests too.
     pub(crate) predates_token_detail: Arc<AtomicBool>,
+    /// When set, the exit predates the dated setup requests: it decodes
+    /// nothing of one and answers the plain `Rejected`.
+    pub(crate) predates_dated_setup: Arc<AtomicBool>,
+    /// For every setup request this exit opened, in arrival order, whether
+    /// it was dated (whatever the exit made of it).
+    pub(crate) dated_setups: Arc<parking_lot::Mutex<Vec<bool>>>,
     /// Every `RouteAnchorRequest` datagram this exit read, in arrival order.
     pub(crate) anchor_requests: Arc<parking_lot::Mutex<Vec<SeenAnchorRequest>>>,
     /// Answers to the next anchor requests, one per request, in order: an
@@ -606,6 +613,8 @@ struct FakeExitBehaviour {
     tokens_in_use: Arc<parking_lot::Mutex<Vec<[u8; SESSION_TOKEN_LEN]>>>,
     tokens_invalid: Arc<parking_lot::Mutex<Vec<[u8; SESSION_TOKEN_LEN]>>>,
     predates_token_detail: Arc<AtomicBool>,
+    predates_dated_setup: Arc<AtomicBool>,
+    dated_setups: Arc<parking_lot::Mutex<Vec<bool>>>,
     anchor_requests: Arc<parking_lot::Mutex<Vec<SeenAnchorRequest>>>,
     anchor_script: Arc<parking_lot::Mutex<std::collections::VecDeque<Option<u8>>>>,
     route_reply: Arc<parking_lot::Mutex<Option<WarrenControlMessage>>>,
@@ -667,21 +676,36 @@ async fn serve_one_fake_exit_connection(
     let Ok(request) = exit_session.open(&frame) else {
         return;
     };
-    let seen = match try_decode_control(&request) {
-        Ok(Some(WarrenControlMessage::IpRequest { client_pubkey, .. })) => {
-            SeenSetupRequest::Wallet {
-                names_pubkey: client_pubkey.is_some(),
-            }
-        }
-        Ok(Some(WarrenControlMessage::IpRequestV7 { session_tokens, .. })) => {
+    let decoded = try_decode_control(&request).ok().flatten();
+    let dated = decoded
+        .as_ref()
+        .and_then(WarrenControlMessage::setup_unix_secs)
+        .is_some();
+    behaviour.dated_setups.lock().push(dated);
+    let predates_dated = dated
+        && (behaviour.predates_dated_setup.load(Ordering::Relaxed)
+            || behaviour.predates_token_detail.load(Ordering::Relaxed));
+    // A dated request reads as its legacy kind: a dated token request is
+    // answered as a detailed one.
+    let seen = match decoded {
+        _ if predates_dated => SeenSetupRequest::Other,
+        Some(
+            WarrenControlMessage::IpRequest { client_pubkey, .. }
+            | WarrenControlMessage::IpRequestDated { client_pubkey, .. },
+        ) => SeenSetupRequest::Wallet {
+            names_pubkey: client_pubkey.is_some(),
+        },
+        Some(WarrenControlMessage::IpRequestV7 { session_tokens, .. }) => {
             SeenSetupRequest::Tokens(session_tokens.iter().map(|t| t.0).collect())
         }
-        Ok(Some(WarrenControlMessage::IpRequestV7Detailed { session_tokens, .. })) => {
-            SeenSetupRequest::DetailedTokens(session_tokens.iter().map(|t| t.0).collect())
-        }
-        Ok(Some(WarrenControlMessage::IpRequestRoute { route_locator, .. })) => {
-            SeenSetupRequest::Route(route_locator.to_bytes())
-        }
+        Some(
+            WarrenControlMessage::IpRequestV7Detailed { session_tokens, .. }
+            | WarrenControlMessage::IpRequestV7Dated { session_tokens, .. },
+        ) => SeenSetupRequest::DetailedTokens(session_tokens.iter().map(|t| t.0).collect()),
+        Some(
+            WarrenControlMessage::IpRequestRoute { route_locator, .. }
+            | WarrenControlMessage::IpRequestRouteDated { route_locator, .. },
+        ) => SeenSetupRequest::Route(route_locator.to_bytes()),
         _ => SeenSetupRequest::Other,
     };
     let route_refusal = match &seen {
@@ -704,7 +728,9 @@ async fn serve_one_fake_exit_connection(
     });
     let predates_detail = detailed && behaviour.predates_token_detail.load(Ordering::Relaxed);
     behaviour.setup_requests.lock().push(seen);
-    let reply_msg = if let Some(refusal) = route_refusal {
+    let reply_msg = if predates_dated {
+        WarrenControlMessage::Rejected
+    } else if let Some(refusal) = route_refusal {
         refusal
     } else if predates_detail {
         WarrenControlMessage::Rejected
@@ -719,7 +745,15 @@ async fn serve_one_fake_exit_connection(
             reason_code: code.code(),
         }
     } else if behaviour.reject.load(Ordering::Relaxed) || lead_token_refusal.is_some() {
-        WarrenControlMessage::Rejected
+        // An exit that decodes a dated request never answers it with the
+        // plain `Rejected`.
+        if dated {
+            WarrenControlMessage::SetupRefused {
+                reason_code: warrenguard_multihop::SetupRefusalCode::Unspecified.code(),
+            }
+        } else {
+            WarrenControlMessage::Rejected
+        }
     } else {
         WarrenControlMessage::IpAssign {
             ipv4: [10, 77, 0, 2],
@@ -957,6 +991,8 @@ pub(crate) fn spawn_fake_multihop_exit_on(
         tokens_in_use: Arc::new(parking_lot::Mutex::new(Vec::new())),
         tokens_invalid: Arc::new(parking_lot::Mutex::new(Vec::new())),
         predates_token_detail: Arc::new(AtomicBool::new(false)),
+        predates_dated_setup: Arc::new(AtomicBool::new(false)),
+        dated_setups: Arc::new(parking_lot::Mutex::new(Vec::new())),
         anchor_requests: Arc::new(parking_lot::Mutex::new(Vec::new())),
         anchor_script: Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
         route_reply: Arc::new(parking_lot::Mutex::new(None)),
@@ -1028,6 +1064,8 @@ pub(crate) fn spawn_fake_multihop_exit_on(
         tokens_in_use: behaviour.tokens_in_use,
         tokens_invalid: behaviour.tokens_invalid,
         predates_token_detail: behaviour.predates_token_detail,
+        predates_dated_setup: behaviour.predates_dated_setup,
+        dated_setups: behaviour.dated_setups,
         anchor_requests: behaviour.anchor_requests,
         anchor_script: behaviour.anchor_script,
         route_reply: behaviour.route_reply,
