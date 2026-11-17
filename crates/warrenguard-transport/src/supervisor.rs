@@ -123,6 +123,14 @@ pub type PathRttObserver = Arc<dyn Fn([u8; 32], u32) + Send + Sync>;
 /// for a stack.
 pub type SessionTokenProvider = Arc<dyn Fn() -> Vec<SessionToken> + Send + Sync>;
 
+/// The wall clock, in Unix seconds, a dated setup request carries. An exit
+/// refuses a time further than [`warrenguard_multihop::SETUP_CLOCK_SKEW_SECS`]
+/// from its own clock, so a consumer that already corrects its signed API
+/// calls from the server's clock hands the same corrected source here; the
+/// raw device clock would turn a device a few minutes off, which the API
+/// accepts, into a refusal at every exit.
+pub type SetupClock = Arc<dyn Fn() -> u64 + Send + Sync>;
+
 /// How the supervisor's sessions are admitted at the exit. Set with
 /// [`MultiHopSupervisor::with_session_admission`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -449,6 +457,18 @@ pub struct SupervisorConfig {
     /// the same anonymous serial and sticky IP. `None` keeps the v6
     /// wallet-signed `IpRequest` + PoP path.
     pub session_token_provider: Option<SessionTokenProvider>,
+    /// The clock a dated setup request is stamped with ([`SetupClock`]).
+    /// `None` reads the device clock.
+    pub setup_clock: Option<SetupClock>,
+}
+
+impl SupervisorConfig {
+    /// The time a dated setup request carries now.
+    fn setup_unix_secs(&self) -> u64 {
+        self.setup_clock
+            .as_ref()
+            .map_or_else(warrenguard_config::unix_now, |clock| clock())
+    }
 }
 
 /// The exit-defining half of a circuit: which relay (first hop) to dial
@@ -2005,7 +2025,7 @@ impl MultiHopSupervisor {
                 MultiHopError::RouteRefused(crate::route_anchor::RouteRefusal::AnchorUnavailable)
             })?;
             let request = if dated {
-                crate::multihop::dated_route_request(request, warrenguard_config::unix_now())
+                crate::multihop::dated_route_request(request, config.setup_unix_secs())
             } else {
                 request
             };
@@ -2019,6 +2039,7 @@ impl MultiHopSupervisor {
                     config.enable_daita,
                     session_token.as_ref().map(std::slice::from_ref),
                     prefer_ipv4,
+                    config.setup_unix_secs(),
                 )
                 .await;
         }
@@ -3110,6 +3131,7 @@ mod tests {
             on_dial_refused: None,
             on_path_rtt: None,
             session_token_provider: None,
+            setup_clock: None,
         }
     }
 
@@ -3878,6 +3900,7 @@ mod run_tests {
             on_dial_refused: None,
             on_path_rtt: None,
             session_token_provider: None,
+            setup_clock: None,
         }
     }
 
@@ -6113,6 +6136,161 @@ mod run_tests {
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
 
+    /// Run a supervisor against `exit` until it gives up, and return its
+    /// verdict, what it surfaced on the fatal channel, and which setups were
+    /// dated.
+    async fn refused_run(
+        exit: &FakeMultihopExit,
+        config: SupervisorConfig,
+    ) -> (
+        Result<(), MultiHopError>,
+        Option<RejectionReason>,
+        Vec<bool>,
+    ) {
+        let (supervisor, _rx) = MultiHopSupervisor::new(config);
+        let mut fatal_rx = supervisor.fatal_rx();
+        let result = tokio::time::timeout(Duration::from_secs(10), supervisor.run())
+            .await
+            .expect("a refusal ends the run");
+        let fatal = *fatal_rx.borrow_and_update();
+        (result, fatal, exit.dated_setups.lock().clone())
+    }
+
+    #[tokio::test]
+    async fn a_clock_refusal_reaches_the_consumer_as_a_reselect_and_never_turns_legacy() {
+        let (operational_key, exit) = exit_holding(0x97, &[]);
+        *exit.refuse_dated_with.lock() =
+            Some(warrenguard_multihop::SetupRefusalCode::ClockSkew.code());
+        let config = config_with_fake_exit(&exit, &operational_key);
+
+        let (result, fatal, dated) = refused_run(&exit, config).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(MultiHopError::Rejected(RejectionReason::ClockSkew))
+            ),
+            "got {result:?}"
+        );
+        assert_eq!(fatal, Some(RejectionReason::ClockSkew));
+        assert_eq!(
+            RejectionReason::ClockSkew.retryability(),
+            warrenguard_wire::Retryability::RetryReselect,
+            "one exit's clock is not the device's verdict"
+        );
+        assert_eq!(
+            dated,
+            vec![true],
+            "SECURITY: a sealed refusal is no sign of an old exit, so no unbound retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replayed_setup_refusal_reaches_the_consumer_as_a_reselect_and_never_turns_legacy() {
+        let (operational_key, exit) = exit_holding(0x98, &[]);
+        *exit.refuse_dated_with.lock() =
+            Some(warrenguard_multihop::SetupRefusalCode::Replayed.code());
+        let config = config_with_fake_exit(&exit, &operational_key);
+
+        let (result, fatal, dated) = refused_run(&exit, config).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(MultiHopError::Rejected(RejectionReason::SetupReplayed))
+            ),
+            "got {result:?}"
+        );
+        assert_eq!(fatal, Some(RejectionReason::SetupReplayed));
+        assert_eq!(dated, vec![true]);
+    }
+
+    #[tokio::test]
+    async fn the_setup_is_dated_by_the_configured_clock() {
+        // A device whose clock is ten minutes behind, while the API corrected
+        // it: the consumer hands the engine the corrected clock.
+        let device_now = warrenguard_config::unix_now();
+        let exit_now = device_now + 600;
+
+        let (operational_key, exit) = exit_holding(0x99, &[]);
+        *exit.exit_clock_unix_secs.lock() = Some(exit_now);
+        let config = config_with_fake_exit(&exit, &operational_key);
+        let (result, fatal, _) = refused_run(&exit, config).await;
+        assert!(
+            matches!(
+                result,
+                Err(MultiHopError::Rejected(RejectionReason::ClockSkew))
+            ),
+            "the raw device clock is refused: got {result:?}"
+        );
+        assert_eq!(fatal, Some(RejectionReason::ClockSkew));
+
+        let (operational_key, exit) = exit_holding(0x9A, &[]);
+        *exit.exit_clock_unix_secs.lock() = Some(exit_now);
+        let mut config = config_with_fake_exit(&exit, &operational_key);
+        config.setup_clock = Some(Arc::new(move || exit_now));
+        let (supervisor, mut rx) = MultiHopSupervisor::new(config);
+        let task = tokio::spawn(supervisor.run());
+        let bundle = first_session(&mut rx).await;
+        assert_eq!(
+            *exit.dated_setups.lock(),
+            vec![true],
+            "the corrected clock is admitted at once"
+        );
+        drop(bundle);
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_bonded_session_at_an_exit_that_predates_the_dated_request_sends_every_leg_legacy() {
+        if bond_pinned_to_one_connection_by_env() {
+            eprintln!("skipped: WARREN_MULTIHOP_CONNS pins the bond to one connection");
+            return;
+        }
+        let (operational_key, exit) = exit_holding(0x9B, &[]);
+        exit.predates_dated_setup.store(true, Ordering::Relaxed);
+        let mut config = config_with_fake_exit(&exit, &operational_key);
+        config.n_connections = 2;
+        let (supervisor, mut rx) = MultiHopSupervisor::new(config);
+        let handle = supervisor.handle();
+        let task = tokio::spawn(supervisor.run());
+        let bundle = first_session(&mut rx).await;
+        let dated = exit.dated_setups.clone();
+        let setups = move |n: usize| {
+            let dated = dated.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while dated.lock().len() < n {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("the legs set up");
+            }
+        };
+
+        setups(3).await;
+        assert_eq!(
+            *exit.dated_setups.lock(),
+            vec![true, false, false],
+            "the background secondary follows its primary to the legacy request"
+        );
+
+        // The make-before-break dial bonds its secondaries inline, on its own
+        // path.
+        handle.overlap_reconnect();
+        setups(5).await;
+        assert_eq!(
+            *exit.dated_setups.lock(),
+            vec![true, false, false, false, false],
+            "so does the secondary of an overlap dial"
+        );
+        drop(bundle);
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
     #[tokio::test]
     async fn an_exit_that_predates_the_detailed_request_gets_the_same_token_plainly() {
         let (operational_key, exit) = exit_holding(0x93, &[]);
@@ -6474,6 +6652,7 @@ mod route_run_tests {
             on_dial_refused: None,
             on_path_rtt: None,
             session_token_provider: None,
+            setup_clock: None,
         }
     }
 

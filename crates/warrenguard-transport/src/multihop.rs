@@ -2584,6 +2584,8 @@ impl MultiHopClient {
     /// the keys this client announces and refuses a frame captured on the
     /// way; it never answers it with the plain `Rejected`, which therefore
     /// means an exit that predates it: send that exit the legacy request.
+    /// `client_unix_secs` is the time it carries: the clock the consumer
+    /// trusts, corrected from the server's when it corrects its API calls.
     ///
     /// # Errors
     ///
@@ -2595,6 +2597,7 @@ impl MultiHopClient {
         wants_daita: bool,
         session_tokens: Option<&[SessionToken]>,
         prefer_ipv4: Option<std::net::Ipv4Addr>,
+        client_unix_secs: u64,
     ) -> Result<Vec<u8>, MultiHopError> {
         let request_msg = compose_setup_request(
             identity,
@@ -2604,7 +2607,7 @@ impl MultiHopClient {
             wants_daita,
             session_tokens,
             prefer_ipv4,
-            Some(warrenguard_config::unix_now()),
+            Some(client_unix_secs),
         );
         self.setup_over_stream_request(&request_msg).await
     }
