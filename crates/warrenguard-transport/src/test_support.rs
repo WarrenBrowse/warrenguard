@@ -489,6 +489,9 @@ pub(crate) struct FakeMultihopExit {
     /// `Some(code)`: every dated request that passes the clock is refused
     /// with this `SetupRefused` code.
     pub(crate) refuse_dated_with: Arc<parking_lot::Mutex<Option<u8>>>,
+    /// When set, the exit requires bound sessions: it answers every legacy
+    /// (undated) request with the plain `Rejected`.
+    pub(crate) require_bound: Arc<AtomicBool>,
     /// Every `RouteAnchorRequest` datagram this exit read, in arrival order.
     pub(crate) anchor_requests: Arc<parking_lot::Mutex<Vec<SeenAnchorRequest>>>,
     /// Answers to the next anchor requests, one per request, in order: an
@@ -623,6 +626,7 @@ struct FakeExitBehaviour {
     dated_setups: Arc<parking_lot::Mutex<Vec<bool>>>,
     exit_clock_unix_secs: Arc<parking_lot::Mutex<Option<u64>>>,
     refuse_dated_with: Arc<parking_lot::Mutex<Option<u8>>>,
+    require_bound: Arc<AtomicBool>,
     anchor_requests: Arc<parking_lot::Mutex<Vec<SeenAnchorRequest>>>,
     anchor_script: Arc<parking_lot::Mutex<std::collections::VecDeque<Option<u8>>>>,
     route_reply: Arc<parking_lot::Mutex<Option<WarrenControlMessage>>>,
@@ -744,7 +748,8 @@ async fn serve_one_fake_exit_connection(
             *behaviour.refuse_dated_with.lock()
         }
     });
-    let reply_msg = if predates_dated {
+    let reply_msg = if predates_dated || (!dated && behaviour.require_bound.load(Ordering::Relaxed))
+    {
         WarrenControlMessage::Rejected
     } else if let Some(reason_code) = dated_refusal {
         WarrenControlMessage::SetupRefused { reason_code }
@@ -1013,6 +1018,7 @@ pub(crate) fn spawn_fake_multihop_exit_on(
         dated_setups: Arc::new(parking_lot::Mutex::new(Vec::new())),
         exit_clock_unix_secs: Arc::new(parking_lot::Mutex::new(None)),
         refuse_dated_with: Arc::new(parking_lot::Mutex::new(None)),
+        require_bound: Arc::new(AtomicBool::new(false)),
         anchor_requests: Arc::new(parking_lot::Mutex::new(Vec::new())),
         anchor_script: Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
         route_reply: Arc::new(parking_lot::Mutex::new(None)),
@@ -1088,6 +1094,7 @@ pub(crate) fn spawn_fake_multihop_exit_on(
         dated_setups: behaviour.dated_setups,
         exit_clock_unix_secs: behaviour.exit_clock_unix_secs,
         refuse_dated_with: behaviour.refuse_dated_with,
+        require_bound: behaviour.require_bound,
         anchor_requests: behaviour.anchor_requests,
         anchor_script: behaviour.anchor_script,
         route_reply: behaviour.route_reply,

@@ -780,6 +780,11 @@ pub struct MultiHopSupervisor {
     /// they predate session binding (warren-core doc 116), so their setups
     /// send the legacy request.
     exits_predating_dated_setup: parking_lot::Mutex<std::collections::HashSet<ExitId>>,
+    /// Exits whose mark in `exits_predating_dated_setup` was cleared once
+    /// because they refused the legacy request: never cleared twice, so an
+    /// exit that really predates the dated request and refuses the account
+    /// costs one extra round trip, not a loop.
+    exits_retried_dated_setup: parking_lot::Mutex<std::collections::HashSet<ExitId>>,
 }
 
 /// Consecutive watchdog-forced redials, each of a session whose ENTIRE life
@@ -914,6 +919,7 @@ impl MultiHopSupervisor {
             lease_schedule: crate::lease_refresh::LeaseSchedule::DEFAULT,
             exits_predating_token_detail: parking_lot::Mutex::new(std::collections::HashSet::new()),
             exits_predating_dated_setup: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            exits_retried_dated_setup: parking_lot::Mutex::new(std::collections::HashSet::new()),
         };
         (supervisor, rx)
     }
@@ -1920,6 +1926,27 @@ impl MultiHopSupervisor {
             self.exits_predating_token_detail
                 .lock()
                 .insert(primary.exit_id());
+            return SetupOutcome::ExitPredatesRequest;
+        }
+
+        // The mark may predate an upgrade: an exit that now requires bound
+        // sessions answers the legacy wallet request with the same plain
+        // `Rejected` an account refusal gets. Ask it the dated request once
+        // more before reading the refusal as the account's. A token request
+        // is left to the token walk, where a plain refusal is an ordinary
+        // answer about one token.
+        if !dated
+            && session_token.is_none()
+            && Self::answered_plain_rejected(&setup_result)
+            && self
+                .exits_retried_dated_setup
+                .lock()
+                .insert(primary.exit_id())
+        {
+            tracing::info!("exit refused the legacy request; trying the dated request once more");
+            self.exits_predating_dated_setup
+                .lock()
+                .remove(&primary.exit_id());
             return SetupOutcome::ExitPredatesRequest;
         }
 
@@ -6134,6 +6161,73 @@ mod run_tests {
         drop(bundle);
         drop(rx);
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    #[tokio::test]
+    async fn an_exit_upgraded_since_it_was_marked_old_gets_the_dated_request_again() {
+        let (operational_key, exit) = exit_holding(0x9C, &[]);
+        exit.predates_dated_setup.store(true, Ordering::Relaxed);
+        let config = config_with_fake_exit(&exit, &operational_key);
+        let (supervisor, mut rx) = MultiHopSupervisor::new(config);
+        let fatal_rx = supervisor.fatal_rx();
+        let task = tokio::spawn(supervisor.run());
+        let bundle = first_session(&mut rx).await;
+        assert_eq!(*exit.dated_setups.lock(), vec![true, false]);
+
+        // The exit is upgraded and now requires bound sessions: the legacy
+        // request the mark sends gets the plain `Rejected`.
+        exit.predates_dated_setup.store(false, Ordering::Relaxed);
+        exit.require_bound.store(true, Ordering::Relaxed);
+        bundle.primary().force_close_for_reconnect();
+        let bundle = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                rx.changed().await.expect("watch sender alive");
+                if let Some(next) = rx.borrow_and_update().clone()
+                    && !Arc::ptr_eq(&next, &bundle)
+                {
+                    return next;
+                }
+            }
+        })
+        .await
+        .expect("the redial publishes a new session");
+
+        assert_eq!(
+            *exit.dated_setups.lock(),
+            vec![true, false, false, true],
+            "the refused legacy request clears the mark, and the dated one is admitted"
+        );
+        assert!(
+            fatal_rx.borrow().is_none(),
+            "an upgraded exit is not a refusal of the account"
+        );
+        drop(bundle);
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    #[tokio::test]
+    async fn a_legacy_refusal_at_an_exit_that_really_predates_the_dated_request_stays_fatal() {
+        let (operational_key, exit) = exit_holding(0x9D, &[]);
+        exit.predates_dated_setup.store(true, Ordering::Relaxed);
+        exit.reject.store(true, Ordering::Relaxed);
+        let config = config_with_fake_exit(&exit, &operational_key);
+
+        let (result, fatal, dated) = refused_run(&exit, config).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(MultiHopError::Rejected(RejectionReason::NotAllowlisted))
+            ),
+            "got {result:?}"
+        );
+        assert_eq!(fatal, Some(RejectionReason::NotAllowlisted));
+        assert_eq!(
+            dated,
+            vec![true, false, true, false],
+            "the dated request is tried once more, then the refusal stands"
+        );
     }
 
     /// Run a supervisor against `exit` until it gives up, and return its
