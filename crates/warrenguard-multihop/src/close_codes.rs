@@ -120,10 +120,11 @@ pub enum RejectionReason {
     /// (code `1`). [`warrenguard_wire::Retryability::RetryReselect`], not
     /// fatal: the wrong clock may be this exit's, and one such exit must not
     /// stop every client. The engine supervisor does not reselect itself, so
-    /// the consumer must: dial another exit, and only when a second exit also
-    /// answers `ClockSkew` stop with
-    /// [`warrenguard_wire::FatalCause::ClockSkew`] and tell the user to set
-    /// the device clock to automatic (never an account message). The time the
+    /// the consumer must, and [`ClockSkewTally`] carries the rule: record
+    /// each `ClockSkew` with its exit and follow the verdict, which turns into
+    /// [`warrenguard_wire::FatalCause::ClockSkew`] once a second, different
+    /// exit refused; the consumer then tells the user to set the device clock
+    /// to automatic (never an account message). The time the
     /// client sends comes from `SupervisorConfig::setup_clock`, which a
     /// consumer that corrects its clock from the API should wire to the same
     /// source.
@@ -271,6 +272,51 @@ impl RejectionReason {
     }
 }
 
+/// The rule that turns [`RejectionReason::ClockSkew`] into a verdict on the
+/// device: one exit refusing the clock may be that exit's own clock, two
+/// different exits refusing it mean the device's is wrong. A supervisor lives
+/// for one connection and cannot count exits, so the consumer keeps one tally
+/// across its redials, records every `ClockSkew` with the exit that answered
+/// it, and calls [`Self::admitted`] on every admitted setup.
+#[derive(Debug, Clone, Default)]
+pub struct ClockSkewTally {
+    first: Option<warrenguard_wire::ExitId>,
+    blamed: bool,
+}
+
+impl ClockSkewTally {
+    /// No refusal recorded.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that `exit` refused the setup for its time, and return what
+    /// the consumer does next: reselect while a single exit refused it,
+    /// [`warrenguard_wire::FatalCause::ClockSkew`] once a second, different
+    /// exit did (and until [`Self::admitted`]).
+    #[must_use]
+    pub fn record(&mut self, exit: warrenguard_wire::ExitId) -> warrenguard_wire::Retryability {
+        use warrenguard_wire::{FatalCause, Retryability};
+        match self.first {
+            Some(first) if first != exit => self.blamed = true,
+            Some(_) => {}
+            None => self.first = Some(exit),
+        }
+        if self.blamed {
+            Retryability::Fatal(FatalCause::ClockSkew)
+        } else {
+            Retryability::RetryReselect
+        }
+    }
+
+    /// A setup was admitted: the clock was good enough for that exit, so
+    /// earlier refusals no longer count.
+    pub fn admitted(&mut self) {
+        *self = Self::default();
+    }
+}
+
 impl core::fmt::Display for RejectionReason {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(self.as_str())
@@ -281,6 +327,35 @@ impl core::fmt::Display for RejectionReason {
 mod tests {
     use super::*;
     use crate::WarrenControlMessage;
+
+    #[test]
+    fn the_clock_is_blamed_only_once_two_different_exits_refused_it() {
+        use warrenguard_wire::{ExitId, FatalCause, Retryability};
+        let (a, b, c) = (
+            ExitId::from_bytes([0xA1; 16]),
+            ExitId::from_bytes([0xB2; 16]),
+            ExitId::from_bytes([0xC3; 16]),
+        );
+        let mut tally = ClockSkewTally::new();
+        assert_eq!(tally.record(a), Retryability::RetryReselect);
+        assert_eq!(
+            tally.record(a),
+            Retryability::RetryReselect,
+            "the same exit twice is still one exit's clock"
+        );
+        assert_eq!(
+            tally.record(b),
+            Retryability::Fatal(FatalCause::ClockSkew),
+            "a second exit says the same: the device clock is wrong"
+        );
+        assert_eq!(tally.record(c), Retryability::Fatal(FatalCause::ClockSkew));
+        tally.admitted();
+        assert_eq!(
+            tally.record(b),
+            Retryability::RetryReselect,
+            "an admitted setup proved the clock good somewhere: start over"
+        );
+    }
 
     #[test]
     fn every_rejection_reason_closes_with_the_same_opaque_code() {

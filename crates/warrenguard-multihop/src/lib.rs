@@ -67,8 +67,8 @@ mod pq_session;
 mod xwing;
 
 pub use close_codes::{
-    RejectionReason, WARREN_MH_DRAINING, WARREN_MH_FORCED_RECONNECT, WARREN_MH_LEASE_EXPIRED,
-    WARREN_MH_REJECTED,
+    ClockSkewTally, RejectionReason, WARREN_MH_DRAINING, WARREN_MH_FORCED_RECONNECT,
+    WARREN_MH_LEASE_EXPIRED, WARREN_MH_REJECTED,
 };
 pub use control::{
     CONTROL_FIRST_BYTE, CONTROL_VERSION_V3, ControlError, PopSignature, WarrenControlMessage,

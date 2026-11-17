@@ -68,7 +68,8 @@ pub enum FatalCause {
     /// admitted, so the user is told to fix it rather than to renew. The
     /// engine's own verdict on one exit's clock refusal is a reselect (that
     /// exit's clock may be the wrong one): a consumer reaches this cause once
-    /// a second exit refused the same way.
+    /// a second exit refused the same way, which `ClockSkewTally` in
+    /// `warrenguard-multihop` counts across redials.
     ClockSkew,
 }
 

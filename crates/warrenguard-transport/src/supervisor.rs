@@ -1253,7 +1253,7 @@ impl MultiHopSupervisor {
                         reason = walked_stack_verdict(reason, &stack);
                     }
                     let _ = self.fatal_tx.send(Some(reason));
-                    tracing::warn!(%reason, "multi-hop session rejected by exit at setup; surfacing fatal");
+                    tracing::warn!(%reason, "multi-hop session rejected by exit at setup; ending the run for the consumer to decide");
                     return Err(MultiHopError::Rejected(reason));
                 }
                 SetupOutcome::ExitPredatesRequest => {
@@ -1573,7 +1573,7 @@ impl MultiHopSupervisor {
                 }
                 if let Some(reason) = multihop::rejection_from_conn_error(&close_err) {
                     let _ = self.fatal_tx.send(Some(reason));
-                    tracing::warn!(%reason, "multi-hop session rejected by exit; surfacing fatal");
+                    tracing::warn!(%reason, "multi-hop session rejected by exit; ending the run for the consumer to decide");
                     bundle.force_close_for_reconnect();
                     let _ = self.tx.send(None);
                     return Err(MultiHopError::Rejected(reason));
