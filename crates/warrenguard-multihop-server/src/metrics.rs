@@ -830,6 +830,137 @@ impl LeaseRefreshSnapshot {
     }
 }
 
+/// One event of setup freshness or session binding on this exit (warren-core
+/// doc 116), the `result` label of `warren_exit_setup_freshness_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SetupFreshnessResult {
+    /// A dated setup passed the clock and replay checks: its connection is
+    /// bound.
+    Dated,
+    /// A legacy (undated) setup was let through under the accept-legacy
+    /// policy: its connection is unbound. The series that must reach zero
+    /// before enforcement.
+    Legacy,
+    /// A dated setup was refused: its time is too far from the exit's clock.
+    ClockSkew,
+    /// A dated setup was refused: its key was already seen.
+    Replayed,
+    /// A dated setup was refused because the recent-key set was full.
+    Saturated,
+    /// A legacy setup was refused under the require-bound policy.
+    LegacyRefused,
+    /// A rekey announcement authorized a new key on a bound connection.
+    RekeyBound,
+    /// A rekey announcement was ignored (unbound connection, or an epoch that
+    /// does not follow the frame's).
+    RekeyIgnored,
+}
+
+impl SetupFreshnessResult {
+    const LABELS: [&'static str; 8] = [
+        "dated",
+        "legacy",
+        "clock_skew",
+        "replayed",
+        "saturated",
+        "legacy_refused",
+        "rekey_bound",
+        "rekey_ignored",
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Dated => 0,
+            Self::Legacy => 1,
+            Self::ClockSkew => 2,
+            Self::Replayed => 3,
+            Self::Saturated => 4,
+            Self::LegacyRefused => 5,
+            Self::RekeyBound => 6,
+            Self::RekeyIgnored => 7,
+        }
+    }
+}
+
+/// Node-wide accounting of setup freshness and session binding:
+/// `warren_exit_setup_freshness_total{result}`.
+///
+/// Same privacy contract as every block here: counters only, never a key or a
+/// label naming a client.
+#[derive(Debug)]
+pub struct SetupFreshnessMetrics {
+    counts: [AtomicU64; 8],
+}
+
+static SETUP_FRESHNESS: SetupFreshnessMetrics = SetupFreshnessMetrics::new();
+
+/// The process-wide setup freshness block.
+#[must_use]
+pub fn setup_freshness_metrics() -> &'static SetupFreshnessMetrics {
+    &SETUP_FRESHNESS
+}
+
+/// Point-in-time read of the process-wide setup freshness block.
+#[must_use]
+pub fn setup_freshness_snapshot() -> SetupFreshnessSnapshot {
+    SETUP_FRESHNESS.snapshot()
+}
+
+impl Default for SetupFreshnessMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SetupFreshnessMetrics {
+    /// A zeroed block.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            counts: [const { AtomicU64::new(0) }; 8],
+        }
+    }
+
+    /// Counts one event. Public so a deployer's exposition can be tested
+    /// against a block it filled itself.
+    pub fn record(&self, result: SetupFreshnessResult) {
+        self.counts[result.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Reads every counter.
+    #[must_use]
+    pub fn snapshot(&self) -> SetupFreshnessSnapshot {
+        SetupFreshnessSnapshot {
+            counts: self.counts.each_ref().map(|a| a.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+/// A point-in-time view of [`SetupFreshnessMetrics`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SetupFreshnessSnapshot {
+    counts: [u64; 8],
+}
+
+impl SetupFreshnessSnapshot {
+    /// `warren_exit_setup_freshness_total{result}`.
+    #[must_use]
+    pub fn by_result(&self) -> [(&'static str, u64); 8] {
+        let mut out = [("", 0); 8];
+        for (i, label) in SetupFreshnessResult::LABELS.iter().enumerate() {
+            out[i] = (label, self.counts[i]);
+        }
+        out
+    }
+
+    /// One counter.
+    #[must_use]
+    pub const fn count(&self, result: SetupFreshnessResult) -> u64 {
+        self.counts[result.index()]
+    }
+}
+
 /// How one setup was admitted or refused, by the kind of admission the client
 /// asked for: wallet-signed (`IpRequest`) or anonymous token (`IpRequestV7`).
 /// Route setups have their own block ([`RouteAdmissionMetrics`]).
@@ -1071,6 +1202,45 @@ impl UplinkSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_freshness_result_counts_under_its_own_label() {
+        let block = SetupFreshnessMetrics::new();
+        let all = [
+            SetupFreshnessResult::Dated,
+            SetupFreshnessResult::Legacy,
+            SetupFreshnessResult::ClockSkew,
+            SetupFreshnessResult::Replayed,
+            SetupFreshnessResult::Saturated,
+            SetupFreshnessResult::LegacyRefused,
+            SetupFreshnessResult::RekeyBound,
+            SetupFreshnessResult::RekeyIgnored,
+        ];
+        for (times, result) in all.iter().enumerate() {
+            for _ in 0..=times {
+                block.record(*result);
+            }
+        }
+        let snapshot = block.snapshot();
+        let by_result = snapshot.by_result();
+        for (i, result) in all.iter().enumerate() {
+            assert_eq!(snapshot.count(*result), i as u64 + 1);
+            assert_eq!(by_result[i].1, i as u64 + 1);
+        }
+        assert_eq!(
+            by_result.map(|(label, _)| label),
+            [
+                "dated",
+                "legacy",
+                "clock_skew",
+                "replayed",
+                "saturated",
+                "legacy_refused",
+                "rekey_bound",
+                "rekey_ignored"
+            ]
+        );
+    }
 
     /// A pump reading with every field distinct, so a fold that crosses two
     /// counters is caught rather than averaging out.

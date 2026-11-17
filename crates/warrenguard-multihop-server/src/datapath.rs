@@ -337,6 +337,15 @@ pub(crate) enum UplinkKind {
     /// handler with the token it carries, if any. Every other control frame
     /// is dropped.
     LeaseRefresh(Option<Box<warrenguard_wire::SessionToken>>),
+    /// A `SessionRekey`: never forwarded, handed to the connection's binding,
+    /// which accepts the key it names for the epoch it names when the
+    /// connection is bound.
+    SessionRekey {
+        /// The key of the announced epoch.
+        new_encapsulated_key: warrenguard_multihop::EncapsulatedKeyBytes,
+        /// The announced epoch.
+        new_epoch: u32,
+    },
     /// DAITA cover traffic. Dropped by design, before the TUN.
     DaitaDummy,
 }
@@ -361,6 +370,15 @@ pub(crate) fn classify_uplink(plaintext: &[u8]) -> UplinkKind {
         }
         Ok(Some(warrenguard_multihop::WarrenControlMessage::LeaseRefresh { session_token })) => {
             return UplinkKind::LeaseRefresh(session_token);
+        }
+        Ok(Some(warrenguard_multihop::WarrenControlMessage::SessionRekey {
+            new_encapsulated_key,
+            new_epoch,
+        })) => {
+            return UplinkKind::SessionRekey {
+                new_encapsulated_key,
+                new_epoch,
+            };
         }
         Ok(Some(_)) => return UplinkKind::ControlFrame,
         Err(e) => {
@@ -746,6 +764,10 @@ pub(crate) struct RxReport {
     pub(crate) pool_drops: u64,
     pub(crate) rate_drops: u64,
     pub(crate) tun_write_errs: u64,
+    /// The share of `session_errs` a bound connection dropped because the
+    /// frame's key was not one the client authorized (doc 116). Reported in
+    /// the pump's own line only: node-wide it is a session miss.
+    pub(crate) unbound_keys: u64,
     /// What this pump has already folded into the node-wide block, so a
     /// publication carries the delta and the node counters stay monotonic.
     pub(crate) published: RxCounters,
@@ -774,6 +796,7 @@ impl RxReport {
             pool_drops: 0,
             rate_drops: 0,
             tun_write_errs: 0,
+            unbound_keys: 0,
             published: RxCounters::default(),
             last_report: Instant::now(),
             label,
@@ -833,6 +856,7 @@ impl RxReport {
             exit_id_mismatches = self.exit_id_mismatches,
             session_errs = self.session_errs,
             session_evicted = self.session_evicted,
+            unbound_keys = self.unbound_keys,
             open_errs = self.open_errs,
             dummies = self.dummies,
             control_frames = self.control_frames,

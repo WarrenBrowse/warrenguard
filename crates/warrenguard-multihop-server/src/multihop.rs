@@ -66,10 +66,12 @@ use crate::datapath::{
 use crate::ip_pool::{ConnId, IpAllocator, IpAllocatorV6, SessionIntent, SessionIntentV6};
 use crate::metrics::{EvictReason, SetupAdmission};
 
+mod binding;
 mod lease;
 mod route;
 mod wallet;
 
+pub use binding::SessionBindingPolicy;
 pub use lease::StaleLease;
 
 /// Retain anti-replay windows for at most this many recent epochs. Rekeys are
@@ -294,19 +296,36 @@ fn classify_admission(
     let Some(allowlist) = allowlist else {
         return Admission::Admitted;
     };
-    let (asserted, pop_sig) = match control_msg {
+    // Strict mode: no pubkey or no possession proof = no egress. A dated
+    // request proves possession under the `/v3` context, which covers its
+    // time; a `/v2` signature never verifies there.
+    let (pubkey, possession_proven) = match control_msg {
         Some(WarrenControlMessage::IpRequest {
-            client_pubkey,
-            pop_sig,
+            client_pubkey: Some(pubkey),
+            pop_sig: Some(sig),
             ..
-        }) => (*client_pubkey, *pop_sig),
-        _ => (None, None),
+        }) => (
+            *pubkey,
+            warrenguard_multihop::verify_pop(pubkey, exit_id, encapsulated_key, sig),
+        ),
+        Some(WarrenControlMessage::IpRequestDated {
+            client_pubkey: Some(pubkey),
+            pop_sig: Some(sig),
+            client_unix_secs,
+            ..
+        }) => (
+            *pubkey,
+            warrenguard_multihop::verify_pop_v3(
+                pubkey,
+                exit_id,
+                encapsulated_key,
+                *client_unix_secs,
+                sig,
+            ),
+        ),
+        _ => return Admission::NotAuthorized,
     };
-    let (Some(pubkey), Some(sig)) = (asserted, pop_sig) else {
-        // Strict mode: no pubkey or no possession proof = no egress.
-        return Admission::NotAuthorized;
-    };
-    if !warrenguard_multihop::verify_pop(&pubkey, exit_id, encapsulated_key, &sig) {
+    if !possession_proven {
         return Admission::NotAuthorized;
     }
     let wpk = WarrenPubkey::from_bytes(pubkey);
@@ -404,7 +423,8 @@ async fn reply_sealed_detail_then_close(
 /// a failed setup, presenting the same token again instead of its next one.
 fn token_refusal_detail(request: &WarrenControlMessage, in_use: bool) -> WarrenControlMessage {
     match request {
-        WarrenControlMessage::IpRequestV7Detailed { .. } => {
+        WarrenControlMessage::IpRequestV7Detailed { .. }
+        | WarrenControlMessage::IpRequestV7Dated { .. } => {
             let code = if in_use {
                 warrenguard_multihop::TokenRejectCode::SerialInUse
             } else {
@@ -414,6 +434,23 @@ fn token_refusal_detail(request: &WarrenControlMessage, in_use: bool) -> WarrenC
                 reason_code: code.code(),
             }
         }
+        _ => WarrenControlMessage::Rejected,
+    }
+}
+
+/// The refusal a legacy (undated) setup gets under
+/// [`SessionBindingPolicy::RequireBound`]: the answer its sender already reads
+/// as a policy refusal, never a variant it predates.
+fn legacy_refusal_detail(request: Option<&WarrenControlMessage>) -> WarrenControlMessage {
+    match request {
+        Some(WarrenControlMessage::IpRequestV7Detailed { .. }) => {
+            WarrenControlMessage::TokenRejected {
+                reason_code: warrenguard_multihop::TokenRejectCode::Unspecified.code(),
+            }
+        }
+        Some(WarrenControlMessage::IpRequestRoute { .. }) => WarrenControlMessage::RouteRejected {
+            reason_code: warrenguard_multihop::RouteRejectCode::Unspecified.code(),
+        },
         _ => WarrenControlMessage::Rejected,
     }
 }
@@ -454,6 +491,12 @@ fn serial_held_by_another_session(
 struct ConnSetup {
     /// HPKE session derived from the setup frame's `encapsulated_key`.
     session: Arc<ExitSession>,
+    /// The setup frame's key, the first one a bound connection accepts.
+    /// Identity material: never logged.
+    encapsulated_key: EncapsulatedKeyBytes,
+    /// Whether the setup was dated: the data plane then accepts only the keys
+    /// the client authorized (doc 116).
+    bound: bool,
     /// Epoch of the setup frame (the pump installs `(session, epoch)`
     /// into the shared `current` slot before pumping).
     epoch: u32,
@@ -502,6 +545,8 @@ struct ConnSetupPq {
     /// before the exit sealed its reply, so it may pick the entry the pump's
     /// keepalive refreshes. Identity material: never logged.
     encapsulated_key: EncapsulatedKeyBytes,
+    /// See [`ConnSetup::bound`].
+    bound: bool,
     epoch: u32,
     assigned_ip: Ipv4Addr,
     assigned_ip_v6: Option<Ipv6Addr>,
@@ -617,11 +662,14 @@ impl SetupTermination {
         revocation_guard: Option<SessionGuard>,
         wants_daita: bool,
         session_rate_key: Option<SessionRateKey>,
+        bound: bool,
     ) -> SetupOutcome {
         let session_key = revocation_guard.as_ref().map(|guard| guard.key);
         match self {
             Self::V1 { session, frame, .. } => SetupOutcome::V1(ConnSetup {
                 session,
+                encapsulated_key: frame.encapsulated_key,
+                bound,
                 epoch: frame.epoch,
                 assigned_ip,
                 assigned_ip_v6,
@@ -634,6 +682,7 @@ impl SetupTermination {
             Self::V2 { session, frame, .. } => SetupOutcome::V2(ConnSetupPq {
                 session,
                 encapsulated_key: frame.encapsulated_key,
+                bound,
                 epoch: frame.epoch,
                 assigned_ip,
                 assigned_ip_v6,
@@ -749,6 +798,7 @@ async fn accept_setup_stream(
     wallet_gate: Option<&Arc<dyn WalletSessionGate>>,
     route_admitter: Option<&route::RouteGate>,
     offered_daita: Option<&warrenguard_wire::DaitaConfig>,
+    freshness: &binding::SetupFreshness,
     #[cfg(feature = "pq-hpke")] pq: Option<&PqSetup>,
 ) -> Option<SetupOutcome> {
     let (send, mut recv) = match conn.accept_bi().await {
@@ -784,6 +834,7 @@ async fn accept_setup_stream(
         wallet_gate,
         route_admitter,
         offered_daita,
+        freshness,
         #[cfg(feature = "pq-hpke")]
         pq,
     )
@@ -824,6 +875,7 @@ async fn process_setup_frame(
     wallet_gate: Option<&Arc<dyn WalletSessionGate>>,
     route_admitter: Option<&route::RouteGate>,
     offered_daita: Option<&warrenguard_wire::DaitaConfig>,
+    freshness: &binding::SetupFreshness,
     #[cfg(feature = "pq-hpke")] pq: Option<&PqSetup>,
 ) -> Option<SetupOutcome> {
     let term = build_setup_termination(
@@ -858,7 +910,76 @@ async fn process_setup_frame(
     let control_msg = warrenguard_multihop::try_decode_control(&plaintext)
         .ok()
         .flatten();
-    let is_wallet_request = matches!(control_msg, Some(WarrenControlMessage::IpRequest { .. }));
+    let is_wallet_request = matches!(
+        control_msg,
+        Some(WarrenControlMessage::IpRequest { .. } | WarrenControlMessage::IpRequestDated { .. })
+    );
+
+    // Freshness, before any admission work: a dated setup too far from this
+    // exit's clock, or whose key this exit already saw, is refused, and the
+    // connection of one that passes is bound (doc 116). The time sits inside
+    // the sealed plaintext, so the holder of a captured frame cannot re-date
+    // it without a new key.
+    let dated_at = control_msg
+        .as_ref()
+        .and_then(WarrenControlMessage::setup_unix_secs);
+    let bound = dated_at.is_some();
+    let freshness_metrics = crate::metrics::setup_freshness_metrics();
+    match dated_at {
+        Some(client_unix_secs) => {
+            use crate::metrics::SetupFreshnessResult as R;
+            use warrenguard_multihop::SetupRefusalCode as C;
+            let refusal = if !warrenguard_multihop::within_setup_skew(
+                client_unix_secs,
+                warrenguard_config::unix_now(),
+            ) {
+                Some((R::ClockSkew, C::ClockSkew))
+            } else {
+                match freshness.recent.claim(&encapsulated_key) {
+                    binding::Claim::Fresh => None,
+                    binding::Claim::Seen => Some((R::Replayed, C::Replayed)),
+                    binding::Claim::Saturated => Some((R::Saturated, C::Unspecified)),
+                }
+            };
+            if let Some((result, code)) = refusal {
+                freshness_metrics.record(result);
+                tracing::debug!(
+                    reason = code.as_str(),
+                    "multihop: dated setup refused; sealed detail + opaque close"
+                );
+                reply_sealed_detail_then_close(
+                    &mut send,
+                    &term,
+                    epoch,
+                    reverse_seq,
+                    conn,
+                    &WarrenControlMessage::SetupRefused {
+                        reason_code: code.code(),
+                    },
+                )
+                .await;
+                return None;
+            }
+            freshness_metrics.record(R::Dated);
+        }
+        None if freshness.policy == SessionBindingPolicy::RequireBound => {
+            freshness_metrics.record(crate::metrics::SetupFreshnessResult::LegacyRefused);
+            tracing::debug!(
+                "multihop: undated setup refused, binding is required; sealed detail + opaque close"
+            );
+            reply_sealed_detail_then_close(
+                &mut send,
+                &term,
+                epoch,
+                reverse_seq,
+                conn,
+                &legacy_refusal_detail(control_msg.as_ref()),
+            )
+            .await;
+            return None;
+        }
+        None => freshness_metrics.record(crate::metrics::SetupFreshnessResult::Legacy),
+    }
 
     // Cold-start grace (deploy / reboot / fresh immutable host with no
     // disk cache): the in-memory allowlist is empty until the refresh
@@ -907,12 +1028,21 @@ async fn process_setup_frame(
         //  - route `IpRequestRoute`: admitted against the device's anchored
         //    main session through the injected `RouteAdmitter`; the route
         //    serial becomes the sticky key. No admitter: not offered.
-        Some(WarrenControlMessage::IpRequestRoute {
-            prefer_ipv4,
-            wants_ipv6,
-            route_locator,
-            wants_daita,
-        }) => {
+        Some(
+            WarrenControlMessage::IpRequestRoute {
+                prefer_ipv4,
+                wants_ipv6,
+                route_locator,
+                wants_daita,
+            }
+            | WarrenControlMessage::IpRequestRouteDated {
+                prefer_ipv4,
+                wants_ipv6,
+                route_locator,
+                wants_daita,
+                ..
+            },
+        ) => {
             // A route the deployer could never renew (no registry to list
             // it) is not offered either.
             let verdict = match (route_admitter, session_registry) {
@@ -975,6 +1105,13 @@ async fn process_setup_frame(
                 wants_ipv6,
                 wants_daita,
                 prefer_ipv4,
+            }
+            | WarrenControlMessage::IpRequestV7Dated {
+                session_tokens,
+                wants_ipv6,
+                wants_daita,
+                prefer_ipv4,
+                ..
             }),
         ) => {
             let admitted = match token_admitter {
@@ -1056,6 +1193,18 @@ async fn process_setup_frame(
                             );
                             WarrenControlMessage::RejectedBanned { reason_code }
                         }
+                        // A dated request is never answered with the plain
+                        // `Rejected`: its sender reads that as an exit that
+                        // predates it and retries with the legacy request.
+                        _ if bound => {
+                            tracing::debug!(
+                                "multihop: dated setup rejected - client not authorized; sealed detail + opaque close"
+                            );
+                            WarrenControlMessage::SetupRefused {
+                                reason_code: warrenguard_multihop::SetupRefusalCode::Unspecified
+                                    .code(),
+                            }
+                        }
                         _ => {
                             tracing::debug!(
                                 "multihop: setup rejected - client not authorized; sealed detail + opaque close"
@@ -1076,13 +1225,22 @@ async fn process_setup_frame(
                 }
             }
             let pk = match other {
-                Some(WarrenControlMessage::IpRequest {
-                    client_pubkey,
-                    wants_ipv6,
-                    wants_daita,
-                    prefer_ipv4,
-                    ..
-                }) => (*client_pubkey, *wants_ipv6, *wants_daita, *prefer_ipv4),
+                Some(
+                    WarrenControlMessage::IpRequest {
+                        client_pubkey,
+                        wants_ipv6,
+                        wants_daita,
+                        prefer_ipv4,
+                        ..
+                    }
+                    | WarrenControlMessage::IpRequestDated {
+                        client_pubkey,
+                        wants_ipv6,
+                        wants_daita,
+                        prefer_ipv4,
+                        ..
+                    },
+                ) => (*client_pubkey, *wants_ipv6, *wants_daita, *prefer_ipv4),
                 _ => (None, false, false, None),
             };
             (pk.0, pk.1, pk.2, None, pk.3)
@@ -1286,6 +1444,7 @@ async fn process_setup_frame(
         revocation_guard,
         wants_daita,
         session_rate_key,
+        bound,
     ))
 }
 
@@ -1311,6 +1470,7 @@ async fn run_setup(
     wallet_gate: Option<&Arc<dyn WalletSessionGate>>,
     route_admitter: Option<&route::RouteGate>,
     offered_daita: Option<&warrenguard_wire::DaitaConfig>,
+    freshness: &binding::SetupFreshness,
     #[cfg(feature = "pq-hpke")] pq: Option<&PqSetup>,
 ) -> Option<SetupOutcome> {
     match source {
@@ -1332,6 +1492,7 @@ async fn run_setup(
                 wallet_gate,
                 route_admitter,
                 offered_daita,
+                freshness,
                 #[cfg(feature = "pq-hpke")]
                 pq,
             )
@@ -1357,6 +1518,7 @@ async fn run_setup(
                 wallet_gate,
                 route_admitter,
                 offered_daita,
+                freshness,
                 #[cfg(feature = "pq-hpke")]
                 pq,
             )
@@ -4214,6 +4376,9 @@ pub struct ExitTerminateCtx<T: PacketDevice + Clone> {
     /// every existing entry point) runs the pumps with zero rate-limit
     /// overhead.
     session_rate: Option<SessionRatePolicy>,
+    /// Exit-wide setup freshness state (the recent setup keys) and the
+    /// session binding policy. See [`Self::with_session_binding_policy`].
+    freshness: binding::SetupFreshness,
     /// Post-quantum (`/v2` X-Wing) session cache. Always built when the crate is
     /// compiled with `pq-hpke`; it only ever holds entries once an X-Wing secret
     /// is also attached (see `xwing_secret`).
@@ -4274,6 +4439,7 @@ impl<T: PacketDevice + Clone> ExitTerminateCtx<T> {
             wallet_gate: None,
             route_admitter: None,
             session_rate: None,
+            freshness: binding::SetupFreshness::new(),
             #[cfg(feature = "pq-hpke")]
             pq_cache: Arc::new(PqSessionCache::new()),
             #[cfg(feature = "pq-hpke")]
@@ -4420,6 +4586,18 @@ impl<T: PacketDevice + Clone> ExitTerminateCtx<T> {
     #[must_use]
     pub fn with_route_admitter(mut self, admitter: Option<Arc<dyn RouteAdmitter>>) -> Self {
         self.route_admitter = admitter.map(route::RouteGate::new);
+        self
+    }
+
+    /// Set what the exit does with a setup that carries no time (doc 116).
+    /// [`SessionBindingPolicy::AcceptLegacy`] (the default) admits it unbound,
+    /// as every client before session binding needs;
+    /// [`SessionBindingPolicy::RequireBound`] refuses it, once a client floor
+    /// that sends dated requests is recorded. Dated setups are checked and
+    /// bound under either policy.
+    #[must_use]
+    pub fn with_session_binding_policy(mut self, policy: SessionBindingPolicy) -> Self {
+        self.freshness.policy = policy;
         self
     }
 
@@ -4591,6 +4769,7 @@ pub async fn terminate_connection<T>(
         ctx.wallet_gate.clone(),
         ctx.route_admitter.clone(),
         ctx.session_rate.clone(),
+        ctx.freshness.clone(),
         #[cfg(feature = "pq-hpke")]
         ctx.pq_setup(),
     )
@@ -4803,6 +4982,7 @@ async fn serve_terminating_connection<T>(
     wallet_gate: Option<Arc<dyn WalletSessionGate>>,
     route_admitter: Option<route::RouteGate>,
     session_rate: Option<SessionRatePolicy>,
+    freshness: binding::SetupFreshness,
     #[cfg(feature = "pq-hpke")] pq: Option<PqSetup>,
 ) where
     T: PacketDevice + Clone,
@@ -4850,6 +5030,7 @@ async fn serve_terminating_connection<T>(
         // the exact spec padding this exit's downlink, so client and exit
         // drive the same defense, one per direction.
         daita_config.as_ref(),
+        &freshness,
         #[cfg(feature = "pq-hpke")]
         pq.as_ref(),
     )
@@ -4916,6 +5097,12 @@ async fn serve_terminating_connection<T>(
     };
     let assigned_ip = setup.assigned_ip;
     let assigned_ip_v6 = setup.assigned_ip_v6;
+    // A bound connection's data plane accepts only the keys the client
+    // authorized; `None` keeps the historical any-key behaviour for a legacy
+    // client, which cannot announce its rekeys.
+    let mut accepted = setup
+        .bound
+        .then(|| binding::AcceptedKeys::seeded(setup.encapsulated_key, setup.epoch));
     let current: SharedCurrentSession = Arc::new(Mutex::new((setup.session, setup.epoch)));
 
     // Inbound-activity counter bumped by the RX task below; feeds the
@@ -5009,6 +5196,16 @@ async fn serve_terminating_connection<T>(
                 report.exit_id_mismatches += 1;
                 continue;
             }
+            // Before the cache: a key the client did not authorize builds no
+            // session and costs no decapsulation.
+            if accepted
+                .as_ref()
+                .is_some_and(|keys| !keys.admits(&frame.encapsulated_key, frame.epoch))
+            {
+                report.session_errs += 1;
+                report.unbound_keys += 1;
+                continue;
+            }
             let handle = match cache_rx.get_or_insert(&frame.encapsulated_key, || {
                 ExitSession::new(&privkey, &frame.encapsulated_key, exit_id)
             }) {
@@ -5047,7 +5244,12 @@ async fn serve_terminating_connection<T>(
                 report.replays += 1;
                 continue;
             }
-            *current_rx.lock() = (session, frame_epoch);
+            {
+                let mut current = current_rx.lock();
+                if binding::installs_current(accepted.is_some(), current.1, frame_epoch) {
+                    *current = (session, frame_epoch);
+                }
+            }
             // Authenticated: this datagram really is the client's uplink, so
             // from here on failing to reach the TUN is a black-hole and not
             // the noise any public UDP endpoint receives.
@@ -5074,6 +5276,19 @@ async fn serve_terminating_connection<T>(
                 UplinkKind::LeaseRefresh(token) => {
                     report.control_frames += 1;
                     anchor.submit_lease_refresh(&plaintext, token);
+                    continue;
+                }
+                UplinkKind::SessionRekey {
+                    new_encapsulated_key,
+                    new_epoch,
+                } => {
+                    report.control_frames += 1;
+                    binding::note_rekey(
+                        accepted.as_mut(),
+                        frame_epoch,
+                        new_encapsulated_key,
+                        new_epoch,
+                    );
                     continue;
                 }
                 UplinkKind::DaitaDummy => {
@@ -5301,6 +5516,10 @@ async fn serve_pq_datagram_pump<T>(
     // Identity material: never logged, not even a prefix.
     let current_key: Arc<Mutex<EncapsulatedKeyBytes>> =
         Arc::new(Mutex::new(setup.encapsulated_key));
+    // See the classical pump.
+    let mut accepted = setup
+        .bound
+        .then(|| binding::AcceptedKeys::seeded(setup.encapsulated_key, setup.epoch));
 
     // Inbound-activity counter for the sticky-IP takeover re-check (see the
     // classical pump). Registration already happened in `run_setup`; here we
@@ -5379,6 +5598,16 @@ async fn serve_pq_datagram_pump<T>(
                 report.exit_id_mismatches += 1;
                 continue;
             }
+            // Before the cache: a key the client did not authorize builds no
+            // session and costs no X-Wing decapsulation.
+            if accepted
+                .as_ref()
+                .is_some_and(|keys| !keys.admits(&frame.encapsulated_key, frame.epoch))
+            {
+                report.session_errs += 1;
+                report.unbound_keys += 1;
+                continue;
+            }
             // A rekey/setup datagram carries `pq_ct`: (re)establish the epoch's
             // session by decapsulating it. A steady-state DATA datagram (empty
             // `pq_ct`) can only LOOK UP an already-established session; a miss
@@ -5446,8 +5675,13 @@ async fn serve_pq_datagram_pump<T>(
             // otherwise silently evict a still-connected session (see
             // `PqSessionCache::refresh`). Only once the frame authenticated: a
             // forged one could otherwise point the keepalive elsewhere.
-            *current_key_rx.lock() = frame_key;
-            *current_rx.lock() = (session, frame_epoch);
+            {
+                let mut current = current_rx.lock();
+                if binding::installs_current(accepted.is_some(), current.1, frame_epoch) {
+                    *current_key_rx.lock() = frame_key;
+                    *current = (session, frame_epoch);
+                }
+            }
             // Authenticated: this datagram really is the client's uplink, so
             // from here on failing to reach the TUN is a black-hole and not
             // the noise any public UDP endpoint receives.
@@ -5469,6 +5703,19 @@ async fn serve_pq_datagram_pump<T>(
                 UplinkKind::LeaseRefresh(token) => {
                     report.control_frames += 1;
                     anchor.submit_lease_refresh(&plaintext, token);
+                    continue;
+                }
+                UplinkKind::SessionRekey {
+                    new_encapsulated_key,
+                    new_epoch,
+                } => {
+                    report.control_frames += 1;
+                    binding::note_rekey(
+                        accepted.as_mut(),
+                        frame_epoch,
+                        new_encapsulated_key,
+                        new_epoch,
+                    );
                     continue;
                 }
                 UplinkKind::DaitaDummy => {
@@ -10803,6 +11050,8 @@ mod tests {
         _endpoint: Endpoint,
         conn: Connection,
         session: warrenguard_multihop::PqClientSession,
+        /// The exit's descriptor key, for a test that rekeys the session.
+        recipient: warrenguard_multihop::XWingRecipientPublicKey,
         assigned: Ipv4Addr,
     }
 
@@ -10834,6 +11083,26 @@ mod tests {
         configure: impl FnOnce(
             ExitTerminateCtx<warrenguard_transport_core::FakeTun>,
         ) -> ExitTerminateCtx<warrenguard_transport_core::FakeTun>,
+    ) -> PqDataClient {
+        pq_data_client_with(tun, configure, |_| WarrenControlMessage::IpRequest {
+            prefer_ipv4: None,
+            client_pubkey: Some([0x4A; 32]),
+            wants_ipv6: false,
+            pop_sig: None,
+            wants_daita: false,
+        })
+        .await
+    }
+
+    /// [`pq_data_client`] with the setup request `build_request` makes from
+    /// the client's session.
+    #[cfg(feature = "pq-hpke")]
+    async fn pq_data_client_with(
+        tun: warrenguard_transport_core::FakeTun,
+        configure: impl FnOnce(
+            ExitTerminateCtx<warrenguard_transport_core::FakeTun>,
+        ) -> ExitTerminateCtx<warrenguard_transport_core::FakeTun>,
+        build_request: impl FnOnce(&warrenguard_multihop::PqClientSession) -> WarrenControlMessage,
     ) -> PqDataClient {
         let exit_key = SigningKey::from_bytes(&[0x42; 32]);
         let x25519_ikm = derive_x25519_ikm_from_ed25519(&exit_key);
@@ -10875,13 +11144,7 @@ mod tests {
         let mut rng = rand_core::UnwrapErr(rand_core::OsRng);
         let session = warrenguard_multihop::PqClientSession::new(&recipient, exit_id, &mut rng)
             .expect("PQ client session");
-        let request = WarrenControlMessage::IpRequest {
-            prefer_ipv4: None,
-            client_pubkey: Some([0x4A; 32]),
-            wants_ipv6: false,
-            pop_sig: None,
-            wants_daita: false,
-        };
+        let request = build_request(&session);
         let plaintext = encode_control(&request).expect("encode request");
         let frame = session.seal_setup(&plaintext, 0, 0).expect("seal v2 setup");
         let bytes = encode_frame_v2(&frame).expect("encode v2 setup");
@@ -10907,6 +11170,7 @@ mod tests {
             _endpoint: endpoint,
             conn,
             session,
+            recipient,
             assigned: Ipv4Addr::from(ipv4),
         }
     }
@@ -11300,5 +11564,555 @@ mod tests {
         }
         let got = settled_tun_outbound(&tun, 5, Duration::from_secs(5)).await;
         assert_eq!(got.len(), 5, "without a policy nothing may be dropped");
+    }
+
+    // ---- session binding and setup freshness (doc 116) ----
+
+    fn dated_wallet(client_unix_secs: u64) -> WarrenControlMessage {
+        WarrenControlMessage::IpRequestDated {
+            prefer_ipv4: None,
+            client_pubkey: Some([0x5D; 32]),
+            wants_ipv6: false,
+            pop_sig: None,
+            wants_daita: false,
+            client_unix_secs,
+        }
+    }
+
+    fn setup_refused(code: warrenguard_multihop::SetupRefusalCode) -> WarrenControlMessage {
+        WarrenControlMessage::SetupRefused {
+            reason_code: code.code(),
+        }
+    }
+
+    /// Next datagram the exit sends this client, raw.
+    async fn next_downlink(conn: &quinn::Connection) -> Vec<u8> {
+        tokio::time::timeout(Duration::from_secs(5), conn.read_datagram())
+            .await
+            .expect("a downlink datagram within the deadline")
+            .expect("readable downlink")
+            .to_vec()
+    }
+
+    /// Send these exact setup bytes on a fresh connection and open the reply
+    /// with `session`. The connection is handed back, so a caller can either
+    /// keep an admitted one alive or read the close of a refused one.
+    async fn setup_bytes_roundtrip(
+        exit: &TerminatingExit,
+        session: &ClientSession,
+        bytes: &[u8],
+    ) -> (Option<WarrenControlMessage>, Endpoint, quinn::Connection) {
+        let provider = warrenguard_tls::default_crypto_provider();
+        let cfg = warrenguard_tls::make_client_config(provider, &[warrenguard_config::ALPN_H3])
+            .expect("client config builds");
+        let mut endpoint =
+            Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).expect("client endpoint binds");
+        endpoint.set_default_client_config(cfg);
+        let conn = endpoint
+            .connect(exit.addr, &exit.sni)
+            .expect("connect")
+            .await
+            .expect("handshake");
+        let (mut send, mut recv) = conn.open_bi().await.expect("open_bi");
+        send.write_all(bytes).await.expect("write setup");
+        let _ = send.finish();
+        let detail = match tokio::time::timeout(
+            Duration::from_secs(5),
+            recv.read_to_end(MAX_MULTIHOP_SETUP_FRAME_BYTES),
+        )
+        .await
+        {
+            Ok(Ok(reply)) if !reply.is_empty() => decode_frame(&reply)
+                .ok()
+                .and_then(|f| session.open_response(&f).ok())
+                .and_then(|p| try_decode_control(&p).ok().flatten()),
+            _ => None,
+        };
+        (detail, endpoint, conn)
+    }
+
+    fn spawn_exit_with_binding(policy: SessionBindingPolicy) -> TerminatingExit {
+        let exit_key = SigningKey::from_bytes(&[0x42; 32]);
+        let (privkey, exit_pub) =
+            derive_x25519_keypair(&ANTI_ORACLE_EXIT_IKM).expect("x25519 keypair derives");
+        let ctx = ExitTerminateCtx::new(
+            privkey,
+            ExitId::from_bytes(ANTI_ORACLE_EXIT_ID),
+            warrenguard_transport_core::FakeTun::new(),
+            None,
+            None,
+            v4_alloc(),
+            None,
+            None,
+        )
+        .with_session_binding_policy(policy);
+        let ExitHarness {
+            addr,
+            sni,
+            endpoint,
+            accept_task,
+        } = spawn_exit_accept_loop(&exit_key, ctx);
+        TerminatingExit {
+            addr,
+            sni,
+            exit_pub,
+            _endpoint: endpoint,
+            accept_task,
+        }
+    }
+
+    /// The attack this binding exists for: the entry relay forwards the
+    /// client's setup untouched, then injects frames sealed under a session
+    /// of its own (anyone holding the exit's published key can make one) on
+    /// the same connection. On a bound connection they never reach the cache,
+    /// so the relay neither sends as the client nor reads its downlink.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_relay_session_on_a_bound_connection_never_takes_the_downlink() {
+        let tun = warrenguard_transport_core::FakeTun::new();
+        let exit = spawn_rate_limited_exit(None, tun.clone(), None);
+        let mut client = data_client(&exit, |_| dated_wallet(warrenguard_config::unix_now())).await;
+        client.send_uplink(100);
+        assert_eq!(
+            settled_tun_outbound(&tun, 1, Duration::from_secs(5))
+                .await
+                .len(),
+            1,
+            "the client's own uplink flows"
+        );
+
+        let mut rng = rand_core::UnwrapErr(rand_core::OsRng);
+        let relay = ClientSession::new(
+            &exit.exit_pub,
+            ExitId::from_bytes(ANTI_ORACLE_EXIT_ID),
+            &mut rng,
+        )
+        .expect("the relay's own session");
+        let dummy = vec![DAITA_DUMMY_FIRST_BYTE; 64];
+        let as_client = sized_tcp(client.assigned_ip, RATE_PEER, 120);
+        for (seq, plaintext) in [(0u64, &dummy), (1, &as_client)] {
+            let frame = relay.seal(plaintext, 0, seq).expect("relay seal");
+            client
+                .conn
+                .send_datagram(encode_frame(&frame).expect("encode").into())
+                .expect("inject on the client's connection");
+        }
+        assert!(
+            settled_tun_outbound(&tun, 0, Duration::from_secs(1))
+                .await
+                .is_empty(),
+            "SECURITY: the relay's uplink must never leave the exit as the client"
+        );
+
+        for len in [40, 576, 1024] {
+            tun.inject_inbound(sized_tcp(RATE_PEER, client.assigned_ip, len));
+            let frame = decode_frame(&next_downlink(&client.conn).await).expect("a v1 frame");
+            assert!(
+                relay.open_response(&frame).is_err(),
+                "SECURITY: the client's downlink must not open under the relay's session"
+            );
+            assert_eq!(
+                client
+                    .session
+                    .open_response(&frame)
+                    .expect("still sealed to the client")
+                    .len(),
+                len
+            );
+        }
+    }
+
+    /// A bound connection moves to a new epoch only when the client announced
+    /// its key, sealed under the epoch it already holds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_bound_connection_takes_a_new_epoch_only_once_the_client_announced_it() {
+        let tun = warrenguard_transport_core::FakeTun::new();
+        let exit = spawn_rate_limited_exit(None, tun.clone(), None);
+        let mut client = data_client(&exit, |_| dated_wallet(warrenguard_config::unix_now())).await;
+        let mut rng = rand_core::UnwrapErr(rand_core::OsRng);
+        client
+            .session
+            .rekey(&exit.exit_pub, &mut rng)
+            .expect("client rekey");
+        let send_new_epoch = |client: &mut DataClient, len: usize| {
+            let seq = client.next_seq;
+            client.next_seq += 1;
+            let frame = client
+                .session
+                .seal(&sized_tcp(client.assigned_ip, RATE_PEER, len), 1, seq)
+                .expect("seal under epoch 1");
+            client
+                .conn
+                .send_datagram(encode_frame(&frame).expect("encode").into())
+                .expect("send");
+        };
+
+        send_new_epoch(&mut client, 100);
+        assert!(
+            settled_tun_outbound(&tun, 0, Duration::from_secs(1))
+                .await
+                .is_empty(),
+            "an epoch the client never announced is dropped"
+        );
+
+        let announce = encode_control(&WarrenControlMessage::SessionRekey {
+            new_encapsulated_key: client.session.encapsulated_key(),
+            new_epoch: 1,
+        })
+        .expect("encode announcement");
+        let seq = client.next_seq;
+        client.next_seq += 1;
+        let frame = client
+            .session
+            .seal_pending_old_epoch(&announce, seq)
+            .expect("seal under epoch 0");
+        client
+            .conn
+            .send_datagram(encode_frame(&frame).expect("encode").into())
+            .expect("send announcement");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        for len in [40, 576, 1024] {
+            send_new_epoch(&mut client, len);
+        }
+        let delivered = settled_tun_outbound(&tun, 3, Duration::from_secs(5)).await;
+        assert_eq!(
+            delivered.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![40, 576, 1024],
+            "the announced epoch flows"
+        );
+        tun.inject_inbound(sized_tcp(RATE_PEER, client.assigned_ip, 300));
+        let frame = decode_frame(&next_downlink(&client.conn).await).expect("a v1 frame");
+        assert_eq!(frame.epoch, 1, "the downlink follows the announced epoch");
+        assert_eq!(
+            client
+                .session
+                .open_response(&frame)
+                .expect("opens under epoch 1")
+                .len(),
+            300
+        );
+    }
+
+    /// `/v2` counterpart of the relay injection: the relay's own X-Wing
+    /// session never reaches the cache of a bound connection.
+    #[cfg(feature = "pq-hpke")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pq_a_relay_session_on_a_bound_connection_never_takes_the_downlink() {
+        let tun = warrenguard_transport_core::FakeTun::new();
+        let client = pq_data_client_with(
+            tun.clone(),
+            |ctx| ctx,
+            |_| dated_wallet(warrenguard_config::unix_now()),
+        )
+        .await;
+        client.send_data(1, &client.packet(51_010));
+        assert_eq!(
+            settled_tun_outbound(&tun, 1, Duration::from_secs(5))
+                .await
+                .len(),
+            1
+        );
+
+        let mut rng = rand_core::UnwrapErr(rand_core::OsRng);
+        let relay = warrenguard_multihop::PqClientSession::new(
+            &client.recipient,
+            ExitId::from_bytes(ANTI_ORACLE_EXIT_ID),
+            &mut rng,
+        )
+        .expect("the relay's own PQ session");
+        client.send(
+            &relay
+                .seal_setup(&[DAITA_DUMMY_FIRST_BYTE; 64], 0, 0)
+                .expect("relay seal"),
+        );
+        client.send(
+            &relay
+                .seal_setup(&client.packet(51_011), 0, 1)
+                .expect("relay seal"),
+        );
+        assert!(
+            settled_tun_outbound(&tun, 0, Duration::from_secs(1))
+                .await
+                .is_empty(),
+            "SECURITY: the relay's uplink must never leave the exit as the client"
+        );
+
+        for len in [40, 576, 1024] {
+            tun.inject_inbound(sized_tcp(RATE_PEER, client.assigned, len));
+            let frame = decode_frame_v2(&next_downlink(&client.conn).await).expect("a v2 frame");
+            assert!(
+                relay.open_response(&frame).is_err(),
+                "SECURITY: the client's downlink must not open under the relay's session"
+            );
+            assert_eq!(
+                client
+                    .session
+                    .open_response(&frame)
+                    .expect("still sealed to the client")
+                    .len(),
+                len
+            );
+        }
+        client.harness.accept_task.abort();
+    }
+
+    /// `/v2` rekey on a bound connection: announcement under epoch 0, then
+    /// the bootstrap ping carrying the new epoch's ML-KEM ciphertext, then
+    /// data. Without the announcement the ping builds nothing.
+    #[cfg(feature = "pq-hpke")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pq_a_bound_connection_takes_a_new_epoch_only_once_the_client_announced_it() {
+        let tun = warrenguard_transport_core::FakeTun::new();
+        let mut client = pq_data_client_with(
+            tun.clone(),
+            |ctx| ctx,
+            |_| dated_wallet(warrenguard_config::unix_now()),
+        )
+        .await;
+        let mut rng = rand_core::UnwrapErr(rand_core::OsRng);
+        client
+            .session
+            .rekey(&client.recipient, &mut rng)
+            .expect("client rekey");
+        let ping = client.session.seal_setup(&[], 1, 10).expect("ping");
+        client.send(&ping);
+        client.send(
+            &client
+                .session
+                .seal(&client.packet(51_020), 1, 11)
+                .expect("seal"),
+        );
+        assert!(
+            settled_tun_outbound(&tun, 0, Duration::from_secs(1))
+                .await
+                .is_empty(),
+            "an epoch the client never announced is dropped, ping included"
+        );
+
+        let announce = encode_control(&WarrenControlMessage::SessionRekey {
+            new_encapsulated_key: client.session.encapsulated_key(),
+            new_epoch: 1,
+        })
+        .expect("encode announcement");
+        client.send(
+            &client
+                .session
+                .seal_pending_old_epoch(&announce, 12)
+                .expect("seal under epoch 0"),
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        client.send(&client.session.seal_setup(&[], 1, 13).expect("ping"));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        client.send(
+            &client
+                .session
+                .seal(&client.packet(51_021), 1, 14)
+                .expect("seal"),
+        );
+        assert_eq!(
+            settled_tun_outbound(&tun, 1, Duration::from_secs(5))
+                .await
+                .len(),
+            1,
+            "the announced epoch flows once its ping established it"
+        );
+        tun.inject_inbound(sized_tcp(RATE_PEER, client.assigned, 300));
+        let frame = decode_frame_v2(&next_downlink(&client.conn).await).expect("a v2 frame");
+        assert_eq!(frame.epoch, 1, "the downlink follows the announced epoch");
+        assert_eq!(
+            client
+                .session
+                .open_response(&frame)
+                .expect("opens under epoch 1")
+                .len(),
+            300
+        );
+        client.harness.accept_task.abort();
+    }
+
+    /// A captured dated setup frame, presented again once the exit's session
+    /// cache forgot the session it built, is refused as replayed: no address,
+    /// no device slot, and the relay sees the same opaque close as any
+    /// refusal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_captured_dated_setup_replayed_after_the_cache_forgot_it_is_refused() {
+        let exit = spawn_terminating_exit(None, v4_alloc());
+        let mut rng = rand_core::UnwrapErr(rand_core::OsRng);
+        let session = ClientSession::new(
+            &exit.exit_pub,
+            ExitId::from_bytes(ANTI_ORACLE_EXIT_ID),
+            &mut rng,
+        )
+        .expect("HPKE setup");
+        let plaintext =
+            encode_control(&dated_wallet(warrenguard_config::unix_now())).expect("encode");
+        let bytes = encode_frame(&session.seal(&plaintext, 0, 0).expect("seal")).expect("encode");
+
+        let (first, _endpoint, original) = setup_bytes_roundtrip(&exit, &session, &bytes).await;
+        assert!(
+            matches!(first, Some(WarrenControlMessage::IpAssign { .. })),
+            "the original setup is admitted, got {first:?}"
+        );
+        drop(original);
+        tokio::time::sleep(SESSION_CACHE_TTL + Duration::from_secs(1)).await;
+
+        let replayed_before = crate::metrics::setup_freshness_snapshot()
+            .count(crate::metrics::SetupFreshnessResult::Replayed);
+        let (second, _endpoint, replay) = setup_bytes_roundtrip(&exit, &session, &bytes).await;
+        assert_eq!(
+            second,
+            Some(setup_refused(
+                warrenguard_multihop::SetupRefusalCode::Replayed
+            )),
+            "SECURITY: a setup frame is not a reusable credential"
+        );
+        assert_opaque_close(
+            tokio::time::timeout(Duration::from_secs(5), replay.closed())
+                .await
+                .ok(),
+        );
+        assert!(
+            crate::metrics::setup_freshness_snapshot()
+                .count(crate::metrics::SetupFreshnessResult::Replayed)
+                > replayed_before
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dated_setup_too_far_from_the_exit_clock_is_refused_either_way() {
+        let exit = spawn_terminating_exit(None, v4_alloc());
+        let now = warrenguard_config::unix_now();
+        for at in [now - 600, now + 600] {
+            let (detail, close) = client_setup_roundtrip(&exit, |_| dated_wallet(at)).await;
+            assert_eq!(
+                detail,
+                Some(setup_refused(
+                    warrenguard_multihop::SetupRefusalCode::ClockSkew
+                )),
+                "a request dated {}s from the exit's clock",
+                i128::from(at) - i128::from(now)
+            );
+            assert_opaque_close(close);
+        }
+        let (_live, _) = client_setup_admitted(&exit, dated_wallet(now - 100)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dated_wallet_request_proves_possession_under_v3_and_is_never_answered_rejected() {
+        let account = SigningKey::from_bytes(&[0x11; 32]);
+        let account_pubkey = account.verifying_key().to_bytes();
+        let exit_id = ExitId::from_bytes(ANTI_ORACLE_EXIT_ID);
+        let now = warrenguard_config::unix_now();
+        let request = |pop_sig| WarrenControlMessage::IpRequestDated {
+            prefer_ipv4: None,
+            client_pubkey: Some(account_pubkey),
+            wants_ipv6: false,
+            pop_sig,
+            wants_daita: false,
+            client_unix_secs: now,
+        };
+        let exit = spawn_terminating_exit(Some(allowlist_with(&[account_pubkey])), v4_alloc());
+
+        let (detail, close) = client_setup_roundtrip(&exit, |session| {
+            request(Some(warrenguard_multihop::sign_pop(
+                &account,
+                &exit_id,
+                &session.encapsulated_key(),
+            )))
+        })
+        .await;
+        assert_eq!(
+            detail,
+            Some(setup_refused(
+                warrenguard_multihop::SetupRefusalCode::Unspecified
+            )),
+            "a /v2 signature does not prove a dated request, and the refusal is never the plain \
+             Rejected that reads as an exit predating the dated request"
+        );
+        assert_opaque_close(close);
+
+        let (detail, _) = client_setup_roundtrip(&exit, |session| {
+            request(Some(warrenguard_multihop::sign_pop_v3(
+                &account,
+                &exit_id,
+                &session.encapsulated_key(),
+                now + 1,
+            )))
+        })
+        .await;
+        assert_eq!(
+            detail,
+            Some(setup_refused(
+                warrenguard_multihop::SetupRefusalCode::Unspecified
+            )),
+            "a /v3 signature over another time does not verify"
+        );
+
+        let (detail, close) = client_setup_roundtrip(&exit, |session| {
+            request(Some(warrenguard_multihop::sign_pop_v3(
+                &account,
+                &exit_id,
+                &session.encapsulated_key(),
+                now,
+            )))
+        })
+        .await;
+        assert!(
+            matches!(detail, Some(WarrenControlMessage::IpAssign { .. })),
+            "the /v3 proof over the request's own time admits, got {detail:?}"
+        );
+        assert!(close.is_none(), "an admitted connection stays open");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refused_dated_token_request_learns_why_and_never_reads_rejected() {
+        let exit = spawn_terminating_exit_v7(v4_alloc(), Arc::new(FakeMhAdmitter { deny: true }));
+        let (detail, close) =
+            client_setup_roundtrip(&exit, |_| WarrenControlMessage::IpRequestV7Dated {
+                prefer_ipv4: Some([0, 0, 0, 0]),
+                wants_ipv6: false,
+                session_tokens: vec![a_session_token(0x51)],
+                wants_daita: false,
+                client_unix_secs: warrenguard_config::unix_now(),
+            })
+            .await;
+        assert_eq!(
+            detail,
+            Some(WarrenControlMessage::TokenRejected {
+                reason_code: warrenguard_multihop::TokenRejectCode::Unspecified.code()
+            })
+        );
+        assert_opaque_close(close);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn require_bound_refuses_legacy_setups_with_the_answer_they_read_and_admits_dated_ones() {
+        let exit = spawn_exit_with_binding(SessionBindingPolicy::RequireBound);
+        let legacy_wallet = WarrenControlMessage::IpRequest {
+            prefer_ipv4: None,
+            client_pubkey: Some([0x5D; 32]),
+            wants_ipv6: false,
+            pop_sig: None,
+            wants_daita: false,
+        };
+        let (detail, close) = client_setup_roundtrip(&exit, |_| legacy_wallet.clone()).await;
+        assert_eq!(detail, Some(WarrenControlMessage::Rejected));
+        assert_opaque_close(close);
+
+        let (detail, _) =
+            client_setup_roundtrip(&exit, |_| detailed_request(a_session_token(0x52))).await;
+        assert_eq!(
+            detail,
+            Some(WarrenControlMessage::TokenRejected {
+                reason_code: warrenguard_multihop::TokenRejectCode::Unspecified.code()
+            }),
+            "a legacy detailed token request gets the refusal it decodes"
+        );
+
+        let (_live, _) =
+            client_setup_admitted(&exit, dated_wallet(warrenguard_config::unix_now())).await;
+
+        let accepting = spawn_exit_with_binding(SessionBindingPolicy::AcceptLegacy);
+        let (_legacy, _) = client_setup_admitted(&accepting, legacy_wallet).await;
     }
 }
