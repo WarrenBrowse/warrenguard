@@ -93,7 +93,7 @@ pub enum MultiHopError {
     #[error("TLS client config build failed: {0}")]
     Tls(#[from] WarrenTlsError),
     /// Binding the local Quinn endpoint failed.
-    #[error("failed to bind local QUIC endpoint on {addr}: {source}")]
+    #[error("failed to bind local QUIC endpoint: {source}")]
     Bind {
         /// Address requested at bind time.
         addr: SocketAddr,
@@ -3154,6 +3154,40 @@ impl MultiHopClient {
     }
 }
 
+/// A loggable summary of why a connection closed: the variant and its code,
+/// never the reason bytes, which the peer chooses.
+#[must_use]
+pub fn close_summary(err: &quinn::ConnectionError) -> CloseSummary<'_> {
+    CloseSummary(err)
+}
+
+/// See [`close_summary`].
+pub struct CloseSummary<'a>(&'a quinn::ConnectionError);
+
+impl std::fmt::Display for CloseSummary<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use quinn::ConnectionError as E;
+        match self.0 {
+            E::ApplicationClosed(close) => {
+                write!(
+                    f,
+                    "closed by peer application (code {:#x})",
+                    close.error_code.into_inner()
+                )
+            }
+            E::ConnectionClosed(close) => {
+                write!(f, "closed by peer transport ({})", close.error_code)
+            }
+            E::TransportError(error) => write!(f, "transport error ({})", error.code),
+            E::VersionMismatch => f.write_str("version mismatch"),
+            E::Reset => f.write_str("reset by peer"),
+            E::TimedOut => f.write_str("timed out"),
+            E::LocallyClosed => f.write_str("closed locally"),
+            E::CidsExhausted => f.write_str("connection ids exhausted"),
+        }
+    }
+}
+
 /// Map a QUIC [`quinn::ConnectionError`] to a [`RejectionReason`] when
 /// it carries the exit's opaque multi-hop policy-rejection close code.
 /// Returns `None` for transient errors (timeout, reset, local close) or
@@ -3379,6 +3413,35 @@ pub(crate) fn client_pq_setup_material_for_test(client: &MultiHopClient) -> ([u8
 
 #[cfg(test)]
 mod tests {
+
+    /// The peer chooses the reason bytes of a close: a hostile relay could
+    /// write anything into the client's log through them.
+    #[test]
+    fn a_close_summary_never_carries_the_peers_reason() {
+        let closed = quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+            error_code: quinn::VarInt::from_u32(0x42),
+            reason: bytes::Bytes::from_static(b"injected\nFAKE LOG LINE"),
+        });
+
+        let summary = close_summary(&closed).to_string();
+
+        assert!(!summary.contains("injected"), "{summary}");
+        assert!(
+            summary.contains("0x42") || summary.contains("66"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn a_bind_failure_names_no_local_address() {
+        let err = MultiHopError::Bind {
+            addr: "203.0.113.5:4433".parse().unwrap(),
+            source: std::io::Error::other("address in use"),
+        };
+
+        assert!(!err.to_string().contains("203.0.113.5"), "{err}");
+    }
+
     use super::*;
 
     use std::cell::RefCell;

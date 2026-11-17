@@ -1615,7 +1615,7 @@ impl MultiHopSupervisor {
                 // None always sees a coherent reconnect_count >= 1.
                 self.metrics.reconnect_count.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
-                    reason = %close_err,
+                    reason = %multihop::close_summary(&close_err),
                     "multi-hop session lost, scheduling reconnect"
                 );
                 // One dead connection condemns the whole bundle: close the
