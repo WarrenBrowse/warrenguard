@@ -490,7 +490,9 @@ pub(crate) struct FakeMultihopExit {
     /// with this `SetupRefused` code.
     pub(crate) refuse_dated_with: Arc<parking_lot::Mutex<Option<u8>>>,
     /// When set, the exit requires bound sessions: it answers every legacy
-    /// (undated) request with the plain `Rejected`.
+    /// (undated) request with the refusal its sender reads as a policy one
+    /// (`TokenRejected` to a detailed token request, `RouteRejected` to a
+    /// route request, the plain `Rejected` otherwise).
     pub(crate) require_bound: Arc<AtomicBool>,
     /// Every `RouteAnchorRequest` datagram this exit read, in arrival order.
     pub(crate) anchor_requests: Arc<parking_lot::Mutex<Vec<SeenAnchorRequest>>>,
@@ -739,6 +741,7 @@ async fn serve_one_fake_exit_connection(
         }
     });
     let predates_detail = detailed && behaviour.predates_token_detail.load(Ordering::Relaxed);
+    let seen_kind = seen.clone();
     behaviour.setup_requests.lock().push(seen);
     let dated_refusal = dated_at.filter(|_| !predates_dated).and_then(|at| {
         let clock = *behaviour.exit_clock_unix_secs.lock();
@@ -748,9 +751,22 @@ async fn serve_one_fake_exit_connection(
             *behaviour.refuse_dated_with.lock()
         }
     });
-    let reply_msg = if predates_dated || (!dated && behaviour.require_bound.load(Ordering::Relaxed))
-    {
+    // What an exit that requires bound sessions answers a legacy request:
+    // the refusal that request's sender already reads as a policy refusal.
+    let legacy_refusal =
+        (!dated && behaviour.require_bound.load(Ordering::Relaxed)).then(|| match &seen_kind {
+            SeenSetupRequest::DetailedTokens(_) => WarrenControlMessage::TokenRejected {
+                reason_code: warrenguard_multihop::TokenRejectCode::Unspecified.code(),
+            },
+            SeenSetupRequest::Route(_) => WarrenControlMessage::RouteRejected {
+                reason_code: warrenguard_multihop::RouteRejectCode::Unspecified.code(),
+            },
+            _ => WarrenControlMessage::Rejected,
+        });
+    let reply_msg = if predates_dated {
         WarrenControlMessage::Rejected
+    } else if let Some(refusal) = legacy_refusal {
+        refusal
     } else if let Some(reason_code) = dated_refusal {
         WarrenControlMessage::SetupRefused { reason_code }
     } else if let Some(refusal) = route_refusal {
