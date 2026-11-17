@@ -127,30 +127,22 @@ impl RecentSetupKeys {
 pub(crate) struct SetupFreshness {
     pub(super) recent: std::sync::Arc<RecentSetupKeys>,
     pub(super) policy: SessionBindingPolicy,
-    /// This process's start, on the wall clock setups are dated with and on
-    /// the monotonic clock that measures how young the process is.
-    started_unix_secs: u64,
+    /// This process's start, on the monotonic clock only. Its wall-clock
+    /// time is derived at each check from the clock the skew check reads, so
+    /// a step of the wall clock since the start (an exit started before NTP
+    /// corrected a fast clock) moves it too.
     started_at: Instant,
 }
 
 impl SetupFreshness {
     pub(super) fn new() -> Self {
-        Self::with_parts(
-            RecentSetupKeys::new(),
-            warrenguard_config::unix_now(),
-            Instant::now(),
-        )
+        Self::with_parts(RecentSetupKeys::new(), Instant::now())
     }
 
-    pub(super) fn with_parts(
-        recent: RecentSetupKeys,
-        started_unix_secs: u64,
-        started_at: Instant,
-    ) -> Self {
+    pub(super) fn with_parts(recent: RecentSetupKeys, started_at: Instant) -> Self {
         Self {
             recent: std::sync::Arc::new(recent),
             policy: SessionBindingPolicy::default(),
-            started_unix_secs,
             started_at,
         }
     }
@@ -176,9 +168,11 @@ impl SetupFreshness {
         // start closes that for a client whose clock is not ahead of the
         // exit's; a client ahead by `d` seconds stays exposed for the last
         // `d` seconds before a restart.
-        let young = now.saturating_duration_since(self.started_at)
-            < Duration::from_secs(RECENT_SETUP_RETENTION_SECS);
-        if young && client_unix_secs < self.started_unix_secs {
+        let age = now.saturating_duration_since(self.started_at);
+        let started_unix_secs = exit_unix_secs.saturating_sub(age.as_secs());
+        if age < Duration::from_secs(RECENT_SETUP_RETENTION_SECS)
+            && client_unix_secs < started_unix_secs
+        {
             return Some((R::RestartFloor, C::Busy));
         }
         match self.recent.claim_at(key, now) {
@@ -457,7 +451,6 @@ mod tests {
         let started = Instant::now();
         let freshness = SetupFreshness::with_parts(
             RecentSetupKeys::with_limits(Duration::from_secs(240), 1),
-            1_800_000_000,
             started,
         );
         let at = started + Duration::from_secs(600);
@@ -475,7 +468,7 @@ mod tests {
         use warrenguard_multihop::SetupRefusalCode as C;
         let started_unix = 1_800_000_000;
         let started = Instant::now();
-        let freshness = SetupFreshness::with_parts(RecentSetupKeys::new(), started_unix, started);
+        let freshness = SetupFreshness::with_parts(RecentSetupKeys::new(), started);
         let at = started + Duration::from_secs(10);
         assert_eq!(
             freshness.check(&K0, started_unix - 1, started_unix + 10, at),
@@ -486,6 +479,29 @@ mod tests {
             freshness.check(&K1, started_unix + 9, started_unix + 10, at),
             None,
             "a setup made since the start is admitted"
+        );
+    }
+
+    #[test]
+    fn an_exit_started_on_a_fast_clock_admits_setups_made_since_its_start() {
+        // The process started while the wall clock ran ten minutes fast, and
+        // NTP stepped it back since: the start must be read off the clock as
+        // it is now, not the sample taken then.
+        use crate::metrics::SetupFreshnessResult as R;
+        use warrenguard_multihop::SetupRefusalCode as C;
+        let exit_now = 1_800_000_000;
+        let started = Instant::now();
+        let freshness = SetupFreshness::with_parts(RecentSetupKeys::new(), started);
+        let at = started + Duration::from_secs(10);
+        assert_eq!(
+            freshness.check(&K0, exit_now - 5, exit_now, at),
+            None,
+            "made five seconds ago, after the start"
+        );
+        assert_eq!(
+            freshness.check(&K1, exit_now - 11, exit_now, at),
+            Some((R::RestartFloor, C::Busy)),
+            "made before the start"
         );
     }
 
