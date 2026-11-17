@@ -166,11 +166,18 @@ pub struct TunnelPool {
     v4_gateway: Ipv4Addr,
     /// `/64` prefix and its gateway, on a dual-stack exit.
     v6: Option<(Ipv6Addr, Ipv6Addr)>,
-    /// A v4 prefix of service addresses the exit itself answers on, besides
-    /// the gateway (resolvers bound on the tunnel interface). Admitted even
-    /// though it lies in a non-global range.
-    v4_services: Option<(Ipv4Addr, u8)>,
+    /// The v4 prefixes of service addresses the exit itself answers on,
+    /// besides the gateway (resolvers bound on the tunnel interface), the
+    /// first `v4_service_count` of them set. Admitted even when non-global
+    /// or inside the pool. Several, so a deployer moving them serves the old
+    /// and the new set until its clients follow; a fixed array keeps the
+    /// pool `Copy` for the datapath.
+    v4_services: [(Ipv4Addr, u8); MAX_V4_SERVICE_PREFIXES],
+    v4_service_count: usize,
 }
+
+/// How many service prefixes a [`TunnelPool`] holds.
+pub const MAX_V4_SERVICE_PREFIXES: usize = 4;
 
 impl TunnelPool {
     /// The v4 half, which every exit has: the network the allocator hands
@@ -183,20 +190,27 @@ impl TunnelPool {
             v4_prefix_len,
             v4_gateway,
             v6: None,
-            v4_services: None,
+            v4_services: [(Ipv4Addr::UNSPECIFIED, 0); MAX_V4_SERVICE_PREFIXES],
+            v4_service_count: 0,
         }
     }
 
-    /// Declare the prefix of local service addresses (see `v4_services`).
+    /// Declare one more prefix of local service addresses (see
+    /// `v4_services`). A prefix beyond [`MAX_V4_SERVICE_PREFIXES`] is
+    /// ignored, which leaves it refused: the gate fails closed.
     #[must_use]
     pub const fn with_v4_services(mut self, network: Ipv4Addr, prefix_len: u8) -> Self {
-        self.v4_services = Some((network, prefix_len));
+        if self.v4_service_count < MAX_V4_SERVICE_PREFIXES {
+            self.v4_services[self.v4_service_count] = (network, prefix_len);
+            self.v4_service_count += 1;
+        }
         self
     }
 
     fn serves_v4(&self, addr: Ipv4Addr) -> bool {
-        self.v4_services
-            .is_some_and(|(net, len)| prefix_holds_v4(net, len, addr))
+        self.v4_services[..self.v4_service_count]
+            .iter()
+            .any(|&(net, len)| prefix_holds_v4(net, len, addr))
     }
 
     /// Add the `/64` half of a dual-stack exit.
@@ -321,8 +335,8 @@ pub fn classify_destination(pkt: &[u8], pool: &TunnelPool) -> Option<PoolRefusal
         Some(4) => match extract_dst_ipv4(pkt) {
             None => Some(PoolRefusal::V4Peer),
             Some(dst) if dst == pool.v4_gateway => None,
-            Some(dst) if pool.holds_v4(dst) => Some(PoolRefusal::V4Peer),
             Some(dst) if pool.serves_v4(dst) => None,
+            Some(dst) if pool.holds_v4(dst) => Some(PoolRefusal::V4Peer),
             Some(dst) if is_non_global_v4(dst) => Some(PoolRefusal::NonGlobal),
             Some(_) => None,
         },
@@ -456,6 +470,34 @@ mod tests {
             Some(PoolRefusal::NonGlobal),
             "only the declared service prefix is an exception, not the whole carrier-NAT range"
         );
+    }
+
+    #[test]
+    fn a_service_prefix_inside_the_pool_is_served_not_refused_as_a_peer() {
+        // Resolvers bound inside the client pool itself: the allocator never
+        // hands these addresses to a session, so they are the exit's own.
+        let pool = pool().with_v4_services(Ipv4Addr::new(10, 66, 255, 0), 26);
+        let resolver = make_ipv4_packet([10, 66, 3, 7], [10, 66, 255, 7]);
+        assert_eq!(classify_destination(&resolver, &pool), None);
+        let neighbour = make_ipv4_packet([10, 66, 3, 7], [10, 66, 255, 64]);
+        assert_eq!(
+            classify_destination(&neighbour, &pool),
+            Some(PoolRefusal::V4Peer),
+            "the pool outside the service prefix stays closed between sessions"
+        );
+    }
+
+    #[test]
+    fn two_service_prefixes_are_both_served() {
+        // A deployer moving its service addresses serves both sets until
+        // every client follows.
+        let pool = pool()
+            .with_v4_services(Ipv4Addr::new(100, 64, 0, 0), 26)
+            .with_v4_services(Ipv4Addr::new(10, 66, 255, 0), 26);
+        for dst in [[100, 64, 0, 7], [10, 66, 255, 7]] {
+            let pkt = make_ipv4_packet([10, 66, 3, 7], dst);
+            assert_eq!(classify_destination(&pkt, &pool), None, "{dst:?}");
+        }
     }
 
     #[test]

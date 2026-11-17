@@ -4821,11 +4821,10 @@ pub async fn terminate_connection<T>(
 fn tunnel_pool(v4: &Arc<Mutex<IpAllocator>>, v6: Option<&Arc<Mutex<IpAllocatorV6>>>) -> TunnelPool {
     let pool = {
         let alloc = v4.lock();
-        let pool = TunnelPool::new(alloc.network(), alloc.prefix_len(), alloc.gateway());
-        match alloc.service_prefix_v4() {
-            Some((network, prefix_len)) => pool.with_v4_services(network, prefix_len),
-            None => pool,
-        }
+        alloc.service_prefixes_v4().iter().fold(
+            TunnelPool::new(alloc.network(), alloc.prefix_len(), alloc.gateway()),
+            |pool, &(network, prefix_len)| pool.with_v4_services(network, prefix_len),
+        )
     };
     match v6 {
         None => pool,
@@ -5985,7 +5984,8 @@ mod tests {
         let mut alloc =
             IpAllocator::new(Ipv4Addr::new(10, 66, 0, 0), 24, Ipv4Addr::new(10, 66, 0, 1))
                 .expect("a valid /24 pool");
-        alloc.set_service_prefix_v4(Ipv4Addr::new(100, 64, 0, 0), 26);
+        alloc.add_service_prefix_v4(Ipv4Addr::new(100, 64, 0, 0), 26);
+        alloc.add_service_prefix_v4(Ipv4Addr::new(10, 66, 0, 192), 26);
         let pool = tunnel_pool(&Arc::new(Mutex::new(alloc)), None);
         let to = |dst: [u8; 4]| {
             let mut pkt = vec![0u8; 40];
@@ -5999,6 +5999,11 @@ mod tests {
             classify_destination(&to([100, 64, 0, 7]), &pool),
             None,
             "the exit's own resolvers live in the declared service prefix"
+        );
+        assert_eq!(
+            classify_destination(&to([10, 66, 0, 200]), &pool),
+            None,
+            "every declared prefix reaches the gate, the one inside the pool included"
         );
         assert_eq!(
             classify_destination(&to([169, 254, 169, 254]), &pool),

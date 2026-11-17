@@ -387,10 +387,23 @@ pub struct IpAllocator {
     /// back to that key only: whatever still routes to it was left by that
     /// key's sessions. Bounded by the subnet.
     last_holder: HashMap<Ipv4Addr, Option<[u8; 32]>>,
-    /// A v4 prefix of service addresses the exit answers on besides the
-    /// gateway (resolvers bound on the tunnel interface). `None` until the
-    /// deployer declares one; the destination gate admits it.
-    service_prefix: Option<(Ipv4Addr, u8)>,
+    /// The v4 prefixes of service addresses the exit answers on besides the
+    /// gateway (resolvers bound on the tunnel interface), empty until the
+    /// deployer declares one. The destination gate admits them, and the
+    /// hosts of one that lies inside the pool are never handed out.
+    service_prefixes: Vec<(Ipv4Addr, u8)>,
+}
+
+/// Whether `addr` lies inside `network / prefix_len`.
+fn in_prefix_v4(network: Ipv4Addr, prefix_len: u8, addr: Ipv4Addr) -> bool {
+    if prefix_len == 0 {
+        return true;
+    }
+    if prefix_len > 32 {
+        return false;
+    }
+    let mask = u32::MAX << (32 - prefix_len);
+    (u32::from(addr) & mask) == (u32::from(network) & mask)
 }
 
 impl IpAllocator {
@@ -494,7 +507,7 @@ impl IpAllocator {
             reclaim: None,
             claims: None,
             last_holder: HashMap::new(),
-            service_prefix: None,
+            service_prefixes: Vec::new(),
         })
     }
 
@@ -839,7 +852,9 @@ impl IpAllocator {
         // share one inner IP across several `used` entries; pushing
         // it to `free` while a sibling still uses it would let the
         // allocator re-hand it to a DIFFERENT identity = collision.
-        if let Some((addr, true)) = self.used.release(conn) {
+        if let Some((addr, true)) = self.used.release(conn)
+            && !self.serves(addr)
+        {
             self.free.push(addr);
         }
     }
@@ -886,18 +901,29 @@ impl IpAllocator {
         self.gateway
     }
 
-    /// Declare the prefix of the exit's own service addresses on the tunnel
-    /// side, besides the gateway (for example resolvers bound on the tunnel
-    /// interface in a non-global range). The destination gate refuses every
-    /// non-global destination except the gateway and this prefix.
-    pub fn set_service_prefix_v4(&mut self, network: Ipv4Addr, prefix_len: u8) {
-        self.service_prefix = Some((network, prefix_len));
+    /// Declare one more prefix of the exit's own service addresses on the
+    /// tunnel side, besides the gateway (for example resolvers bound on the
+    /// tunnel interface). The destination gate refuses every non-global
+    /// destination and every pool peer except the gateway and these
+    /// prefixes. A prefix inside the pool leaves it: its free hosts at once,
+    /// a held one when its last connection releases it, so no session can
+    /// ever hold the address a resolver answers on.
+    pub fn add_service_prefix_v4(&mut self, network: Ipv4Addr, prefix_len: u8) {
+        self.service_prefixes.push((network, prefix_len));
+        self.free
+            .retain(|&addr| !in_prefix_v4(network, prefix_len, addr));
     }
 
-    /// The declared service prefix, if any.
+    /// Every declared service prefix, in declaration order.
     #[must_use]
-    pub fn service_prefix_v4(&self) -> Option<(Ipv4Addr, u8)> {
-        self.service_prefix
+    pub fn service_prefixes_v4(&self) -> &[(Ipv4Addr, u8)] {
+        &self.service_prefixes
+    }
+
+    fn serves(&self, addr: Ipv4Addr) -> bool {
+        self.service_prefixes
+            .iter()
+            .any(|&(network, prefix_len)| in_prefix_v4(network, prefix_len, addr))
     }
 }
 
@@ -1255,6 +1281,63 @@ mod tests {
                 "allocator must never hand out the gateway address"
             );
         }
+    }
+
+    #[test]
+    fn a_service_prefix_inside_the_pool_is_never_allocated() {
+        let mut pool = IpAllocator::new(NET, 24, GW).expect("/24 pool builds");
+        let services = Ipv4Addr::new(10, 66, 0, 192);
+        pool.add_service_prefix_v4(services, 26);
+        let mut handed = 0;
+        let mut conn = 0;
+        while let Some(addr) = pool.allocate(conn) {
+            assert!(
+                u32::from(addr) & 0xFFFF_FFC0 != u32::from(services),
+                "{addr} is one of the exit's own service addresses: a session holding it shadows the resolver"
+            );
+            handed += 1;
+            conn += 1;
+        }
+        // 254 hosts, minus the gateway, minus the 63 of .192/26 below the
+        // broadcast address the pool never held.
+        assert_eq!(handed, 253 - 63);
+    }
+
+    #[test]
+    fn a_service_address_held_before_its_declaration_never_returns_to_the_pool() {
+        let mut pool = IpAllocator::new(NET, 29, GW).expect("/29 pool builds");
+        let mut conn = 0;
+        while pool.allocate(conn).is_some() {
+            conn += 1;
+        }
+        pool.add_service_prefix_v4(Ipv4Addr::new(10, 66, 0, 4), 30);
+        for held in 0..conn {
+            pool.release(held);
+        }
+        let mut again = Vec::new();
+        while let Some(addr) = pool.allocate(100 + again.len() as ConnId) {
+            again.push(addr);
+        }
+        again.sort();
+        assert_eq!(
+            again,
+            [Ipv4Addr::new(10, 66, 0, 2), Ipv4Addr::new(10, 66, 0, 3)],
+            "a released address of a declared service prefix stays out of the pool"
+        );
+    }
+
+    #[test]
+    fn every_declared_service_prefix_is_reported() {
+        let mut pool = IpAllocator::new(NET, 16, GW).expect("/16 pool builds");
+        pool.add_service_prefix_v4(Ipv4Addr::new(100, 64, 0, 0), 26);
+        pool.add_service_prefix_v4(Ipv4Addr::new(10, 66, 255, 0), 26);
+        assert_eq!(
+            pool.service_prefixes_v4(),
+            [
+                (Ipv4Addr::new(100, 64, 0, 0), 26),
+                (Ipv4Addr::new(10, 66, 255, 0), 26)
+            ]
+        );
     }
 
     #[test]
