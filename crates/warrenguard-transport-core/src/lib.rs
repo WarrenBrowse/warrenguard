@@ -31,7 +31,9 @@ pub use ip_parse::{
     extract_dst_ipv6, extract_src_ipv4, extract_src_ipv6, source_ip_matches,
 };
 pub use packet_device::{FakeTun, PacketDevice};
-pub use path_probe::{PATH_PROBE_INTERVAL, PathProbeDelta, spawn_path_probe};
+pub use path_probe::{
+    PATH_PROBE_INTERVAL, PathProbeDelta, spawn_path_probe, spawn_server_path_probe,
+};
 pub use stale_source::{reject_stale_source, uplink_reject_stale_source};
 pub use transport_config::{
     CLIENT_MAX_IDLE_TIMEOUT_SECS, DATAGRAM_MAX_REORDER, warren_transport_config_client,

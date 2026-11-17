@@ -194,11 +194,99 @@ impl PathProbeDelta {
     }
 }
 
+/// Which log the probe writes to.
+///
+/// A client's probe lines go to its own local log, where a problem report
+/// reads them. On an exit they would be one timeline per subscriber session
+/// (its activity bursts, with per-interval datagram counts), which the exit's
+/// logging policy forbids at `info` and above, so the server side writes at
+/// `debug` and the node-level telemetry carries the aggregate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeSide {
+    Client,
+    Server,
+}
+
+/// One connection's sample, ready to be written.
+struct ProbeLine {
+    cwnd: u64,
+    rtt_ms: f64,
+    mtu: u16,
+    dg_buf_free: usize,
+    delta: PathProbeDelta,
+    app: Option<(u64, u64)>,
+}
+
+impl ProbeLine {
+    fn emit(&self, side: ProbeSide, label: &'static str, idx: usize) {
+        // tracing fixes an event's level per call site, so the same line is
+        // written through either macro.
+        macro_rules! line {
+            ($mac:ident) => {{
+                let d = &self.delta;
+                match self.app {
+                    Some((app_tx, app_rx)) => tracing::$mac!(
+                        probe = label,
+                        conn = idx,
+                        cwnd = self.cwnd,
+                        rtt_ms = format_args!("{:.1}", self.rtt_ms),
+                        mtu = self.mtu,
+                        sent = d.sent_packets,
+                        lost = d.lost_packets,
+                        congestion = d.congestion_events,
+                        dg_tx = d.dg_frames_tx,
+                        dg_rx = d.dg_frames_rx,
+                        dg_buf_free = self.dg_buf_free,
+                        dg_drop_aqm = d.dg_dropped_aqm,
+                        dg_drop_full = d.dg_dropped_overflow,
+                        ecn_not = d.ecn_not_ect,
+                        ecn_ect0 = d.ecn_ect0,
+                        ecn_ect1 = d.ecn_ect1,
+                        ecn_ce = d.ecn_ce,
+                        black_holes = d.black_holes,
+                        udp_gso = format_args!("{:.1}", d.udp_gso_ratio()),
+                        app_tx,
+                        app_rx,
+                        "path probe"
+                    ),
+                    None => tracing::$mac!(
+                        probe = label,
+                        conn = idx,
+                        cwnd = self.cwnd,
+                        rtt_ms = format_args!("{:.1}", self.rtt_ms),
+                        mtu = self.mtu,
+                        sent = d.sent_packets,
+                        lost = d.lost_packets,
+                        congestion = d.congestion_events,
+                        dg_tx = d.dg_frames_tx,
+                        dg_rx = d.dg_frames_rx,
+                        dg_buf_free = self.dg_buf_free,
+                        dg_drop_aqm = d.dg_dropped_aqm,
+                        dg_drop_full = d.dg_dropped_overflow,
+                        ecn_not = d.ecn_not_ect,
+                        ecn_ect0 = d.ecn_ect0,
+                        ecn_ect1 = d.ecn_ect1,
+                        ecn_ce = d.ecn_ce,
+                        black_holes = d.black_holes,
+                        udp_gso = format_args!("{:.1}", d.udp_gso_ratio()),
+                        "path probe"
+                    ),
+                }
+            }};
+        }
+        match side {
+            ProbeSide::Client => line!(info),
+            ProbeSide::Server => line!(debug),
+        }
+    }
+}
+
 /// Spawns the probe task over a set of connections (one client session:
 /// 1 conn mono, N conns multi). Logs one INFO line per active
 /// connection per [`PATH_PROBE_INTERVAL`] while traffic flows, and
 /// terminates by itself once every connection is closed, so callers
-/// can fire-and-forget the handle.
+/// can fire-and-forget the handle. For a client's own log; an exit or a
+/// relay uses [`spawn_server_path_probe`].
 ///
 /// `app` carries the exit-side per-client app-level counters
 /// ([`ClientMetrics`]); when present, the probe logs `app_tx`/`app_rx`
@@ -210,11 +298,29 @@ pub fn spawn_path_probe(
     conns: Vec<Connection>,
     app: Option<Arc<ClientMetrics>>,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_probe(ProbeSide::Client, label, conns, app)
+}
+
+/// [`spawn_path_probe`] for a server (exit or relay) leg: the same samples,
+/// written at `debug`, so a node's log carries no per-session timeline.
+#[must_use = "fire-and-forget is fine (the task self-terminates), but discard explicitly with let _"]
+pub fn spawn_server_path_probe(
+    label: &'static str,
+    conns: Vec<Connection>,
+    app: Option<Arc<ClientMetrics>>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_probe(ProbeSide::Server, label, conns, app)
+}
+
+fn spawn_probe(
+    side: ProbeSide,
+    label: &'static str,
+    conns: Vec<Connection>,
+    app: Option<Arc<ClientMetrics>>,
+) -> tokio::task::JoinHandle<()> {
     // `WARREN_PATH_PROBE=0` opts out entirely: no timer task per
-    // connection and no per-identity throughput/RTT time series in the
-    // logs (defense-in-depth for operators who want quieter exits).
-    // Default stays ON. The env read and
-    // its read-once caching live in the central knob registry.
+    // connection. Default stays ON. The env read and its read-once caching
+    // live in the central knob registry.
     if !warrenguard_config::knobs::path_probe_enabled() {
         return tokio::spawn(async {});
     }
@@ -265,55 +371,15 @@ pub fn spawn_path_probe(
                 if !heartbeat && !delta.is_noteworthy() {
                     continue;
                 }
-                let rtt_ms = cur.path.rtt.as_secs_f64() * 1000.0;
-                match app_deltas {
-                    Some((app_tx, app_rx)) => tracing::info!(
-                        probe = label,
-                        conn = idx,
-                        cwnd = cur.path.cwnd,
-                        rtt_ms = format_args!("{rtt_ms:.1}"),
-                        mtu = cur.path.current_mtu,
-                        sent = delta.sent_packets,
-                        lost = delta.lost_packets,
-                        congestion = delta.congestion_events,
-                        dg_tx = delta.dg_frames_tx,
-                        dg_rx = delta.dg_frames_rx,
-                        dg_buf_free = conn.datagram_send_buffer_space(),
-                        dg_drop_aqm = delta.dg_dropped_aqm,
-                        dg_drop_full = delta.dg_dropped_overflow,
-                        ecn_not = delta.ecn_not_ect,
-                        ecn_ect0 = delta.ecn_ect0,
-                        ecn_ect1 = delta.ecn_ect1,
-                        ecn_ce = delta.ecn_ce,
-                        black_holes = delta.black_holes,
-                        udp_gso = format_args!("{:.1}", delta.udp_gso_ratio()),
-                        app_tx,
-                        app_rx,
-                        "path probe"
-                    ),
-                    None => tracing::info!(
-                        probe = label,
-                        conn = idx,
-                        cwnd = cur.path.cwnd,
-                        rtt_ms = format_args!("{rtt_ms:.1}"),
-                        mtu = cur.path.current_mtu,
-                        sent = delta.sent_packets,
-                        lost = delta.lost_packets,
-                        congestion = delta.congestion_events,
-                        dg_tx = delta.dg_frames_tx,
-                        dg_rx = delta.dg_frames_rx,
-                        dg_buf_free = conn.datagram_send_buffer_space(),
-                        dg_drop_aqm = delta.dg_dropped_aqm,
-                        dg_drop_full = delta.dg_dropped_overflow,
-                        ecn_not = delta.ecn_not_ect,
-                        ecn_ect0 = delta.ecn_ect0,
-                        ecn_ect1 = delta.ecn_ect1,
-                        ecn_ce = delta.ecn_ce,
-                        black_holes = delta.black_holes,
-                        udp_gso = format_args!("{:.1}", delta.udp_gso_ratio()),
-                        "path probe"
-                    ),
+                ProbeLine {
+                    cwnd: cur.path.cwnd,
+                    rtt_ms: cur.path.rtt.as_secs_f64() * 1000.0,
+                    mtu: cur.path.current_mtu,
+                    dg_buf_free: conn.datagram_send_buffer_space(),
+                    delta,
+                    app: app_deltas,
                 }
+                .emit(side, label, idx);
             }
             if all_closed {
                 break;
@@ -325,6 +391,82 @@ pub fn spawn_path_probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lines a subscriber filtered at `level` receives while `f` runs.
+    fn lines_at(level: tracing::Level, f: impl FnOnce()) -> String {
+        use std::io::Write;
+        use std::sync::Mutex;
+        #[derive(Clone, Default)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .map_err(|_| std::io::ErrorKind::Other)?
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = Sink::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(level)
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = sink.0.lock().map(|b| b.clone()).unwrap_or_default();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn busy_line() -> ProbeLine {
+        let delta = PathProbeDelta::between(
+            &stats_with(0, 0, 0, 0, 0, 0, 0),
+            &stats_with(100, 3, 1, 90, 80, 100, 50),
+        );
+        ProbeLine {
+            cwnd: 12_000,
+            rtt_ms: 41.5,
+            mtu: 1_350,
+            dg_buf_free: 4_096,
+            delta,
+            app: Some((7, 9)),
+        }
+    }
+
+    #[test]
+    fn an_exit_probe_line_never_reaches_an_info_log() {
+        let line = busy_line();
+        let at_info = lines_at(tracing::Level::INFO, || {
+            line.emit(ProbeSide::Server, "exit-mh", 0)
+        });
+        assert!(
+            at_info.is_empty(),
+            "a per-session counter line on the exit is an activity timeline (doc 111): it must stay below info, got {at_info}"
+        );
+        let at_debug = lines_at(tracing::Level::DEBUG, || {
+            line.emit(ProbeSide::Server, "exit-mh", 0)
+        });
+        assert!(
+            at_debug.contains("path probe"),
+            "still available when an operator asks for debug: {at_debug}"
+        );
+    }
+
+    #[test]
+    fn a_client_probe_line_stays_in_the_client_info_log() {
+        let line = busy_line();
+        let at_info = lines_at(tracing::Level::INFO, || {
+            line.emit(ProbeSide::Client, "client", 0)
+        });
+        assert!(
+            at_info.contains("path probe") && at_info.contains("dg_tx=90"),
+            "the client's own log keeps the probe for problem reports: {at_info}"
+        );
+    }
 
     fn stats_with(
         sent: u64,

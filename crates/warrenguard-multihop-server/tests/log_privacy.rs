@@ -219,3 +219,89 @@ fn multihop_server_keeps_session_timing_out_of_retained_levels() {
         }
     }
 }
+
+/// The exit's per-connection path probe writes below `info`: the client
+/// variant, which logs at `info` for a client's own problem reports, would put
+/// one activity timeline per subscriber session in the exit log.
+#[test]
+fn the_exit_spawns_only_the_server_path_probe() {
+    for path in ["src/multihop.rs", "src/datapath.rs"] {
+        let src = std::fs::read_to_string(path).unwrap_or_default();
+        assert!(
+            !src.contains("spawn_path_probe("),
+            "{path} spawns the client path probe; an exit must use spawn_server_path_probe"
+        );
+    }
+    let multihop = std::fs::read_to_string(MULTIHOP_SRC).expect("read src/multihop.rs");
+    assert!(
+        multihop.contains("spawn_server_path_probe("),
+        "the exit still samples its legs, at debug"
+    );
+}
+
+/// The macro that writes the event whose message is `msg` in `src`.
+fn macro_of(src: &str, msg: &str) -> Option<String> {
+    let at = src.find(msg)?;
+    let head = &src[..at];
+    let start = head.rfind("tracing::")?;
+    let rest = &head[start + "tracing::".len()..];
+    Some(
+        rest.chars()
+            .take_while(|c| c.is_ascii_alphabetic())
+            .collect(),
+    )
+}
+
+/// One event per session setup, refusal or route change gives the exit log a
+/// connect timeline at second resolution, and a refusal line names a fact
+/// about one subscriber (banned, device limit, token in use). The node-level
+/// admission counters carry the same facts without a timeline, so these
+/// events stay at `debug`. A setup with no tunnel address is a node fault and
+/// stays a warning.
+#[test]
+fn per_session_setup_events_stay_below_info() {
+    let src = std::fs::read_to_string(MULTIHOP_SRC).expect("read src/multihop.rs");
+    for msg in [
+        "multihop: route setup refused; sealed detail + opaque close",
+        "its serial holds a live session it does",
+        "multihop: v7 setup rejected - token invalid/denied; sealed detail + opaque close",
+        "multihop: setup rejected - account banned (CRL); sealed detail + opaque close",
+        "multihop: setup rejected - client not authorized; sealed detail + opaque close",
+        "multihop: setup rejected - pubkey revoked during setup (TOCTOU recheck)",
+        "multihop: wallet session refused by the session gate; sealed detail + opaque close",
+        IP_ASSIGN_BANNER,
+        "multihop: bonded downlink route registered",
+        "multihop: sticky-IP takeover, existing downlink owner(s) present; stale re-check armed",
+        "multihop: evicted dead downlink predecessor(s) after sticky-IP takeover",
+    ] {
+        assert_eq!(
+            macro_of(&src, msg).as_deref(),
+            Some("debug"),
+            "`{msg}` is a per-session event: it must be written at debug"
+        );
+    }
+    assert_eq!(
+        macro_of(&src, "ip-nego: no tunnel address at setup").as_deref(),
+        Some("warn"),
+        "a setup with no address is a node fault, not a session event"
+    );
+}
+
+/// The black-hole warning names the failure, not the session's volume.
+#[test]
+fn the_blackhole_warning_carries_no_session_volume() {
+    let src = std::fs::read_to_string("src/datapath.rs").expect("read src/datapath.rs");
+    let end = src
+        .find("this session black-holed")
+        .expect("the black-hole warning exists");
+    let start = src[..end]
+        .rfind("tracing::warn!(")
+        .expect("it is a warning");
+    let event = &src[start..end];
+    for field in ["datagrams =", "opened =", "to_tun ="] {
+        assert!(
+            !event.contains(field),
+            "the black-hole warning carries `{field}`, a per-session volume at warn"
+        );
+    }
+}

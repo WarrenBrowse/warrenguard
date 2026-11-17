@@ -3882,6 +3882,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "warren-quinn",
  "warrenguard-config",
  "warrenguard-daita",

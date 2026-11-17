@@ -928,7 +928,7 @@ async fn process_setup_frame(
                 }
                 RouteAdmission::Refuse(code) => {
                     crate::metrics::route_admission_metrics().record_refused(code);
-                    tracing::info!(
+                    tracing::debug!(
                         code = code.as_str(),
                         "multihop: route setup refused; sealed detail + opaque close"
                     );
@@ -992,7 +992,7 @@ async fn process_setup_frame(
                     ) =>
                 {
                     crate::metrics::admission_metrics().record(SetupAdmission::TokenRefused);
-                    tracing::warn!(
+                    tracing::debug!(
                         "multihop: v7 setup rejected - its serial holds a live session it does \
                          not belong to; sealed detail + opaque close"
                     );
@@ -1020,7 +1020,7 @@ async fn process_setup_frame(
                 refusal => {
                     crate::metrics::admission_metrics().record(SetupAdmission::TokenRefused);
                     let in_use = refusal == warrenguard_server::TokenAdmission::SerialInUse;
-                    tracing::warn!(
+                    tracing::debug!(
                         in_use,
                         "multihop: v7 setup rejected - token invalid/denied; sealed detail + opaque close"
                     );
@@ -1051,13 +1051,13 @@ async fn process_setup_frame(
                     // suspension message.
                     let detail = match verdict {
                         Admission::Banned(reason_code) => {
-                            tracing::warn!(
+                            tracing::debug!(
                                 "multihop: setup rejected - account banned (CRL); sealed detail + opaque close"
                             );
                             WarrenControlMessage::RejectedBanned { reason_code }
                         }
                         _ => {
-                            tracing::warn!(
+                            tracing::debug!(
                                 "multihop: setup rejected - client not authorized; sealed detail + opaque close"
                             );
                             WarrenControlMessage::Rejected
@@ -1133,7 +1133,7 @@ async fn process_setup_frame(
                 && !al.is_allowed_at(&pubkey, warrenguard_config::unix_now())
             {
                 crate::metrics::admission_metrics().record(SetupAdmission::WalletRefused);
-                tracing::warn!(
+                tracing::debug!(
                     "multihop: setup rejected - pubkey revoked during setup (TOCTOU recheck)"
                 );
                 // `guard` drops here -> unregister; close the connection
@@ -1195,7 +1195,7 @@ async fn process_setup_frame(
             None => registry.wallet.mark_admitted(&session),
             Some(verdict) => {
                 crate::metrics::admission_metrics().record(verdict);
-                tracing::info!(
+                tracing::debug!(
                     retired = verdict == SetupAdmission::WalletRetired,
                     "multihop: wallet session refused by the session gate; sealed detail + opaque close"
                 );
@@ -1266,7 +1266,7 @@ async fn process_setup_frame(
     // only the FAMILY presence (`dual_stack`) and the prefix length are
     // emitted. `crates/warrenguard-multihop-server/tests/log_privacy.rs`
     // enforces this at the source level.
-    tracing::info!(
+    tracing::debug!(
         dual_stack = spec.assigned_v6.is_some(),
         "ip-nego: IpAssign sent over setup stream"
     );
@@ -2522,7 +2522,7 @@ impl<A: std::hash::Hash + Eq + Copy> RouteTable<A> {
             peer: None,
             stale: Arc::new(AtomicBool::new(false)),
         });
-        tracing::info!(
+        tracing::debug!(
             senders = slot.senders.len(),
             "multihop: bonded downlink route registered"
         );
@@ -4635,7 +4635,7 @@ fn arm_takeover_recheck(
     // Make the takeover visible for the next investigator: counts only, no
     // address or pubkey (the exit's no-log discipline). The 2026-07-16
     // black-hole was silent precisely because this collision left no trace.
-    tracing::info!(
+    tracing::debug!(
         v4 = predecessors_v4.len(),
         v6 = predecessors_v6.len(),
         "multihop: sticky-IP takeover, existing downlink owner(s) present; stale re-check armed"
@@ -4656,7 +4656,7 @@ fn arm_takeover_recheck(
         }
         if evicted.total() > 0 {
             evicted.publish();
-            tracing::info!(
+            tracing::debug!(
                 closed = evicted.closed,
                 silent = evicted.silent,
                 "multihop: evicted dead downlink predecessor(s) after sticky-IP takeover"
@@ -4931,7 +4931,7 @@ async fn serve_terminating_connection<T>(
     // Transport path probe (Lever 1a): the unified prod dispatcher terminates
     // clients HERE, so the multihop path needs its own probe spawn for
     // observability parity.
-    drop(warrenguard_transport_core::spawn_path_probe(
+    drop(warrenguard_transport_core::spawn_server_path_probe(
         "exit-mh",
         vec![conn.clone()],
         None,
@@ -5308,7 +5308,7 @@ async fn serve_pq_datagram_pump<T>(
         route_control.route_admitter,
     );
 
-    drop(warrenguard_transport_core::spawn_path_probe(
+    drop(warrenguard_transport_core::spawn_server_path_probe(
         "exit-mh-pq",
         vec![conn.clone()],
         None,

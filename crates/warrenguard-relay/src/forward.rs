@@ -78,7 +78,7 @@ pub async fn forward_session(
     // pathology manifests server-side, and it had ZERO visibility during
     // the 2026-07-22 brownout forensics; the probe self-terminates when
     // the connection closes.
-    drop(warrenguard_transport_core::spawn_path_probe(
+    drop(warrenguard_transport_core::spawn_server_path_probe(
         "relay-client-leg",
         vec![client_conn.clone()],
         None,

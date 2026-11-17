@@ -880,9 +880,6 @@ impl Drop for RxReport {
         self.publish();
         if self.is_uplink_blackhole() {
             tracing::warn!(
-                datagrams = self.datagrams,
-                opened = self.opened,
-                to_tun = self.to_tun,
                 spoofed_drops = self.spoof.total(),
                 spoofed_v4_mismatch = self.spoof.v4_mismatch,
                 spoofed_v6_link_local = self.spoof.v6_link_local,
