@@ -25,10 +25,6 @@ ignore = [
     # local PEM cert/key material at config/startup time, never
     # attacker-controlled bytes at runtime, so there is no reachable surface.
     "RUSTSEC-2025-0134",
-    # anyhow: unsoundness in `Error::downcast_mut()`. The engine never calls
-    # `downcast_mut` (verified: zero uses); anyhow is used only for error
-    # context/propagation in binaries, so the unsound path is unreachable.
-    "RUSTSEC-2026-0190",
     # rsa 0.10.0-rc.18 (Marvin timing side channel, no patched release). The
     # engine's only private-key use is the RFC 9474 blind-signing issuer: raw
     # RSA on client-chosen input, with no padding, blinded by a fresh OS-RNG
@@ -69,8 +65,11 @@ allow = [
 confidence-threshold = 0.93
 
 [sources]
-unknown-registry = "warn"
-unknown-git = "warn"
+# `deny`, not `warn`: cargo-deny exits zero on warnings, so with `warn` the
+# allow-list below enforced nothing and an arbitrary `git = "..."` dependency
+# passed the one gate built to catch it.
+unknown-registry = "deny"
+unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # The warren-quinn fork is the only sanctioned git dependency (see CLAUDE.md
 # section 3: the QUIC stack is pinned by tag on this fork).
