@@ -40,6 +40,11 @@ pub enum SetupRefusalCode {
     ClockSkew,
     /// `2`: the exit already saw a setup under this `encapsulated_key`.
     Replayed,
+    /// `3`: the exit cannot vouch for this setup's freshness right now (its
+    /// set of recent setup keys is full, or it restarted within the
+    /// retention window and the request predates the restart). Not the
+    /// account: another exit.
+    Busy,
     /// A code this build does not know. Read as [`Self::Unspecified`].
     Other(u8),
 }
@@ -52,6 +57,7 @@ impl SetupRefusalCode {
             0 => Self::Unspecified,
             1 => Self::ClockSkew,
             2 => Self::Replayed,
+            3 => Self::Busy,
             other => Self::Other(other),
         }
     }
@@ -63,6 +69,7 @@ impl SetupRefusalCode {
             Self::Unspecified => 0,
             Self::ClockSkew => 1,
             Self::Replayed => 2,
+            Self::Busy => 3,
             Self::Other(code) => code,
         }
     }
@@ -74,6 +81,7 @@ impl SetupRefusalCode {
             Self::Unspecified => "unspecified",
             Self::ClockSkew => "clock_skew",
             Self::Replayed => "replayed",
+            Self::Busy => "busy",
             Self::Other(_) => "other",
         }
     }
@@ -101,9 +109,11 @@ mod tests {
             SetupRefusalCode::Unspecified,
             SetupRefusalCode::ClockSkew,
             SetupRefusalCode::Replayed,
+            SetupRefusalCode::Busy,
         ] {
             assert_eq!(SetupRefusalCode::from_code(code.code()), code);
         }
+        assert_eq!(SetupRefusalCode::Busy.code(), 3);
         assert_eq!(SetupRefusalCode::from_code(9), SetupRefusalCode::Other(9));
         assert_eq!(SetupRefusalCode::Other(9).code(), 9);
         assert_eq!(SetupRefusalCode::ClockSkew.as_str(), "clock_skew");

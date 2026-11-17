@@ -157,8 +157,11 @@ impl SetupError {
             // The same request meets the same refusal; the route admission
             // path falls back to another admission rather than redialling.
             SetupError::SetupRefused(code) => match crate::SetupRefusalCode::from_code(*code) {
-                crate::SetupRefusalCode::ClockSkew => Retryability::Fatal(FatalCause::ClockSkew),
-                crate::SetupRefusalCode::Replayed => Retryability::RetryReselect,
+                // The wrong clock may be this exit's: see
+                // `RejectionReason::ClockSkew` for what the consumer does.
+                crate::SetupRefusalCode::ClockSkew
+                | crate::SetupRefusalCode::Replayed
+                | crate::SetupRefusalCode::Busy => Retryability::RetryReselect,
                 _ => Retryability::Fatal(FatalCause::NotAuthorized),
             },
             SetupError::IpExhausted | SetupError::RouteRejected(_) => Retryability::RetryReselect,
@@ -632,7 +635,13 @@ mod tests {
         assert!(matches!(refusal, SetupError::SetupRefused(1)));
         assert_eq!(
             refusal.retryability(),
-            Retryability::Fatal(FatalCause::ClockSkew)
+            Retryability::RetryReselect,
+            "one exit with a wrong clock must not stop the client"
+        );
+        assert_eq!(
+            SetupError::SetupRefused(3).retryability(),
+            Retryability::RetryReselect,
+            "a busy exit is a capacity refusal: another exit"
         );
         assert_eq!(
             SetupError::SetupRefused(2).retryability(),

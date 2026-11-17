@@ -117,8 +117,16 @@ pub enum RejectionReason {
     TokensRefusedWithoutReason,
     /// The device clock is further than [`crate::SETUP_CLOCK_SKEW_SECS`]
     /// from the exit's. Learned from the HPKE-sealed `SetupRefused` detail
-    /// (code `1`). Fatal: every exit refuses the same request until the clock
-    /// is corrected.
+    /// (code `1`). [`warrenguard_wire::Retryability::RetryReselect`], not
+    /// fatal: the wrong clock may be this exit's, and one such exit must not
+    /// stop every client. The engine supervisor does not reselect itself, so
+    /// the consumer must: dial another exit, and only when a second exit also
+    /// answers `ClockSkew` stop with
+    /// [`warrenguard_wire::FatalCause::ClockSkew`] and tell the user to set
+    /// the device clock to automatic (never an account message). The time the
+    /// client sends comes from `SupervisorConfig::setup_clock`, which a
+    /// consumer that corrects its clock from the API should wire to the same
+    /// source.
     ClockSkew,
     /// The exit had already seen a setup under this session's key. Learned
     /// from the HPKE-sealed `SetupRefused` detail (code `2`). An honest client
@@ -178,6 +186,8 @@ impl RejectionReason {
                 Some(match crate::SetupRefusalCode::from_code(*reason_code) {
                     crate::SetupRefusalCode::ClockSkew => Self::ClockSkew,
                     crate::SetupRefusalCode::Replayed => Self::SetupReplayed,
+                    // A capacity refusal of this exit, like a full pool.
+                    crate::SetupRefusalCode::Busy => Self::IpExhausted,
                     _ => Self::NotAllowlisted,
                 })
             }
@@ -251,7 +261,9 @@ impl RejectionReason {
             // As the last word on a stack, see the variant.
             Self::SerialInUse => Retryability::Fatal(FatalCause::DeviceLimit),
             Self::IpExhausted => Retryability::RetryReselect,
-            Self::ClockSkew => Retryability::Fatal(FatalCause::ClockSkew),
+            // See the variant: the consumer reselects and decides on a second
+            // exit's answer.
+            Self::ClockSkew => Retryability::RetryReselect,
             // Not the account: a party on the path copied the setup frame.
             // Another entry is the way around it.
             Self::SetupReplayed => Retryability::RetryReselect,
@@ -479,7 +491,7 @@ mod tests {
 
     #[test]
     fn a_dated_setup_refusal_names_the_clock_or_the_replay() {
-        use warrenguard_wire::{FatalCause, Retryability};
+        use warrenguard_wire::Retryability;
         let read = |code| {
             RejectionReason::from_sealed_detail(&WarrenControlMessage::SetupRefused {
                 reason_code: code,
@@ -488,8 +500,17 @@ mod tests {
         assert_eq!(read(1), Some(RejectionReason::ClockSkew));
         assert_eq!(
             RejectionReason::ClockSkew.retryability(),
-            Retryability::Fatal(FatalCause::ClockSkew),
-            "a skewed clock is the device's, and no other exit admits it: fatal with its own cause"
+            Retryability::RetryReselect,
+            "one exit with a wrong clock must not stop the client: another exit decides"
+        );
+        assert_eq!(
+            read(3),
+            Some(RejectionReason::IpExhausted),
+            "a busy exit is a capacity refusal, like a full pool"
+        );
+        assert_eq!(
+            read(3).map(RejectionReason::retryability),
+            Some(Retryability::RetryReselect)
         );
         assert_eq!(read(2), Some(RejectionReason::SetupReplayed));
         assert_eq!(

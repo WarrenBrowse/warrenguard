@@ -141,6 +141,7 @@ fn main() {
                 control("setup_refused_unspecified", "tag 20, code 0: not authorized", &refused(SetupRefusalCode::Unspecified)),
                 control("setup_refused_clock_skew", "tag 20, code 1: the time is too far from the exit's clock", &refused(SetupRefusalCode::ClockSkew)),
                 control("setup_refused_replayed", "tag 20, code 2: the exit already saw this setup key", &refused(SetupRefusalCode::Replayed)),
+                control("setup_refused_busy", "tag 20, code 3: the exit cannot vouch for the setup's freshness now (its recent-key set is full, or it restarted within the retention window); another exit", &refused(SetupRefusalCode::Busy)),
                 control("session_rekey", "tag 21: the new epoch's raw 32-byte key (that of rekey_frame_v2), then new_epoch 1 as a varint", &announce),
             ],
         },

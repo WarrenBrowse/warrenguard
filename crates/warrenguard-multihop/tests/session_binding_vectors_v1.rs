@@ -156,6 +156,9 @@ fn expected_message(name: &str, file: &File) -> WarrenControlMessage {
         "setup_refused_replayed" => WarrenControlMessage::SetupRefused {
             reason_code: SetupRefusalCode::Replayed.code(),
         },
+        "setup_refused_busy" => WarrenControlMessage::SetupRefused {
+            reason_code: SetupRefusalCode::Busy.code(),
+        },
         "session_rekey" => WarrenControlMessage::SessionRekey {
             new_encapsulated_key: arr(&file.rekey_frame_v2.epoch1_encapsulated_key_hex),
             new_epoch: 1,
@@ -167,7 +170,7 @@ fn expected_message(name: &str, file: &File) -> WarrenControlMessage {
 #[test]
 fn every_control_vector_encodes_and_decodes_byte_for_byte() {
     let file = load();
-    assert_eq!(file.control.vectors.len(), 7);
+    assert_eq!(file.control.vectors.len(), 8);
     for v in &file.control.vectors {
         let msg = expected_message(&v.name, &file);
         let bytes = encode_control(&msg).expect("encode");
