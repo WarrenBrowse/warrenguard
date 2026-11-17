@@ -100,6 +100,12 @@ pub struct MasqueConfig {
     pub max_tunnels_per_connection: u32,
     /// How long a request stream may take to deliver its complete head.
     pub request_deadline: Duration,
+    /// How long a connection may stay open before a credential admits it.
+    /// Past it an unadmitted connection is closed: the TLS handshake asks for
+    /// no credential, so without this bound a peer that opens connections
+    /// and never authenticates holds each one for as long as it keeps it
+    /// alive.
+    pub unadmitted_deadline: Duration,
     /// The credential epoch: an admission ends at the next multiple of this
     /// period on the wall clock, plus [`Self::admission_grace`].
     pub admission_period: Duration,
@@ -118,6 +124,7 @@ impl Default for MasqueConfig {
         Self {
             max_tunnels_per_connection: 256,
             request_deadline: Duration::from_secs(10),
+            unadmitted_deadline: Duration::from_secs(10),
             admission_period: Duration::from_secs(3600),
             admission_grace: Duration::from_secs(300),
             other_response: Bytes::from(encode_response_headers(404, &[])),
@@ -213,6 +220,21 @@ where
             conn.clone(),
             self.config.max_tunnels_per_connection,
         ));
+        {
+            let state = state.clone();
+            let deadline = self.config.unadmitted_deadline;
+            tokio::spawn(async move {
+                tokio::select! {
+                    () = tokio::time::sleep(deadline) => {}
+                    _ = state.connection().closed() => return,
+                }
+                if !state.is_admitted() {
+                    tracing::trace!(conn = state.id(), "masque: unadmitted connection closed");
+                    // Neutral code, as a web server ending an idle connection.
+                    state.connection().close(quinn::VarInt::from_u32(0), b"");
+                }
+            });
+        }
 
         // Speak first, as a real HTTP/3 server does: the control stream with
         // our SETTINGS, then the two QPACK streams. A browser sends no

@@ -2259,6 +2259,12 @@ trait PeerLiveness: Send + Sync {
     fn packets_from_peer(&self) -> u64;
     /// `true` once the connection is closed for good.
     fn is_closed(&self) -> bool;
+    /// Closes the connection. Used when its channel is pushed out of a full
+    /// slot: a connection left open after losing its downlink keeps its
+    /// uplink, its address lease and the exit's per-connection state, which
+    /// is how one identity could hold the exit with connections it no longer
+    /// receives on.
+    fn close(&self);
 }
 
 impl PeerLiveness for Connection {
@@ -2267,6 +2273,12 @@ impl PeerLiveness for Connection {
     }
     fn is_closed(&self) -> bool {
         self.close_reason().is_some()
+    }
+    fn close(&self) {
+        // Zero is the code every deployed client reads as a transient loss:
+        // the evicted leg is redialed or dropped from the bond, never taken
+        // for a policy refusal.
+        Connection::close(self, VarInt::from_u32(0), &[]);
     }
 }
 
@@ -2500,32 +2512,47 @@ impl<A: std::hash::Hash + Eq + Copy> RouteTable<A> {
     /// take down the only live owner on the next registration. The scan
     /// reads a QUIC connection under the map guard, which is why it is
     /// reached only at the cap and never on the common path.
+    ///
+    /// The sacrificed channel's connection is closed. An identity's
+    /// connections all share its address, so this cap is the per-identity
+    /// connection cap, and it only bounds anything if the connection that
+    /// lost its downlink stops holding the exit too.
     fn register(&self, ip: A, tx: tokio::sync::mpsc::Sender<Vec<u8>>) {
-        let mut routes = self.0.lock();
-        let slot = routes
-            .entry(ip)
-            .or_insert_with(|| RouteSlot::new(tx.clone()));
-        if slot.senders.iter().any(|s| s.tx.same_channel(&tx)) {
-            return;
+        let evicted = {
+            let mut routes = self.0.lock();
+            let slot = routes
+                .entry(ip)
+                .or_insert_with(|| RouteSlot::new(tx.clone()));
+            if slot.senders.iter().any(|s| s.tx.same_channel(&tx)) {
+                return;
+            }
+            let evicted = if slot.senders.len() >= MAX_SENDERS_PER_IP {
+                let victim = slot
+                    .senders
+                    .iter()
+                    .position(|d| d.peer.as_ref().is_some_and(|p| p.is_closed()))
+                    .unwrap_or(0);
+                slot.senders.remove(victim).peer
+            } else {
+                None
+            };
+            slot.senders.push(Downlink {
+                tx,
+                activity: None,
+                peer: None,
+                stale: Arc::new(AtomicBool::new(false)),
+            });
+            tracing::debug!(
+                senders = slot.senders.len(),
+                "multihop: bonded downlink route registered"
+            );
+            evicted
+        };
+        if let Some(peer) = evicted
+            && !peer.is_closed()
+        {
+            peer.close();
         }
-        if slot.senders.len() >= MAX_SENDERS_PER_IP {
-            let victim = slot
-                .senders
-                .iter()
-                .position(|d| d.peer.as_ref().is_some_and(|p| p.is_closed()))
-                .unwrap_or(0);
-            slot.senders.remove(victim);
-        }
-        slot.senders.push(Downlink {
-            tx,
-            activity: None,
-            peer: None,
-            stale: Arc::new(AtomicBool::new(false)),
-        });
-        tracing::debug!(
-            senders = slot.senders.len(),
-            "multihop: bonded downlink route registered"
-        );
     }
 
     /// Attaches the liveness handles to `tx`'s route entry under `ip`, so a
@@ -7535,6 +7562,7 @@ mod tests {
     struct FakePeer {
         packets: AtomicU64,
         closed: std::sync::atomic::AtomicBool,
+        close_calls: AtomicU64,
     }
 
     impl FakePeer {
@@ -7542,6 +7570,7 @@ mod tests {
             Arc::new(Self {
                 packets: AtomicU64::new(0),
                 closed: std::sync::atomic::AtomicBool::new(false),
+                close_calls: AtomicU64::new(0),
             })
         }
     }
@@ -7552,6 +7581,10 @@ mod tests {
         }
         fn is_closed(&self) -> bool {
             self.closed.load(Ordering::Relaxed)
+        }
+        fn close(&self) {
+            self.close_calls.fetch_add(1, Ordering::Relaxed);
+            self.closed.store(true, Ordering::Relaxed);
         }
     }
 
@@ -7842,6 +7875,46 @@ mod tests {
         assert!(
             slot.senders.iter().any(|s| s.tx.same_channel(&tx_oldest)),
             "the live sender must survive the registration that hit the cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn at_capacity_the_sacrificed_senders_connection_is_closed() {
+        // One identity's connections share its sticky address, so the slot cap
+        // is the per-identity connection cap. Dropping the oldest channel from
+        // the fan-out and leaving its connection open let one key pile up
+        // connections without bound: each kept its uplink and its exit state.
+        let router = MultihopTunRouter::default();
+        let ip = Ipv4Addr::new(10, 66, 0, 41);
+        let oldest = FakePeer::new();
+        let (tx_oldest, _rx_oldest) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        register_watched(
+            &router,
+            ip,
+            &tx_oldest,
+            &Arc::new(AtomicU64::new(1)),
+            &oldest,
+        );
+        let mut live = Vec::new();
+        for _ in 1..MAX_SENDERS_PER_IP {
+            let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+            let peer = FakePeer::new();
+            register_watched(&router, ip, &tx, &Arc::new(AtomicU64::new(1)), &peer);
+            live.push((tx, rx, peer));
+        }
+
+        let (tx_new, _rx_new) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        router.register(ip, tx_new.clone());
+
+        assert_eq!(
+            oldest.close_calls.load(Ordering::Relaxed),
+            1,
+            "the connection whose channel was pushed out must be closed, not left serving an uplink"
+        );
+        assert!(
+            live.iter()
+                .all(|(_, _, p)| p.close_calls.load(Ordering::Relaxed) == 0),
+            "only the sacrificed sender's connection may be closed"
         );
     }
 

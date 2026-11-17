@@ -323,6 +323,19 @@ fn connect_head(authority: &str, credential: Option<&str>) -> Vec<u8> {
     encode_frame(FRAME_HEADERS, &encode_field_section(&fields))
 }
 
+/// A plain `GET /` of the cover site, the request a web prober sends.
+fn decoy_request_head() -> Vec<u8> {
+    encode_frame(
+        FRAME_HEADERS,
+        &encode_field_section(&[
+            field(b":method", b"GET"),
+            field(b":scheme", b"https"),
+            field(b":authority", COVER.as_bytes()),
+            field(b":path", b"/"),
+        ]),
+    )
+}
+
 fn connect_udp_head(path: &str, credential: Option<&str>) -> Vec<u8> {
     let mut fields = vec![
         field(b":method", b"CONNECT"),
@@ -612,6 +625,55 @@ async fn a_datagram_sent_before_the_connect_udp_response_is_relayed() {
         .expect("datagram");
     let (_, _, payload) = read_masque_datagram(&reply).expect("well-formed");
     assert_eq!(payload, b"early");
+}
+
+/// Short, so the tests run in a second; production uses the default.
+const TEST_UNADMITTED_DEADLINE: Duration = Duration::from_millis(500);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connection_no_credential_admits_is_closed_at_the_unadmitted_deadline() {
+    // The handshake asks for no credential, so a peer that opens its control
+    // stream and then only keeps the connection alive must not hold it (and
+    // the dispatcher slot it sits in) for as long as it likes.
+    let (config, dialer) = tunnel_config().await;
+    let config = MasqueConfig {
+        unadmitted_deadline: TEST_UNADMITTED_DEADLINE,
+        ..config
+    };
+    let (addr, root) = spawn_server(ingress(StubAdmitter::admitting(), true, dialer, config));
+    let conn = connect(addr, &root).await;
+    let _ctrl = open_control(&conn, true).await;
+    // A plain request answered without a credential does not count.
+    let other = request(&conn, &decoy_request_head()).await;
+    assert_eq!(other.status, 200);
+
+    let closed = tokio::time::timeout(TEST_UNADMITTED_DEADLINE * 6, conn.closed()).await;
+
+    assert!(
+        closed.is_ok(),
+        "an unadmitted connection must be closed once the deadline passes"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_admitted_connection_outlives_the_unadmitted_deadline() {
+    let (config, dialer) = tunnel_config().await;
+    let config = MasqueConfig {
+        unadmitted_deadline: TEST_UNADMITTED_DEADLINE,
+        ..config
+    };
+    let (addr, root) = spawn_server(ingress(StubAdmitter::admitting(), true, dialer, config));
+    let conn = connect(addr, &root).await;
+    let _ctrl = open_control(&conn, true).await;
+    let admitted = request(&conn, &connect_head("a.example:443", Some(&credential()))).await;
+    assert_eq!(admitted.status, 200);
+
+    let closed = tokio::time::timeout(TEST_UNADMITTED_DEADLINE * 6, conn.closed()).await;
+
+    assert!(
+        closed.is_err(),
+        "a connection a credential admitted must not be closed by the unadmitted deadline"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -917,16 +979,7 @@ async fn a_request_that_is_not_a_proxy_request_gets_the_deployer_response() {
     let conn = connect(addr, &root).await;
     let _ctrl = open_control(&conn, true).await;
 
-    let get = encode_frame(
-        FRAME_HEADERS,
-        &encode_field_section(&[
-            field(b":method", b"GET"),
-            field(b":scheme", b"https"),
-            field(b":authority", COVER.as_bytes()),
-            field(b":path", b"/"),
-        ]),
-    );
-    let mut x = request(&conn, &get).await;
+    let mut x = request(&conn, &decoy_request_head()).await;
 
     assert_eq!(x.status, 200);
     let body = read_data(&mut x.recv, x.rest, usize::MAX).await;

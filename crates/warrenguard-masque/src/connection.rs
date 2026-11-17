@@ -84,6 +84,10 @@ impl ConnState {
         self.tunnels.clone().try_acquire_owned().ok()
     }
 
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
     /// A process-local identifier of the connection, for correlating log
     /// lines; it names no peer.
     pub(crate) fn id(&self) -> usize {
