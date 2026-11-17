@@ -92,6 +92,10 @@ pub enum MultiHopError {
     /// QUIC initial cipher, etc.).
     #[error("TLS client config build failed: {0}")]
     Tls(#[from] WarrenTlsError),
+    /// The post-quantum seal is required and the exit offers no ML-KEM key:
+    /// the session is not dialled classically. Another exit may offer one.
+    #[error("the exit offers no post-quantum key and the post-quantum seal is required")]
+    PostQuantumUnavailable,
     /// Binding the local Quinn endpoint failed.
     #[error("failed to bind local QUIC endpoint: {source}")]
     Bind {
@@ -355,7 +359,7 @@ impl MultiHopError {
         }
         // The same route request meets the same refusal: the consumer moves
         // to another admission (a token route), never a fatal account state.
-        if let MultiHopError::RouteRefused(_) = self {
+        if let MultiHopError::RouteRefused(_) | MultiHopError::PostQuantumUnavailable = self {
             return warrenguard_wire::Retryability::RetryReselect;
         }
         if self.dial_refusal().is_some() {

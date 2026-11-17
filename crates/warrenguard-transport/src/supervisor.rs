@@ -344,7 +344,7 @@ pub struct SupervisorConfig {
     /// Raw ML-KEM-768 encapsulation key of the exit (`MLKEM768_ENCAPS_KEY_LEN`
     /// bytes) from its PQ-signed descriptor, or `None`/empty when the exit
     /// advertises no PQ key. When present the supervisor dials the `/v2` X-Wing
-    /// hybrid seal with `require_pq = false`, so an exit publishing no PQ
+    /// hybrid seal; unless [`Self::require_pq`] is set, an exit publishing no PQ
     /// descriptor still falls back to the byte-identical classical `/v1` session
     /// over `exit_x25519_multihop_pubkey`.
     pub exit_mlkem768_pubkey: Option<Vec<u8>>,
@@ -460,6 +460,11 @@ pub struct SupervisorConfig {
     /// The clock a dated setup request is stamped with ([`SetupClock`]).
     /// `None` reads the device clock.
     pub setup_clock: Option<SetupClock>,
+    /// Require the post-quantum X-Wing seal: an exit offering no ML-KEM key
+    /// fails the dial with [`MultiHopError::PostQuantumUnavailable`] instead
+    /// of falling back to the classical seal, and a failed post-quantum
+    /// negotiation is never retried classically.
+    pub require_pq: bool,
 }
 
 impl SupervisorConfig {
@@ -1766,9 +1771,8 @@ impl MultiHopSupervisor {
 
     /// Dial one fresh session to `target`, preferring the post-quantum X-Wing
     /// (`/v2`) seal when the target carries an ML-KEM key and falling back to
-    /// the classical X25519 (`/v1`) seal otherwise. `require_pq = false`: an
-    /// exit advertising no PQ key stays on the byte-identical classical session,
-    /// so this is inert on the wire until exits publish PQ descriptors. Shared
+    /// the classical X25519 (`/v1`) seal otherwise, unless
+    /// [`SupervisorConfig::require_pq`] refuses the classical seal. Shared
     /// by the primary dial ([`Self::connect_once`], itself the overlap re-dial
     /// and cold-retry path) and each bonded secondary ([`Self::dial_secondary`])
     /// so a make-before-break swap never downgrades a live PQ circuit.
@@ -1777,14 +1781,19 @@ impl MultiHopSupervisor {
         target: &CircuitTarget,
         bind_addr: std::net::SocketAddr,
     ) -> Result<MultiHopClient, MultiHopError> {
+        // A build without the post-quantum seal cannot honour the requirement.
+        #[cfg(not(feature = "pq-hpke"))]
+        if config.require_pq {
+            return Err(MultiHopError::PostQuantumUnavailable);
+        }
         #[cfg(feature = "pq-hpke")]
-        if let Some(mlkem768_ek) = pq_dial_key(target) {
+        if let Some(mlkem768_ek) = dial_seal(target, config.require_pq)? {
             return MultiHopClient::connect_with_transport_config_pq(
                 &target.relay,
                 target.exit_id,
                 &target.exit_x25519_multihop_pubkey,
                 mlkem768_ek,
-                false,
+                config.require_pq,
                 &config.operational_pubkey,
                 &config.client_signing,
                 bind_addr,
@@ -2960,6 +2969,17 @@ fn secondary_bind_addr(primary: std::net::SocketAddr) -> std::net::SocketAddr {
     addr
 }
 
+/// The ML-KEM key to seal the session with, `None` for the classical seal,
+/// or the refusal when the post-quantum seal is required and the exit offers
+/// no key.
+#[cfg(feature = "pq-hpke")]
+fn dial_seal(target: &CircuitTarget, require_pq: bool) -> Result<Option<&[u8]>, MultiHopError> {
+    match pq_dial_key(target) {
+        None if require_pq => Err(MultiHopError::PostQuantumUnavailable),
+        key => Ok(key),
+    }
+}
+
 /// The exit ML-KEM key to seal a dial with, or `None` for the classical seal.
 /// Empty key material counts as absent so an exit that publishes no PQ
 /// descriptor keeps the classical `/v1` session (inert on the wire until a
@@ -3187,6 +3207,7 @@ mod tests {
             on_path_rtt: None,
             session_token_provider: None,
             setup_clock: None,
+            require_pq: false,
         }
     }
 
@@ -3268,6 +3289,30 @@ mod tests {
         let pq = CircuitTarget::from_config(&cfg);
         assert_eq!(pq.exit_mlkem768_pubkey.as_deref(), Some(key.as_slice()));
         assert_eq!(pq_dial_key(&pq), Some(key.as_slice()));
+    }
+
+    /// With the post-quantum seal required, an exit that offers no ML-KEM key
+    /// is never dialled classically: the consumer reselects another exit.
+    #[cfg(feature = "pq-hpke")]
+    #[test]
+    fn a_required_post_quantum_seal_refuses_an_exit_without_a_key() {
+        use warrenguard_multihop::MLKEM768_ENCAPS_KEY_LEN;
+
+        let classical = CircuitTarget::from_config(&dummy_config());
+        assert!(matches!(dial_seal(&classical, false), Ok(None)));
+        assert!(matches!(
+            dial_seal(&classical, true),
+            Err(MultiHopError::PostQuantumUnavailable)
+        ));
+
+        let mut cfg = dummy_config();
+        cfg.exit_mlkem768_pubkey = Some(vec![7u8; MLKEM768_ENCAPS_KEY_LEN]);
+        let pq = CircuitTarget::from_config(&cfg);
+        assert!(matches!(dial_seal(&pq, true), Ok(Some(_))));
+        assert_eq!(
+            MultiHopError::PostQuantumUnavailable.retryability(),
+            warrenguard_wire::Retryability::RetryReselect
+        );
     }
 
     #[test]
@@ -3956,6 +4001,7 @@ mod run_tests {
             on_path_rtt: None,
             session_token_provider: None,
             setup_clock: None,
+            require_pq: false,
         }
     }
 
@@ -6821,6 +6867,7 @@ mod route_run_tests {
             on_path_rtt: None,
             session_token_provider: None,
             setup_clock: None,
+            require_pq: false,
         }
     }
 

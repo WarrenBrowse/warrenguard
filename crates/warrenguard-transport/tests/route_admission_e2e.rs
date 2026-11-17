@@ -216,6 +216,7 @@ fn config(exit: &Exit, tokens: Option<SessionTokenProvider>) -> SupervisorConfig
         on_path_rtt: None,
         session_token_provider: tokens,
         setup_clock: None,
+        require_pq: false,
     }
 }
 
