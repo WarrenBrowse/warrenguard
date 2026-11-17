@@ -42,6 +42,7 @@ mod control;
 pub mod dial;
 mod errors;
 mod exit_descriptor;
+mod freshness;
 mod lease_refresh;
 mod node_attestation;
 mod operational_cert;
@@ -81,6 +82,9 @@ pub use exit_descriptor::{
     verify_exit_descriptor_pq, verify_exit_descriptor_v2,
     verify_exit_descriptor_with_dns_attestation,
 };
+pub use freshness::{
+    RECENT_SETUP_RETENTION_SECS, SETUP_CLOCK_SKEW_SECS, SetupRefusalCode, within_setup_skew,
+};
 pub use lease_refresh::LeaseRefreshStatus;
 pub use node_attestation::{
     NodeAttestationError, node_attestation_signing_payload, sign_node_attestation,
@@ -90,7 +94,10 @@ pub use operational_cert::{
     OperationalCertError, operational_cert_signing_payload, sign_operational_cert,
     verify_operational_cert,
 };
-pub use pop::{POP_CONTEXT_V2, pop_signing_message, sign_pop, verify_pop};
+pub use pop::{
+    POP_CONTEXT_V2, POP_CONTEXT_V3, pop_signing_message, pop_signing_message_v3, sign_pop,
+    sign_pop_v3, verify_pop, verify_pop_v3,
+};
 pub use relay::{
     RELAY_AUTH_PROOF_LEN, RELAY_AUTH_PROOF_VERSION, RelayDescriptorSigned, RelayPkiError,
     decode_relay_auth_proof, encode_relay_auth_proof, relay_descriptor_signing_payload,

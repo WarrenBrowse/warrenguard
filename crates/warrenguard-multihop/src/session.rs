@@ -152,6 +152,9 @@ fn compose_export_info_reverse(epoch: u32, seq: u64) -> [u8; 22 + 4 + 8 + 1] {
 /// arriving at the client.
 struct PendingOldEpoch {
     ctx: hpke::aead::AeadCtxS<WarrenAead, WarrenKdf, WarrenKem>,
+    /// The previous epoch's key, so [`ClientSession::seal_pending_old_epoch`]
+    /// stamps a frame the exit finds under the session it already holds.
+    encapsulated_key: EncapsulatedKeyBytes,
     epoch: u32,
 }
 
@@ -289,6 +292,7 @@ impl ClientSession {
         let old_epoch = self.epoch;
         self.pending_old_epoch = Some(PendingOldEpoch {
             ctx: old_ctx,
+            encapsulated_key: self.encapsulated_key,
             epoch: old_epoch,
         });
 
@@ -343,11 +347,61 @@ impl ClientSession {
         epoch: u32,
         seq: u64,
     ) -> Result<WarrenMultihopFrame, MultihopError> {
+        Self::seal_with(
+            &self.ctx,
+            self.encapsulated_key,
+            &self.exit_id,
+            payload,
+            epoch,
+            seq,
+        )
+    }
+
+    /// Seal a payload under the RETAINED previous epoch, during the overlap
+    /// after a [`Self::rekey`]: the frame carries the previous epoch's number
+    /// and key, so it opens under the session the exit already holds. Used for
+    /// the rekey announcement, which only the previous session can
+    /// authenticate, and for data while the exit has not yet acknowledged the
+    /// new epoch.
+    ///
+    /// # Errors
+    ///
+    /// - [`MultihopError::RekeyFailed`] if there is no pending old epoch.
+    /// - The errors of [`Self::seal`].
+    pub fn seal_pending_old_epoch(
+        &self,
+        payload: &[u8],
+        seq: u64,
+    ) -> Result<WarrenMultihopFrame, MultihopError> {
+        let pending = self
+            .pending_old_epoch
+            .as_ref()
+            .ok_or(MultihopError::RekeyFailed(
+                "no pending old epoch to seal a frame under",
+            ))?;
+        Self::seal_with(
+            &pending.ctx,
+            pending.encapsulated_key,
+            &self.exit_id,
+            payload,
+            pending.epoch,
+            seq,
+        )
+    }
+
+    fn seal_with(
+        ctx: &hpke::aead::AeadCtxS<WarrenAead, WarrenKdf, WarrenKem>,
+        encapsulated_key: EncapsulatedKeyBytes,
+        exit_id: &ExitId,
+        payload: &[u8],
+        epoch: u32,
+        seq: u64,
+    ) -> Result<WarrenMultihopFrame, MultihopError> {
         let mut per_packet_key = [0u8; PER_PACKET_KEY_LEN];
         let info = compose_export_info(epoch, seq);
-        self.ctx.export(&info, &mut per_packet_key)?;
+        ctx.export(&info, &mut per_packet_key)?;
 
-        let aad = compose_aad(&self.exit_id, epoch, seq);
+        let aad = compose_aad(exit_id, epoch, seq);
 
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&per_packet_key));
         let nonce = Nonce::from_slice(&NONCE_ZERO_12);
@@ -363,10 +417,10 @@ impl ClientSession {
 
         Ok(WarrenMultihopFrame {
             version: WARREN_HPKE_VERSION_V1,
-            exit_id: self.exit_id,
+            exit_id: *exit_id,
             epoch,
             seq,
-            encapsulated_key: self.encapsulated_key,
+            encapsulated_key,
             aead_tag: tag_arr,
             ciphertext: buf,
         })

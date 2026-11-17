@@ -110,6 +110,11 @@ pub enum SetupError {
     /// wallet holding that token's slot.
     #[error("multihop token refused")]
     TokenRejected(u8),
+    /// The exit refused a dated setup request (sealed
+    /// [`WarrenControlMessage::SetupRefused`]). Carries the wire code of
+    /// [`crate::SetupRefusalCode`].
+    #[error("multihop dated setup refused")]
+    SetupRefused(u8),
     /// The reply was not a control message, or was a control message the client
     /// never expects to receive (e.g. an `IpRequest`).
     #[error("unexpected multihop setup reply")]
@@ -151,6 +156,11 @@ impl SetupError {
             },
             // The same request meets the same refusal; the route admission
             // path falls back to another admission rather than redialling.
+            SetupError::SetupRefused(code) => match crate::SetupRefusalCode::from_code(*code) {
+                crate::SetupRefusalCode::ClockSkew => Retryability::Fatal(FatalCause::ClockSkew),
+                crate::SetupRefusalCode::Replayed => Retryability::RetryReselect,
+                _ => Retryability::Fatal(FatalCause::NotAuthorized),
+            },
             SetupError::IpExhausted | SetupError::RouteRejected(_) => Retryability::RetryReselect,
             SetupError::Session(_) | SetupError::Control(_) | SetupError::UnexpectedReply => {
                 Retryability::RetrySameTarget
@@ -206,6 +216,9 @@ pub fn ip_assignment_from_setup_plaintext(plaintext: &[u8]) -> Result<IpAssignme
         Some(WarrenControlMessage::TokenRejected { reason_code }) => {
             Err(SetupError::TokenRejected(reason_code))
         }
+        Some(WarrenControlMessage::SetupRefused { reason_code }) => {
+            Err(SetupError::SetupRefused(reason_code))
+        }
         // An IpRequest (client->exit direction), a mid-session ExitDraining
         // advisory (data-plane only, never a setup reply), or a non-control
         // plaintext on the reply path is a protocol violation by the peer. The
@@ -221,7 +234,11 @@ pub fn ip_assignment_from_setup_plaintext(plaintext: &[u8]) -> Result<IpAssignme
             | WarrenControlMessage::RouteAnchorAck { .. }
             | WarrenControlMessage::RouteEnded { .. }
             | WarrenControlMessage::LeaseRefresh { .. }
-            | WarrenControlMessage::LeaseRefreshAck { .. },
+            | WarrenControlMessage::LeaseRefreshAck { .. }
+            | WarrenControlMessage::IpRequestDated { .. }
+            | WarrenControlMessage::IpRequestV7Dated { .. }
+            | WarrenControlMessage::IpRequestRouteDated { .. }
+            | WarrenControlMessage::SessionRekey { .. },
         )
         | None => Err(SetupError::UnexpectedReply),
     }
@@ -605,6 +622,27 @@ mod tests {
                 "code {unspecified} is a token that did not verify"
             );
         }
+    }
+
+    #[test]
+    fn a_dated_setup_refusal_keeps_its_code_and_its_verdict() {
+        use warrenguard_wire::{FatalCause, Retryability};
+        let skew = encode_control(&WarrenControlMessage::SetupRefused { reason_code: 1 }).unwrap();
+        let refusal = ip_assignment_from_setup_plaintext(&skew).expect_err("a refusal");
+        assert!(matches!(refusal, SetupError::SetupRefused(1)));
+        assert_eq!(
+            refusal.retryability(),
+            Retryability::Fatal(FatalCause::ClockSkew)
+        );
+        assert_eq!(
+            SetupError::SetupRefused(2).retryability(),
+            Retryability::RetryReselect,
+            "a replayed setup key is the path's doing: another entry"
+        );
+        assert_eq!(
+            SetupError::SetupRefused(0).retryability(),
+            Retryability::Fatal(FatalCause::NotAuthorized)
+        );
     }
 
     #[test]

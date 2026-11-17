@@ -208,3 +208,46 @@ fn fresh_session_starts_with_no_pending_old_epoch() {
     assert!(!client.has_pending_old_epoch());
     assert_eq!(client.pending_old_epoch_value(), None);
 }
+
+#[test]
+fn a_frame_sealed_under_the_pending_epoch_opens_under_the_session_the_exit_already_holds() {
+    // The rekey announcement and the data sent before the exit acknowledges
+    // the new epoch ride the PREVIOUS epoch: they must carry its key and
+    // number, so the exit opens them with the session it built at setup and
+    // not with one it has not been told about yet.
+    let (exit_priv, exit_pub) = derive_exit_keypair(&EXIT_IKM);
+    let exit_id = ExitId::from_bytes(EXIT_ID);
+    let mut rng = ChaCha20Rng::from_seed(RNG_SEED_INITIAL);
+    let mut client = ClientSession::new(&exit_pub, exit_id, &mut rng).expect("setup");
+    assert!(
+        matches!(
+            client.seal_pending_old_epoch(b"x", 0),
+            Err(MultihopError::RekeyFailed(_))
+        ),
+        "no previous epoch before the first rekey"
+    );
+    let old_key = client.encapsulated_key();
+    let exit_e0 = ExitSession::new(&exit_priv, &old_key, exit_id).expect("exit epoch 0");
+
+    let mut rng_rekey = ChaCha20Rng::from_seed(RNG_SEED_REKEY);
+    client.rekey(&exit_pub, &mut rng_rekey).expect("rekey");
+    let frame = client
+        .seal_pending_old_epoch(b"announce", 41)
+        .expect("seal under the previous epoch");
+
+    assert_eq!(frame.encapsulated_key, old_key, "the previous epoch's key");
+    assert_eq!(frame.epoch, 0, "the previous epoch's number");
+    assert_eq!(frame.seq, 41);
+    assert_eq!(
+        exit_e0
+            .open(&frame)
+            .expect("the exit's epoch 0 session opens it"),
+        b"announce"
+    );
+    let exit_e1 =
+        ExitSession::new(&exit_priv, &client.encapsulated_key(), exit_id).expect("exit epoch 1");
+    assert!(
+        exit_e1.open(&frame).is_err(),
+        "the new epoch's session must not open it"
+    );
+}

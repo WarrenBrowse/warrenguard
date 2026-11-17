@@ -449,6 +449,97 @@ pub enum WarrenControlMessage {
         /// See [`crate::TokenRejectCode`].
         reason_code: u8,
     },
+
+    /// Client -> exit, setup stream (discriminant 17). A dated
+    /// [`Self::IpRequest`]: the same fields in the same order, then the
+    /// client's wall clock. `pop_sig` is the `/v3` proof of possession
+    /// ([`crate::pop_signing_message_v3`]), which covers the time.
+    ///
+    /// An exit that decodes it binds the connection's data plane to the
+    /// setup's session (see [`Self::SessionRekey`]), refuses a time further
+    /// than [`crate::SETUP_CLOCK_SKEW_SECS`] from its own clock, refuses a
+    /// setup key it already saw, and never answers it with the plain
+    /// [`Self::Rejected`] (it uses [`Self::SetupRefused`]). An exit that
+    /// predates it decodes nothing and, in strict mode, answers the plain
+    /// `Rejected`: that answer tells the client to send this exit the legacy
+    /// request.
+    IpRequestDated {
+        /// As [`Self::IpRequest::prefer_ipv4`].
+        prefer_ipv4: Option<[u8; 4]>,
+        /// As [`Self::IpRequest::client_pubkey`].
+        client_pubkey: Option<[u8; 32]>,
+        /// As [`Self::IpRequest::wants_ipv6`].
+        wants_ipv6: bool,
+        /// The `/v3` proof of possession, over the time as well.
+        pop_sig: Option<PopSignature>,
+        /// As [`Self::IpRequest::wants_daita`].
+        wants_daita: bool,
+        /// The client's wall clock, Unix seconds.
+        client_unix_secs: u64,
+    },
+
+    /// Client -> exit, setup stream (discriminant 18). A dated
+    /// [`Self::IpRequestV7Detailed`]: the same fields in the same order, then
+    /// the client's wall clock. A refused token is answered with
+    /// [`Self::TokenRejected`], as for the detailed request. Freshness and
+    /// binding as for [`Self::IpRequestDated`].
+    IpRequestV7Dated {
+        /// As [`Self::IpRequestV7::prefer_ipv4`].
+        prefer_ipv4: Option<[u8; 4]>,
+        /// As [`Self::IpRequestV7::wants_ipv6`].
+        wants_ipv6: bool,
+        /// As [`Self::IpRequestV7::session_tokens`].
+        session_tokens: Vec<SessionToken>,
+        /// As [`Self::IpRequestV7::wants_daita`].
+        wants_daita: bool,
+        /// The client's wall clock, Unix seconds.
+        client_unix_secs: u64,
+    },
+
+    /// Client -> exit, setup stream (discriminant 19). A dated
+    /// [`Self::IpRequestRoute`]: the same fields in the same order, then the
+    /// client's wall clock. Freshness and binding as for
+    /// [`Self::IpRequestDated`].
+    IpRequestRouteDated {
+        /// As [`Self::IpRequestRoute::prefer_ipv4`].
+        prefer_ipv4: Option<[u8; 4]>,
+        /// As [`Self::IpRequestRoute::wants_ipv6`].
+        wants_ipv6: bool,
+        /// As [`Self::IpRequestRoute::route_locator`].
+        route_locator: crate::route_admission::SealedToApi,
+        /// As [`Self::IpRequestRoute::wants_daita`].
+        wants_daita: bool,
+        /// The client's wall clock, Unix seconds.
+        client_unix_secs: u64,
+    },
+
+    /// Exit -> client, setup stream (discriminant 20). The refusal of a dated
+    /// request where a legacy request would get the plain [`Self::Rejected`]:
+    /// not authorized, too far from the exit's clock, or a setup key the exit
+    /// already saw. Sealed before the same single opaque close as every policy
+    /// refusal. `reason_code` is a [`crate::SetupRefusalCode`] as a plain `u8`
+    /// so an unknown code still decodes.
+    SetupRefused {
+        /// See [`crate::SetupRefusalCode`].
+        reason_code: u8,
+    },
+
+    /// Client -> exit, **uplink datagram** (discriminant 21), sealed under
+    /// the PREVIOUS epoch's session. Announces the key of the client's next
+    /// epoch on this connection. On a connection set up with a dated request
+    /// the exit drops every frame whose key it was not given this way or by
+    /// the setup, before building any session from it: on a relayed circuit
+    /// the exit's peer is the relay, which can create a session against the
+    /// exit's public key as easily as the client can, but cannot seal under
+    /// the client's. The AEAD tag under the previous session is the
+    /// authenticator. An exit that predates it drops it as an unknown control
+    /// frame.
+    SessionRekey {
+        /// The `encapsulated_key` every frame of the new epoch carries.
+        new_encapsulated_key: [u8; 32],
+        /// The new epoch, one above the epoch of the frame carrying this.
+        new_epoch: u32,
+    },
 }
 
 impl WarrenControlMessage {
@@ -474,6 +565,29 @@ impl WarrenControlMessage {
             Self::LeaseRefreshAck { .. } => "LeaseRefreshAck",
             Self::IpRequestV7Detailed { .. } => "IpRequestV7Detailed",
             Self::TokenRejected { .. } => "TokenRejected",
+            Self::IpRequestDated { .. } => "IpRequestDated",
+            Self::IpRequestV7Dated { .. } => "IpRequestV7Dated",
+            Self::IpRequestRouteDated { .. } => "IpRequestRouteDated",
+            Self::SetupRefused { .. } => "SetupRefused",
+            Self::SessionRekey { .. } => "SessionRekey",
+        }
+    }
+
+    /// The client's wall clock a dated setup request carries, `None` for
+    /// every other message (the legacy requests included).
+    #[must_use]
+    pub fn setup_unix_secs(&self) -> Option<u64> {
+        match self {
+            Self::IpRequestDated {
+                client_unix_secs, ..
+            }
+            | Self::IpRequestV7Dated {
+                client_unix_secs, ..
+            }
+            | Self::IpRequestRouteDated {
+                client_unix_secs, ..
+            } => Some(*client_unix_secs),
+            _ => None,
         }
     }
 }
@@ -1071,6 +1185,193 @@ mod tests {
             vec![0xC0, 0x03, 0x10, 0x01],
             "TokenRejected is tag 16 then one reason byte"
         );
+    }
+
+    /// A dated request is its legacy request's fields under a new tag, then
+    /// the time as a postcard varint.
+    fn assert_dated_layout(
+        legacy: &WarrenControlMessage,
+        dated: &WarrenControlMessage,
+        tag: u8,
+        unix_secs: u64,
+    ) {
+        let legacy = encode_control(legacy).unwrap();
+        let dated_bytes = encode_control(dated).unwrap();
+        assert_eq!(dated_bytes[2], tag, "{} tag", dated.variant_name());
+        let time = postcard::to_stdvec(&unix_secs).unwrap();
+        let fields_end = dated_bytes.len() - time.len();
+        assert_eq!(
+            dated_bytes[3..fields_end],
+            legacy[3..],
+            "{}: the legacy fields follow the tag in the same order",
+            dated.variant_name()
+        );
+        assert_eq!(dated_bytes[fields_end..], time[..], "then the time");
+        assert_eq!(dated.setup_unix_secs(), Some(unix_secs));
+        assert_eq!(
+            try_decode_control(&dated_bytes).unwrap().as_ref(),
+            Some(dated),
+            "{} round-trips",
+            dated.variant_name()
+        );
+    }
+
+    #[test]
+    fn ip_request_dated_is_the_wallet_request_then_the_time_under_tag_17() {
+        let t = 1_800_000_000;
+        assert_dated_layout(
+            &WarrenControlMessage::IpRequest {
+                prefer_ipv4: Some([10, 66, 0, 42]),
+                client_pubkey: Some([0x42; 32]),
+                wants_ipv6: true,
+                pop_sig: Some(PopSignature([0xA5; 64])),
+                wants_daita: true,
+            },
+            &WarrenControlMessage::IpRequestDated {
+                prefer_ipv4: Some([10, 66, 0, 42]),
+                client_pubkey: Some([0x42; 32]),
+                wants_ipv6: true,
+                pop_sig: Some(PopSignature([0xA5; 64])),
+                wants_daita: true,
+                client_unix_secs: t,
+            },
+            0x11,
+            t,
+        );
+    }
+
+    #[test]
+    fn ip_request_v7_dated_is_the_detailed_request_then_the_time_under_tag_18() {
+        let t = 1_800_000_001;
+        let tokens = vec![SessionToken([0xCD; warrenguard_wire::SESSION_TOKEN_LEN])];
+        assert_dated_layout(
+            &WarrenControlMessage::IpRequestV7Detailed {
+                prefer_ipv4: Some([0, 0, 0, 0]),
+                wants_ipv6: false,
+                session_tokens: tokens.clone(),
+                wants_daita: true,
+            },
+            &WarrenControlMessage::IpRequestV7Dated {
+                prefer_ipv4: Some([0, 0, 0, 0]),
+                wants_ipv6: false,
+                session_tokens: tokens,
+                wants_daita: true,
+                client_unix_secs: t,
+            },
+            0x12,
+            t,
+        );
+    }
+
+    #[test]
+    fn ip_request_route_dated_is_the_route_request_then_the_time_under_tag_19() {
+        let t = 1_800_000_002;
+        assert_dated_layout(
+            &WarrenControlMessage::IpRequestRoute {
+                prefer_ipv4: None,
+                wants_ipv6: true,
+                route_locator: blob(0x3C),
+                wants_daita: false,
+            },
+            &WarrenControlMessage::IpRequestRouteDated {
+                prefer_ipv4: None,
+                wants_ipv6: true,
+                route_locator: blob(0x3C),
+                wants_daita: false,
+                client_unix_secs: t,
+            },
+            0x13,
+            t,
+        );
+    }
+
+    #[test]
+    fn setup_refused_wire_layout_is_frozen() {
+        assert_eq!(
+            encode_control(&WarrenControlMessage::SetupRefused { reason_code: 2 }).unwrap(),
+            vec![0xC0, 0x03, 0x14, 0x02],
+            "SetupRefused is tag 20 then one reason byte"
+        );
+    }
+
+    #[test]
+    fn session_rekey_wire_layout_is_frozen() {
+        let bytes = encode_control(&WarrenControlMessage::SessionRekey {
+            new_encapsulated_key: [0x6E; 32],
+            new_epoch: 300,
+        })
+        .unwrap();
+        let mut expected = vec![0xC0, 0x03, 0x15];
+        expected.extend_from_slice(&[0x6E; 32]);
+        expected.extend_from_slice(&[0xAC, 0x02]);
+        assert_eq!(
+            bytes, expected,
+            "SessionRekey is tag 21, the raw 32-byte key, then the epoch as a varint"
+        );
+    }
+
+    #[test]
+    fn only_the_dated_requests_carry_a_setup_time() {
+        assert_eq!(
+            WarrenControlMessage::IpRequest {
+                prefer_ipv4: None,
+                client_pubkey: None,
+                wants_ipv6: false,
+                pop_sig: None,
+                wants_daita: false,
+            }
+            .setup_unix_secs(),
+            None
+        );
+        assert_eq!(
+            WarrenControlMessage::SessionRekey {
+                new_encapsulated_key: [0; 32],
+                new_epoch: 1,
+            }
+            .setup_unix_secs(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_deployed_decoder_refuses_the_session_binding_variants() {
+        let new_variants = [
+            WarrenControlMessage::IpRequestDated {
+                prefer_ipv4: None,
+                client_pubkey: Some([0x01; 32]),
+                wants_ipv6: false,
+                pop_sig: Some(PopSignature([0x02; 64])),
+                wants_daita: false,
+                client_unix_secs: 1_800_000_000,
+            },
+            WarrenControlMessage::IpRequestV7Dated {
+                prefer_ipv4: None,
+                wants_ipv6: false,
+                session_tokens: vec![SessionToken([0x01; warrenguard_wire::SESSION_TOKEN_LEN])],
+                wants_daita: false,
+                client_unix_secs: 1_800_000_000,
+            },
+            WarrenControlMessage::IpRequestRouteDated {
+                prefer_ipv4: None,
+                wants_ipv6: false,
+                route_locator: blob(0x01),
+                wants_daita: false,
+                client_unix_secs: 1_800_000_000,
+            },
+            WarrenControlMessage::SetupRefused { reason_code: 1 },
+            WarrenControlMessage::SessionRekey {
+                new_encapsulated_key: [0x03; 32],
+                new_epoch: 1,
+            },
+        ];
+        for msg in new_variants {
+            let bytes = encode_control(&msg).unwrap();
+            assert!(
+                postcard::from_bytes::<DeployedControlMessage>(&bytes[2..]).is_err(),
+                "a deployed peer must fail to decode {} (then drop or refuse it), never misread it",
+                msg.variant_name()
+            );
+        }
     }
 
     #[test]

@@ -81,6 +81,74 @@ pub fn verify_pop(
         .is_ok()
 }
 
+/// Domain-separation context of the dated proof of possession carried by
+/// [`crate::WarrenControlMessage::IpRequestDated`]. The `/v2` message binds
+/// the account key to one session but not to a time, so a captured setup
+/// frame stays admissible as long as an exit can rebuild its session; `/v3`
+/// adds the request's time, which the exit checks against its clock.
+pub const POP_CONTEXT_V3: &[u8] = b"warren/multihop/pop/v3";
+
+/// The byte string the `/v3` proof of possession covers:
+/// [`POP_CONTEXT_V3`] || `exit_id` (16) || `encapsulated_key` (32) ||
+/// `client_unix_secs` (8, big-endian). Fixed-length parts, raw
+/// concatenation, no length prefixes.
+#[must_use]
+pub fn pop_signing_message_v3(
+    exit_id: &ExitId,
+    encapsulated_key: &EncapsulatedKeyBytes,
+    client_unix_secs: u64,
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(POP_CONTEXT_V3.len() + 16 + 32 + 8);
+    msg.extend_from_slice(POP_CONTEXT_V3);
+    msg.extend_from_slice(exit_id.as_bytes());
+    msg.extend_from_slice(encapsulated_key);
+    msg.extend_from_slice(&client_unix_secs.to_be_bytes());
+    msg
+}
+
+/// Sign the `/v3` proof of possession that goes into
+/// `IpRequestDated::pop_sig`.
+#[must_use]
+pub fn sign_pop_v3(
+    key: &SigningKey,
+    exit_id: &ExitId,
+    encapsulated_key: &EncapsulatedKeyBytes,
+    client_unix_secs: u64,
+) -> PopSignature {
+    PopSignature(
+        key.sign(&pop_signing_message_v3(
+            exit_id,
+            encapsulated_key,
+            client_unix_secs,
+        ))
+        .to_bytes(),
+    )
+}
+
+/// Verify a `/v3` proof of possession, with the same strict posture as
+/// [`verify_pop`]. `false` unless the signature covers exactly this
+/// `(exit_id, encapsulated_key, client_unix_secs)`; a `/v2` signature never
+/// verifies here.
+#[must_use]
+pub fn verify_pop_v3(
+    client_pubkey: &[u8; 32],
+    exit_id: &ExitId,
+    encapsulated_key: &EncapsulatedKeyBytes,
+    client_unix_secs: u64,
+    sig: &PopSignature,
+) -> bool {
+    let Ok(verifying_key) = VerifyingKey::from_bytes(client_pubkey) else {
+        return false;
+    };
+    let signature = Signature::from_bytes(&sig.0);
+    verifying_key
+        .verify_strict(
+            &pop_signing_message_v3(exit_id, encapsulated_key, client_unix_secs),
+            &signature,
+        )
+        .is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,6 +277,75 @@ mod tests {
             !verify_pop(&identity, &exit_id, &ENCAP, &forged),
             "a small-order (weak) account key must be rejected under strict verification"
         );
+    }
+
+    #[test]
+    fn pop_v3_message_layout_is_frozen() {
+        let exit_id = ExitId::from_bytes(EXIT_ID);
+        let msg = pop_signing_message_v3(&exit_id, &ENCAP, 0x0102_0304_0506_0708);
+        let mut expected = b"warren/multihop/pop/v3".to_vec();
+        expected.extend_from_slice(&EXIT_ID);
+        expected.extend_from_slice(&ENCAP);
+        expected.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            msg, expected,
+            "/v3 PoP signing message layout drifted - mint a new context string"
+        );
+    }
+
+    #[test]
+    fn pop_v3_is_bound_to_the_time() {
+        // A captured dated request cannot be re-dated: the signature over one
+        // time does not verify for any other.
+        let key = det_key(0x11);
+        let exit_id = ExitId::from_bytes(EXIT_ID);
+        let pubkey = key.verifying_key().to_bytes();
+        let sig = sign_pop_v3(&key, &exit_id, &ENCAP, 1_800_000_000);
+        assert!(verify_pop_v3(
+            &pubkey,
+            &exit_id,
+            &ENCAP,
+            1_800_000_000,
+            &sig
+        ));
+        assert!(
+            !verify_pop_v3(&pubkey, &exit_id, &ENCAP, 1_800_000_001, &sig),
+            "a /v3 PoP for one time must not verify for another"
+        );
+        assert!(
+            !verify_pop_v3(&pubkey, &exit_id, &[0x5D; 32], 1_800_000_000, &sig),
+            "nor for another session"
+        );
+    }
+
+    #[test]
+    fn the_two_pop_versions_never_verify_for_each_other() {
+        let key = det_key(0x11);
+        let exit_id = ExitId::from_bytes(EXIT_ID);
+        let pubkey = key.verifying_key().to_bytes();
+        let v2 = sign_pop(&key, &exit_id, &ENCAP);
+        assert!(
+            !verify_pop_v3(&pubkey, &exit_id, &ENCAP, 0, &v2),
+            "a /v2 signature must not pass as a dated one"
+        );
+        let v3 = sign_pop_v3(&key, &exit_id, &ENCAP, 0);
+        assert!(!verify_pop(&pubkey, &exit_id, &ENCAP, &v3));
+    }
+
+    #[test]
+    fn pop_v3_rejects_another_key_and_a_malformed_pubkey() {
+        let owner = det_key(0x11);
+        let attacker = det_key(0x22);
+        let exit_id = ExitId::from_bytes(EXIT_ID);
+        let sig = sign_pop_v3(&attacker, &exit_id, &ENCAP, 7);
+        assert!(!verify_pop_v3(
+            &owner.verifying_key().to_bytes(),
+            &exit_id,
+            &ENCAP,
+            7,
+            &sig
+        ));
+        assert!(!verify_pop_v3(&[0xFF; 32], &exit_id, &ENCAP, 7, &sig));
     }
 
     /// Replays the frozen cross-implementation golden vector in

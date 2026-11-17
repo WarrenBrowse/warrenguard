@@ -64,6 +64,10 @@ pub enum FatalCause {
     /// network helps: the user changes network, or unpins an entry country
     /// the network cannot reach.
     NoReachableEntry,
+    /// The device clock is too far from the exit's for a dated setup to be
+    /// admitted. Every exit answers the same until the clock is corrected,
+    /// so the user is told to fix it rather than to renew.
+    ClockSkew,
 }
 
 impl Retryability {

@@ -115,6 +115,16 @@ pub enum RejectionReason {
     /// active reads it as the device limit. Never a sealed detail: the
     /// supervisor's verdict on a whole stack.
     TokensRefusedWithoutReason,
+    /// The device clock is further than [`crate::SETUP_CLOCK_SKEW_SECS`]
+    /// from the exit's. Learned from the HPKE-sealed `SetupRefused` detail
+    /// (code `1`). Fatal: every exit refuses the same request until the clock
+    /// is corrected.
+    ClockSkew,
+    /// The exit had already seen a setup under this session's key. Learned
+    /// from the HPKE-sealed `SetupRefused` detail (code `2`). An honest client
+    /// never presents a key twice, so only a party that copied the setup
+    /// frame on the way (the entry relay) can cause it: reselect.
+    SetupReplayed,
     /// The exit closed with the opaque policy-rejection code but the
     /// sealed detail did not arrive (e.g. the reply stream was cut).
     /// Definitive all the same: an immediate redial would hit the same
@@ -163,7 +173,20 @@ impl RejectionReason {
                     _ => Self::NotAllowlisted,
                 })
             }
+            // A code this build does not know reads as the plain refusal.
+            crate::WarrenControlMessage::SetupRefused { reason_code } => {
+                Some(match crate::SetupRefusalCode::from_code(*reason_code) {
+                    crate::SetupRefusalCode::ClockSkew => Self::ClockSkew,
+                    crate::SetupRefusalCode::Replayed => Self::SetupReplayed,
+                    _ => Self::NotAllowlisted,
+                })
+            }
             crate::WarrenControlMessage::IpRequest { .. }
+            | crate::WarrenControlMessage::IpRequestDated { .. }
+            | crate::WarrenControlMessage::IpRequestV7Dated { .. }
+            | crate::WarrenControlMessage::IpRequestRouteDated { .. }
+            // Session upkeep on the data plane, never a setup answer.
+            | crate::WarrenControlMessage::SessionRekey { .. }
             | crate::WarrenControlMessage::IpRequestV7 { .. }
             | crate::WarrenControlMessage::IpRequestV7Detailed { .. }
             | crate::WarrenControlMessage::IpAssign { .. }
@@ -197,6 +220,8 @@ impl RejectionReason {
             Self::DeviceLimit => "device-limit",
             Self::SerialInUse => "serial-in-use",
             Self::TokensRefusedWithoutReason => "tokens-refused-without-reason",
+            Self::ClockSkew => "clock-skew",
+            Self::SetupReplayed => "setup-replayed",
             Self::PolicyRefused => "policy-refused",
         }
     }
@@ -226,6 +251,10 @@ impl RejectionReason {
             // As the last word on a stack, see the variant.
             Self::SerialInUse => Retryability::Fatal(FatalCause::DeviceLimit),
             Self::IpExhausted => Retryability::RetryReselect,
+            Self::ClockSkew => Retryability::Fatal(FatalCause::ClockSkew),
+            // Not the account: a party on the path copied the setup frame.
+            // Another entry is the way around it.
+            Self::SetupReplayed => Retryability::RetryReselect,
         }
     }
 }
@@ -253,6 +282,8 @@ mod tests {
             RejectionReason::DeviceLimit,
             RejectionReason::SerialInUse,
             RejectionReason::TokensRefusedWithoutReason,
+            RejectionReason::ClockSkew,
+            RejectionReason::SetupReplayed,
             RejectionReason::PolicyRefused,
         ] {
             assert_eq!(
@@ -443,6 +474,42 @@ mod tests {
             RejectionReason::from_sealed_detail(&assign),
             None,
             "a normal IpAssign must never read as a rejection"
+        );
+    }
+
+    #[test]
+    fn a_dated_setup_refusal_names_the_clock_or_the_replay() {
+        use warrenguard_wire::{FatalCause, Retryability};
+        let read = |code| {
+            RejectionReason::from_sealed_detail(&WarrenControlMessage::SetupRefused {
+                reason_code: code,
+            })
+        };
+        assert_eq!(read(1), Some(RejectionReason::ClockSkew));
+        assert_eq!(
+            RejectionReason::ClockSkew.retryability(),
+            Retryability::Fatal(FatalCause::ClockSkew),
+            "a skewed clock is the device's, and no other exit admits it: fatal with its own cause"
+        );
+        assert_eq!(read(2), Some(RejectionReason::SetupReplayed));
+        assert_eq!(
+            RejectionReason::SetupReplayed.retryability(),
+            Retryability::RetryReselect,
+            "a replayed setup key is the path's doing, not the account's: reselect"
+        );
+        for unspecified in [0u8, 77] {
+            assert_eq!(
+                read(unspecified),
+                Some(RejectionReason::NotAllowlisted),
+                "code {unspecified} reads as the plain refusal"
+            );
+        }
+        assert_eq!(
+            RejectionReason::from_sealed_detail(&WarrenControlMessage::SessionRekey {
+                new_encapsulated_key: [0; 32],
+                new_epoch: 1,
+            }),
+            None
         );
     }
 
