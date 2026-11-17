@@ -318,7 +318,9 @@ pub(crate) fn is_icmp_error(pkt: &[u8]) -> bool {
     match pkt.first().map(|b| b >> 4) {
         Some(4) => {
             let ihl = usize::from(pkt[0] & 0x0f) * 4;
-            pkt.len() > ihl && pkt[9] == 1 && matches!(pkt[ihl], 3 | 4 | 5 | 11 | 12)
+            // A header shorter than the minimum would put the protocol byte
+            // (offset 9) past the buffer or inside the payload.
+            ihl >= 20 && pkt.len() > ihl && pkt[9] == 1 && matches!(pkt[ihl], 3 | 4 | 5 | 11 | 12)
         }
         Some(6) if pkt.len() > IPV6_HEADER => pkt[6] == 58 && pkt[IPV6_HEADER] < 128,
         _ => false,
@@ -464,6 +466,20 @@ pub(crate) fn l4_pseudo_sum(
 
 #[cfg(test)]
 mod tests {
+
+    /// A truncated IPv4 buffer whose header length field is too small to
+    /// reach the protocol byte is not an ICMP error, and never panics.
+    #[test]
+    fn a_truncated_ipv4_header_is_not_an_icmp_error() {
+        for len in 1..20 {
+            let mut pkt = vec![0u8; len];
+            pkt[0] = 0x40; // version 4, IHL 0
+            assert!(!is_icmp_error(&pkt), "len {len}");
+            pkt[0] = 0x41; // version 4, IHL 1 (4 bytes)
+            assert!(!is_icmp_error(&pkt), "len {len}");
+        }
+    }
+
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
