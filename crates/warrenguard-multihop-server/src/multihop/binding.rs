@@ -16,7 +16,9 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use warrenguard_multihop::{EncapsulatedKeyBytes, RECENT_SETUP_RETENTION_SECS};
+use warrenguard_multihop::{EncapsulatedKeyBytes, RECENT_SETUP_RETENTION_SECS, SetupRefusalCode};
+
+use crate::metrics::SetupFreshnessResult;
 
 /// What the exit does with a setup that carries no time (a client that
 /// predates session binding).
@@ -72,8 +74,12 @@ pub(super) struct RecentSetupKeys {
 
 impl RecentSetupKeys {
     pub(super) fn new() -> Self {
+        // Two seconds over the wire constant: the skew check compares whole
+        // wall-clock seconds inclusively while this set ages keys on the
+        // monotonic clock, so a key forgotten at exactly the retention could
+        // still pass that check for up to one second on either side.
         Self::with_limits(
-            Duration::from_secs(RECENT_SETUP_RETENTION_SECS),
+            Duration::from_secs(RECENT_SETUP_RETENTION_SECS + 2),
             RECENT_SETUP_KEYS_CAP,
         )
     }
@@ -87,10 +93,6 @@ impl RecentSetupKeys {
             retention,
             cap,
         }
-    }
-
-    pub(super) fn claim(&self, key: &EncapsulatedKeyBytes) -> Claim {
-        self.claim_at(key, Instant::now())
     }
 
     pub(super) fn claim_at(&self, key: &EncapsulatedKeyBytes, now: Instant) -> Claim {
@@ -125,13 +127,64 @@ impl RecentSetupKeys {
 pub(crate) struct SetupFreshness {
     pub(super) recent: std::sync::Arc<RecentSetupKeys>,
     pub(super) policy: SessionBindingPolicy,
+    /// This process's start, on the wall clock setups are dated with and on
+    /// the monotonic clock that measures how young the process is.
+    started_unix_secs: u64,
+    started_at: Instant,
 }
 
 impl SetupFreshness {
     pub(super) fn new() -> Self {
+        Self::with_parts(
+            RecentSetupKeys::new(),
+            warrenguard_config::unix_now(),
+            Instant::now(),
+        )
+    }
+
+    pub(super) fn with_parts(
+        recent: RecentSetupKeys,
+        started_unix_secs: u64,
+        started_at: Instant,
+    ) -> Self {
         Self {
-            recent: std::sync::Arc::new(RecentSetupKeys::new()),
+            recent: std::sync::Arc::new(recent),
             policy: SessionBindingPolicy::default(),
+            started_unix_secs,
+            started_at,
+        }
+    }
+
+    /// The refusal a dated setup under `key`, dated `client_unix_secs`, gets
+    /// on an exit whose clock reads `exit_unix_secs`, or `None` to admit it.
+    /// A key that reaches the recent set stays claimed whatever follows.
+    pub(super) fn check(
+        &self,
+        key: &EncapsulatedKeyBytes,
+        client_unix_secs: u64,
+        exit_unix_secs: u64,
+        now: Instant,
+    ) -> Option<(SetupFreshnessResult, SetupRefusalCode)> {
+        use SetupFreshnessResult as R;
+        use SetupRefusalCode as C;
+        if !warrenguard_multihop::within_setup_skew(client_unix_secs, exit_unix_secs) {
+            return Some((R::ClockSkew, C::ClockSkew));
+        }
+        // The recent set lives in memory: a process younger than the
+        // retention never saw the setups made just before it started, and a
+        // relay holding one could replay it once. Refusing what predates the
+        // start closes that for a client whose clock is not ahead of the
+        // exit's; a client ahead by `d` seconds stays exposed for the last
+        // `d` seconds before a restart.
+        let young = now.saturating_duration_since(self.started_at)
+            < Duration::from_secs(RECENT_SETUP_RETENTION_SECS);
+        if young && client_unix_secs < self.started_unix_secs {
+            return Some((R::RestartFloor, C::Busy));
+        }
+        match self.recent.claim_at(key, now) {
+            Claim::Fresh => None,
+            Claim::Seen => Some((R::Replayed, C::Replayed)),
+            Claim::Saturated => Some((R::Saturated, C::Busy)),
         }
     }
 }
@@ -252,7 +305,7 @@ pub(super) fn note_rekey(
     new_key: EncapsulatedKeyBytes,
     new_epoch: u32,
 ) {
-    use crate::metrics::{SetupFreshnessResult, setup_freshness_metrics};
+    use crate::metrics::setup_freshness_metrics;
     let bound = accepted.is_some_and(|keys| keys.authorize(frame_epoch, new_key, new_epoch));
     setup_freshness_metrics().record(if bound {
         SetupFreshnessResult::RekeyBound
@@ -395,6 +448,62 @@ mod tests {
             "expired entries make room again"
         );
         assert_eq!(recent.len(), 1);
+    }
+
+    #[test]
+    fn a_saturated_set_refuses_with_the_retryable_busy_code() {
+        use crate::metrics::SetupFreshnessResult as R;
+        use warrenguard_multihop::SetupRefusalCode as C;
+        let started = Instant::now();
+        let freshness = SetupFreshness::with_parts(
+            RecentSetupKeys::with_limits(Duration::from_secs(240), 1),
+            1_800_000_000,
+            started,
+        );
+        let at = started + Duration::from_secs(600);
+        assert_eq!(freshness.check(&K0, 1_800_000_600, 1_800_000_600, at), None);
+        assert_eq!(
+            freshness.check(&K1, 1_800_000_600, 1_800_000_600, at),
+            Some((R::Saturated, C::Busy)),
+            "a full set is this exit's load, never the account's verdict"
+        );
+    }
+
+    #[test]
+    fn a_young_exit_refuses_a_setup_dated_before_it_started() {
+        use crate::metrics::SetupFreshnessResult as R;
+        use warrenguard_multihop::SetupRefusalCode as C;
+        let started_unix = 1_800_000_000;
+        let started = Instant::now();
+        let freshness = SetupFreshness::with_parts(RecentSetupKeys::new(), started_unix, started);
+        let at = started + Duration::from_secs(10);
+        assert_eq!(
+            freshness.check(&K0, started_unix - 1, started_unix + 10, at),
+            Some((R::RestartFloor, C::Busy)),
+            "SECURITY: the set that would have caught its replay died with the previous process"
+        );
+        assert_eq!(
+            freshness.check(&K1, started_unix + 9, started_unix + 10, at),
+            None,
+            "a setup made since the start is admitted"
+        );
+    }
+
+    #[test]
+    fn a_setup_key_outlives_the_last_second_its_time_passes_the_skew_check() {
+        // The skew check is inclusive on whole wall-clock seconds while the
+        // set ages keys on the monotonic clock: a key forgotten at exactly
+        // the retention could still pass the check for up to a second.
+        let recent = RecentSetupKeys::new();
+        let t0 = Instant::now();
+        assert_eq!(recent.claim_at(&K0, t0), Claim::Fresh);
+        assert_eq!(
+            recent.claim_at(
+                &K0,
+                t0 + Duration::from_secs(RECENT_SETUP_RETENTION_SECS + 1)
+            ),
+            Claim::Seen
+        );
     }
 
     #[test]

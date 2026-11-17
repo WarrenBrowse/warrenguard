@@ -848,6 +848,9 @@ pub enum SetupFreshnessResult {
     Replayed,
     /// A dated setup was refused because the recent-key set was full.
     Saturated,
+    /// A dated setup was refused because it predates this process's start,
+    /// which is younger than the retention of the recent-key set.
+    RestartFloor,
     /// A legacy setup was refused under the require-bound policy.
     LegacyRefused,
     /// A rekey announcement authorized a new key on a bound connection.
@@ -858,7 +861,7 @@ pub enum SetupFreshnessResult {
 }
 
 impl SetupFreshnessResult {
-    const LABELS: [&'static str; 8] = [
+    const LABELS: [&'static str; 9] = [
         "dated",
         "legacy",
         "clock_skew",
@@ -867,6 +870,7 @@ impl SetupFreshnessResult {
         "legacy_refused",
         "rekey_bound",
         "rekey_ignored",
+        "restart_floor",
     ];
 
     const fn index(self) -> usize {
@@ -879,6 +883,7 @@ impl SetupFreshnessResult {
             Self::LegacyRefused => 5,
             Self::RekeyBound => 6,
             Self::RekeyIgnored => 7,
+            Self::RestartFloor => 8,
         }
     }
 }
@@ -890,7 +895,7 @@ impl SetupFreshnessResult {
 /// label naming a client.
 #[derive(Debug)]
 pub struct SetupFreshnessMetrics {
-    counts: [AtomicU64; 8],
+    counts: [AtomicU64; 9],
 }
 
 static SETUP_FRESHNESS: SetupFreshnessMetrics = SetupFreshnessMetrics::new();
@@ -918,7 +923,7 @@ impl SetupFreshnessMetrics {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            counts: [const { AtomicU64::new(0) }; 8],
+            counts: [const { AtomicU64::new(0) }; 9],
         }
     }
 
@@ -940,14 +945,14 @@ impl SetupFreshnessMetrics {
 /// A point-in-time view of [`SetupFreshnessMetrics`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SetupFreshnessSnapshot {
-    counts: [u64; 8],
+    counts: [u64; 9],
 }
 
 impl SetupFreshnessSnapshot {
     /// `warren_exit_setup_freshness_total{result}`.
     #[must_use]
-    pub fn by_result(&self) -> [(&'static str, u64); 8] {
-        let mut out = [("", 0); 8];
+    pub fn by_result(&self) -> [(&'static str, u64); 9] {
+        let mut out = [("", 0); 9];
         for (i, label) in SetupFreshnessResult::LABELS.iter().enumerate() {
             out[i] = (label, self.counts[i]);
         }
@@ -1215,6 +1220,7 @@ mod tests {
             SetupFreshnessResult::LegacyRefused,
             SetupFreshnessResult::RekeyBound,
             SetupFreshnessResult::RekeyIgnored,
+            SetupFreshnessResult::RestartFloor,
         ];
         for (times, result) in all.iter().enumerate() {
             for _ in 0..=times {
@@ -1237,7 +1243,8 @@ mod tests {
                 "saturated",
                 "legacy_refused",
                 "rekey_bound",
-                "rekey_ignored"
+                "rekey_ignored",
+                "restart_floor"
             ]
         );
     }

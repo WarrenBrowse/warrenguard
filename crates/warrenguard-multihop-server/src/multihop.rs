@@ -942,20 +942,12 @@ async fn process_setup_frame(
     let freshness_metrics = crate::metrics::setup_freshness_metrics();
     match dated_at {
         Some(client_unix_secs) => {
-            use crate::metrics::SetupFreshnessResult as R;
-            use warrenguard_multihop::SetupRefusalCode as C;
-            let refusal = if !warrenguard_multihop::within_setup_skew(
+            let refusal = freshness.check(
+                &encapsulated_key,
                 client_unix_secs,
                 warrenguard_config::unix_now(),
-            ) {
-                Some((R::ClockSkew, C::ClockSkew))
-            } else {
-                match freshness.recent.claim(&encapsulated_key) {
-                    binding::Claim::Fresh => None,
-                    binding::Claim::Seen => Some((R::Replayed, C::Replayed)),
-                    binding::Claim::Saturated => Some((R::Saturated, C::Unspecified)),
-                }
-            };
+                Instant::now(),
+            );
             if let Some((result, code)) = refusal {
                 freshness_metrics.record(result);
                 tracing::debug!(
@@ -975,7 +967,7 @@ async fn process_setup_frame(
                 .await;
                 return None;
             }
-            freshness_metrics.record(R::Dated);
+            freshness_metrics.record(crate::metrics::SetupFreshnessResult::Dated);
         }
         None if freshness.policy == SessionBindingPolicy::RequireBound => {
             freshness_metrics.record(crate::metrics::SetupFreshnessResult::LegacyRefused);
@@ -12119,7 +12111,9 @@ mod tests {
             );
             assert_opaque_close(close);
         }
-        let (_live, _) = client_setup_admitted(&exit, dated_wallet(now - 100)).await;
+        // Not earlier than `now`: a setup dated before this just-started
+        // exit's start is refused by the restart floor.
+        let (_live, _) = client_setup_admitted(&exit, dated_wallet(now)).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
