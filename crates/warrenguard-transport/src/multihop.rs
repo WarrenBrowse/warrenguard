@@ -26,7 +26,6 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -470,10 +469,12 @@ impl Default for RekeyPolicy {
 /// to buffer on the setup stream.
 pub const MAX_MULTIHOP_SETUP_FRAME_BYTES: usize = 64 * 1024;
 
-/// Doctrine overlap window after a rekey during which the previous
-/// epoch's `AeadCtxS` and `ReplayWindow` are retained client-side so
-/// in-flight reverse-direction frames can still decrypt. Set to the
-/// upper bound of the 2-5 s envelope.
+/// Doctrine overlap window during which the previous epoch's `AeadCtxS` and
+/// `ReplayWindow` are retained client-side so in-flight reverse-direction
+/// frames can still decrypt. Set to the upper bound of the 2-5 s envelope.
+/// It runs from the rekey but never ends before the exit acknowledged the new
+/// epoch: until then the previous one carries the data. That wait is bounded
+/// by [`REKEY_ACK_DEADLINE`].
 const PENDING_OLD_EPOCH_TTL: Duration = Duration::from_secs(5);
 
 /// Minimum spacing between resent epoch bootstraps (the rekey announcement
@@ -481,6 +482,15 @@ const PENDING_OLD_EPOCH_TTL: Duration = Duration::from_secs(5);
 /// unacked. Frequent enough that a few lost datagrams cost a fraction of a
 /// second, without spamming the exit on every `send_packet` call.
 const REKEY_BOOTSTRAP_RESEND_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Longest a rekey may stay unacknowledged before the client gives up on the
+/// connection and redials. Until the ack the client may not rekey again, so
+/// a relay dropping only the new epoch's frames would otherwise freeze the
+/// key for the life of the connection. 30 s is 150 resends at
+/// [`REKEY_BOOTSTRAP_RESEND_INTERVAL`]: no loss rate a tunnel survives eats
+/// that many in a row, and it stays far under the default rekey age, so the
+/// key lifetime the policy promises is exceeded by at most this much.
+pub const REKEY_ACK_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Per-epoch anti-replay tracker. The receive path picks the matching
 /// instance for `frame.epoch` so a straggler from the just-closed
@@ -576,6 +586,24 @@ where
     Ok((plaintext, is_pending))
 }
 
+/// What [`MultiHopClient::rekey_unless_unacked`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RekeyDecision {
+    /// Installed this new epoch.
+    Rekeyed(u32),
+    /// Kept this epoch: the exit has not acknowledged it yet.
+    Unacked(u32),
+    /// The policy no longer asked for a rekey.
+    NotDue,
+}
+
+/// What an authenticated reply proves: the exit holds the epoch it was
+/// sealed under.
+#[derive(Debug, Clone, Copy)]
+struct ReplyAck {
+    epoch: u32,
+}
+
 /// Maps a [`MultihopError`] from a wire-frame encode call
 /// ([`encode_frame`] / [`encode_frame_v2`]) to the transport's error type.
 /// Shared by the `/v1` and `/v2` branches of
@@ -636,19 +664,29 @@ impl ClientSessionKind {
         }
     }
 
+    /// The current epoch and whether a previous one is retained, read under
+    /// one lock so a concurrent rekey cannot pair one epoch with the other's
+    /// pending state.
+    fn epoch_and_pending(&self) -> (u32, bool) {
+        match self {
+            Self::V1(s) => {
+                let s = s.read();
+                (s.epoch(), s.has_pending_old_epoch())
+            }
+            #[cfg(feature = "pq-hpke")]
+            Self::V2 { session, .. } => {
+                let s = session.read();
+                (s.epoch(), s.has_pending_old_epoch())
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn has_pending_old_epoch(&self) -> bool {
         match self {
             Self::V1(s) => s.read().has_pending_old_epoch(),
             #[cfg(feature = "pq-hpke")]
             Self::V2 { session, .. } => session.read().has_pending_old_epoch(),
-        }
-    }
-
-    fn prune_pending_old_epoch(&self) {
-        match self {
-            Self::V1(s) => s.write().prune_pending_old_epoch(),
-            #[cfg(feature = "pq-hpke")]
-            Self::V2 { session, .. } => session.write().prune_pending_old_epoch(),
         }
     }
 
@@ -743,7 +781,9 @@ pub struct MultiHopClient {
     session: ClientSessionKind,
     seq_send: AtomicU64,
     frames_in_epoch: AtomicU64,
-    last_rekey: Mutex<Instant>,
+    /// When the current epoch was installed. On the tokio clock so the
+    /// [`REKEY_ACK_DEADLINE`] can be driven by a paused test clock.
+    last_rekey: Mutex<tokio::time::Instant>,
     rekey_policy: RekeyPolicy,
     exit_pubkey: WarrenKemPublicKey,
     exit_id: ExitId,
@@ -763,20 +803,21 @@ pub struct MultiHopClient {
     /// [`WarrenControlMessage::IpAssign`]. `None` before setup, or if the
     /// reply was a policy refusal (`Rejected` / `IpExhausted`) instead.
     assignment: Mutex<Option<IpAssignment>>,
-    /// Whether the exit has proven (by a reverse frame observed on the
-    /// current epoch) that it switched to this epoch. While `false` after a
-    /// rekey, DATA frames seal under the RETAINED previous epoch, which the
-    /// exit already holds, never the new one: an exit that binds the
-    /// connection to the keys the client announced drops a new-epoch frame
-    /// until the announcement reached it, and on `/v2` the new epoch's
-    /// `pq_ct` only ever rides its own small bootstrap frame, so a rekey's
-    /// ML-KEM ciphertext can never oversize a caller's full-size DATA frame.
-    /// Reset to `false` on every rekey; set `true` right after a successful
-    /// [`Self::setup_over_stream`] (the setup rides the reliable stream) and
-    /// by [`Self::decode_and_open_reply`] once a reverse frame proves the exit
-    /// moved to the current epoch. A `/v1` session starts acked: its epoch 0
-    /// needs no bootstrap.
-    epoch_acked: AtomicBool,
+    /// One past the highest epoch an authenticated reply proved the exit
+    /// holds (`0`: none yet). The current epoch is acknowledged when this
+    /// exceeds it. An epoch number, never a flag: a reply opened just before
+    /// a rekey and recorded just after it proves the epoch it was sealed
+    /// under, and a flag would read it as an acknowledgement of the new one.
+    /// While the current epoch is unacknowledged after a rekey, DATA frames
+    /// seal under the RETAINED previous epoch, which the exit already holds:
+    /// an exit that binds the connection to the keys the client announced
+    /// drops a new-epoch frame until the announcement reached it, and on
+    /// `/v2` the new epoch's `pq_ct` only ever rides its own small bootstrap
+    /// frame, so a rekey's ML-KEM ciphertext can never oversize a caller's
+    /// full-size DATA frame. A `/v1` session starts with epoch 0
+    /// acknowledged: it needs no bootstrap. A `/v2` one acknowledges it with
+    /// the setup reply, which rides the reliable stream.
+    acked_epochs: AtomicU64,
     /// When [`Self::send_rekey_bootstrap`] last fired, so
     /// [`Self::maybe_resend_rekey_bootstrap`] can rate-limit the resend to
     /// [`REKEY_BOOTSTRAP_RESEND_INTERVAL`] instead of resending on every
@@ -805,6 +846,7 @@ pub struct MultiHopMetrics {
     /// rekey's `pq_ct` at all (worth investigating).
     #[cfg(feature = "pq-hpke")]
     pq_setup_resends: AtomicU64,
+    rekey_ack_timeouts: AtomicU64,
 }
 
 /// Snapshot of [`MultiHopMetrics`] for a single point in time.
@@ -838,6 +880,10 @@ pub struct MultiHopMetricsSnapshot {
     /// pings sent while the latest rekey was not yet acked by the exit.
     #[cfg(feature = "pq-hpke")]
     pub pq_setup_resends: u64,
+    /// Rekeys the exit never acknowledged within [`REKEY_ACK_DEADLINE`]. Each
+    /// one closed the connection for a redial, since a fresh setup is the only
+    /// way left to replace the key.
+    pub rekey_ack_timeouts: u64,
 }
 
 impl MultiHopMetrics {
@@ -854,6 +900,7 @@ impl MultiHopMetrics {
             decode_fallback_to_old_epoch: self.decode_fallback_to_old_epoch.load(Ordering::Relaxed),
             #[cfg(feature = "pq-hpke")]
             pq_setup_resends: self.pq_setup_resends.load(Ordering::Relaxed),
+            rekey_ack_timeouts: self.rekey_ack_timeouts.load(Ordering::Relaxed),
         }
     }
 }
@@ -1551,7 +1598,7 @@ impl MultiHopClient {
             session: ClientSessionKind::V1(RwLock::new(session)),
             seq_send: AtomicU64::new(0),
             frames_in_epoch: AtomicU64::new(0),
-            last_rekey: Mutex::new(Instant::now()),
+            last_rekey: Mutex::new(tokio::time::Instant::now()),
             rekey_policy: RekeyPolicy::default(),
             exit_pubkey,
             exit_id,
@@ -1561,7 +1608,7 @@ impl MultiHopClient {
             metrics: MultiHopMetrics::default(),
             relay_auth_pubkey,
             assignment: Mutex::new(None),
-            epoch_acked: AtomicBool::new(true),
+            acked_epochs: AtomicU64::new(1),
             rekey_bootstrap_last_sent: Mutex::new(None),
         })
     }
@@ -1651,7 +1698,7 @@ impl MultiHopClient {
             },
             seq_send: AtomicU64::new(0),
             frames_in_epoch: AtomicU64::new(0),
-            last_rekey: Mutex::new(Instant::now()),
+            last_rekey: Mutex::new(tokio::time::Instant::now()),
             rekey_policy: RekeyPolicy::default(),
             exit_pubkey,
             exit_id,
@@ -1661,7 +1708,7 @@ impl MultiHopClient {
             metrics: MultiHopMetrics::default(),
             relay_auth_pubkey,
             assignment: Mutex::new(None),
-            epoch_acked: AtomicBool::new(false),
+            acked_epochs: AtomicU64::new(0),
             rekey_bootstrap_last_sent: Mutex::new(None),
         })
     }
@@ -2107,14 +2154,18 @@ impl MultiHopClient {
         // the pump loop free of a dedicated timer task while bounding
         // the leak surface to a single rekey worth of state.
         self.prune_pending_overlap_if_expired();
+        self.close_if_rekey_ack_overdue();
 
         // Check rekey BEFORE sealing the next frame. The lib's
         // ClientSession::rekey now retains the previous AeadCtxS in a
         // pending-old-epoch slot so in-flight reverse frames keep
-        // decoding through the doctrine 5 s overlap.
+        // decoding through the doctrine 5 s overlap. The cheap check runs
+        // first; the decision is retaken under the session write lock.
         let frames_so_far = self.frames_in_epoch.load(Ordering::Acquire);
         if self.should_rekey(frames_so_far) {
-            self.rekey()?;
+            self.rekey_unless_unacked(|client| {
+                client.rekey_policy_due(client.frames_in_epoch.load(Ordering::Acquire))
+            })?;
         }
 
         // Piggyback the epoch-bootstrap retry on ordinary traffic, the same
@@ -2174,6 +2225,7 @@ impl MultiHopClient {
     ///   tampered ciphertext).
     pub async fn recv(&self) -> Result<Vec<u8>, MultiHopError> {
         self.prune_pending_overlap_if_expired();
+        self.close_if_rekey_ack_overdue();
 
         let datagram = self
             .conn
@@ -2234,7 +2286,7 @@ impl MultiHopClient {
             ClientSessionKind::V1(session) => {
                 let frame = {
                     let sess = session.read();
-                    if !self.epoch_acked.load(Ordering::Acquire) && sess.has_pending_old_epoch() {
+                    if !self.epoch_is_acked(sess.epoch()) && sess.has_pending_old_epoch() {
                         // The exit has not moved to the new epoch yet (it may
                         // not even have the announcement): keep the data on
                         // the epoch it already holds.
@@ -2250,28 +2302,26 @@ impl MultiHopClient {
             ClientSessionKind::V2 { session, .. } => {
                 let frame = {
                     let sess = session.read();
-                    if self.epoch_acked.load(Ordering::Acquire) {
+                    if self.epoch_is_acked(sess.epoch()) {
                         sess.seal(payload, sess.epoch(), seq)?
                     } else if sess.has_pending_old_epoch() {
                         // (b) preferred: the exit already established the
                         // OLD epoch (it accepted the pre-rekey traffic), so
                         // full-size DATA keeps flowing there for the
-                        // doctrine overlap window while the new epoch
-                        // bootstraps on its own ping. Bounded by
-                        // `PENDING_OLD_EPOCH_TTL`: normal RTTs ack well
-                        // inside it.
+                        // overlap while the new epoch bootstraps on its own
+                        // ping. Bounded by `REKEY_ACK_DEADLINE`: normal RTTs
+                        // ack well inside the first resend.
                         sess.seal_pending_old_epoch(payload, seq)?
                     } else {
-                        // (a) fallback: the overlap window elapsed with no
-                        // ack yet (should not happen at normal RTTs; a
-                        // resent ping is still in flight, see
-                        // `maybe_resend_rekey_bootstrap`). Seal under the new
-                        // epoch with NO pq_ct: the exit cannot open this
-                        // without a setup frame it kept, so it is dropped
-                        // until a ping lands and flips the epoch to acked.
-                        // Losing packets here is the lesser evil versus
-                        // reattaching pq_ct, which is exactly the
-                        // oversized-frame bug this design fixes.
+                        // (a) no epoch the exit is known to hold: epoch 0
+                        // before its setup reply came back (the previous
+                        // epoch is never pruned while a rekey is unacked).
+                        // Seal under the current epoch with NO pq_ct: the
+                        // exit cannot open this without the setup it has not
+                        // processed yet, so it is dropped. Losing packets
+                        // here is the lesser evil versus reattaching pq_ct,
+                        // which is exactly the oversized-frame bug this
+                        // design fixes.
                         sess.seal(payload, sess.epoch(), seq)?
                     }
                 };
@@ -2287,6 +2337,26 @@ impl MultiHopClient {
     /// path so the crypto + replay accounting are identical regardless
     /// of which transport carried the frame.
     fn decode_and_open_reply(&self, bytes: &[u8]) -> Result<Vec<u8>, MultiHopError> {
+        let (plaintext, ack) = self.open_reply(bytes)?;
+        self.apply_reply_ack(ack);
+        Ok(plaintext)
+    }
+
+    /// Record what an opened reply proves: the exit holds the epoch the
+    /// reply was sealed under.
+    fn apply_reply_ack(&self, ack: ReplyAck) {
+        self.acked_epochs
+            .fetch_max(u64::from(ack.epoch) + 1, Ordering::AcqRel);
+    }
+
+    /// Whether a reply proved the exit holds `epoch`.
+    fn epoch_is_acked(&self, epoch: u32) -> bool {
+        self.acked_epochs.load(Ordering::Acquire) > u64::from(epoch)
+    }
+
+    /// [`Self::decode_and_open_reply`] without its acknowledgement, which the
+    /// caller applies with [`Self::apply_reply_ack`].
+    fn open_reply(&self, bytes: &[u8]) -> Result<(Vec<u8>, ReplyAck), MultiHopError> {
         match &self.session {
             ClientSessionKind::V1(session) => {
                 let frame = decode_frame(bytes).map_err(|e| {
@@ -2306,6 +2376,7 @@ impl MultiHopClient {
                 // authenticated. A frame whose epoch matches neither slot (a
                 // deeper old epoch, or a typo by a hostile relay) is counted
                 // as a replay reject and surfaced as MultiHopError::Replay.
+                let epoch = frame.epoch;
                 let gated = open_replay_gated(&self.replay, frame.epoch, frame.seq, move || {
                     let sess = session.read();
                     // Consume the decoded frame: decrypt in place in its own
@@ -2313,11 +2384,8 @@ impl MultiHopClient {
                     // reverse-direction datapath.
                     Ok(sess.open_response_owned(frame)?)
                 });
-                let (plaintext, frame_epoch_is_pending) = self.record_reply_metrics(gated)?;
-                if !frame_epoch_is_pending {
-                    self.epoch_acked.store(true, Ordering::Release);
-                }
-                Ok(plaintext)
+                let plaintext = self.record_reply_metrics(gated)?;
+                Ok((plaintext, ReplyAck { epoch }))
             }
             #[cfg(feature = "pq-hpke")]
             ClientSessionKind::V2 { session, .. } => {
@@ -2331,32 +2399,25 @@ impl MultiHopClient {
                         .fetch_add(1, Ordering::Relaxed);
                     return Err(MultiHopError::UnexpectedExitId);
                 }
+                let epoch = frame.epoch;
                 let gated = open_replay_gated(&self.replay, frame.epoch, frame.seq, move || {
                     let sess = session.read();
                     Ok(sess.open_response(&frame)?)
                 });
-                let (plaintext, frame_epoch_is_pending) = self.record_reply_metrics(gated)?;
-                // The resend-until-ack signal: a reverse frame that matched
-                // the CURRENT (not the rekey-overlap pending) window proves
-                // the exit has decapsulated this epoch's pq_ct, so the
-                // forward path can stop re-carrying it.
-                if !frame_epoch_is_pending {
-                    self.epoch_acked.store(true, Ordering::Release);
-                }
-                Ok(plaintext)
+                let plaintext = self.record_reply_metrics(gated)?;
+                Ok((plaintext, ReplyAck { epoch }))
             }
         }
     }
 
     /// Shared tail of the reply-open chokepoint: given the result of
     /// [`open_replay_gated`], update the frames/bytes/replay/fallback
-    /// counters and return the plaintext plus whether the frame matched the
-    /// rekey-overlap pending epoch. Identical accounting for `/v1` and
+    /// counters and return the plaintext. Identical accounting for `/v1` and
     /// `/v2` replies.
     fn record_reply_metrics(
         &self,
         gated: Result<(Vec<u8>, bool), MultiHopError>,
-    ) -> Result<(Vec<u8>, bool), MultiHopError> {
+    ) -> Result<Vec<u8>, MultiHopError> {
         let (plaintext, frame_epoch_is_pending) = match gated {
             Ok(opened) => opened,
             Err(e) => {
@@ -2375,7 +2436,7 @@ impl MultiHopClient {
         self.metrics
             .bytes_recv
             .fetch_add(plaintext.len() as u64, Ordering::Relaxed);
-        Ok((plaintext, frame_epoch_is_pending))
+        Ok(plaintext)
     }
 
     /// Perform the multi-hop SETUP round-trip over a reliable bidi QUIC
@@ -2603,14 +2664,10 @@ impl MultiHopClient {
             .bytes_sent
             .fetch_add(plaintext.len() as u64, Ordering::Relaxed);
 
+        // The opened reply acknowledges its epoch: the setup round trip is a
+        // RELIABLE stream, so the exit decapsulated this epoch's pq_ct and the
+        // datagram data path starts acked, with no reverse datagram needed.
         let opened = self.decode_and_open_reply(&reply)?;
-        // Explicit, on top of `decode_and_open_reply`'s generic pending-epoch
-        // check reaching the same conclusion for epoch 0: the setup round
-        // trip is a RELIABLE stream, so a successful open here already
-        // proves the exit decapsulated this epoch's pq_ct. The datagram data
-        // path can therefore start acked immediately, without waiting to
-        // observe a separate reverse datagram first.
-        self.epoch_acked.store(true, Ordering::Release);
         // Opportunistically capture the typed IP allocation for
         // `Self::assignment` and friends. Best-effort: a `Rejected` /
         // `IpExhausted` reply (or any other non-IpAssign control message)
@@ -2738,11 +2795,40 @@ impl MultiHopClient {
     /// automatic lazy pruning in [`Self::send`] / [`Self::recv`] for callers
     /// that track the overlap deadline themselves (e.g. an external
     /// [`RekeyPolicy`]-shaped doctrine with a caller-chosen overlap window).
-    /// Idempotent.
+    /// Idempotent. A no-op while the latest rekey is unacknowledged: the
+    /// previous epoch then carries the data and is the only one able to
+    /// announce the new key.
     pub fn prune_old_epoch(&self) {
-        self.session.prune_pending_old_epoch();
-        self.replay.lock().pending = None;
-        *self.pending_old_epoch_at.lock() = None;
+        self.prune_pending_epoch_once_acked();
+    }
+
+    /// Drop the previous epoch unless the exit has not acknowledged the
+    /// current one, decided under the session write lock so a concurrent
+    /// rekey cannot slip its fresh pending epoch in between.
+    fn prune_pending_epoch_once_acked(&self) {
+        let prune = |current_epoch: u32| {
+            if !self.epoch_is_acked(current_epoch) {
+                return false;
+            }
+            self.replay.lock().pending = None;
+            *self.pending_old_epoch_at.lock() = None;
+            true
+        };
+        match &self.session {
+            ClientSessionKind::V1(session) => {
+                let mut sess = session.write();
+                if sess.has_pending_old_epoch() && prune(sess.epoch()) {
+                    sess.prune_pending_old_epoch();
+                }
+            }
+            #[cfg(feature = "pq-hpke")]
+            ClientSessionKind::V2 { session, .. } => {
+                let mut sess = session.write();
+                if sess.has_pending_old_epoch() && prune(sess.epoch()) {
+                    sess.prune_pending_old_epoch();
+                }
+            }
+        }
     }
 
     /// Force an immediate rekey. Allocates a fresh HPKE setup against
@@ -2753,40 +2839,88 @@ impl MultiHopClient {
     /// the new one, and restarting the counter would reuse its (key, nonce)
     /// pairs.
     ///
-    /// Returns the new epoch number on success.
+    /// Returns the new epoch number on success. While the previous rekey is
+    /// unacknowledged this changes nothing and returns the current epoch:
+    /// another rekey would replace the only epoch the exit holds with one it
+    /// was never told about.
     ///
     /// # Errors
     ///
     /// - [`MultiHopError::Session`] if the underlying HPKE rekey fails
     ///   (KEM ECDH error or epoch overflow at `u32::MAX`).
     pub fn rekey(&self) -> Result<u32, MultiHopError> {
+        match self.rekey_unless_unacked(|_| true)? {
+            RekeyDecision::Rekeyed(epoch) | RekeyDecision::Unacked(epoch) => Ok(epoch),
+            RekeyDecision::NotDue => Ok(self.current_epoch()),
+        }
+    }
+
+    /// Rekey when `due` holds and the previous rekey was acknowledged, both
+    /// decided under the session write lock, and install every piece of the
+    /// new epoch's state before that lock is released. Two senders crossing
+    /// the policy threshold together would otherwise both rekey, moving the
+    /// client to an epoch the exit never heard of. `due` runs under the lock:
+    /// it must not touch the session.
+    fn rekey_unless_unacked(
+        &self,
+        due: impl FnOnce(&Self) -> bool,
+    ) -> Result<RekeyDecision, MultiHopError> {
         let new_epoch = match &self.session {
             ClientSessionKind::V1(session) => {
                 let mut sess = session.write();
+                let epoch = sess.epoch();
+                if sess.has_pending_old_epoch() && !self.epoch_is_acked(epoch) {
+                    return Ok(RekeyDecision::Unacked(epoch));
+                }
+                if !due(self) {
+                    return Ok(RekeyDecision::NotDue);
+                }
                 sess.rekey(
                     &self.exit_pubkey,
                     &mut rand_core::UnwrapErr(rand_core::OsRng),
                 )?;
-                sess.epoch()
+                let new_epoch = sess.epoch();
+                self.install_epoch(new_epoch);
+                new_epoch
             }
             #[cfg(feature = "pq-hpke")]
             ClientSessionKind::V2 { session, recipient } => {
                 let mut sess = session.write();
+                let epoch = sess.epoch();
+                if sess.has_pending_old_epoch() && !self.epoch_is_acked(epoch) {
+                    return Ok(RekeyDecision::Unacked(epoch));
+                }
+                if !due(self) {
+                    return Ok(RekeyDecision::NotDue);
+                }
                 sess.rekey(recipient, &mut rand_core::UnwrapErr(rand_core::OsRng))?;
-                sess.epoch()
+                let new_epoch = sess.epoch();
+                self.install_epoch(new_epoch);
+                new_epoch
             }
         };
-        // The new epoch is announced and bootstrapped on lossy datagrams
-        // (unlike epoch 0, which rides the reliable setup stream), so it
-        // stays unacked until a reverse frame of it arrives (see
-        // `send_rekey_bootstrap` below and `decode_and_open_reply`).
-        self.epoch_acked.store(false, Ordering::Release);
+        self.metrics.rekey_count.fetch_add(1, Ordering::Relaxed);
+        tracing::info!("multi-hop session rekey applied");
+
+        // Announce and bootstrap the new epoch on their own small datagrams
+        // immediately, decoupled from the data path (see the module docs on
+        // the historical oversized-DATA-frame bug). Best-effort: a lost one
+        // is resent by `send_packet` via `maybe_resend_rekey_bootstrap`, so a
+        // failure here must never fail the rekey call itself.
+        let _ = self.send_rekey_bootstrap();
+
+        Ok(RekeyDecision::Rekeyed(new_epoch))
+    }
+
+    /// The client-side state of a just-installed epoch. Called with the
+    /// session write lock held; takes only the replay and timestamp locks.
+    fn install_epoch(&self, new_epoch: u32) {
         // The send counter is NOT reset: until the acknowledgement the
         // client keeps sealing under the previous epoch, and a counter
         // restarted at 0 would reuse that epoch's (key, nonce) pairs. A fresh
         // epoch window on the exit accepts a first sequence number above 0.
         self.frames_in_epoch.store(0, Ordering::Release);
-        *self.last_rekey.lock() = Instant::now();
+        *self.last_rekey.lock() = tokio::time::Instant::now();
         // Move the current replay window into the pending slot so
         // in-flight reverse frames from the old epoch are still
         // replay-checked correctly during the doctrine overlap
@@ -2803,17 +2937,6 @@ impl MultiHopClient {
             state.pending = Some(old);
         }
         *self.pending_old_epoch_at.lock() = Some(Instant::now());
-        self.metrics.rekey_count.fetch_add(1, Ordering::Relaxed);
-        tracing::info!("multi-hop session rekey applied");
-
-        // Announce and bootstrap the new epoch on their own small datagrams
-        // immediately, decoupled from the data path (see the module docs on
-        // the historical oversized-DATA-frame bug). Best-effort: a lost one
-        // is resent by `send_packet` via `maybe_resend_rekey_bootstrap`, so a
-        // failure here must never fail the rekey call itself.
-        let _ = self.send_rekey_bootstrap();
-
-        Ok(new_epoch)
     }
 
     /// Announce and bootstrap the current epoch on two small datagrams of
@@ -2911,7 +3034,7 @@ impl MultiHopClient {
     /// rate-limited to [`REKEY_BOOTSTRAP_RESEND_INTERVAL`] so steady traffic
     /// does not resend on every packet.
     fn maybe_resend_rekey_bootstrap(&self) {
-        if self.epoch_acked.load(Ordering::Acquire) {
+        if self.epoch_is_acked(self.session.epoch()) {
             return;
         }
         let due = {
@@ -2935,12 +3058,6 @@ impl MultiHopClient {
     /// the cleanup happens lazily on the next traffic event after
     /// expiry, without needing a dedicated background task.
     fn prune_pending_overlap_if_expired(&self) {
-        // While a rekey is unacked the previous epoch is the one carrying
-        // the data and the only one that can announce the new key: it stays
-        // until the exit moves.
-        if self.rekey_unacked() {
-            return;
-        }
         let should_prune = {
             let at = self.pending_old_epoch_at.lock();
             match *at {
@@ -2951,22 +3068,48 @@ impl MultiHopClient {
         if !should_prune {
             return;
         }
-        self.session.prune_pending_old_epoch();
-        self.replay.lock().pending = None;
-        *self.pending_old_epoch_at.lock() = None;
+        // While a rekey is unacked the previous epoch is the one carrying
+        // the data and the only one that can announce the new key: it stays
+        // until the exit moves.
+        self.prune_pending_epoch_once_acked();
+    }
+
+    /// Close the connection for a redial once a rekey has waited
+    /// [`REKEY_ACK_DEADLINE`] for its acknowledgement. Checked lazily from
+    /// the send and receive paths, the same way the overlap is pruned.
+    fn close_if_rekey_ack_overdue(&self) {
+        if self.last_rekey.lock().elapsed() < REKEY_ACK_DEADLINE || !self.rekey_unacked() {
+            return;
+        }
+        if self.conn.close_reason().is_some() {
+            return;
+        }
+        self.metrics
+            .rekey_ack_timeouts
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            deadline_secs = REKEY_ACK_DEADLINE.as_secs(),
+            "multi-hop rekey never acknowledged by the exit; closing for a redial"
+        );
+        self.force_close_for_reconnect();
     }
 
     /// Whether a rekey is waiting for the exit's acknowledgement. Another
     /// rekey would replace the only epoch the exit holds with one it was
     /// never told about.
     fn rekey_unacked(&self) -> bool {
-        !self.epoch_acked.load(Ordering::Acquire) && self.session.has_pending_old_epoch()
+        let (epoch, pending) = self.session.epoch_and_pending();
+        pending && !self.epoch_is_acked(epoch)
     }
 
     fn should_rekey(&self, frames_sent: u64) -> bool {
-        if self.rekey_unacked() {
-            return false;
-        }
+        !self.rekey_unacked() && self.rekey_policy_due(frames_sent)
+    }
+
+    /// The [`RekeyPolicy`] alone, without the acknowledgement gate. Touches
+    /// no session lock, so [`Self::rekey_unless_unacked`] can run it under
+    /// the write lock.
+    fn rekey_policy_due(&self, frames_sent: u64) -> bool {
         if frames_sent >= self.rekey_policy.max_frames {
             return true;
         }
@@ -4691,6 +4834,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_v1_announcement_is_resent_while_the_new_epoch_is_unacked() {
+        // A lost announcement leaves a binding exit dropping every frame of
+        // the new epoch: it must go again with the next traffic.
+        let pair =
+            crate::test_support::spawn_loopback_multihop(ExitId::from_bytes([0x6a; 16])).await;
+        let new_epoch = pair.client.rekey().expect("rekey");
+        let expect_announcement = |frame: &warrenguard_multihop::WarrenMultihopFrame| {
+            assert_eq!(
+                frame.epoch,
+                new_epoch - 1,
+                "sealed under the previous epoch"
+            );
+            let plaintext = pair
+                .exit_session
+                .open(frame)
+                .expect("the previous epoch's session opens it");
+            assert_eq!(
+                warrenguard_multihop::try_decode_control(&plaintext).expect("a control message"),
+                Some(WarrenControlMessage::SessionRekey {
+                    new_encapsulated_key: pair.client.session.encapsulated_key(),
+                    new_epoch,
+                })
+            );
+        };
+        let first = recv_v1_frame(&pair.exit_conn).await;
+        expect_announcement(&first);
+        assert_eq!(recv_v1_frame(&pair.exit_conn).await.epoch, new_epoch);
+
+        tokio::time::sleep(REKEY_BOOTSTRAP_RESEND_INTERVAL + Duration::from_millis(50)).await;
+        pair.client.send(b"\x45later").await.expect("send");
+        let resent = recv_v1_frame(&pair.exit_conn).await;
+        expect_announcement(&resent);
+        assert!(resent.seq > first.seq, "a fresh sequence number");
+        assert_eq!(
+            recv_v1_frame(&pair.exit_conn).await.epoch,
+            new_epoch,
+            "and the bootstrap with it"
+        );
+        let data = recv_v1_frame(&pair.exit_conn).await;
+        assert_eq!(
+            data.epoch,
+            new_epoch - 1,
+            "data stays on the epoch the exit holds"
+        );
+    }
+
+    #[tokio::test]
     async fn no_second_rekey_starts_while_the_first_is_unacked() {
         // A second rekey would replace the only epoch the exit holds with
         // one it was never told about, and drop the epoch that can announce.
@@ -4723,6 +4913,109 @@ mod tests {
             .expect("must not time out")
             .expect("the ack opens");
         assert!(pair.client.should_rekey(u64::MAX), "acked again");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_senders_past_the_threshold_rekey_exactly_once() {
+        // The uplink pump, DAITA cover, the lease refresh and the route anchor
+        // all call `send_packet` on one client. Two of them rekeying in the
+        // same HPKE window would move to an epoch the exit never heard of.
+        const SENDERS: usize = 16;
+        let mut pair =
+            crate::test_support::spawn_loopback_multihop(ExitId::from_bytes([0x66; 16])).await;
+        Arc::get_mut(&mut pair.client)
+            .expect("sole owner before any clone")
+            .set_rekey_policy(RekeyPolicy {
+                max_frames: 1,
+                max_age: Duration::from_secs(3600),
+            });
+        pair.client.send_packet(b"\x45first").expect("first frame");
+        let barrier = std::sync::Barrier::new(SENDERS);
+        std::thread::scope(|scope| {
+            for _ in 0..SENDERS {
+                scope.spawn(|| {
+                    barrier.wait();
+                    pair.client.send_packet(b"\x45racing").expect("send");
+                });
+            }
+        });
+        assert_eq!(pair.client.metrics().rekey_count, 1);
+        assert_eq!(pair.client.current_epoch(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_explicit_rekey_or_prune_while_unacked_changes_nothing() {
+        let pair =
+            crate::test_support::spawn_loopback_multihop(ExitId::from_bytes([0x67; 16])).await;
+        let first = pair.client.rekey().expect("rekey");
+        assert_eq!(
+            pair.client.rekey().expect("second rekey"),
+            first,
+            "a second rekey before the ack keeps the announced epoch"
+        );
+        assert_eq!(pair.client.metrics().rekey_count, 1);
+        pair.client.prune_old_epoch();
+        assert!(
+            pair.client.session.has_pending_old_epoch(),
+            "the only epoch able to re-announce stays until the exit moves"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_opened_before_a_rekey_never_acknowledges_the_new_epoch() {
+        // The receive task opens a reply of the current epoch, the send task
+        // rekeys, then the receive task records what the reply proved: it
+        // proved the epoch it was sealed under, never the one that came after.
+        let pair =
+            crate::test_support::spawn_loopback_multihop(ExitId::from_bytes([0x68; 16])).await;
+        let reply = pair
+            .exit_session
+            .seal_response(b"\x45before", 0, 0)
+            .expect("seal_response");
+        let (_, ack) = pair
+            .client
+            .open_reply(&encode_frame(&reply).expect("encode"))
+            .expect("the reply opens");
+        pair.client.rekey().expect("rekey");
+        pair.client.apply_reply_ack(ack);
+        assert!(
+            pair.client.rekey_unacked(),
+            "no frame of the new epoch came back"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rekey_the_exit_never_acknowledges_closes_the_connection_for_a_redial() {
+        // A relay that drops only the new epoch's frames: no ack ever comes.
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_idle_timeout(Some(
+            quinn::IdleTimeout::try_from(Duration::from_secs(3600)).expect("idle timeout"),
+        ));
+        let pair = crate::test_support::spawn_loopback_multihop_with_transport(
+            ExitId::from_bytes([0x69; 16]),
+            Some(Arc::new(transport)),
+        )
+        .await;
+        tokio::time::pause();
+        pair.client.rekey().expect("rekey");
+
+        tokio::time::advance(REKEY_ACK_DEADLINE - Duration::from_secs(1)).await;
+        pair.client
+            .send_packet(b"\x45within")
+            .expect("the session serves until the deadline");
+        assert_eq!(pair.client.metrics().rekey_ack_timeouts, 0);
+        assert!(pair.client.conn.close_reason().is_none());
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let _ = pair.client.send_packet(b"\x45late");
+        assert_eq!(pair.client.metrics().rekey_ack_timeouts, 1);
+        assert!(
+            matches!(
+                pair.client.conn.close_reason(),
+                Some(quinn::ConnectionError::LocallyClosed)
+            ),
+            "the supervisor reads a local close as a transient loss and redials"
+        );
     }
 
     #[tokio::test]
