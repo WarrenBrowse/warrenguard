@@ -2344,6 +2344,28 @@ fn seal_current_v1(current: SharedCurrentSession) -> impl Fn(&[u8], u64) -> Opti
     }
 }
 
+/// Answer a rekey bootstrap on a bound connection (an empty uplink frame,
+/// which a client sends only while the exit has not acknowledged its newest
+/// epoch) with one cover frame sealed under the connection's current epoch,
+/// when the bootstrap's epoch is that epoch. The client reads any frame of an
+/// epoch as the exit's acknowledgement and drops the cover frame, so a
+/// session with no downlink traffic still completes its rekey. Every resent
+/// bootstrap is answered, so a lost answer costs one resend interval.
+fn ack_epoch_bootstrap(
+    is_current_epoch: bool,
+    seal_current: &impl Fn(&[u8], u64) -> Option<Vec<u8>>,
+    reverse_seq: &AtomicU64,
+    conn: &Connection,
+) {
+    if !is_current_epoch {
+        return;
+    }
+    let seq = reverse_seq.fetch_add(1, Ordering::AcqRel);
+    if let Some(bytes) = seal_current(&[DAITA_DUMMY_FIRST_BYTE], seq) {
+        let _ = conn.send_datagram(bytes.into());
+    }
+}
+
 /// Drain-emitter sealer for a `/v2` connection: the latest X-Wing session and
 /// the `/v2` frame encoding, which the post-quantum client decodes like any
 /// other downlink datagram.
@@ -5170,6 +5192,8 @@ async fn serve_terminating_connection<T>(
     let router_rx = router.clone();
     let down_tx_rx = down_tx.clone();
     let daita_rx = daita.clone();
+    let ack_seal = seal_current_v1(current.clone());
+    let ack_seq = reverse_seq.clone();
     let rate_rx = rate.clone();
     let mut tun_writer = TunWriter::new(tun.clone(), LABEL);
     let mut spoof_gate = SpoofGate::new(assigned_ip, assigned_ip_v6, LABEL);
@@ -5308,6 +5332,15 @@ async fn serve_terminating_connection<T>(
                 UplinkKind::DaitaDummy => {
                     report.dummies += 1;
                     daita_rx.fire(&[DaitaEvent::PaddingRecv]);
+                    if accepted.is_some() && plaintext.is_empty() {
+                        let current_epoch = current_rx.lock().1;
+                        ack_epoch_bootstrap(
+                            current_epoch == frame_epoch,
+                            &ack_seal,
+                            &ack_seq,
+                            &conn_rx,
+                        );
+                    }
                     continue;
                 }
             }
@@ -5584,6 +5617,8 @@ async fn serve_pq_datagram_pump<T>(
     let down_tx_rx = down_tx.clone();
     let pq_rx = pq.clone();
     let current_key_rx = current_key.clone();
+    let ack_seal = seal_current_v2(current.clone());
+    let ack_seq = reverse_seq.clone();
     let rate_rx = rate.clone();
     let mut tun_writer = TunWriter::new(tun.clone(), LABEL);
     let mut spoof_gate = SpoofGate::new(assigned_ip, assigned_ip_v6, LABEL);
@@ -5738,6 +5773,15 @@ async fn serve_pq_datagram_pump<T>(
                 }
                 UplinkKind::DaitaDummy => {
                     report.dummies += 1;
+                    if accepted.is_some() && plaintext.is_empty() {
+                        let current_epoch = current_rx.lock().1;
+                        ack_epoch_bootstrap(
+                            current_epoch == frame_epoch,
+                            &ack_seal,
+                            &ack_seq,
+                            &conn_rx,
+                        );
+                    }
                     continue;
                 }
             }
@@ -11811,6 +11855,83 @@ mod tests {
         );
     }
 
+    /// The exit acknowledges an announced epoch as soon as its bootstrap
+    /// frame arrives, with one cover frame sealed under it, so a client whose
+    /// downlink is idle (an upload) still learns the exit moved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_bound_connection_acknowledges_an_announced_epoch_without_user_traffic() {
+        let tun = warrenguard_transport_core::FakeTun::new();
+        let exit = spawn_rate_limited_exit(None, tun.clone(), None);
+        let mut client = data_client(&exit, |_| dated_wallet(warrenguard_config::unix_now())).await;
+        let mut rng = rand_core::UnwrapErr(rand_core::OsRng);
+        client
+            .session
+            .rekey(&exit.exit_pub, &mut rng)
+            .expect("client rekey");
+        let announce = encode_control(&WarrenControlMessage::SessionRekey {
+            new_encapsulated_key: client.session.encapsulated_key(),
+            new_epoch: 1,
+        })
+        .expect("encode announcement");
+        let frame = client
+            .session
+            .seal_pending_old_epoch(&announce, 1)
+            .expect("seal under epoch 0");
+        client
+            .conn
+            .send_datagram(encode_frame(&frame).expect("encode").into())
+            .expect("send announcement");
+        let bootstrap = client.session.seal(&[], 1, 2).expect("bootstrap");
+        client
+            .conn
+            .send_datagram(encode_frame(&bootstrap).expect("encode").into())
+            .expect("send bootstrap");
+
+        let ack = decode_frame(&next_downlink(&client.conn).await).expect("a v1 frame");
+        assert_eq!(ack.epoch, 1, "sealed under the announced epoch");
+        assert_eq!(
+            client
+                .session
+                .open_response(&ack)
+                .expect("opens under epoch 1"),
+            vec![DAITA_DUMMY_FIRST_BYTE],
+            "a cover frame every client already drops"
+        );
+        assert!(
+            settled_tun_outbound(&tun, 0, Duration::from_millis(300))
+                .await
+                .is_empty()
+        );
+    }
+
+    /// A client from before session binding sends empty frames too (its
+    /// `/v2` pings), and must keep receiving exactly what it did: an unbound
+    /// connection is never answered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unbound_connection_never_gets_an_epoch_acknowledgement() {
+        let tun = warrenguard_transport_core::FakeTun::new();
+        let exit = spawn_rate_limited_exit(None, tun.clone(), None);
+        let client = data_client(&exit, |_| WarrenControlMessage::IpRequest {
+            prefer_ipv4: None,
+            client_pubkey: Some([0x5D; 32]),
+            wants_ipv6: false,
+            pop_sig: None,
+            wants_daita: false,
+        })
+        .await;
+        let empty = client.session.seal(&[], 0, 1).expect("empty frame");
+        client
+            .conn
+            .send_datagram(encode_frame(&empty).expect("encode").into())
+            .expect("send");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), client.conn.read_datagram())
+                .await
+                .is_err(),
+            "nothing comes back to a legacy client"
+        );
+    }
+
     /// `/v2` counterpart of the relay injection: the relay's own X-Wing
     /// session never reaches the cache of a bound connection.
     #[cfg(feature = "pq-hpke")]
@@ -11935,16 +12056,19 @@ mod tests {
             "the announced epoch flows once its ping established it"
         );
         tun.inject_inbound(sized_tcp(RATE_PEER, client.assigned, 300));
-        let frame = decode_frame_v2(&next_downlink(&client.conn).await).expect("a v2 frame");
-        assert_eq!(frame.epoch, 1, "the downlink follows the announced epoch");
-        assert_eq!(
-            client
+        // The ping was answered with a cover frame first: skip it.
+        let (frame, plaintext) = loop {
+            let frame = decode_frame_v2(&next_downlink(&client.conn).await).expect("a v2 frame");
+            let plaintext = client
                 .session
                 .open_response(&frame)
-                .expect("opens under epoch 1")
-                .len(),
-            300
-        );
+                .expect("opens under epoch 1");
+            if plaintext != [DAITA_DUMMY_FIRST_BYTE] {
+                break (frame, plaintext);
+            }
+        };
+        assert_eq!(frame.epoch, 1, "the downlink follows the announced epoch");
+        assert_eq!(plaintext.len(), 300);
         client.harness.accept_task.abort();
     }
 
@@ -12043,6 +12167,55 @@ mod tests {
                 .await
                 .is_empty(),
             "SECURITY: a previous-epoch frame must never reach the TUN twice"
+        );
+        client.harness.accept_task.abort();
+    }
+
+    /// `/v2` counterpart of the epoch acknowledgement: the bootstrap ping
+    /// carries the new epoch's ML-KEM ciphertext, and its answer is the
+    /// exit's first frame under that epoch.
+    #[cfg(feature = "pq-hpke")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pq_a_bound_connection_acknowledges_an_announced_epoch_without_user_traffic() {
+        let tun = warrenguard_transport_core::FakeTun::new();
+        let mut client = pq_data_client_with(
+            tun.clone(),
+            |ctx| ctx,
+            |_| dated_wallet(warrenguard_config::unix_now()),
+        )
+        .await;
+        let mut rng = rand_core::UnwrapErr(rand_core::OsRng);
+        client
+            .session
+            .rekey(&client.recipient, &mut rng)
+            .expect("client rekey");
+        let announce = encode_control(&WarrenControlMessage::SessionRekey {
+            new_encapsulated_key: client.session.encapsulated_key(),
+            new_epoch: 1,
+        })
+        .expect("encode announcement");
+        client.send(
+            &client
+                .session
+                .seal_pending_old_epoch(&announce, 1)
+                .expect("seal under epoch 0"),
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        client.send(&client.session.seal_setup(&[], 1, 2).expect("ping"));
+
+        let ack = decode_frame_v2(&next_downlink(&client.conn).await).expect("a v2 frame");
+        assert_eq!(ack.epoch, 1, "sealed under the announced epoch");
+        assert_eq!(
+            client
+                .session
+                .open_response(&ack)
+                .expect("opens under epoch 1"),
+            vec![DAITA_DUMMY_FIRST_BYTE]
+        );
+        assert!(
+            settled_tun_outbound(&tun, 0, Duration::from_millis(300))
+                .await
+                .is_empty()
         );
         client.harness.accept_task.abort();
     }

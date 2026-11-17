@@ -489,7 +489,11 @@ const REKEY_BOOTSTRAP_RESEND_INTERVAL: Duration = Duration::from_millis(200);
 /// key for the life of the connection. 30 s is 150 resends at
 /// [`REKEY_BOOTSTRAP_RESEND_INTERVAL`]: no loss rate a tunnel survives eats
 /// that many in a row, and it stays far under the default rekey age, so the
-/// key lifetime the policy promises is exceeded by at most this much.
+/// key lifetime the policy promises is exceeded by at most this much. A
+/// binding exit answers every bootstrap of an epoch it accepted with a cover
+/// frame under that epoch, so an upload with no downlink is acknowledged too;
+/// an exit that predates binding sends no such answer, and a session there
+/// with no downlink for the whole deadline redials once per rekey.
 pub const REKEY_ACK_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Per-epoch anti-replay tracker. The receive path picks the matching
@@ -4834,6 +4838,145 @@ mod tests {
                 f.seq
             );
         }
+    }
+
+    /// The real client against the real exit termination loop: a session
+    /// whose only traffic is uplink still completes a rekey, because the exit
+    /// answers the bootstrap of an epoch it accepted, and so never reaches the
+    /// acknowledgement deadline.
+    #[tokio::test]
+    async fn an_upload_only_session_completes_its_rekey_at_a_binding_exit() {
+        use warrenguard_multihop_server::multihop::{
+            ExitTerminateCtx, SetupSource, derive_x25519_keypair, terminate_connection,
+        };
+        let long_idle = || {
+            let mut transport = quinn::TransportConfig::default();
+            transport.max_idle_timeout(Some(
+                quinn::IdleTimeout::try_from(Duration::from_secs(3600)).expect("idle timeout"),
+            ));
+            Arc::new(transport)
+        };
+        let tls_key = SigningKey::from_bytes(&[0x6b; 32]);
+        let (privkey, exit_pub) = derive_x25519_keypair(&[0x6b; 32]).expect("x25519");
+        let exit_id = ExitId::from_bytes([0x6b; 16]);
+        let pool = Arc::new(parking_lot::Mutex::new(
+            warrenguard_multihop_server::ip_pool::IpAllocator::new(
+                std::net::Ipv4Addr::new(10, 66, 0, 0),
+                24,
+                std::net::Ipv4Addr::new(10, 66, 0, 1),
+            )
+            .expect("pool"),
+        ));
+        let ctx = ExitTerminateCtx::new(
+            privkey,
+            exit_id,
+            warrenguard_transport_core::FakeTun::new(),
+            None,
+            None,
+            pool,
+            None,
+            None,
+        );
+        let mut server_cfg = warrenguard_tls::make_server_config(
+            &tls_key,
+            warrenguard_tls::default_crypto_provider(),
+            &[warrenguard_config::ALPN_H3],
+        )
+        .expect("server config");
+        server_cfg.transport_config(long_idle());
+        let listen = Endpoint::server(server_cfg, (std::net::Ipv4Addr::LOCALHOST, 0).into())
+            .expect("exit binds");
+        let addr = listen.local_addr().expect("addr");
+        let accept = {
+            let listen = listen.clone();
+            tokio::spawn(async move {
+                while let Some(incoming) = listen.accept().await {
+                    let ctx = ctx.clone();
+                    tokio::spawn(async move {
+                        if let Ok(conn) = incoming.await {
+                            terminate_connection(conn, SetupSource::AcceptFromConn, ctx).await;
+                        }
+                    });
+                }
+            })
+        };
+
+        let mut client_cfg = warrenguard_tls::make_client_config(
+            warrenguard_tls::default_crypto_provider(),
+            &[warrenguard_config::ALPN_H3],
+        )
+        .expect("client config");
+        client_cfg.transport_config(long_idle());
+        let mut endpoint =
+            Endpoint::client((std::net::Ipv4Addr::LOCALHOST, 0).into()).expect("client binds");
+        endpoint.set_default_client_config(client_cfg);
+        let sni = warrenguard_tls::name::encode(WarrenPubkey::from_bytes(
+            *tls_key.verifying_key().as_bytes(),
+        ));
+        let conn = endpoint
+            .connect(addr, &sni)
+            .expect("connect")
+            .await
+            .expect("handshake");
+        let client = Arc::new(
+            MultiHopClient::from_established_connection(
+                endpoint,
+                conn,
+                exit_id,
+                &warrenguard_multihop::test_support::pubkey_to_bytes(&exit_pub),
+                None,
+            )
+            .expect("client"),
+        );
+        client
+            .setup_over_stream_dated(
+                None,
+                false,
+                false,
+                None,
+                None,
+                warrenguard_config::unix_now(),
+            )
+            .await
+            .expect("dated setup admitted");
+        let source: std::net::Ipv4Addr = client.assignment().expect("assigned").ipv4.into();
+        let downlink = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { while client.recv().await.is_ok() {} })
+        };
+        let mut packet = vec![0u8; 40];
+        packet[0] = 0x45;
+        packet[3] = 40;
+        packet[9] = 17;
+        packet[12..16].copy_from_slice(&source.octets());
+        packet[16..20].copy_from_slice(&[198, 51, 100, 7]);
+
+        client.rekey().expect("rekey");
+        for _ in 0..40 {
+            if !client.rekey_unacked() {
+                break;
+            }
+            client.send_packet(&packet).expect("upload");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            !client.rekey_unacked(),
+            "the exit acknowledged the new epoch with no downlink traffic of the user"
+        );
+
+        tokio::time::pause();
+        tokio::time::advance(REKEY_ACK_DEADLINE + Duration::from_secs(1)).await;
+        let _ = client.send_packet(&packet);
+        assert_eq!(client.metrics().rekey_ack_timeouts, 0);
+        assert!(
+            !matches!(
+                client.conn.close_reason(),
+                Some(quinn::ConnectionError::LocallyClosed)
+            ),
+            "no redial"
+        );
+        downlink.abort();
+        accept.abort();
     }
 
     #[tokio::test]
