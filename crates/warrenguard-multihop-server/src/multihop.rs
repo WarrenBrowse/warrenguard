@@ -4584,7 +4584,11 @@ pub async fn terminate_connection<T>(
 fn tunnel_pool(v4: &Arc<Mutex<IpAllocator>>, v6: Option<&Arc<Mutex<IpAllocatorV6>>>) -> TunnelPool {
     let pool = {
         let alloc = v4.lock();
-        TunnelPool::new(alloc.network(), alloc.prefix_len(), alloc.gateway())
+        let pool = TunnelPool::new(alloc.network(), alloc.prefix_len(), alloc.gateway());
+        match alloc.service_prefix_v4() {
+            Some((network, prefix_len)) => pool.with_v4_services(network, prefix_len),
+            None => pool,
+        }
     };
     match v6 {
         None => pool,
@@ -5638,6 +5642,34 @@ pub fn format_x25519_pubkey_hex(pub_key: &WarrenKemPublicKey) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_destination_gate_admits_the_allocator_s_service_prefix() {
+        use warrenguard_transport_core::{PoolRefusal, classify_destination};
+        let mut alloc =
+            IpAllocator::new(Ipv4Addr::new(10, 66, 0, 0), 24, Ipv4Addr::new(10, 66, 0, 1))
+                .expect("a valid /24 pool");
+        alloc.set_service_prefix_v4(Ipv4Addr::new(100, 64, 0, 0), 26);
+        let pool = tunnel_pool(&Arc::new(Mutex::new(alloc)), None);
+        let to = |dst: [u8; 4]| {
+            let mut pkt = vec![0u8; 40];
+            pkt[0] = 0x45;
+            pkt[9] = 17;
+            pkt[12..16].copy_from_slice(&[10, 66, 0, 9]);
+            pkt[16..20].copy_from_slice(&dst);
+            pkt
+        };
+        assert_eq!(
+            classify_destination(&to([100, 64, 0, 7]), &pool),
+            None,
+            "the exit's own resolvers live in the declared service prefix"
+        );
+        assert_eq!(
+            classify_destination(&to([169, 254, 169, 254]), &pool),
+            Some(PoolRefusal::NonGlobal),
+            "the provider's metadata service is never reachable from a tunnel"
+        );
+    }
     use crate::datapath::tests::ipv4_tcp_full;
 
     // ---- Downlink over-read backpressure gate ----

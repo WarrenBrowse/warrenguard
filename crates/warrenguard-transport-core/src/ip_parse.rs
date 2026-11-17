@@ -166,6 +166,10 @@ pub struct TunnelPool {
     v4_gateway: Ipv4Addr,
     /// `/64` prefix and its gateway, on a dual-stack exit.
     v6: Option<(Ipv6Addr, Ipv6Addr)>,
+    /// A v4 prefix of service addresses the exit itself answers on, besides
+    /// the gateway (resolvers bound on the tunnel interface). Admitted even
+    /// though it lies in a non-global range.
+    v4_services: Option<(Ipv4Addr, u8)>,
 }
 
 impl TunnelPool {
@@ -179,7 +183,20 @@ impl TunnelPool {
             v4_prefix_len,
             v4_gateway,
             v6: None,
+            v4_services: None,
         }
+    }
+
+    /// Declare the prefix of local service addresses (see `v4_services`).
+    #[must_use]
+    pub const fn with_v4_services(mut self, network: Ipv4Addr, prefix_len: u8) -> Self {
+        self.v4_services = Some((network, prefix_len));
+        self
+    }
+
+    fn serves_v4(&self, addr: Ipv4Addr) -> bool {
+        self.v4_services
+            .is_some_and(|(net, len)| prefix_holds_v4(net, len, addr))
     }
 
     /// Add the `/64` half of a dual-stack exit.
@@ -191,17 +208,54 @@ impl TunnelPool {
 
     /// `true` when `addr` is inside the v4 pool prefix.
     fn holds_v4(&self, addr: Ipv4Addr) -> bool {
-        // A shift of 32 is undefined, so a /0 pool is answered directly
-        // rather than by masking.
-        if self.v4_prefix_len == 0 {
-            return true;
-        }
-        if self.v4_prefix_len > 32 {
-            return false;
-        }
-        let mask = u32::MAX << (32 - self.v4_prefix_len);
-        (u32::from(addr) & mask) == (u32::from(self.v4_network) & mask)
+        prefix_holds_v4(self.v4_network, self.v4_prefix_len, addr)
     }
+}
+
+fn prefix_holds_v4(network: Ipv4Addr, prefix_len: u8, addr: Ipv4Addr) -> bool {
+    // A shift of 32 is undefined, so a /0 prefix is answered directly
+    // rather than by masking.
+    if prefix_len == 0 {
+        return true;
+    }
+    if prefix_len > 32 {
+        return false;
+    }
+    let mask = u32::MAX << (32 - prefix_len);
+    (u32::from(addr) & mask) == (u32::from(network) & mask)
+}
+
+/// Destinations that are not on the public internet: this host, its
+/// provider's private and link-local networks (the metadata service sits at
+/// 169.254.169.254), carrier NAT, multicast and the reserved blocks.
+fn is_non_global_v4(addr: Ipv4Addr) -> bool {
+    const RANGES: [([u8; 4], u8); 9] = [
+        ([0, 0, 0, 0], 8),
+        ([10, 0, 0, 0], 8),
+        ([100, 64, 0, 0], 10),
+        ([127, 0, 0, 0], 8),
+        ([169, 254, 0, 0], 16),
+        ([172, 16, 0, 0], 12),
+        ([192, 168, 0, 0], 16),
+        ([224, 0, 0, 0], 4),
+        ([240, 0, 0, 0], 4),
+    ];
+    RANGES
+        .iter()
+        .any(|(net, len)| prefix_holds_v4(Ipv4Addr::from(*net), *len, addr))
+}
+
+/// The v6 counterpart: unspecified, loopback, unique-local, link-local,
+/// multicast, and a v4-mapped address (which would carry a v4 destination
+/// past the v4 policy).
+fn is_non_global_v6(addr: Ipv6Addr) -> bool {
+    let bits = u128::from(addr);
+    addr.is_unspecified()
+        || addr.is_loopback()
+        || (bits >> 121) == (0xfc00_u128 >> 9)
+        || (bits >> 118) == (0xfe80_u128 >> 6)
+        || (bits >> 120) == 0xff
+        || addr.to_ipv4_mapped().is_some()
 }
 
 /// Why the destination gate refused an uplink packet. The set is closed and
@@ -215,11 +269,18 @@ pub enum PoolRefusal {
     V4Peer,
     /// The same, on the `/64` of a dual-stack exit.
     V6Peer,
+    /// A destination off the public internet (private, link-local,
+    /// loopback, carrier NAT, multicast, reserved), outside the pool and
+    /// not one of the exit's own service addresses.
+    NonGlobal,
 }
 
 /// Destination policy on the exit's uplink write path: an inner packet
 /// addressed into the exit's own client pool never reaches the TUN, except
-/// at the gateway address.
+/// at the gateway address, and neither does one addressed off the public
+/// internet (the node itself, its provider's private and link-local
+/// networks, the metadata service, carrier NAT, multicast, reserved
+/// blocks), except at the exit's declared service prefix.
 ///
 /// `None` admits the packet, `Some(refusal)` names why it cannot be
 /// admitted.
@@ -230,7 +291,11 @@ pub enum PoolRefusal {
 /// keeps two sessions off each other's assigned addresses
 /// (`incidents/2026-08-16-two-sessions-on-one-exit-reach-each-other-s-pool-addresses.md`).
 ///
-/// **Scope: the pool, not the segment.** The pool is what the allocator
+/// The non-global refusal is the engine half of a rule the exit's firewall
+/// also carries: a tunnel otherwise reaches whatever the node can route to,
+/// starting with the provider metadata service at 169.254.169.254.
+///
+/// **Scope of the peer refusal: the pool, not the segment.** The pool is what the allocator
 /// hands out, which is the set of addresses a session can actually hold. The
 /// exit's TUN may sit on a wider on-link subnet than that (the Warren fleet
 /// runs a `/24` allocator on a `/16` interface), and a destination inside
@@ -257,6 +322,8 @@ pub fn classify_destination(pkt: &[u8], pool: &TunnelPool) -> Option<PoolRefusal
             None => Some(PoolRefusal::V4Peer),
             Some(dst) if dst == pool.v4_gateway => None,
             Some(dst) if pool.holds_v4(dst) => Some(PoolRefusal::V4Peer),
+            Some(dst) if pool.serves_v4(dst) => None,
+            Some(dst) if is_non_global_v4(dst) => Some(PoolRefusal::NonGlobal),
             Some(_) => None,
         },
         Some(6) => {
@@ -270,6 +337,7 @@ pub fn classify_destination(pkt: &[u8], pool: &TunnelPool) -> Option<PoolRefusal
                 Some(dst) if (u128::from(dst) >> 64) == (u128::from(network) >> 64) => {
                     Some(PoolRefusal::V6Peer)
                 }
+                Some(dst) if is_non_global_v6(dst) => Some(PoolRefusal::NonGlobal),
                 Some(_) => None,
             }
         }
@@ -317,11 +385,101 @@ mod tests {
     }
 
     #[test]
-    fn a_destination_just_outside_the_prefix_is_admitted() {
-        // 10.67.0.0 differs from the pool in the second octet, so a gate
-        // masking the wrong number of bits refuses it and black-holes a
-        // legitimate private destination.
+    fn a_destination_just_outside_the_prefix_is_not_a_pool_peer() {
+        // 10.67.0.0 differs from the pool in the second octet: a gate
+        // masking the wrong number of bits would call it a peer. It is a
+        // private destination, refused as such.
         let pkt = make_ipv4_packet([10, 66, 3, 7], [10, 67, 0, 5]);
+        assert_eq!(
+            classify_destination(&pkt, &pool()),
+            Some(PoolRefusal::NonGlobal)
+        );
+    }
+
+    #[test]
+    fn every_non_global_v4_range_is_refused() {
+        for dst in [
+            [0, 1, 2, 3],
+            [10, 0, 0, 1],
+            [100, 64, 1, 1],
+            [100, 127, 255, 254],
+            [127, 0, 0, 1],
+            [169, 254, 169, 254],
+            [172, 16, 0, 1],
+            [172, 31, 255, 254],
+            [192, 168, 1, 1],
+            [224, 0, 0, 251],
+            [239, 255, 255, 250],
+            [240, 0, 0, 1],
+            [255, 255, 255, 255],
+        ] {
+            let pkt = make_ipv4_packet([10, 66, 3, 7], dst);
+            assert_eq!(
+                classify_destination(&pkt, &pool()),
+                Some(PoolRefusal::NonGlobal),
+                "{dst:?} is not on the internet: a tunnel must not reach the node's provider \
+                 network, its metadata service or its loopback"
+            );
+        }
+    }
+
+    #[test]
+    fn the_edges_of_the_private_ranges_stay_public() {
+        for dst in [
+            [172, 15, 255, 255],
+            [172, 32, 0, 0],
+            [100, 63, 255, 255],
+            [100, 128, 0, 0],
+            [192, 167, 255, 255],
+            [223, 255, 255, 255],
+        ] {
+            let pkt = make_ipv4_packet([10, 66, 3, 7], dst);
+            assert_eq!(
+                classify_destination(&pkt, &pool()),
+                None,
+                "{dst:?} is a public address"
+            );
+        }
+    }
+
+    #[test]
+    fn the_local_service_prefix_stays_addressable() {
+        // The exit binds its content-blocking resolvers in a carrier-NAT
+        // block on the tunnel interface; the gateway is the other local
+        // service address.
+        let pool = pool().with_v4_services(Ipv4Addr::new(100, 64, 0, 0), 26);
+        let resolver = make_ipv4_packet([10, 66, 3, 7], [100, 64, 0, 7]);
+        assert_eq!(classify_destination(&resolver, &pool), None);
+        let beyond = make_ipv4_packet([10, 66, 3, 7], [100, 64, 0, 64]);
+        assert_eq!(
+            classify_destination(&beyond, &pool),
+            Some(PoolRefusal::NonGlobal),
+            "only the declared service prefix is an exception, not the whole carrier-NAT range"
+        );
+    }
+
+    #[test]
+    fn every_non_global_v6_range_is_refused() {
+        let mapped: Ipv6Addr = "::ffff:169.254.169.254"
+            .parse()
+            .unwrap_or(Ipv6Addr::UNSPECIFIED);
+        for dst in [
+            Ipv6Addr::UNSPECIFIED,
+            Ipv6Addr::LOCALHOST,
+            Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1),
+            mapped,
+        ] {
+            let pkt = make_ipv6_packet(POOL6_NET.octets(), dst.octets());
+            assert_eq!(
+                classify_destination(&pkt, &pool()),
+                Some(PoolRefusal::NonGlobal),
+                "{dst}"
+            );
+        }
+        let public = Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111);
+        let pkt = make_ipv6_packet(POOL6_NET.octets(), public.octets());
         assert_eq!(classify_destination(&pkt, &pool()), None);
     }
 

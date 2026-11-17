@@ -596,7 +596,7 @@ pub struct PoolGate {
     pub(crate) drops: u64,
     /// One rate limiter per class, same rationale as [`SpoofGate`]: a
     /// shared one hides every class behind the first that fires.
-    pub(crate) logs: [RateLimited; 2],
+    pub(crate) logs: [RateLimited; 3],
     pub(crate) label: &'static str,
 }
 
@@ -607,7 +607,7 @@ impl PoolGate {
         Self {
             pool,
             drops: 0,
-            logs: [const { RateLimited::new(10_000) }; 2],
+            logs: [const { RateLimited::new(10_000) }; 3],
             label,
         }
     }
@@ -621,6 +621,7 @@ impl PoolGate {
         let (class, slot) = match refusal {
             PoolRefusal::V4Peer => ("v4_peer", 0),
             PoolRefusal::V6Peer => ("v6_peer", 1),
+            PoolRefusal::NonGlobal => ("non_global", 2),
         };
         if self.logs[slot].hit() {
             tracing::warn!(
@@ -628,7 +629,7 @@ impl PoolGate {
                 len = plaintext.len(),
                 drops = self.drops,
                 pump = self.label,
-                "rx_task: dropped an uplink packet addressed into the exit's own client pool"
+                "rx_task: dropped an uplink packet addressed into the exit's own pool or off the public internet"
             );
         }
         false

@@ -387,6 +387,10 @@ pub struct IpAllocator {
     /// back to that key only: whatever still routes to it was left by that
     /// key's sessions. Bounded by the subnet.
     last_holder: HashMap<Ipv4Addr, Option<[u8; 32]>>,
+    /// A v4 prefix of service addresses the exit answers on besides the
+    /// gateway (resolvers bound on the tunnel interface). `None` until the
+    /// deployer declares one; the destination gate admits it.
+    service_prefix: Option<(Ipv4Addr, u8)>,
 }
 
 impl IpAllocator {
@@ -490,6 +494,7 @@ impl IpAllocator {
             reclaim: None,
             claims: None,
             last_holder: HashMap::new(),
+            service_prefix: None,
         })
     }
 
@@ -879,6 +884,20 @@ impl IpAllocator {
     #[must_use]
     pub fn gateway(&self) -> Ipv4Addr {
         self.gateway
+    }
+
+    /// Declare the prefix of the exit's own service addresses on the tunnel
+    /// side, besides the gateway (for example resolvers bound on the tunnel
+    /// interface in a non-global range). The destination gate refuses every
+    /// non-global destination except the gateway and this prefix.
+    pub fn set_service_prefix_v4(&mut self, network: Ipv4Addr, prefix_len: u8) {
+        self.service_prefix = Some((network, prefix_len));
+    }
+
+    /// The declared service prefix, if any.
+    #[must_use]
+    pub fn service_prefix_v4(&self) -> Option<(Ipv4Addr, u8)> {
+        self.service_prefix
     }
 }
 
