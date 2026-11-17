@@ -141,25 +141,62 @@ impl SetupFreshness {
 /// arrives before the bootstrap frame of the epoch it names.
 const ACCEPTED_KEYS_KEPT: usize = 4;
 
+/// The anti-replay window of one HPKE session, as the session cache hands it.
+pub(super) type SharedReplayWindows = std::sync::Arc<Mutex<super::EpochReplayWindows>>;
+
+#[derive(Debug)]
+struct AcceptedKey {
+    key: EncapsulatedKeyBytes,
+    epoch: u32,
+    /// The window this key's frames are checked against on this connection,
+    /// pinned at its first frame. The session cache forgets an entry 5 s after
+    /// its last frame and a miss rebuilds the same session with an empty
+    /// window, so a window held only by the cache would let a relay replay
+    /// every frame of a key the connection still accepts.
+    replay: Option<SharedReplayWindows>,
+}
+
 /// The keys a bound connection's data plane accepts, each with the one epoch
 /// its frames may carry.
 #[derive(Debug)]
 pub(super) struct AcceptedKeys {
-    keys: Vec<(EncapsulatedKeyBytes, u32)>,
+    keys: Vec<AcceptedKey>,
 }
 
 impl AcceptedKeys {
     /// Seeded by the setup frame, the only key the client proved before the
-    /// data plane started.
-    pub(super) fn seeded(key: EncapsulatedKeyBytes, epoch: u32) -> Self {
+    /// data plane started, with the window that recorded it.
+    pub(super) fn seeded(
+        key: EncapsulatedKeyBytes,
+        epoch: u32,
+        replay: SharedReplayWindows,
+    ) -> Self {
         let mut keys = Vec::with_capacity(ACCEPTED_KEYS_KEPT + 1);
-        keys.push((key, epoch));
+        keys.push(AcceptedKey {
+            key,
+            epoch,
+            replay: Some(replay),
+        });
         Self { keys }
     }
 
     /// Whether a frame under `key` at `epoch` may reach the session cache.
     pub(super) fn admits(&self, key: &EncapsulatedKeyBytes, epoch: u32) -> bool {
-        self.keys.iter().any(|(k, e)| k == key && *e == epoch)
+        self.keys.iter().any(|k| k.key == *key && k.epoch == epoch)
+    }
+
+    /// The window a frame under `key` is checked against: the one this
+    /// connection pinned for the key, else `cached` (the session cache's),
+    /// which is pinned now and outlives the cache entry.
+    pub(super) fn replay_window<'a>(
+        &'a mut self,
+        key: &EncapsulatedKeyBytes,
+        cached: &'a SharedReplayWindows,
+    ) -> &'a SharedReplayWindows {
+        match self.keys.iter_mut().find(|k| k.key == *key) {
+            Some(entry) => entry.replay.get_or_insert_with(|| cached.clone()),
+            None => cached,
+        }
     }
 
     /// Record the key a `SessionRekey` announced, carried by an authenticated
@@ -175,16 +212,20 @@ impl AcceptedKeys {
         if frame_epoch.checked_add(1) != Some(new_epoch) {
             return false;
         }
-        if let Some((_, epoch)) = self.keys.iter().find(|(k, _)| *k == new_key) {
-            return *epoch == new_epoch;
+        if let Some(entry) = self.keys.iter().find(|k| k.key == new_key) {
+            return entry.epoch == new_epoch;
         }
-        self.keys.push((new_key, new_epoch));
+        self.keys.push(AcceptedKey {
+            key: new_key,
+            epoch: new_epoch,
+            replay: None,
+        });
         if self.keys.len() > ACCEPTED_KEYS_KEPT
             && let Some(oldest) = self
                 .keys
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, (_, epoch))| *epoch)
+                .min_by_key(|(_, k)| k.epoch)
                 .map(|(i, _)| i)
         {
             self.keys.swap_remove(oldest);
@@ -228,9 +269,34 @@ mod tests {
     const K1: EncapsulatedKeyBytes = [0x11; 32];
     const RELAY: EncapsulatedKeyBytes = [0xEE; 32];
 
+    fn window() -> SharedReplayWindows {
+        std::sync::Arc::new(Mutex::new(super::super::EpochReplayWindows::default()))
+    }
+
+    #[test]
+    fn a_key_keeps_the_window_it_first_used_whatever_the_cache_hands_later() {
+        let setup = window();
+        let mut keys = AcceptedKeys::seeded(K0, 0, setup.clone());
+        let rebuilt = window();
+        assert!(
+            std::sync::Arc::ptr_eq(keys.replay_window(&K0, &rebuilt), &setup),
+            "the setup key stays on the window that recorded the setup"
+        );
+        assert!(keys.authorize(0, K1, 1));
+        let first = window();
+        assert!(std::sync::Arc::ptr_eq(
+            keys.replay_window(&K1, &first),
+            &first
+        ));
+        assert!(
+            std::sync::Arc::ptr_eq(keys.replay_window(&K1, &rebuilt), &first),
+            "an announced key is pinned at its first frame"
+        );
+    }
+
     #[test]
     fn a_bound_connection_admits_only_the_setup_key_at_its_epoch() {
-        let keys = AcceptedKeys::seeded(K0, 0);
+        let keys = AcceptedKeys::seeded(K0, 0, window());
         assert!(keys.admits(&K0, 0));
         assert!(
             !keys.admits(&RELAY, 0),
@@ -244,7 +310,7 @@ mod tests {
 
     #[test]
     fn an_announcement_authorizes_the_next_epoch_only() {
-        let mut keys = AcceptedKeys::seeded(K0, 0);
+        let mut keys = AcceptedKeys::seeded(K0, 0, window());
         assert!(
             !keys.authorize(0, K1, 2),
             "an epoch that skips one is refused"
@@ -273,7 +339,7 @@ mod tests {
 
     #[test]
     fn the_oldest_epoch_goes_once_the_set_is_full() {
-        let mut keys = AcceptedKeys::seeded([0; 32], 0);
+        let mut keys = AcceptedKeys::seeded([0; 32], 0, window());
         for epoch in 1..=ACCEPTED_KEYS_KEPT as u32 {
             assert!(keys.authorize(epoch - 1, [epoch as u8; 32], epoch));
         }

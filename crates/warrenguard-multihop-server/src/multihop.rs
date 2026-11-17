@@ -497,6 +497,9 @@ struct ConnSetup {
     /// Whether the setup was dated: the data plane then accepts only the keys
     /// the client authorized (doc 116).
     bound: bool,
+    /// The anti-replay window that recorded the setup frame, which a bound
+    /// connection keeps for the setup key as long as it lives.
+    replay: Arc<Mutex<EpochReplayWindows>>,
     /// Epoch of the setup frame (the pump installs `(session, epoch)`
     /// into the shared `current` slot before pumping).
     epoch: u32,
@@ -547,6 +550,8 @@ struct ConnSetupPq {
     encapsulated_key: EncapsulatedKeyBytes,
     /// See [`ConnSetup::bound`].
     bound: bool,
+    /// See [`ConnSetup::replay`].
+    replay: Arc<Mutex<EpochReplayWindows>>,
     epoch: u32,
     assigned_ip: Ipv4Addr,
     assigned_ip_v6: Option<Ipv6Addr>,
@@ -666,10 +671,15 @@ impl SetupTermination {
     ) -> SetupOutcome {
         let session_key = revocation_guard.as_ref().map(|guard| guard.key);
         match self {
-            Self::V1 { session, frame, .. } => SetupOutcome::V1(ConnSetup {
+            Self::V1 {
+                session,
+                frame,
+                replay,
+            } => SetupOutcome::V1(ConnSetup {
                 session,
                 encapsulated_key: frame.encapsulated_key,
                 bound,
+                replay,
                 epoch: frame.epoch,
                 assigned_ip,
                 assigned_ip_v6,
@@ -679,10 +689,15 @@ impl SetupTermination {
                 session_key,
             }),
             #[cfg(feature = "pq-hpke")]
-            Self::V2 { session, frame, .. } => SetupOutcome::V2(ConnSetupPq {
+            Self::V2 {
+                session,
+                frame,
+                replay,
+            } => SetupOutcome::V2(ConnSetupPq {
                 session,
                 encapsulated_key: frame.encapsulated_key,
                 bound,
+                replay,
                 epoch: frame.epoch,
                 assigned_ip,
                 assigned_ip_v6,
@@ -1808,7 +1823,9 @@ struct SessionCacheEntry {
     /// (a cache miss rebuilds a byte-identical [`ExitSession`]) would
     /// get a fresh window and could re-accept an ancient replay. The TTL
     /// bounds that residue to the doctrine rekey-overlap window; a frame
-    /// older than that is harmless (the client has long moved on).
+    /// older than that is harmless (the client has long moved on). A bound
+    /// connection is not exposed to it: it pins the window of every key it
+    /// accepts for its own lifetime (`binding::AcceptedKeys`).
     ///
     /// The `/v2` equivalent entry does not rely on frame traffic alone: a
     /// live connection's `serve_pq_datagram_pump` keepalive refreshes it
@@ -5102,7 +5119,7 @@ async fn serve_terminating_connection<T>(
     // client, which cannot announce its rekeys.
     let mut accepted = setup
         .bound
-        .then(|| binding::AcceptedKeys::seeded(setup.encapsulated_key, setup.epoch));
+        .then(|| binding::AcceptedKeys::seeded(setup.encapsulated_key, setup.epoch, setup.replay));
     let current: SharedCurrentSession = Arc::new(Mutex::new((setup.session, setup.epoch)));
 
     // Inbound-activity counter bumped by the RX task below; feeds the
@@ -5215,6 +5232,12 @@ async fn serve_terminating_connection<T>(
                     continue;
                 }
             };
+            // A bound connection checks each key against the window it
+            // pinned for it, which outlives the cache entry.
+            let replay_windows = match accepted.as_mut() {
+                Some(keys) => keys.replay_window(&frame.encapsulated_key, &handle.replay_windows),
+                None => &handle.replay_windows,
+            };
             let session = handle.session;
             // Capture the Copy scalars used after the open (anti-replay
             // seq/epoch and the epoch slot) before the zero-copy open consumes
@@ -5235,8 +5258,7 @@ async fn serve_terminating_connection<T>(
             // The window is shared across every connection driving this HPKE
             // session (cf. SessionCache), so a replay on a fresh connection is
             // rejected too.
-            if handle
-                .replay_windows
+            if replay_windows
                 .lock()
                 .check_and_record(frame_seq, frame_epoch)
                 .is_err()
@@ -5519,7 +5541,7 @@ async fn serve_pq_datagram_pump<T>(
     // See the classical pump.
     let mut accepted = setup
         .bound
-        .then(|| binding::AcceptedKeys::seeded(setup.encapsulated_key, setup.epoch));
+        .then(|| binding::AcceptedKeys::seeded(setup.encapsulated_key, setup.epoch, setup.replay));
 
     // Inbound-activity counter for the sticky-IP takeover re-check (see the
     // classical pump). Registration already happened in `run_setup`; here we
@@ -5651,6 +5673,11 @@ async fn serve_pq_datagram_pump<T>(
                     }
                 }
             };
+            // See the classical pump.
+            let replay_windows = match accepted.as_mut() {
+                Some(keys) => keys.replay_window(&frame.encapsulated_key, &handle.replay_windows),
+                None => &handle.replay_windows,
+            };
             let session = handle.session;
             let (frame_seq, frame_epoch, frame_key) =
                 (frame.seq, frame.epoch, frame.encapsulated_key);
@@ -5661,8 +5688,7 @@ async fn serve_pq_datagram_pump<T>(
                     continue;
                 }
             };
-            if handle
-                .replay_windows
+            if replay_windows
                 .lock()
                 .check_and_record(frame_seq, frame_epoch)
                 .is_err()
@@ -11926,6 +11952,105 @@ mod tests {
                 .expect("opens under epoch 1")
                 .len(),
             300
+        );
+        client.harness.accept_task.abort();
+    }
+
+    /// A data frame a relay captured on a bound connection, replayed once the
+    /// exit's session cache forgot its session (here an idle connection's
+    /// current epoch), is still a replay: the cache rebuilds an identical
+    /// session, but the window that recorded the frame lives as long as the
+    /// connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_bound_frame_replayed_after_the_cache_forgot_its_session_never_reaches_the_tun() {
+        let tun = warrenguard_transport_core::FakeTun::new();
+        let exit = spawn_rate_limited_exit(None, tun.clone(), None);
+        let client = data_client(&exit, |_| dated_wallet(warrenguard_config::unix_now())).await;
+        let captured = encode_frame(
+            &client
+                .session
+                .seal(&sized_tcp(client.assigned_ip, RATE_PEER, 100), 0, 1)
+                .expect("seal"),
+        )
+        .expect("encode");
+        client
+            .conn
+            .send_datagram(captured.clone().into())
+            .expect("send");
+        assert_eq!(
+            settled_tun_outbound(&tun, 1, Duration::from_secs(5))
+                .await
+                .len(),
+            1,
+            "the original frame flows"
+        );
+
+        tokio::time::sleep(SESSION_CACHE_TTL + Duration::from_secs(1)).await;
+        client
+            .conn
+            .send_datagram(captured.into())
+            .expect("replay on the same connection");
+        assert!(
+            settled_tun_outbound(&tun, 0, Duration::from_secs(1))
+                .await
+                .is_empty(),
+            "SECURITY: a replayed frame must never reach the TUN twice"
+        );
+    }
+
+    /// `/v2` counterpart, on the epoch a rekey left: a frame of the previous
+    /// epoch that carries its ML-KEM ciphertext rebuilds the session once the
+    /// cache dropped it, and must still be refused as a replay while the
+    /// connection keeps that key in its accepted set.
+    #[cfg(feature = "pq-hpke")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pq_an_old_epoch_frame_replayed_after_the_cache_forgot_it_never_reaches_the_tun() {
+        let tun = warrenguard_transport_core::FakeTun::new();
+        let mut client = pq_data_client_with(
+            tun.clone(),
+            |ctx| ctx,
+            |_| dated_wallet(warrenguard_config::unix_now()),
+        )
+        .await;
+        let captured = client
+            .session
+            .seal_setup(&client.packet(51_030), 0, 1)
+            .expect("seal under epoch 0");
+        client.send(&captured);
+        assert_eq!(
+            settled_tun_outbound(&tun, 1, Duration::from_secs(5))
+                .await
+                .len(),
+            1,
+            "the original frame flows"
+        );
+
+        let mut rng = rand_core::UnwrapErr(rand_core::OsRng);
+        client
+            .session
+            .rekey(&client.recipient, &mut rng)
+            .expect("client rekey");
+        let announce = encode_control(&WarrenControlMessage::SessionRekey {
+            new_encapsulated_key: client.session.encapsulated_key(),
+            new_epoch: 1,
+        })
+        .expect("encode announcement");
+        client.send(
+            &client
+                .session
+                .seal_pending_old_epoch(&announce, 2)
+                .expect("seal under epoch 0"),
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        client.send(&client.session.seal_setup(&[], 1, 3).expect("ping"));
+
+        tokio::time::sleep(SESSION_CACHE_TTL + Duration::from_secs(1)).await;
+        client.send(&captured);
+        assert!(
+            settled_tun_outbound(&tun, 0, Duration::from_secs(1))
+                .await
+                .is_empty(),
+            "SECURITY: a previous-epoch frame must never reach the TUN twice"
         );
         client.harness.accept_task.abort();
     }
