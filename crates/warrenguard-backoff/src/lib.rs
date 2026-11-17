@@ -91,6 +91,17 @@ impl Backoff {
         max: Duration::from_secs(15),
     };
 
+    /// Client session redial profile.
+    ///
+    /// Base 300 ms, ceiling 2 s: a mobile or laptop network change recovers
+    /// within a few seconds, and the [`Self::HANDSHAKE`] ceiling would park a
+    /// redial well past the moment the link returns. The one value every
+    /// client supervisor shares.
+    pub const CLIENT_REDIAL: Self = Self {
+        base: Duration::from_millis(300),
+        max: Duration::from_secs(2),
+    };
+
     /// Long-running background loop profile.
     ///
     /// Base 1 s, ceiling 60 s. Typical use: heartbeat loops that
@@ -237,6 +248,13 @@ impl JitterBackoff {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_client_redial_profile_recovers_within_seconds() {
+        assert_eq!(Backoff::CLIENT_REDIAL.base, Duration::from_millis(300));
+        assert_eq!(Backoff::CLIENT_REDIAL.max, Duration::from_secs(2));
+    }
+
     use super::*;
 
     #[test]
